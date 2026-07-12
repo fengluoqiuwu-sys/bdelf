@@ -1,4 +1,8 @@
+# Install torch/torchvision from the PyTorch CUDA 13.0 wheel index.
+--extra-index-url https://download.pytorch.org/whl/cu130
 torch
+torchvision
 huggingface_hub
+transformers
 PyYAML
 httpx[socks]
