@@ -301,13 +301,13 @@ def eval_gpt2_ppl(
         return float("nan"), float("nan")
     batch_iter: DataLoader | tqdm = loader
     if pbar_parent is not None:
+        pbar_parent.clear()
         batch_iter = tqdm(
             loader,
             desc="eval/gpt2-large",
             unit="batch",
             leave=False,
             dynamic_ncols=True,
-            parent=pbar_parent,
             total=len(loader),
         )
     try:
@@ -325,8 +325,10 @@ def eval_gpt2_ppl(
                 total_loss += float(loss.item())
             batches += 1
     finally:
-        if pbar_parent is not None and isinstance(batch_iter, tqdm):
+        if isinstance(batch_iter, tqdm):
             batch_iter.close()
+        if pbar_parent is not None:
+            pbar_parent.refresh()
     avg_loss = total_loss / max(1, batches)
     return avg_loss, loss_to_ppl(avg_loss)
 
@@ -766,7 +768,6 @@ def train_loop(
                             eval_token_layout,
                             pbar_parent=pbar,
                         )
-                        pbar.refresh()
                         eval_row = {
                             "step": step,
                             "gpt2_loss": round(gpt2_loss, 6),
