@@ -1,11 +1,12 @@
 """Block Diffusion + Embedded Language Flow (BDELF).
 
-在 BD3LM 块扩散注意力框架下，将块内 MDLM 离散掩码替换为 ELF 式连续 Flow Matching：
-  - 训练：80% 去噪分支（MSE，[z_t, x0] 拼接 + 块扩散掩码）
-  - 训练：20% 解码分支（CE，t=1 腐蚀 embedding → token）
-  - 推理：semi-AR 逐块 ODE 积分 + 最终 decode
+Within the BD3LM block-diffusion attention framework, replaces in-block MDLM
+discrete masking with ELF-style continuous flow matching:
+  - Training: 80% denoising branch (MSE, [z_t, x0] concat + block-diffusion mask)
+  - Training: 20% decoding branch (CE, t=1 corrupted embedding -> token)
+  - Inference: semi-AR per-block ODE integration + final decode
 
-参考:
+References:
   - Block Diffusion: https://arxiv.org/abs/2503.09573
   - ELF: https://arxiv.org/abs/2605.10938
 """
@@ -29,6 +30,7 @@ from models.bd3lm.model import (
     build_block_diff_mask,
 )
 from models.bdelf.config import FL_BDELFConfig
+from models.bdelf.infer import BDELFInferState, build_window_pair_mask
 from models.model import FL_PreTrainedModel, ensure_token_layout, split_model_cfg
 from models.rope import pair_positions, window_positions
 from models.tokens import FL_TokenLayout, apply_token_layout_to_config, token_layout_from_cfg
@@ -41,42 +43,8 @@ except ImportError:
   _FLEX_IMPORT_OK = False
 
 
-def build_window_pair_mask(
-  window_start: int,
-  window_len: int,
-  diffusion_block_size: int,
-  device: torch.device,
-) -> torch.Tensor:
-  """滑窗版块扩散掩码，形状 (2*window_len, 2*window_len)。"""
-  n = window_len
-  q = torch.arange(n * 2, device=device)[:, None]
-  kv = torch.arange(n * 2, device=device)[None, :]
-
-  def global_pos(idx: torch.Tensor) -> torch.Tensor:
-    local = torch.where(idx >= n, idx - n, idx)
-    return window_start + local
-
-  gq, gkv = global_pos(q), global_pos(kv)
-  x0_q = q >= n
-  x0_kv = kv >= n
-
-  block_q = torch.where(
-    x0_q, gq // diffusion_block_size, gq // diffusion_block_size,
-  )
-  block_kv = torch.where(
-    x0_kv, gkv // diffusion_block_size, gkv // diffusion_block_size,
-  )
-
-  block_diagonal = (block_q == block_kv) & (x0_q == x0_kv)
-  offset_block_causal = (
-    (block_q > block_kv) & x0_kv & (~x0_q)
-  )
-  block_causal = (block_q >= block_kv) & x0_kv & x0_q
-  return block_diagonal | offset_block_causal | block_causal
-
-
 class TimestepEmbedder(nn.Module):
-  """正弦时间步嵌入（DiT / ELF 风格）。"""
+  """Sinusoidal timestep embedding (DiT / ELF style)."""
 
   def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
     super().__init__()
@@ -107,7 +75,7 @@ class TimestepEmbedder(nn.Module):
 
 
 class FlowBlock(nn.Module):
-  """带时间条件化的 Transformer 块。"""
+  """Transformer block with timestep conditioning."""
 
   def __init__(
     self, n_embd: int, n_head: int, dropout: float, attn_backend: str = "flex",
@@ -133,6 +101,60 @@ class FlowBlock(nn.Module):
     h = self.ln_2(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
     x = x + self.mlp(h)
     return x
+
+  def forward_infer_prefix(
+    self,
+    x: torch.Tensor,
+    sdpa_attn_mask: torch.Tensor,
+    positions: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Inference prefix stream: no AdaLN; prefix hidden states do not vary with ODE timestep t."""
+    h = self.ln_1(x)
+    attn_out, k, v = self.attn.forward_prefix_infer(h, sdpa_attn_mask, positions)
+    x = x + attn_out
+    x = x + self.mlp(self.ln_2(x))
+    return x, k, v
+
+  def forward_infer_suffix(
+    self,
+    x: torch.Tensor,
+    cond: torch.Tensor,
+    k_prefix: torch.Tensor | None,
+    v_prefix: torch.Tensor | None,
+    sdpa_attn_mask: torch.Tensor,
+    positions: torch.Tensor,
+  ) -> torch.Tensor:
+    """Inference suffix stream: only the current block is modulated by AdaLN(t)."""
+    scale, shift = self.ada_ln(cond).chunk(2, dim=-1)
+    h = self.ln_1(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    x = x + self.attn.forward_suffix_cross_infer(
+      h, k_prefix, v_prefix, sdpa_attn_mask, positions,
+    )
+    h = self.ln_2(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    x = x + self.mlp(h)
+    return x
+
+  def forward_infer_append(
+    self,
+    x_new: torch.Tensor,
+    x_prefix: torch.Tensor,
+    prefix_self_mask: torch.Tensor,
+    cross_mask: torch.Tensor,
+    prefix_positions: torch.Tensor,
+    suffix_positions: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """P4: propagate only the new block through layers and append to prefix hidden states."""
+    h_old = self.ln_1(x_prefix)
+    _, k_old, v_old = self.attn.forward_prefix_infer(
+      h_old, prefix_self_mask, prefix_positions,
+    )
+    h_new = self.ln_1(x_new)
+    attn_out = self.attn.forward_suffix_cross_infer(
+      h_new, k_old, v_old, cross_mask, suffix_positions,
+    )
+    x_new = x_new + attn_out
+    x_new = x_new + self.mlp(self.ln_2(x_new))
+    return torch.cat([x_prefix, x_new], dim=1), x_new
 
 
 class _BDELFBackbone(nn.Module):
@@ -165,10 +187,10 @@ class _BDELFBackbone(nn.Module):
     super().__init__()
     if attn_backend == "flex" and not FLEX_ATTN_AVAILABLE:
       raise RuntimeError(
-        "attn_backend=flex 需要 PyTorch FlexAttention，请升级或改用 sdpa"
+        "attn_backend=flex requires PyTorch FlexAttention; upgrade PyTorch or use sdpa"
       )
     if attn_backend not in ("flex", "sdpa"):
-      raise ValueError(f"未知 attn_backend: {attn_backend}")
+      raise ValueError(f"unknown attn_backend: {attn_backend}")
 
     self.max_seq_len = max_seq_len
     self.diffusion_block_size = diffusion_block_size
@@ -208,12 +230,12 @@ class _BDELFBackbone(nn.Module):
   def _validate_seq_len(self, seq_len: int) -> None:
     if seq_len > self.max_seq_len:
       raise ValueError(
-        f"序列长度 {seq_len} 超过 max_seq_len {self.max_seq_len}"
+        f"sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}"
       )
     db = self.diffusion_block_size
     if seq_len % db != 0:
       raise ValueError(
-        f"序列长度 {seq_len} 必须能被 diffusion_block_size ({db}) 整除"
+        f"sequence length {seq_len} must be divisible by diffusion_block_size ({db})"
       )
 
   def _init_weights(self, module: nn.Module) -> None:
@@ -273,7 +295,7 @@ class _BDELFBackbone(nn.Module):
   def _embed_continuous_pair(
     self, z_half: torch.Tensor, x0_half: torch.Tensor,
   ) -> torch.Tensor:
-    """拼接 [z_t, x0]（RoPE 在 attention 内应用）。"""
+    """Concatenate [z_t, x0] (RoPE is applied inside attention)."""
     z = self.drop(z_half)
     x0 = self.drop(x0_half)
     return torch.cat([z, x0], dim=1)
@@ -287,13 +309,14 @@ class _BDELFBackbone(nn.Module):
     window_len: int | None = None,
     window_start: int = 0,
   ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """块扩散 backbone。
+    """Block-diffusion backbone.
 
     Args:
-      pair_emb: (B, 2*L, D) 训练时 L 随 batch 变化；推理时 L 为当前全长前缀
-      t: (B,) 时间步
-      decode: 是否解码模式（输出 logits）
-      window_len: 推理时单半长度；None 表示训练
+      pair_emb: (B, 2*L, D); L varies per batch during training; at inference L is the
+        current full-length prefix
+      t: (B,) timesteps
+      decode: whether to run in decode mode (output logits)
+      window_len: single-half length at inference; None means training
     """
     bsz = pair_emb.size(0)
     cond = self.time_embed(t)
@@ -379,11 +402,11 @@ class _BDELFBackbone(nn.Module):
     *,
     branch: Literal["denoise", "decode"] | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """训练/评估前向。
+    """Training/evaluation forward pass.
 
     Args:
-      branch: ``None`` 时按 ``decoder_prob`` 随机选分支；``"denoise"`` / ``"decode"``
-        用于 eval 或调试时固定分支。
+      branch: when ``None``, randomly choose a branch per ``decoder_prob``;
+        ``"denoise"`` / ``"decode"`` fix the branch for eval or debugging.
     """
     del targets
     bsz, seq_len = idx.shape
@@ -404,7 +427,7 @@ class _BDELFBackbone(nn.Module):
     return torch.empty(0), loss
 
   # -------------------------------------------------------------------------
-  # 推理：semi-AR 块内 ODE + decode
+  # Inference: semi-AR in-block ODE + decode
   # -------------------------------------------------------------------------
 
   def _get_sampling_steps(self, num_steps: int, device: torch.device) -> torch.Tensor:
@@ -430,7 +453,7 @@ class _BDELFBackbone(nn.Module):
     t_next: torch.Tensor,
     window_start: int,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """单块 Euler ODE 步。"""
+    """Single-block Euler ODE step."""
     bsz, win_len, _ = z.shape
     pair = self._embed_continuous_pair(z, x0_ctx)
     t_batch = t.expand(bsz)
@@ -469,7 +492,7 @@ class _BDELFBackbone(nn.Module):
     device: torch.device,
     dtype: torch.dtype,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """构造全长前缀 z/x0 两半（各 win_len），window_start 恒为 0。"""
+    """Build full-length prefix z/x0 halves (each win_len); window_start is always 0."""
     n_samples = z_block.size(0)
     win_len = end_idx - start_idx
     db = self.diffusion_block_size
@@ -496,6 +519,7 @@ class _BDELFBackbone(nn.Module):
     num_ode_steps: int,
     *,
     bos_token_id: int | None = None,
+    use_fast_infer: bool = True,
   ) -> tuple[torch.Tensor, int]:
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
     db = self.diffusion_block_size
@@ -504,6 +528,70 @@ class _BDELFBackbone(nn.Module):
     num_strides = seqlen // db
     nfe = 0
     t_steps = self._get_sampling_steps(num_ode_steps, device)
+
+    if not use_fast_infer:
+      return self._semi_ar_flow_sampler_legacy(
+        n_samples, seqlen, num_ode_steps,
+        bos_token_id=bos_token_id,
+        t_steps=t_steps,
+      )
+
+    state = BDELFInferState(self, n_samples, seqlen, device, dtype)
+    emb_accum = torch.zeros(
+      n_samples, 0, self.wte.embedding_dim, device=device, dtype=dtype,
+    )
+
+    for stride in range(num_strides):
+      z_block = torch.randn(
+        n_samples, db, self.wte.embedding_dim, device=device, dtype=dtype,
+      ) * self.denoiser_noise_scale
+
+      if stride == 0 and bos is not None:
+        bos_emb = self._tokens_to_emb(
+          torch.full((n_samples,), bos, device=device, dtype=torch.long),
+        )
+        z_block[:, 0] = bos_emb[:, 0]
+
+      state.begin_stride(stride, emb_accum)
+
+      for i in range(len(t_steps) - 1):
+        t = t_steps[i]
+        t_next = t_steps[i + 1]
+        z_block = state.ode_step(z_block, stride, t, t_next)
+        nfe += 1
+
+      block_tokens = state.decode_block(z_block, stride)
+      nfe += 1
+
+      if stride == 0 and bos is not None:
+        block_tokens[:, 0] = bos
+
+      emb_block = self._tokens_to_emb(block_tokens)
+      emb_accum = torch.cat([emb_accum, emb_block], dim=1)
+      state.on_stride_complete(emb_block, stride)
+      state.append_tokens(block_tokens)
+
+    return state.tokens(), nfe
+
+  @torch.no_grad()
+  def _semi_ar_flow_sampler_legacy(
+    self,
+    n_samples: int,
+    seqlen: int,
+    num_ode_steps: int,
+    *,
+    bos_token_id: int | None = None,
+    t_steps: torch.Tensor | None = None,
+  ) -> tuple[torch.Tensor, int]:
+    """Unoptimized inference path for numerical alignment checks."""
+    bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
+    db = self.diffusion_block_size
+    device = next(self.parameters()).device
+    dtype = next(self.parameters()).dtype
+    num_strides = seqlen // db
+    nfe = 0
+    if t_steps is None:
+      t_steps = self._get_sampling_steps(num_ode_steps, device)
 
     tokens = torch.zeros(n_samples, 0, dtype=torch.long, device=device)
     emb_accum = torch.zeros(
@@ -564,7 +652,7 @@ class _BDELFBackbone(nn.Module):
   ) -> tuple[torch.Tensor, int]:
     cfg = sampling_cfg or {}
     if seqlen is None:
-      raise ValueError("generate 需要显式指定 seqlen")
+      raise ValueError("generate requires an explicit seqlen")
     num_ode_steps = num_steps if num_steps is not None else cfg.get("num_ode_steps", 8)
     bos = self.token_layout.bos_token_id
     if bos_token_id is not None:
@@ -574,12 +662,14 @@ class _BDELFBackbone(nn.Module):
       self._infer_time_schedule = infer_schedule
 
     self._validate_seq_len(seqlen)
+    use_fast_infer = cfg.get("use_fast_infer", True)
 
     return self._semi_ar_flow_sampler(
       n_samples=num_samples,
       seqlen=seqlen,
       num_ode_steps=num_ode_steps,
       bos_token_id=bos,
+      use_fast_infer=use_fast_infer,
     )
 
 

@@ -22,3 +22,4 @@ fix_bos: true
 sampling:
   num_ode_steps: 8
   time_schedule: logit_normal
+  use_fast_infer: true

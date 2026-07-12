@@ -132,10 +132,11 @@ CONFIG_CLS = FL_BDELFConfig
 
 @dataclass
 class FlowSamplingConfig:
-    """BDELF 推理配置。"""
+    """BDELF inference configuration."""
 
     num_ode_steps: int = 8
     time_schedule: str | None = None
+    use_fast_infer: bool = True
 
     @classmethod
     def from_dict(cls, cfg: dict) -> FlowSamplingConfig:

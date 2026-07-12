@@ -28,6 +28,8 @@ def ensure_token_layout(config: PretrainedConfig) -> None:
 def merge_sampling_cfg(
     config: PretrainedConfig,
     sampling_cfg: Dict[str, Any] | None,
+    *,
+    use_fast_infer_override: bool | None = None,
 ) -> Dict[str, Any]:
     """Merge explicit ``sampling_cfg`` over ``config.sampling`` from yaml."""
     base = getattr(config, "sampling", None) or {}
@@ -36,6 +38,8 @@ def merge_sampling_cfg(
     merged = dict(base)
     if sampling_cfg:
         merged.update(sampling_cfg)
+    if use_fast_infer_override is not None:
+        merged["use_fast_infer"] = use_fast_infer_override
     return merged
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
@@ -136,7 +140,7 @@ class FL_PreTrainedModel(PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         tokens = input_ids if input_ids is not None else idx
         if tokens is None:
-            raise ValueError("forward 需要 input_ids 或 idx")
+            raise ValueError("forward requires input_ids or idx")
         label_tensor = labels if labels is not None else targets
         return self.backbone(tokens, label_tensor, **kwargs)
 
@@ -156,11 +160,19 @@ class FL_PreTrainedModel(PreTrainedModel):
         self,
         *args: Any,
         sampling_cfg: Dict[str, Any] | None = None,
+        for_eval: bool = False,
         **kwargs: Any,
     ) -> Any:
+        infer_override = None
+        if for_eval:
+            infer_override = False
         return self.backbone.generate(
             *args,
-            sampling_cfg=merge_sampling_cfg(self.config, sampling_cfg),
+            sampling_cfg=merge_sampling_cfg(
+                self.config,
+                sampling_cfg,
+                use_fast_infer_override=infer_override,
+            ),
             **kwargs,
         )
 
@@ -180,7 +192,7 @@ class FL_PreTrainedModel(PreTrainedModel):
         else:
             scale, unit = 1.0, ""
         human = f"{n / scale:.2f}{unit}" if unit else str(n)
-        print(f"总参数量: {n:,} ({human})")
+        print(f"[model] Total parameters: {n:,} ({human})")
 
 
 def build_model(model_name: str, model_cfg: dict) -> FL_PreTrainedModel:
@@ -188,10 +200,10 @@ def build_model(model_name: str, model_cfg: dict) -> FL_PreTrainedModel:
     try:
         module = importlib.import_module(f"models.{model_name}")
     except ModuleNotFoundError as exc:
-        raise ValueError(f"未找到模型包 models/{model_name}/") from exc
+        raise ValueError(f"Model package not found: models/{model_name}/") from exc
 
     if not hasattr(module, "build_model"):
-        raise ValueError(f"models/{model_name}/ 缺少 build_model(cfg) 函数")
+        raise ValueError(f"models/{model_name}/ is missing build_model(cfg)")
     return module.build_model(model_cfg)
 
 
@@ -201,10 +213,10 @@ def get_model(model: str, config_name: str) -> FL_PreTrainedModel:
     try:
         module = importlib.import_module(f"models.{model}")
     except ModuleNotFoundError as exc:
-        raise ValueError(f"未找到模型包 models/{model}/") from exc
+        raise ValueError(f"Model package not found: models/{model}/") from exc
 
     if not hasattr(module, "CONFIG_CLS"):
-        raise ValueError(f"models/{model}/ 缺少 CONFIG_CLS")
+        raise ValueError(f"models/{model}/ is missing CONFIG_CLS")
     config = config_from_yaml(module.CONFIG_CLS, path)
     ensure_token_layout(config)
     return module.build_model_from_config(config)
