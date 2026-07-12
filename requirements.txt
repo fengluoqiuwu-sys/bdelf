@@ -6,4 +6,5 @@ huggingface_hub
 datasets
 transformers
 PyYAML
+matplotlib
 httpx[socks]
