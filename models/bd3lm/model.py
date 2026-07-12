@@ -1,17 +1,17 @@
-"""Block Diffusion Language Model (BD3LM) 最简实现。
+"""Minimal Block Diffusion Language Model (BD3LM) implementation.
 
-参考论文: Block Diffusion: Interpolating Between Autoregressive and Diffusion
+Reference paper: Block Diffusion: Interpolating Between Autoregressive and Diffusion
 Language Models (https://arxiv.org/abs/2503.09573)
-参考代码: bd3lms (kuleshov-group/bd3lms)
+Reference code: bd3lms (kuleshov-group/bd3lms)
 
-核心思路:
-  1. 训练时将噪声序列 xt 与干净序列 x0 拼接为 [xt, x0]
-  2. 使用块扩散注意力掩码（块对角 + 偏移块因果 + 块因果）
-  3. SUBS 参数化预测被 mask 位置的干净 token
-  4. Log-linear 噪声调度
+Core ideas:
+  1. During training, concatenate noisy sequence xt and clean sequence x0 as [xt, x0]
+  2. Use block diffusion attention mask (block diagonal + offset block causal + block causal)
+  3. SUBS parameterization predicts clean tokens at masked positions
+  4. Log-linear noise schedule
 
-接口约定: forward(x0, targets) -> (logits, loss)
-  - full_sequence_training=True，训练/评估均使用完整序列（不做 AR shift）
+Interface: forward(x0, targets) -> (logits, loss)
+  - full_sequence_training=True: training/eval use the full sequence (no AR shift)
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ except ImportError:
 def block_diff_mask(
   b, h, q_idx, kv_idx, block_size: int | None = None, n: int | None = None,
 ) -> torch.Tensor:
-  """FlexAttention 用块扩散掩码（与 bd3lms models/dit.py 一致）。"""
+  """Block diffusion mask for FlexAttention (matches bd3lms models/dit.py)."""
   del b, h
   x0_flag_q = q_idx >= n
   x0_flag_kv = kv_idx >= n
@@ -91,7 +91,7 @@ def build_block_diff_mask(
   diffusion_block_size: int,
   device: torch.device,
 ) -> torch.Tensor:
-  """构造块扩散 bool 掩码（SDPA 回退路径），形状 (2*seq_len, 2*seq_len)。"""
+  """Build block diffusion bool mask (SDPA fallback path), shape (2*seq_len, 2*seq_len)."""
   n = seq_len
   q_idx = torch.arange(n * 2, device=device)[:, None]
   kv_idx = torch.arange(n * 2, device=device)[None, :]
@@ -102,7 +102,7 @@ def build_block_diff_mask(
 
 
 class LogLinearNoise(nn.Module):
-  """Log-linear 噪声调度: move_chance = t, loss_scale = -1/t。"""
+  """Log-linear noise schedule: move_chance = t, loss_scale = -1/t."""
 
   def __init__(self, eps: float = 1e-3) -> None:
     super().__init__()
@@ -116,7 +116,7 @@ class LogLinearNoise(nn.Module):
 
 
 class BlockDiffusionAttention(nn.Module):
-  """带块扩散掩码的多头自注意力（FlexAttention，SDPA 回退）。"""
+  """Multi-head self-attention with block diffusion mask (FlexAttention, SDPA fallback)."""
 
   def __init__(
     self,
@@ -127,7 +127,7 @@ class BlockDiffusionAttention(nn.Module):
   ) -> None:
     super().__init__()
     if n_embd % n_head != 0:
-      raise ValueError(f"n_embd ({n_embd}) 必须能被 n_head ({n_head}) 整除")
+      raise ValueError(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
     self.n_head = n_head
     self.n_embd = n_embd
     self.head_dim = n_embd // n_head
@@ -173,9 +173,66 @@ class BlockDiffusionAttention(nn.Module):
         is_causal=False,
       )
     else:
-      raise RuntimeError("BlockDiffusionAttention 需要 flex_block_mask 或 sdpa_attn_mask")
+      raise RuntimeError("BlockDiffusionAttention requires flex_block_mask or sdpa_attn_mask")
 
     y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_embd)
+    return self.resid_dropout(self.c_proj(y))
+
+  def _project_qkv(
+    self,
+    h: torch.Tensor,
+    positions: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bsz, seq_len, _ = h.size()
+    qkv = self.c_attn(h)
+    q, k, v = qkv.split(self.n_embd, dim=2)
+
+    def reshape_heads(t: torch.Tensor) -> torch.Tensor:
+      return t.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+
+    q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
+    q, k = self.rope.apply_qk(q, k, positions)
+    return q, k, v
+
+  def forward_prefix_infer(
+    self,
+    h: torch.Tensor,
+    sdpa_attn_mask: torch.Tensor,
+    positions: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prefix self-attention; returns output and K/V reused by suffix cross-attn."""
+    q, k, v = self._project_qkv(h, positions)
+    y = F.scaled_dot_product_attention(
+      q, k, v,
+      attn_mask=sdpa_attn_mask,
+      dropout_p=0.0,
+      is_causal=False,
+    )
+    y = y.transpose(1, 2).contiguous().view(h.size(0), h.size(1), self.n_embd)
+    return self.resid_dropout(self.c_proj(y)), k, v
+
+  def forward_suffix_cross_infer(
+    self,
+    h: torch.Tensor,
+    k_prefix: torch.Tensor | None,
+    v_prefix: torch.Tensor | None,
+    sdpa_attn_mask: torch.Tensor,
+    positions: torch.Tensor,
+  ) -> torch.Tensor:
+    """Suffix queries attend over [prefix KV; suffix KV]."""
+    q, k_suffix, v_suffix = self._project_qkv(h, positions)
+    if k_prefix is None:
+      k, v = k_suffix, v_suffix
+    else:
+      k = torch.cat([k_prefix, k_suffix], dim=2)
+      v = torch.cat([v_prefix, v_suffix], dim=2)
+    y = F.scaled_dot_product_attention(
+      q, k, v,
+      attn_mask=sdpa_attn_mask,
+      dropout_p=0.0,
+      is_causal=False,
+    )
+    y = y.transpose(1, 2).contiguous().view(h.size(0), h.size(1), self.n_embd)
     return self.resid_dropout(self.c_proj(y))
 
 
@@ -239,10 +296,10 @@ class _BD3LMBackbone(nn.Module):
 
     if attn_backend == "flex" and not FLEX_ATTN_AVAILABLE:
       raise RuntimeError(
-        "attn_backend=flex 需要 PyTorch FlexAttention，请升级 PyTorch 或改用 attn_backend=sdpa"
+        "attn_backend=flex requires PyTorch FlexAttention; upgrade PyTorch or use attn_backend=sdpa"
       )
     if attn_backend not in ("flex", "sdpa"):
-      raise ValueError(f"未知 attn_backend: {attn_backend}")
+      raise ValueError(f"Unknown attn_backend: {attn_backend}")
 
     self.max_seq_len = max_seq_len
     self.diffusion_block_size = diffusion_block_size
@@ -276,12 +333,12 @@ class _BD3LMBackbone(nn.Module):
   def _validate_seq_len(self, seq_len: int) -> None:
     if seq_len > self.max_seq_len:
       raise ValueError(
-        f"序列长度 {seq_len} 超过 max_seq_len {self.max_seq_len}"
+        f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}"
       )
     db = self.diffusion_block_size
     if seq_len % db != 0:
       raise ValueError(
-        f"序列长度 {seq_len} 必须能被 diffusion_block_size ({db}) 整除"
+        f"Sequence length {seq_len} must be divisible by diffusion_block_size ({db})"
       )
 
   def _init_weights(self, module: nn.Module) -> None:
@@ -333,11 +390,11 @@ class _BD3LMBackbone(nn.Module):
     return cached
 
   def _embed(self, idx: torch.Tensor) -> torch.Tensor:
-    """对拼接序列 [xt, x0] 做 token embedding（RoPE 在 attention 内应用）。"""
+    """Token embedding for concatenated sequence [xt, x0] (RoPE applied inside attention)."""
     return self.drop(self.wte(idx))
 
   def _backbone(self, x_input: torch.Tensor) -> torch.Tensor:
-    """输入拼接序列，输出 xt 部分的 logits。"""
+    """Run backbone on concatenated sequence; return logits for the xt half."""
     n = x_input.size(1) // 2
     x = self._embed(x_input)
     positions = pair_positions(n, x.device)
@@ -356,7 +413,7 @@ class _BD3LMBackbone(nn.Module):
   def _subs_parameterization(
     self, logits: torch.Tensor, xt: torch.Tensor,
   ) -> torch.Tensor:
-    """SUBS 参数化：被 mask 位置预测 x0，未 mask 位置 log prob 为 0。"""
+    """SUBS parameterization: predict x0 at masked positions; log prob 0 at unmasked positions."""
     logits = logits.clone()
     logits[:, :, self.mask_index] += self.neg_infinity
     logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
@@ -369,19 +426,19 @@ class _BD3LMBackbone(nn.Module):
   def _sample_t(
     self, batch_size: int, seq_len: int, device: torch.device,
   ) -> torch.Tensor:
-    """按块均匀采样噪声时间 t ∈ [sampling_eps_min, sampling_eps_max]。"""
+    """Sample noise time t uniformly per block in [sampling_eps_min, sampling_eps_max]."""
     num_blocks = seq_len // self.diffusion_block_size
     t = torch.rand(batch_size, num_blocks, device=device)
     t = t * (self.sampling_eps_max - self.sampling_eps_min) + self.sampling_eps_min
     return t.repeat_interleave(self.diffusion_block_size, dim=-1)
 
   def _q_xt(self, x0: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-    """前向扩散：以概率 p 将 token 替换为 mask。"""
+    """Forward diffusion: replace tokens with mask with probability p."""
     move = torch.rand_like(x0, dtype=torch.float32) <= p
     return torch.where(move, self.mask_index, x0)
 
   def _diffusion_loss(self, x0: torch.Tensor) -> torch.Tensor:
-    """计算扩散训练损失（token 级 NLL 均值）。"""
+    """Compute diffusion training loss (mean token-level NLL)."""
     bsz, seq_len = x0.shape
     self._validate_seq_len(seq_len)
 
@@ -396,7 +453,7 @@ class _BD3LMBackbone(nn.Module):
 
     logits = self._backbone(x_input)
 
-    # fp32：50258 维 logsumexp 与 loss 加权在 bf16 下不够稳定
+    # fp32: 50258-dim logsumexp and loss weighting are unstable in bf16
     with torch.amp.autocast("cuda", enabled=False):
       log_score = self._subs_parameterization(logits.float(), xt)
       log_p = torch.gather(
@@ -410,18 +467,18 @@ class _BD3LMBackbone(nn.Module):
     idx: torch.Tensor,
     targets: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """训练/评估接口。
+    """Training/eval interface.
 
     Args:
-      idx: 完整 token 序列 (B, L)，L 可变且须能被 diffusion_block_size 整除
-      targets: 忽略（兼容 train.py 接口）
+      idx: Full token sequence (B, L); L is variable and must be divisible by diffusion_block_size
+      targets: Ignored (compatible with train.py interface)
     """
     del targets
     loss = self._diffusion_loss(idx)
     return torch.empty(0), loss
 
   # -------------------------------------------------------------------------
-  # 推理 / 采样（移植自 bd3lms diffusion/base.py）
+  # Inference / sampling (ported from bd3lms diffusion/base.py)
   # -------------------------------------------------------------------------
 
   def _sample_prior(self, *batch_dims: int) -> torch.Tensor:
@@ -430,14 +487,14 @@ class _BD3LMBackbone(nn.Module):
     )
 
   def _embed_sample(self, idx: torch.Tensor, window_start: int) -> torch.Tensor:
-    """采样模式 embedding（RoPE 在 attention 内应用）。"""
+    """Sampling-mode embedding (RoPE applied inside attention)."""
     del window_start
     return self.drop(self.wte(idx))
 
   def _build_sample_block_causal_mask(
     self, window_start: int, window_len: int, device: torch.device,
   ) -> torch.Tensor:
-    """采样用块因果掩码（官方 sample_mode 取 full mask 的 x0|x0 子块）。"""
+    """Block-causal mask for sampling (official sample_mode uses x0|x0 sub-block of full mask)."""
     pos = torch.arange(
       window_start, window_start + window_len, device=device,
     )
@@ -448,7 +505,7 @@ class _BD3LMBackbone(nn.Module):
   def _backbone_sample(
     self, xt_window: torch.Tensor, window_start: int = 0,
   ) -> torch.Tensor:
-    """采样前向：仅 xt 窗口 + 块因果注意力（对齐官方 sample_mode）。"""
+    """Sampling forward: xt window only + block-causal attention (matches official sample_mode)."""
     x = self._embed_sample(xt_window, window_start)
     window_len = xt_window.size(1)
     positions = window_positions(window_start, window_len, xt_window.device)
@@ -496,7 +553,7 @@ class _BD3LMBackbone(nn.Module):
     first_hitting: bool,
     nucleus_p: float,
   ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """单步 DDPM 去噪更新（bd3lms diffusion/base.py）。"""
+    """Single DDPM denoising step (bd3lms diffusion/base.py)."""
     db = self.diffusion_block_size
     _, move_chance_t = self.noise(t)
     _, move_chance_s = self.noise(t - dt)
@@ -546,7 +603,7 @@ class _BD3LMBackbone(nn.Module):
     nucleus_p: float = 1.0,
     bos_token_id: int | None = None,
   ) -> tuple[torch.Tensor, int]:
-    """Semi-AR 块扩散采样；始终使用从位置 0 起的全长上下文。"""
+    """Semi-AR block diffusion sampling; always uses full context starting at position 0."""
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
     db = self.diffusion_block_size
     num_strides = seqlen // db
@@ -612,15 +669,15 @@ class _BD3LMBackbone(nn.Module):
     bos_token_id: int | None = None,
     sampling_cfg: dict | None = None,
   ) -> tuple[torch.Tensor, int]:
-    """从噪声生成 token 序列。
+    """Generate token sequences from noise.
 
     Returns:
       tokens: (num_samples, seqlen)
-      nfe: 实际模型前向次数（官方 metrics.nfes）
+      nfe: Actual number of model forward passes (official metrics.nfes)
     """
     cfg = sampling_cfg or {}
     if seqlen is None:
-      raise ValueError("generate 需要显式指定 seqlen")
+      raise ValueError("generate requires an explicit seqlen")
     num_steps = num_steps if num_steps is not None else cfg.get("num_steps", 5000)
     first_hitting = (
       first_hitting if first_hitting is not None
@@ -633,7 +690,7 @@ class _BD3LMBackbone(nn.Module):
 
     self._validate_seq_len(seqlen)
     if sampler != "semi_ar":
-      raise NotImplementedError(f"采样器 {sampler!r} 尚未移植")
+      raise NotImplementedError(f"Sampler {sampler!r} has not been ported yet")
 
     return self._semi_ar_sampler(
       n_samples=num_samples,
@@ -646,7 +703,7 @@ class _BD3LMBackbone(nn.Module):
 
 
 def _sample_categorical(categorical_probs: torch.Tensor) -> torch.Tensor:
-  """Gumbel-max 采样（bd3lms diffusion/base.py）。"""
+  """Gumbel-max sampling (bd3lms diffusion/base.py)."""
   gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
   return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
