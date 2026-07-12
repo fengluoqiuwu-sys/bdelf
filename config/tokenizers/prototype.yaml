@@ -1,0 +1,6 @@
+_doc: Tokenizer config template (FL_TokenizerConfig)
+
+name: prototype
+base_tokenizer: gpt2
+base_tokenizer_cache_path: cache/tokenizers/gpt2
+special_tokens: []

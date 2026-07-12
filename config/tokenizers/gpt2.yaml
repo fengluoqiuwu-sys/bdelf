@@ -1,0 +1,9 @@
+_doc: GPT-2 tokenizer config
+
+name: gpt2
+base_tokenizer: gpt2
+base_tokenizer_cache_path: cache/tokenizers/gpt2
+special_tokens:
+  - "<|pad|>"
+  - "<|bos|>"
+  - "<|eos|>"
