@@ -1,14 +1,8 @@
-# OpenWebText (OWT) dataset config
+_doc: OpenWebText (OWT) dataset config
 
-name: owt                        # dataset name (custom identifier)
-repo_id: Skylion007/openwebtext  # repo id on HuggingFace Hub
-revision: main                   # branch / tag / commit (default: main)
-
-# Splits to download. Use "|" to download multiple, e.g. "train | test".
+name: owt
+repo_id: Skylion007/openwebtext
+revision: main
 download_split: train
-
-# Local download path. Defaults to "cache/datasets/{name}" when left empty.
 download_path: cache/datasets/owt
-
-# Supported splits (may be produced after processing).
 split: train

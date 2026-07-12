@@ -12,12 +12,13 @@ Contains:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
-import yaml
 from torch.utils.data import Dataset
+
+from config_util import load_yaml_config
 
 # Directory holding the per-dataset yaml configs.
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "datasets"
@@ -51,7 +52,7 @@ def get_dataset(name: str) -> "FL_Dataset":
 
     config_path = CONFIG_DIR / f"{name}.yaml"
     if not config_path.exists():
-        raise FileNotFoundError(f"配置 {name}.yaml 不存在")
+        raise FileNotFoundError(f"Config {name}.yaml does not exist")
 
     config = FL_DatasetConfig.from_yaml(config_path)
     return cls(config)
@@ -74,7 +75,12 @@ class FL_DatasetConfig:
     """Generic dataset config.
 
     Fields map one-to-one with the yaml template under ``config/datasets``.
+    Non-attribute YAML keys are stored in ``extra``.
     """
+
+    _YAML_REQUIRED = frozenset(
+        {"name", "repo_id", "revision", "download_split", "download_path", "split"}
+    )
 
     name: str = "prototype"
     repo_id: str = ""
@@ -85,12 +91,10 @@ class FL_DatasetConfig:
     download_split: str = "train"
     # Supported splits (may be produced after processing).
     split: str = "train"
-    # Local download path. Defaults to "cache/datasets/{name}" when empty.
+    # Local download path. Leave empty to use the HuggingFace Hub default cache.
     download_path: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        if not self.download_path:
-            self.download_path = f"cache/datasets/{self.name}"
+    # YAML keys that are not config attributes (e.g. _doc).
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def download_splits(self) -> List[str]:
@@ -104,13 +108,8 @@ class FL_DatasetConfig:
 
     @classmethod
     def from_yaml(cls, path: str | os.PathLike) -> "FL_DatasetConfig":
-        """Load config from a yaml file; unknown fields are ignored."""
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-
-        valid_keys = {f.name for f in fields(cls)}
-        kwargs = {k: v for k, v in raw.items() if k in valid_keys}
-        return cls(**kwargs)
+        """Load config from a yaml file with strict key validation."""
+        return load_yaml_config(cls, path, required=cls._YAML_REQUIRED)
 
 
 class FL_Dataset(Dataset):
@@ -129,10 +128,43 @@ class FL_Dataset(Dataset):
         """Check if the dataset is the prototype dataset."""
         return self.config and self.config.name == "prototype"
 
+    def _snapshot_allow_patterns(self) -> Optional[List[str]]:
+        if self.config.subset:
+            return [f"{self.config.subset}/*"]
+        return None
+
+    def _hf_snapshot_download(self, *, local_files_only: bool):
+        import hf_config  # noqa: F401
+        from huggingface_hub import snapshot_download
+
+        kwargs = {
+            "repo_id": self.config.repo_id,
+            "repo_type": "dataset",
+            "revision": self.config.revision,
+            "allow_patterns": self._snapshot_allow_patterns(),
+        }
+        if local_files_only:
+            kwargs["local_files_only"] = True
+        elif self.config.download_path:
+            download_path = Path(self.config.download_path)
+            download_path.mkdir(parents=True, exist_ok=True)
+            kwargs["local_dir"] = str(download_path)
+
+        return snapshot_download(**kwargs)
+
     def is_downloaded(self) -> bool:
-        """Check whether the local download path exists and is non-empty."""
+        """Check whether the dataset is available locally."""
         if self._is_prototype():
             return False
+        if not self.config.download_path:
+            from huggingface_hub.errors import LocalEntryNotFoundError
+
+            try:
+                self._hf_snapshot_download(local_files_only=True)
+                return True
+            except LocalEntryNotFoundError:
+                return False
+
         path = Path(self.config.download_path)
         if not path.exists():
             return False
@@ -150,35 +182,18 @@ class FL_Dataset(Dataset):
     def download(self) -> bool:
         """Download the dataset locally.
 
-        - If a local download already exists, print "已下载" and return ``True``.
-        - Otherwise download from the HuggingFace Hub into ``config.download_path``.
+        - If a local download already exists, print "Already downloaded" and return ``True``.
+        - Otherwise download from the HuggingFace Hub. When ``download_path`` is
+          empty, files go to the HuggingFace Hub default cache; otherwise into
+          ``config.download_path``.
           Global HuggingFace settings (disable XET, use the hf-mirror endpoint)
           are applied by importing ``hf_config`` before importing ``huggingface_hub``.
         """
         if self._is_prototype():
             raise ValueError("Prototype dataset cannot be downloaded.")
         if self.is_downloaded():
-            print("已下载")
+            print("Already downloaded")
             return True
 
-        # Import hf_config first to apply global HF settings, then import the
-        # huggingface_hub package so the mirror and XET settings take effect.
-        import hf_config  # noqa: F401
-        from huggingface_hub import snapshot_download
-
-        download_path = Path(self.config.download_path)
-        download_path.mkdir(parents=True, exist_ok=True)
-
-        # When a subset is set, only download files under that subset folder.
-        allow_patterns = None
-        if self.config.subset:
-            allow_patterns = [f"{self.config.subset}/*"]
-
-        snapshot_download(
-            repo_id=self.config.repo_id,
-            repo_type="dataset",
-            revision=self.config.revision,
-            local_dir=str(download_path),
-            allow_patterns=allow_patterns,
-        )
+        self._hf_snapshot_download(local_files_only=False)
         return True
