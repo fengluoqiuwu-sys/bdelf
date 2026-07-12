@@ -1,0 +1,6 @@
+_doc: bdelf/100m-fast micro-batch for fast-16gb
+name: 100m-fast
+batch_size: 4
+grad_accum_steps: 4
+num_params_m: 110.4
+estimated_peak_vram_gb: 6.2

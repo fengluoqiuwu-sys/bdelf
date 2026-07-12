@@ -1,0 +1,6 @@
+_doc: ar/100m-fast micro-batch for fast-16gb
+name: 100m-fast
+batch_size: 8
+grad_accum_steps: 2
+num_params_m: 98.9
+estimated_peak_vram_gb: 5.1

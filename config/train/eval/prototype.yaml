@@ -1,0 +1,8 @@
+_doc: Eval config template
+name: prototype
+eval_model: gpt2-large
+eval_model_dtype: bf16
+eval_model_device: cuda
+use_fast_infer: false
+eval_sample_count: null
+eval_sample_seed: 42

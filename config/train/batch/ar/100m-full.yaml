@@ -1,0 +1,6 @@
+_doc: ar/100m-full micro-batch for full-8x4090
+name: 100m-full
+batch_size: 12
+grad_accum_steps: 2
+num_params_m: 98.9
+estimated_peak_vram_gb: 5.4

@@ -1,0 +1,9 @@
+_doc: gpt2-large eval resident on GPU (~2.5GB bf16)
+name: gpt2-large-cuda
+eval_model: gpt2-large
+eval_model_dtype: bf16
+eval_model_device: cuda
+use_fast_infer: false
+eval_sample_count: 1024
+eval_sample_seed: 42
+estimated_vram_gb: 2.5

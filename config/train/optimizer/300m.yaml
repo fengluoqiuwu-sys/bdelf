@@ -1,0 +1,8 @@
+_doc: AdamW lr schedule base for ~300m models
+name: 300m
+dtype: bf16
+learning_rate: 0.0002
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0

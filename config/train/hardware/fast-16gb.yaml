@@ -1,0 +1,7 @@
+_doc: Single GPU 16GB smoke-test profile
+name: fast-16gb
+world_size: 1
+num_workers: 16
+gpu_memory_gb: 16
+memory_headroom_gb: 1.0
+hardware_profile: single GPU 16GB

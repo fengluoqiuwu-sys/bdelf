@@ -1,0 +1,6 @@
+_doc: Hardware profile template
+name: prototype
+world_size: 1
+num_workers: 8
+gpu_memory_gb: 16
+memory_headroom_gb: 1.0

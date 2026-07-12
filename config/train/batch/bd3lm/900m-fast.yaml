@@ -1,0 +1,6 @@
+_doc: bd3lm/900m-fast micro-batch for fast-16gb
+name: 900m-fast
+batch_size: 1
+grad_accum_steps: 4
+num_params_m: 870.5
+estimated_peak_vram_gb: 13.8

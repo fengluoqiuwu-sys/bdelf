@@ -1,0 +1,6 @@
+_doc: bd3lm/300m-fast micro-batch for fast-16gb
+name: 300m-fast
+batch_size: 1
+grad_accum_steps: 8
+num_params_m: 303.4
+estimated_peak_vram_gb: 7.9

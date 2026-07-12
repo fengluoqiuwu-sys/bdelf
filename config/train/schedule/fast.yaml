@@ -1,0 +1,12 @@
+_doc: Fast smoke-test schedule
+name: fast
+variant: fast
+max_steps: 10000
+warmup_steps: 1000
+min_lr_ratio: 0.1
+log_plot_every: 100
+eval_every: 2000
+save_every: 2000
+snapshot_every: 10000
+resume: true
+seed: 42
