@@ -182,10 +182,6 @@ class _GPTBackbone(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    @torch.no_grad()
     def generate(
         self,
         num_samples: int = 1,

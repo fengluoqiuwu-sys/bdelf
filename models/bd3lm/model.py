@@ -420,10 +420,6 @@ class _BD3LMBackbone(nn.Module):
     loss = self._diffusion_loss(idx)
     return torch.empty(0), loss
 
-  @torch.no_grad()
-  def count_parameters(self) -> int:
-    return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
   # -------------------------------------------------------------------------
   # 推理 / 采样（移植自 bd3lms diffusion/base.py）
   # -------------------------------------------------------------------------

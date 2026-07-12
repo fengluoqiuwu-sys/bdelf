@@ -403,10 +403,6 @@ class _BDELFBackbone(nn.Module):
       self.last_loss_branch = "mixed"
     return torch.empty(0), loss
 
-  @torch.no_grad()
-  def count_parameters(self) -> int:
-    return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
   # -------------------------------------------------------------------------
   # 推理：semi-AR 块内 ODE + decode
   # -------------------------------------------------------------------------

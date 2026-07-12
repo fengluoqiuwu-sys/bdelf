@@ -165,7 +165,22 @@ class FL_PreTrainedModel(PreTrainedModel):
         )
 
     def count_parameters(self) -> int:
-        return self.backbone.count_parameters()
+        """Return total parameter count (tokenizer is not part of the model)."""
+        return sum(p.numel() for p in self.parameters())
+
+    def print_parameter_count(self) -> None:
+        """Print total parameter count (tokenizer is not part of the model)."""
+        n = self.count_parameters()
+        if n >= 1_000_000_000:
+            scale, unit = 1e9, "B"
+        elif n >= 1_000_000:
+            scale, unit = 1e6, "M"
+        elif n >= 1_000:
+            scale, unit = 1e3, "K"
+        else:
+            scale, unit = 1.0, ""
+        human = f"{n / scale:.2f}{unit}" if unit else str(n)
+        print(f"总参数量: {n:,} ({human})")
 
 
 def build_model(model_name: str, model_cfg: dict) -> FL_PreTrainedModel:
