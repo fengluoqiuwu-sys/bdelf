@@ -6,4 +6,4 @@ revision: main
 subset: wikitext-103-v1
 download_split: train | validation | test
 download_path: cache/datasets/wikitext
-split: train | valid | test
+split: train | eval

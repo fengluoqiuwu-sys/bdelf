@@ -5,4 +5,6 @@ repo_id: Skylion007/openwebtext
 revision: main
 download_split: train
 download_path: cache/datasets/owt
-split: train
+split: train | eval
+eval_count: 10000
+eval_seed: 42

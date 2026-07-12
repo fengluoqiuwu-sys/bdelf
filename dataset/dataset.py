@@ -12,9 +12,10 @@ Contains:
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 from torch.utils.data import Dataset
 
@@ -93,6 +94,10 @@ class FL_DatasetConfig:
     split: str = "train"
     # Local download path. Leave empty to use the HuggingFace Hub default cache.
     download_path: Optional[str] = None
+    # Random eval holdout size (arxiv / owt): sample this many rows as eval.
+    eval_count: Optional[int] = None
+    # Random seed for eval holdout sampling (arxiv / owt).
+    eval_seed: Optional[int] = None
     # YAML keys that are not config attributes (e.g. _doc).
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -178,6 +183,77 @@ class FL_Dataset(Dataset):
         if self._is_prototype():
             return []
         return self.config.splits
+
+    def load_split(self, split: str):
+        """Load one logical split (e.g. ``train`` / ``eval``) as a HF Dataset."""
+        if self._is_prototype():
+            raise ValueError("Prototype dataset cannot be loaded.")
+        if split not in self.config.splits:
+            raise ValueError(
+                f"Unknown split '{split}'. Supported: {self.config.splits}"
+            )
+        return self._build_split(split)
+
+    def _build_split(self, split: str):
+        """Build a logical split. Subclasses may override for custom mapping."""
+        if self.config.eval_count is not None:
+            return self._build_random_holdout_split(split)
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement split mapping."
+        )
+
+    def _build_random_holdout_split(self, split: str):
+        """Sample ``eval_count`` rows as eval; the rest become train."""
+        if self.config.eval_count is None or self.config.eval_seed is None:
+            raise ValueError(
+                f"{self.config.name}: eval_count and eval_seed are required "
+                "for random holdout splits."
+            )
+        if self.config.eval_count < 0:
+            raise ValueError(
+                f"{self.config.name}: eval_count must be non-negative."
+            )
+
+        full = self._load_raw_split("train")
+        train_indices, eval_indices = self._random_holdout_indices(len(full))
+        if split == "train":
+            return full.select(train_indices)
+        if split == "eval":
+            return full.select(eval_indices)
+        raise ValueError(f"Unknown split '{split}'.")
+
+    def _random_holdout_indices(self, total: int) -> Tuple[List[int], List[int]]:
+        """Return (train_indices, eval_indices) cached on the instance."""
+        cached = getattr(self, "_holdout_indices", None)
+        if cached is not None and cached[0] == total:
+            return cached[1], cached[2]
+
+        eval_count = min(self.config.eval_count, total)
+        rng = random.Random(self.config.eval_seed)
+        indices = list(range(total))
+        rng.shuffle(indices)
+        eval_indices = sorted(indices[:eval_count])
+        eval_set = set(eval_indices)
+        train_indices = [i for i in range(total) if i not in eval_set]
+        self._holdout_indices = (total, train_indices, eval_indices)
+        return train_indices, eval_indices
+
+    def _load_raw_split(self, hf_split: str):
+        """Load one HuggingFace split name without remapping."""
+        import hf_config  # noqa: F401
+        from datasets import load_dataset
+
+        kwargs: Dict[str, Any] = {
+            "path": self.config.repo_id,
+            "split": hf_split,
+            "revision": self.config.revision,
+        }
+        if self.config.subset:
+            kwargs["name"] = self.config.subset
+        if self.config.download_path:
+            kwargs["data_dir"] = str(self.config.download_path)
+
+        return load_dataset(**kwargs)
 
     def download(self) -> bool:
         """Download the dataset locally.

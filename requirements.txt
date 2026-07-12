@@ -3,6 +3,7 @@
 torch
 torchvision
 huggingface_hub
+datasets
 transformers
 PyYAML
 httpx[socks]
