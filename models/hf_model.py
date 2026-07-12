@@ -12,6 +12,16 @@ from transformers import PreTrainedModel
 
 CACHE_ROOT = Path("cache/models")
 
+# PyTorch eval baseline only; skip ONNX / TF / Flax / Rust duplicates in HF repos.
+_EVAL_MODEL_ALLOW_PATTERNS = (
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "model-*.safetensors",
+    "pytorch_model.bin",
+    "pytorch_model-*.bin",
+)
+
 
 def _cache_name(repo_id: str) -> str:
     return repo_id.replace("/", "--")
@@ -24,12 +34,18 @@ def resolve_hf_model_cache_path(repo_id: str, cache_path: str | os.PathLike | No
     return CACHE_ROOT / _cache_name(repo_id)
 
 
+def _has_model_weights(path: Path) -> bool:
+    if (path / "model.safetensors").is_file() or (path / "pytorch_model.bin").is_file():
+        return True
+    return any(path.glob("model-*.safetensors")) or any(path.glob("pytorch_model-*.bin"))
+
+
 def is_hf_model_cached(repo_id: str, cache_path: str | os.PathLike | None = None) -> bool:
     """Check whether a model snapshot exists locally."""
     path = resolve_hf_model_cache_path(repo_id, cache_path)
     if not path.is_dir():
         return False
-    return (path / "config.json").exists()
+    return (path / "config.json").is_file() and _has_model_weights(path)
 
 
 def download_hf_model(
@@ -44,7 +60,7 @@ def download_hf_model(
 
     local_dir = resolve_hf_model_cache_path(repo_id, cache_path)
     if is_hf_model_cached(repo_id, local_dir):
-        print("Already downloaded")
+        print("[model] Already downloaded")
         return local_dir
 
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +68,7 @@ def download_hf_model(
         repo_id=repo_id,
         revision=revision,
         local_dir=str(local_dir),
+        allow_patterns=list(_EVAL_MODEL_ALLOW_PATTERNS),
     )
     return local_dir
 
@@ -130,9 +147,11 @@ def load_hf_model_from_cache(
 
     kwargs: Dict[str, Any] = dict(load_kwargs)
     if torch_dtype is not None:
-        kwargs["torch_dtype"] = torch_dtype
+        kwargs["dtype"] = torch_dtype
 
     model = AutoModelForCausalLM.from_pretrained(str(cache_path), **kwargs)
+    if getattr(model, "loss_type", None) is None:
+        model.loss_type = "ForCausalLM"
     if device is not None:
         model = model.to(device)
     return model
