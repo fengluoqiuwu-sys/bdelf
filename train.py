@@ -357,6 +357,7 @@ def prepare_gpt2_eval_batch(
     *,
     gpt2_vocab_size: int,
     fill_token_id: int,
+    ignore_prefix_len: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map extended-vocab token ids to GPT-2 baseline range for eval PPL."""
     input_ids = batch.clone()
@@ -365,6 +366,8 @@ def prepare_gpt2_eval_batch(
     input_ids[oov] = fill_token_id
     for token_id in (layout.bos_token_id, layout.eos_token_id, layout.pad_token_id):
         labels[labels == token_id] = -100
+    if ignore_prefix_len > 0:
+        labels[:, :ignore_prefix_len] = -100
     return input_ids, labels
 
 
@@ -381,11 +384,14 @@ def eval_generative_gpt2_ppl(
     seqlen: int,
     pbar_parent: tqdm | None = None,
 ) -> tuple[float, float]:
-    """Generative PPL: train model completes eval chunks; gpt2-large scores the output."""
+    """Generative PPL: train model completes eval chunks; gpt2-large scores generated suffix."""
     was_training = train_model.training
     train_model.eval()
     gpt2_model.eval()
     gpt2_device = next(gpt2_model.parameters()).device
+    prefix_len = _eval_prefix_len(
+        seqlen, cfg.eval_prefix_ratio, _model_block_size(train_model),
+    )
     gpt2_vocab_size = int(getattr(gpt2_model.config, "vocab_size", 50257))
     fill_token_id = int(
         getattr(gpt2_model.config, "eos_token_id", None) or 50256,
@@ -419,6 +425,7 @@ def eval_generative_gpt2_ppl(
                 eval_token_layout,
                 gpt2_vocab_size=gpt2_vocab_size,
                 fill_token_id=fill_token_id,
+                ignore_prefix_len=prefix_len,
             )
             with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
                 outputs = gpt2_model(input_ids, labels=labels)
@@ -433,7 +440,14 @@ def eval_generative_gpt2_ppl(
         if was_training:
             train_model.train()
     avg_loss = total_loss / max(1, batches)
-    return avg_loss, loss_to_ppl(avg_loss)
+    avg_ppl = loss_to_ppl(avg_loss)
+    if batches > 0:
+        summary = f"eval/gpt2-large (gen): loss {avg_loss:.4f} ppl {avg_ppl:.2f}"
+        if pbar_parent is not None:
+            tqdm.write(f"{_TRAIN_LOG} {summary}")
+        else:
+            _train_log(summary)
+    return avg_loss, avg_ppl
 
 
 def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> None:
@@ -601,15 +615,9 @@ def format_interval_summary(
     step: int,
     max_steps: int,
     row: dict[str, Any],
-    *,
-    gpt2_loss: float | None = None,
-    gpt2_ppl: float | None = None,
 ) -> list[str]:
     pct = 100.0 * (step + 1) / max_steps
-    lines = [f"[{step + 1}/{max_steps} ({pct:.1f}%)] {_train_metrics_text(row)}"]
-    if gpt2_loss is not None and gpt2_ppl is not None:
-        lines.append(f"  eval/gpt2-large (gen): loss {gpt2_loss:.4f} ppl {gpt2_ppl:.2f}")
-    return lines
+    return [f"[{step + 1}/{max_steps} ({pct:.1f}%)] {_train_metrics_text(row)}"]
 
 
 def _rank0_log(msg: str, pbar: tqdm | None) -> None:
@@ -885,10 +893,7 @@ def train_loop(
                         }
                         append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
 
-                    for line in format_interval_summary(
-                        step, cfg.max_steps, row,
-                        gpt2_loss=gpt2_loss, gpt2_ppl=gpt2_ppl,
-                    ):
+                    for line in format_interval_summary(step, cfg.max_steps, row):
                         _rank0_log(line, pbar)
 
                 if (step + 1) % cfg.log_plot_every == 0:
