@@ -40,6 +40,7 @@ class FL_ARConfig(PretrainedConfig):
         n_embd: int = 672,
         dropout: float = 0.1,
         use_flash: bool = True,
+        sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if "block_size" in kwargs:
@@ -58,6 +59,7 @@ class FL_ARConfig(PretrainedConfig):
         self.n_embd = n_embd
         self.dropout = dropout
         self.use_flash = use_flash
+        self.sampling = sampling or {}
 
     def token_layout(self) -> FL_TokenLayout:
         return FL_TokenLayout(

@@ -7,3 +7,6 @@ n_head: 12
 n_embd: 672
 dropout: 0.1
 use_flash: true
+
+sampling:
+  use_kv_cache: true

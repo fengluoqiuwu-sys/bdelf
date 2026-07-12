@@ -8,6 +8,7 @@ and standard LM interfaces; training still calls ``backbone.forward(idx, targets
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,14 @@ from models.ar.config import FL_ARConfig
 from models.model import FL_PreTrainedModel, ensure_token_layout, split_model_cfg
 from models.rope import RotaryEmbedding
 from models.tokens import apply_token_layout_to_config, token_layout_from_cfg
+
+
+@dataclass
+class ARKVCache:
+    """Per-layer cached K/V for autoregressive decode, shape ``(B, H, L, D)``."""
+
+    k: torch.Tensor
+    v: torch.Tensor
 
 
 class CausalSelfAttention(nn.Module):
@@ -30,7 +39,7 @@ class CausalSelfAttention(nn.Module):
     ) -> None:
         super().__init__()
         if n_embd % n_head != 0:
-            raise ValueError(f"n_embd ({n_embd}) 必须能被 n_head ({n_head}) 整除")
+            raise ValueError(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
         self.n_head = n_head
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
@@ -80,6 +89,48 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_embd)
         return self.resid_dropout(self.c_proj(y))
 
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        cache: ARKVCache | None,
+        pos_start: int,
+    ) -> tuple[torch.Tensor, ARKVCache]:
+        """Incremental decode: ``x`` is usually a single token; ``pos_start`` is its absolute position."""
+        bsz, seq_len, _ = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+
+        def reshape_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+
+        q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
+
+        positions = torch.arange(
+            pos_start, pos_start + seq_len, device=x.device, dtype=torch.long,
+        )
+        q, k = self.rope.apply_qk(q, k, positions)
+
+        if cache is not None:
+            k = torch.cat([cache.k, k], dim=2)
+            v = torch.cat([cache.v, v], dim=2)
+
+        if self.use_flash:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            attn = F.softmax(attn, dim=-1)
+            y = attn @ v
+
+        y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_embd)
+        out = self.resid_dropout(self.c_proj(y))
+        return out, ARKVCache(k=k, v=v)
+
 
 class MLP(nn.Module):
     def __init__(self, n_embd: int, dropout: float) -> None:
@@ -115,6 +166,17 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        cache: ARKVCache | None,
+        pos_start: int,
+    ) -> tuple[torch.Tensor, ARKVCache]:
+        attn_out, cache = self.attn.forward_with_cache(self.ln_1(x), cache, pos_start)
+        x = x + attn_out
+        x = x + self.mlp(self.ln_2(x))
+        return x, cache
 
 
 class _GPTBackbone(nn.Module):
@@ -164,7 +226,7 @@ class _GPTBackbone(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         bsz, seq_len = idx.size()
         if seq_len > self.max_seq_len:
-            raise ValueError(f"序列长度 {seq_len} 超过 max_seq_len {self.max_seq_len}")
+            raise ValueError(f"sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
 
         x = self.drop(self.wte(idx))
         for block in self.h:
@@ -181,26 +243,65 @@ class _GPTBackbone(nn.Module):
             )
         return logits, loss
 
-    @torch.no_grad()
-    def generate(
+    def _forward_with_kv_cache(
         self,
-        num_samples: int = 1,
-        seqlen: int | None = None,
+        idx: torch.Tensor,
+        kv_caches: list[ARKVCache | None] | None,
+        pos_start: int,
+    ) -> tuple[torch.Tensor, list[ARKVCache]]:
+        x = self.drop(self.wte(idx))
+        new_caches: list[ARKVCache] = []
+        for layer_idx, block in enumerate(self.h):
+            layer_cache = None if kv_caches is None else kv_caches[layer_idx]
+            x, layer_cache = block.forward_with_cache(x, layer_cache, pos_start)
+            new_caches.append(layer_cache)
+        x = self.ln_f(x)
+        return self.lm_head(x), new_caches
+
+    @torch.no_grad()
+    def _generate_with_kv_cache(
+        self,
+        num_samples: int,
+        seqlen: int,
         *,
-        temperature: float = 1.0,
-        top_k: int | None = None,
-        bos_token_id: int | None = None,
-        sampling_cfg: dict | None = None,
+        temperature: float,
+        top_k: int | None,
+        bos: int,
     ) -> tuple[torch.Tensor, int]:
-        """Greedy / top-k autoregressive sampling."""
-        del sampling_cfg
-        seqlen = seqlen or self.max_seq_len
-        if seqlen > self.max_seq_len:
-            raise ValueError(
-                f"seqlen ({seqlen}) 超过 max_seq_len ({self.max_seq_len})"
-            )
         device = next(self.parameters()).device
-        bos = bos_token_id if bos_token_id is not None else self.token_layout.bos_token_id
+        idx = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
+        kv_caches: list[ARKVCache | None] | None = None
+        nfe = 0
+
+        for pos in range(seqlen - 1):
+            logits, kv_caches = self._forward_with_kv_cache(
+                idx[:, -1:],
+                kv_caches,
+                pos_start=pos,
+            )
+            nfe += 1
+            logits = logits[:, -1, :] / max(temperature, 1e-8)
+            if top_k is not None and top_k > 0:
+                values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                cutoff = values[:, -1, None]
+                logits = logits.masked_fill(logits < cutoff, float("-inf"))
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, next_token), dim=1)
+
+        return idx, nfe
+
+    @torch.no_grad()
+    def _generate_legacy(
+        self,
+        num_samples: int,
+        seqlen: int,
+        *,
+        temperature: float,
+        top_k: int | None,
+        bos: int,
+    ) -> tuple[torch.Tensor, int]:
+        device = next(self.parameters()).device
         idx = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
         nfe = 0
         for _ in range(seqlen - 1):
@@ -215,6 +316,35 @@ class _GPTBackbone(nn.Module):
             idx = torch.cat((idx, next_token), dim=1)
             nfe += 1
         return idx, nfe
+
+    @torch.no_grad()
+    def generate(
+        self,
+        num_samples: int = 1,
+        seqlen: int | None = None,
+        *,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        bos_token_id: int | None = None,
+        sampling_cfg: dict | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Greedy / top-k autoregressive sampling."""
+        cfg = sampling_cfg or {}
+        use_kv_cache = cfg.get("use_kv_cache", True)
+        seqlen = seqlen or self.max_seq_len
+        if seqlen > self.max_seq_len:
+            raise ValueError(
+                f"seqlen ({seqlen}) exceeds max_seq_len ({self.max_seq_len})"
+            )
+        bos = bos_token_id if bos_token_id is not None else self.token_layout.bos_token_id
+        gen_kwargs = dict(
+            temperature=temperature,
+            top_k=top_k,
+            bos=bos,
+        )
+        if use_kv_cache:
+            return self._generate_with_kv_cache(num_samples, seqlen, **gen_kwargs)
+        return self._generate_legacy(num_samples, seqlen, **gen_kwargs)
 
 
 class FL_ARModel(FL_PreTrainedModel):
@@ -231,11 +361,13 @@ def build_model_from_config(config: FL_ARConfig) -> FL_ARModel:
 
 
 def build_model(cfg: dict) -> FL_ARModel:
-    data, _ = split_model_cfg(cfg)
+    data, sampling = split_model_cfg(cfg)
     layout = token_layout_from_cfg(data)
     data.pop("tokenizer", None)
     for key in ("vocab_size", "bos_token_id", "eos_token_id", "pad_token_id"):
         data.pop(key, None)
     config = FL_ARConfig(**data)
     apply_token_layout_to_config(config, layout)
+    if sampling is not None:
+        config.sampling = sampling
     return build_model_from_config(config)
