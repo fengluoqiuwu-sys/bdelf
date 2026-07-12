@@ -19,7 +19,7 @@ from torch.utils.data import Dataset
 
 from config_util import load_yaml_config
 from dataset import FL_Dataset, get_dataset
-from tokenizer import FL_Tokenizer, get_tokenizer
+from tokenizer import FL_TokenLayout, FL_Tokenizer, get_token_layout, get_tokenizer
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "preprocess"
 CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "preprocessed_datasets"
@@ -67,13 +67,6 @@ class FL_PreprocessConfig:
         if config.chunk_length < 2:
             raise ValueError(f"{path}: chunk_length must be >= 2")
         return config
-
-
-@dataclass(frozen=True)
-class _SpecialTokenIds:
-    bos: int
-    eos: int
-    pad: int
 
 
 @dataclass(frozen=True)
@@ -148,18 +141,6 @@ def _fingerprint(config: FL_PreprocessConfig, source: FL_Dataset) -> str:
 def _cache_dir(config: FL_PreprocessConfig, source: FL_Dataset) -> Path:
     return CACHE_DIR / f"{source.config.name}_{config.name}_{_fingerprint(config, source)}"
 
-
-def _special_token_ids(tokenizer: FL_Tokenizer) -> _SpecialTokenIds:
-    ids = {}
-    for name in ("bos", "eos", "pad"):
-        token = f"<|{name}|>"
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id is None or token_id == tokenizer.unk_token_id:
-            raise ValueError(
-                f"Tokenizer '{tokenizer.config.name}' does not define {token!r}."
-            )
-        ids[name] = int(token_id)
-    return _SpecialTokenIds(**ids)
 
 
 def _worker_count() -> int:
@@ -238,7 +219,7 @@ class _StreamingChunker:
         *,
         chunk_length: int,
         overflow_mode: OverflowMode,
-        special: _SpecialTokenIds,
+        special: FL_TokenLayout,
     ) -> None:
         self.chunk_length = chunk_length
         self.overflow_mode = overflow_mode
@@ -262,7 +243,7 @@ class _StreamingChunker:
         chunks: List[np.ndarray] = []
         while self._buffer.size >= self.content:
             row = np.empty(self.chunk_length, dtype=_DTYPE)
-            row[0] = self.special.bos
+            row[0] = self.special.bos_token_id
             row[1:] = self._buffer[: self.content]
             chunks.append(row)
             self._buffer = self._buffer[self.content :]
@@ -284,16 +265,16 @@ class _StreamingChunker:
             need = self.content - self._buffer.size
             wrap = _cyclic_take(self._stream_prefix, need)
             body = np.concatenate((self._buffer, wrap))
-            row[0] = self.special.bos
+            row[0] = self.special.bos_token_id
             row[1:] = body
             return row.reshape(1, self.chunk_length), None
 
         if self.overflow_mode == "pad_eos":
             body = np.concatenate(
-                ([self.special.bos], self._buffer, [self.special.eos])
+                ([self.special.bos_token_id], self._buffer, [self.special.eos_token_id])
             ).astype(_DTYPE)
             valid = min(body.size, self.chunk_length)
-            row.fill(self.special.pad)
+            row.fill(self.special.pad_token_id)
             row[:valid] = body[:valid]
             return row.reshape(1, self.chunk_length), np.asarray([valid], dtype=_DTYPE)
 
@@ -438,7 +419,7 @@ def _stream_preprocess_split(
     cache_dir: Path,
     split: str,
     config: FL_PreprocessConfig,
-    special: _SpecialTokenIds,
+    special: FL_TokenLayout,
     workers: int,
 ) -> _SplitCacheMeta:
     texts = _collect_texts(hf_dataset, config.text_column)
@@ -544,7 +525,7 @@ def _build_cache(
     source: FL_Dataset,
     cache_dir: Path,
 ) -> Dict[str, int]:
-    special = _special_token_ids(get_tokenizer(config.tokenizer))
+    special = get_token_layout(config.tokenizer)
     workers = _worker_count()
     fingerprint = _fingerprint(config, source)
     manifest = _load_manifest(cache_dir)
