@@ -24,6 +24,26 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "tokenizers"
 _FL_TOKENIZER_CLASSES: Dict[str, Type["FL_Tokenizer"]] = {}
 
 
+@dataclass(frozen=True)
+class FL_TokenLayout:
+    """Token IDs shared by preprocess, AR, BD3LM, and BDELF."""
+
+    vocab_size: int
+    bos_token_id: int
+    eos_token_id: int
+    pad_token_id: int
+    ignore_index: int = -100
+
+    @property
+    def mask_token_id(self) -> int:
+        """BD3LM absorbing mask (one slot beyond tokenizer vocab)."""
+        return self.vocab_size
+
+    @property
+    def bd3lm_vocab_size(self) -> int:
+        return self.vocab_size + 1
+
+
 def list_tokenizers() -> List[str]:
     """Return tokenizer names discovered from ``config/tokenizers/*.yaml``."""
     if not CONFIG_DIR.exists():
@@ -49,6 +69,11 @@ def get_tokenizer(name: str) -> "FL_Tokenizer":
 
     config = FL_TokenizerConfig.from_yaml(config_path)
     return FL_Tokenizer(config)
+
+
+def get_token_layout(tokenizer_name: str) -> FL_TokenLayout:
+    """Resolve ``FL_TokenLayout`` from a registered ``FL_Tokenizer``."""
+    return get_tokenizer(tokenizer_name).get_token_layout()
 
 
 def _parse_special_tokens(value: Union[str, List[str], None]) -> List[str]:
@@ -136,6 +161,27 @@ class _FLTokenizerMixin:
         """Check whether the tokenizer has been saved locally."""
         path = Path(self.config.base_tokenizer_cache_path)
         return path.exists() and (path / "tokenizer_config.json").exists()
+
+    def get_special_token_id(self, name: str) -> int:
+        """Return the ID for ``<|name|>`` (e.g. ``bos`` → ``<|bos|>``)."""
+        token = f"<|{name}|>"
+        token_id = self.convert_tokens_to_ids(token)
+        unk = getattr(self, "unk_token_id", None)
+        if token_id is None or (unk is not None and token_id == unk):
+            raise ValueError(
+                f"Tokenizer '{self.config.name}' does not define {token!r}."
+            )
+        return int(token_id)
+
+    def get_token_layout(self, *, ignore_index: int = -100) -> FL_TokenLayout:
+        """Build the shared token layout used by models and preprocess."""
+        return FL_TokenLayout(
+            vocab_size=self.get_vocab_size(),
+            bos_token_id=self.get_special_token_id("bos"),
+            eos_token_id=self.get_special_token_id("eos"),
+            pad_token_id=self.get_special_token_id("pad"),
+            ignore_index=ignore_index,
+        )
 
 
 def _get_fl_tokenizer_class(base_cls: type) -> Type["FL_Tokenizer"]:
