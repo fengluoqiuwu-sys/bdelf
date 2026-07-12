@@ -109,6 +109,10 @@ class FL_EvalConfig:
     # Online eval subsample; None / omitted runs the full eval split
     eval_sample_count: Optional[int] = None
     eval_sample_seed: int = 42
+    # Prefix ratio on eval chunks for generative PPL (0 = unconditional)
+    eval_prefix_ratio: float = 0.5
+    # BD3LM sampling steps during online generative eval
+    eval_gen_steps: int = 128
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -161,6 +165,8 @@ class FL_TrainConfig:
     eval_use_fast_infer: bool
     eval_sample_count: Optional[int]
     eval_sample_seed: int
+    eval_prefix_ratio: float
+    eval_gen_steps: int
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -312,6 +318,15 @@ def compose_train_config(
             f"{run_name}: eval_sample_count must be >= 1 when set, "
             f"got {eval_cfg.eval_sample_count}"
         )
+    if not (0.0 <= eval_cfg.eval_prefix_ratio < 1.0):
+        raise ValueError(
+            f"{run_name}: eval_prefix_ratio must be in [0, 1), "
+            f"got {eval_cfg.eval_prefix_ratio}"
+        )
+    if eval_cfg.eval_gen_steps < 1:
+        raise ValueError(
+            f"{run_name}: eval_gen_steps must be >= 1, got {eval_cfg.eval_gen_steps}"
+        )
 
     if batch.batch_size < 1 or batch.grad_accum_steps < 1 or hardware.world_size < 1:
         raise ValueError(f"{run_name}: batch/world_size must be >= 1")
@@ -385,6 +400,8 @@ def compose_train_config(
         eval_use_fast_infer=eval_cfg.use_fast_infer,
         eval_sample_count=eval_cfg.eval_sample_count,
         eval_sample_seed=eval_cfg.eval_sample_seed,
+        eval_prefix_ratio=eval_cfg.eval_prefix_ratio,
+        eval_gen_steps=eval_cfg.eval_gen_steps,
         extra=extra,
     )
 

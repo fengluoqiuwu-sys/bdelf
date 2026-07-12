@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 import hf_config  # noqa: F401
-from models import build_model, list_model_configs, list_models, resolve_model_config_path
+from models import build_model, get_hf_model, list_model_configs, list_models, resolve_model_config_path
+from models.tokens import FL_TokenLayout, token_layout_from_cfg
 from dataset import list_datasets
 from preprocess import get_preprocessed, list_preprocess
 from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
@@ -44,7 +45,7 @@ TRAIN_CSV_FIELDS = [
     "lr",
     "tokens_per_sec",
 ]
-EVAL_CSV_FIELDS = ["step", "eval_loss", "eval_ppl", "lr"]
+EVAL_CSV_FIELDS = ["step", "gpt2_loss", "gpt2_ppl", "lr"]
 
 _TRAIN_LOG = "[train]"
 
@@ -255,41 +256,174 @@ def loss_to_ppl(loss: float) -> float:
     return math.exp(min(loss, 20.0))
 
 
+def _eval_prefix_len(
+    seqlen: int,
+    prefix_ratio: float,
+    block_size: int | None,
+) -> int:
+    if prefix_ratio <= 0.0:
+        return 0
+    prefix_len = int(seqlen * prefix_ratio)
+    if block_size is not None:
+        prefix_len = (prefix_len // block_size) * block_size
+    if prefix_len <= 0:
+        return 0
+    return min(prefix_len, seqlen - 1)
+
+
+def _model_block_size(model: nn.Module) -> int | None:
+    raw = unwrap_model(model)
+    config = getattr(raw, "config", None)
+    block_size = getattr(config, "diffusion_block_size", None)
+    return int(block_size) if block_size is not None else None
+
+
+def _build_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
+    sampling_cfg: dict[str, Any] = {"use_fast_infer": cfg.eval_use_fast_infer}
+    if cfg.model == "bd3lm":
+        sampling_cfg["num_steps"] = cfg.eval_gen_steps
+    return sampling_cfg
+
+
 @torch.no_grad()
-def eval_model_loss(
+def ar_complete_from_prefix(
     model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    amp_dtype: torch.dtype,
+    prefix_ids: torch.Tensor,
+    seqlen: int,
+) -> torch.Tensor:
+    backbone = unwrap_model(model).backbone
+    prefix_len = prefix_ids.size(1)
+    if prefix_len >= seqlen:
+        return prefix_ids[:, :seqlen].clone()
+    if prefix_len > 1:
+        _, kv_caches = backbone._forward_with_kv_cache(prefix_ids, None, pos_start=0)
+        idx = prefix_ids.clone()
+        start_pos = prefix_len - 1
+    else:
+        kv_caches = None
+        idx = prefix_ids.clone()
+        start_pos = 0
+    for pos in range(start_pos, seqlen - 1):
+        logits, kv_caches = backbone._forward_with_kv_cache(
+            idx[:, -1:], kv_caches, pos_start=pos,
+        )
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        idx = torch.cat([idx, next_token], dim=1)
+    return idx
+
+
+@torch.no_grad()
+def complete_eval_sequences(
+    model: nn.Module,
+    eval_batch: torch.Tensor,
     *,
-    dual_branch: bool,
+    cfg: FL_TrainConfig,
+    seqlen: int,
+) -> torch.Tensor:
+    """Complete eval chunks with the training model (prefix-conditioned or unconditional)."""
+    batch_size = eval_batch.size(0)
+    block_size = _model_block_size(model)
+    prefix_len = _eval_prefix_len(seqlen, cfg.eval_prefix_ratio, block_size)
+    gen_model = unwrap_model(model)
+    sampling_cfg = _build_eval_sampling_cfg(cfg)
+
+    if prefix_len > 0:
+        prefix_tokens = eval_batch[:, :prefix_len]
+    else:
+        prefix_tokens = None
+
+    if uses_full_sequence(model):
+        return gen_model.generate(
+            num_samples=batch_size,
+            seqlen=seqlen,
+            prefix_tokens=prefix_tokens,
+            for_eval=True,
+            sampling_cfg=sampling_cfg,
+        )[0]
+
+    if prefix_tokens is not None:
+        return ar_complete_from_prefix(model, prefix_tokens, seqlen)
+    return gen_model.generate(
+        num_samples=batch_size,
+        seqlen=seqlen,
+        for_eval=True,
+        sampling_cfg=sampling_cfg,
+    )[0]
+
+
+def prepare_gpt2_eval_batch(
+    batch: torch.Tensor,
+    layout: FL_TokenLayout,
+    *,
+    gpt2_vocab_size: int,
+    fill_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map extended-vocab token ids to GPT-2 baseline range for eval PPL."""
+    input_ids = batch.clone()
+    labels = batch.clone()
+    oov = input_ids >= gpt2_vocab_size
+    input_ids[oov] = fill_token_id
+    for token_id in (layout.bos_token_id, layout.eos_token_id, layout.pad_token_id):
+        labels[labels == token_id] = -100
+    return input_ids, labels
+
+
+@torch.no_grad()
+def eval_generative_gpt2_ppl(
+    train_model: nn.Module,
+    gpt2_model: nn.Module,
+    loader: DataLoader,
+    train_device: torch.device,
+    gpt2_amp_dtype: torch.dtype,
+    eval_token_layout: FL_TokenLayout,
+    *,
+    cfg: FL_TrainConfig,
+    seqlen: int,
     pbar_parent: tqdm | None = None,
 ) -> tuple[float, float]:
-    """Eval loss/PPL of the training model on the held-out eval split."""
-    was_training = model.training
-    model.eval()
-    eval_branch = "decode" if dual_branch else None
+    """Generative PPL: train model completes eval chunks; gpt2-large scores the output."""
+    was_training = train_model.training
+    train_model.eval()
+    gpt2_model.eval()
+    gpt2_device = next(gpt2_model.parameters()).device
+    gpt2_vocab_size = int(getattr(gpt2_model.config, "vocab_size", 50257))
+    fill_token_id = int(
+        getattr(gpt2_model.config, "eos_token_id", None) or 50256,
+    )
+    use_gpt2_amp = gpt2_device.type == "cuda"
     total_loss = 0.0
     batches = 0
     if len(loader) == 0:
         return float("nan"), float("nan")
+
     batch_iter: DataLoader | tqdm = loader
     if pbar_parent is not None:
         pbar_parent.clear()
         batch_iter = tqdm(
             loader,
-            desc="eval",
+            desc="eval/gpt2-large",
             unit="batch",
             leave=False,
             dynamic_ncols=True,
             total=len(loader),
         )
     try:
-        for batch in batch_iter:
-            batch = batch.to(device, non_blocking=True)
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                loss = forward_loss(model, batch, branch=eval_branch)
-            total_loss += float(loss.item())
+        for eval_batch in batch_iter:
+            eval_batch = eval_batch.to(train_device, non_blocking=True)
+            generated = complete_eval_sequences(
+                train_model, eval_batch, cfg=cfg, seqlen=seqlen,
+            )
+            generated = generated.to(gpt2_device, non_blocking=True)
+            input_ids, labels = prepare_gpt2_eval_batch(
+                generated,
+                eval_token_layout,
+                gpt2_vocab_size=gpt2_vocab_size,
+                fill_token_id=fill_token_id,
+            )
+            with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
+                outputs = gpt2_model(input_ids, labels=labels)
+                loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+                total_loss += float(loss.item())
             batches += 1
     finally:
         if isinstance(batch_iter, tqdm):
@@ -297,7 +431,7 @@ def eval_model_loss(
         if pbar_parent is not None:
             pbar_parent.refresh()
         if was_training:
-            model.train()
+            train_model.train()
     avg_loss = total_loss / max(1, batches)
     return avg_loss, loss_to_ppl(avg_loss)
 
@@ -360,9 +494,7 @@ def update_ppl_plots(
     train_lr = [float(r["lr"]) for r in train_rows]
 
     eval_steps = [int(r["step"]) for r in eval_rows]
-    eval_ppl = [
-        _parse_float(r.get("eval_ppl") or r.get("gpt2_ppl")) for r in eval_rows
-    ]
+    eval_ppl = [_parse_float(r.get("gpt2_ppl")) for r in eval_rows]
 
     for cap, filename in ((1000.0, "ppl_under_1000.png"), (100.0, "ppl_under_100.png")):
         t_steps, t_ppls = zip(
@@ -386,7 +518,7 @@ def update_ppl_plots(
         if e_steps:
             ax_ppl.plot(
                 e_steps, e_ppls, color="#D62728", linewidth=2.8, marker="o",
-                markersize=4, label="eval ppl", zorder=5,
+                markersize=4, label="eval ppl (gpt2-large, gen)", zorder=5,
             )
 
         ax_lr = ax_ppl.twinx()
@@ -470,13 +602,13 @@ def format_interval_summary(
     max_steps: int,
     row: dict[str, Any],
     *,
-    eval_loss: float | None = None,
-    eval_ppl: float | None = None,
+    gpt2_loss: float | None = None,
+    gpt2_ppl: float | None = None,
 ) -> list[str]:
     pct = 100.0 * (step + 1) / max_steps
     lines = [f"[{step + 1}/{max_steps} ({pct:.1f}%)] {_train_metrics_text(row)}"]
-    if eval_loss is not None and eval_ppl is not None:
-        lines.append(f"  eval: loss {eval_loss:.4f} ppl {eval_ppl:.2f}")
+    if gpt2_loss is not None and gpt2_ppl is not None:
+        lines.append(f"  eval/gpt2-large (gen): loss {gpt2_loss:.4f} ppl {gpt2_ppl:.2f}")
     return lines
 
 
@@ -577,12 +709,27 @@ def set_seed(seed: int, rank: int) -> None:
         torch.cuda.manual_seed_all(s)
 
 
+def load_eval_baseline(cfg: FL_TrainConfig) -> nn.Module:
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    torch_dtype = dtype_map[cfg.eval_model_dtype]
+    device = cfg.eval_model_device
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("eval_model_device=cuda but no CUDA device was found")
+    model = get_hf_model(cfg.eval_model, torch_dtype=torch_dtype, device=device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
 def train_loop(
     model: nn.Module,
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
     train_ds: TokenChunkDataset,
     eval_loader: DataLoader | None,
+    gpt2_model: nn.Module | None,
+    eval_token_layout: FL_TokenLayout | None,
     *,
     rank: int,
     world_size: int,
@@ -644,7 +791,8 @@ def train_loop(
     dual_branch = uses_dual_branch_logging(model)
     if rank == 0 and dual_branch:
         _train_log(
-            "BDELF dual-branch: train and eval ppl both use decode branch CE",
+            "BDELF dual-branch: train ppl is decode branch only; "
+            "eval is generative PPL (model completion scored by gpt2-large)",
         )
 
     model.train()
@@ -709,31 +857,37 @@ def train_loop(
                     (step + 1) % cfg.eval_every == 0 or (step + 1) >= cfg.max_steps
                 )
                 if interval_done:
-                    eval_loss: float | None = None
-                    eval_ppl: float | None = None
+                    gpt2_loss: float | None = None
+                    gpt2_ppl: float | None = None
                     if (
                         (step + 1) % cfg.eval_every == 0
                         and eval_loader is not None
+                        and gpt2_model is not None
+                        and eval_token_layout is not None
                     ):
-                        eval_loss, eval_ppl = eval_model_loss(
+                        gpt2_amp_dtype = get_amp_dtype(cfg.eval_model_dtype)
+                        gpt2_loss, gpt2_ppl = eval_generative_gpt2_ppl(
                             model,
+                            gpt2_model,
                             eval_loader,
                             device,
-                            amp_dtype,
-                            dual_branch=dual_branch,
+                            gpt2_amp_dtype,
+                            eval_token_layout,
+                            cfg=cfg,
+                            seqlen=int(cfg.extra.get("chunk_length", 1024)),
                             pbar_parent=pbar,
                         )
                         eval_row = {
                             "step": step,
-                            "eval_loss": round(eval_loss, 6),
-                            "eval_ppl": round(eval_ppl, 4),
+                            "gpt2_loss": round(gpt2_loss, 6),
+                            "gpt2_ppl": round(gpt2_ppl, 4),
                             "lr": lr,
                         }
                         append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
 
                     for line in format_interval_summary(
                         step, cfg.max_steps, row,
-                        eval_loss=eval_loss, eval_ppl=eval_ppl,
+                        gpt2_loss=gpt2_loss, gpt2_ppl=gpt2_ppl,
                     ):
                         _rank0_log(line, pbar)
 
@@ -924,9 +1078,10 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     )
 
     eval_loader: DataLoader | None = None
+    gpt2_model: nn.Module | None = None
     if rank == 0:
         if len(eval_ds) == 0:
-            _train_log("WARNING: eval dataset is empty; eval will be skipped")
+            _train_log("WARNING: eval dataset is empty; generative eval will be skipped")
         else:
             eval_loader = DataLoader(
                 eval_ds,
@@ -936,12 +1091,28 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 pin_memory=torch.cuda.is_available(),
                 collate_fn=collate_input_ids,
             )
+            gpt2_model = load_eval_baseline(cfg)
+            _train_log(
+                f"Loaded eval baseline {cfg.eval_model} "
+                f"({cfg.eval_model_dtype}, {cfg.eval_model_device})",
+            )
+            if cfg.eval_prefix_ratio > 0:
+                _train_log(
+                    f"Generative eval: prefix ratio {cfg.eval_prefix_ratio:.2f}, "
+                    f"completion scored by {cfg.eval_model}",
+                )
+            else:
+                _train_log(
+                    f"Generative eval: unconditional samples scored by {cfg.eval_model}",
+                )
 
     model_cfg_path = resolve_model_config_path(model_name, model_size)
     import yaml
 
     with open(model_cfg_path, encoding="utf-8") as f:
         model_cfg = yaml.safe_load(f) or {}
+
+    eval_token_layout = token_layout_from_cfg(model_cfg)
 
     model = build_model(model_name, model_cfg).to(device)
     model_meta = {
@@ -969,6 +1140,8 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         model_meta,
         train_ds,
         eval_loader,
+        gpt2_model,
+        eval_token_layout,
         rank=rank,
         world_size=world_size,
         device=device,

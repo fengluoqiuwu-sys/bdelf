@@ -6,4 +6,6 @@ eval_model_device: cuda
 use_fast_infer: false
 eval_sample_count: 1024
 eval_sample_seed: 42
+eval_prefix_ratio: 0.5
+eval_gen_steps: 128
 estimated_vram_gb: 2.5

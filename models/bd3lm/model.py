@@ -602,6 +602,7 @@ class _BD3LMBackbone(nn.Module):
     first_hitting: bool = True,
     nucleus_p: float = 1.0,
     bos_token_id: int | None = None,
+    prefix_tokens: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, int]:
     """Semi-AR block diffusion sampling; always uses full context starting at position 0."""
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
@@ -610,8 +611,28 @@ class _BD3LMBackbone(nn.Module):
     device = next(self.parameters()).device
     sampling_steps = 0
     ones = torch.ones((n_samples, 1), device=device)
+    prefix_strides = 0
+    if prefix_tokens is not None:
+      prefix_len = prefix_tokens.size(1)
+      if prefix_tokens.size(0) != n_samples:
+        raise ValueError("prefix_tokens batch size must match n_samples")
+      if prefix_len == 0 or prefix_len % db != 0 or prefix_len >= seqlen:
+        raise ValueError(
+          f"prefix length {prefix_len} must be a positive multiple of "
+          f"diffusion_block_size ({db}) and less than seqlen ({seqlen})"
+        )
+      prefix_strides = prefix_len // db
 
+    x_accum: torch.Tensor | None = None
     for stride_num in range(num_strides):
+      if stride_num < prefix_strides:
+        block = prefix_tokens[:, stride_num * db : (stride_num + 1) * db]
+        if x_accum is None:
+          x_accum = block.clone()
+        else:
+          x_accum = torch.cat((x_accum, block), dim=1)
+        continue
+
       if stride_num == 0:
         x_accum = self._sample_prior(n_samples, db).to(device)
         if bos is not None:
@@ -667,6 +688,7 @@ class _BD3LMBackbone(nn.Module):
     first_hitting: bool | None = None,
     nucleus_p: float | None = None,
     bos_token_id: int | None = None,
+    prefix_tokens: torch.Tensor | None = None,
     sampling_cfg: dict | None = None,
   ) -> tuple[torch.Tensor, int]:
     """Generate token sequences from noise.
@@ -699,6 +721,7 @@ class _BD3LMBackbone(nn.Module):
       first_hitting=first_hitting,
       nucleus_p=nucleus_p,
       bos_token_id=bos,
+      prefix_tokens=prefix_tokens,
     )
 
 

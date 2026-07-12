@@ -520,6 +520,7 @@ class _BDELFBackbone(nn.Module):
     *,
     bos_token_id: int | None = None,
     use_fast_infer: bool = True,
+    prefix_tokens: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, int]:
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
     db = self.diffusion_block_size
@@ -534,14 +535,34 @@ class _BDELFBackbone(nn.Module):
         n_samples, seqlen, num_ode_steps,
         bos_token_id=bos_token_id,
         t_steps=t_steps,
+        prefix_tokens=prefix_tokens,
       )
 
     state = BDELFInferState(self, n_samples, seqlen, device, dtype)
-    emb_accum = torch.zeros(
-      n_samples, 0, self.wte.embedding_dim, device=device, dtype=dtype,
-    )
+    start_stride = 0
+    if prefix_tokens is not None:
+      prefix_len = prefix_tokens.size(1)
+      if prefix_tokens.size(0) != n_samples:
+        raise ValueError("prefix_tokens batch size must match n_samples")
+      if prefix_len == 0 or prefix_len % db != 0 or prefix_len >= seqlen:
+        raise ValueError(
+          f"prefix length {prefix_len} must be a positive multiple of "
+          f"diffusion_block_size ({db}) and less than seqlen ({seqlen})"
+        )
+      emb_accum = self._tokens_to_emb(prefix_tokens)
+      state.set_emb_accum(emb_accum)
+      state.tokens_buf[:, :prefix_len] = prefix_tokens
+      state.token_len = prefix_len
+      start_stride = prefix_len // db
+      for stride in range(start_stride):
+        block_emb = emb_accum[:, stride * db : (stride + 1) * db]
+        state.on_stride_complete(block_emb, stride)
+    else:
+      emb_accum = torch.zeros(
+        n_samples, 0, self.wte.embedding_dim, device=device, dtype=dtype,
+      )
 
-    for stride in range(num_strides):
+    for stride in range(start_stride, num_strides):
       z_block = torch.randn(
         n_samples, db, self.wte.embedding_dim, device=device, dtype=dtype,
       ) * self.denoiser_noise_scale
@@ -582,6 +603,7 @@ class _BDELFBackbone(nn.Module):
     *,
     bos_token_id: int | None = None,
     t_steps: torch.Tensor | None = None,
+    prefix_tokens: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, int]:
     """Unoptimized inference path for numerical alignment checks."""
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
@@ -593,12 +615,26 @@ class _BDELFBackbone(nn.Module):
     if t_steps is None:
       t_steps = self._get_sampling_steps(num_ode_steps, device)
 
-    tokens = torch.zeros(n_samples, 0, dtype=torch.long, device=device)
-    emb_accum = torch.zeros(
-      n_samples, 0, self.wte.embedding_dim, device=device, dtype=dtype,
-    )
+    start_stride = 0
+    if prefix_tokens is not None:
+      prefix_len = prefix_tokens.size(1)
+      if prefix_tokens.size(0) != n_samples:
+        raise ValueError("prefix_tokens batch size must match n_samples")
+      if prefix_len == 0 or prefix_len % db != 0 or prefix_len >= seqlen:
+        raise ValueError(
+          f"prefix length {prefix_len} must be a positive multiple of "
+          f"diffusion_block_size ({db}) and less than seqlen ({seqlen})"
+        )
+      emb_accum = self._tokens_to_emb(prefix_tokens)
+      tokens = prefix_tokens.clone()
+      start_stride = prefix_len // db
+    else:
+      tokens = torch.zeros(n_samples, 0, dtype=torch.long, device=device)
+      emb_accum = torch.zeros(
+        n_samples, 0, self.wte.embedding_dim, device=device, dtype=dtype,
+      )
 
-    for stride in range(num_strides):
+    for stride in range(start_stride, num_strides):
       z_block = torch.randn(
         n_samples, db, self.wte.embedding_dim, device=device, dtype=dtype,
       ) * self.denoiser_noise_scale
@@ -648,6 +684,7 @@ class _BDELFBackbone(nn.Module):
     num_steps: int | None = None,
     *,
     bos_token_id: int | None = None,
+    prefix_tokens: torch.Tensor | None = None,
     sampling_cfg: dict | None = None,
   ) -> tuple[torch.Tensor, int]:
     cfg = sampling_cfg or {}
@@ -670,6 +707,7 @@ class _BDELFBackbone(nn.Module):
       num_ode_steps=num_ode_steps,
       bos_token_id=bos,
       use_fast_infer=use_fast_infer,
+      prefix_tokens=prefix_tokens,
     )
 
 
