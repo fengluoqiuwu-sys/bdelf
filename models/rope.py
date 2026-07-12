@@ -30,7 +30,7 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, base: float = 10000.0) -> None:
         super().__init__()
         if head_dim % 2 != 0:
-            raise ValueError(f"RoPE head_dim ({head_dim}) 必须为偶数")
+            raise ValueError(f"RoPE head_dim ({head_dim}) must be even")
         inv_freq = 1.0 / (
             base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
         )

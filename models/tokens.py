@@ -18,7 +18,7 @@ def token_layout_from_cfg(cfg: Mapping[str, Any]) -> FL_TokenLayout:
     """Resolve layout from model yaml via ``tokenizer`` (same name as preprocess)."""
     tokenizer_name = cfg.get("tokenizer")
     if not tokenizer_name:
-        raise ValueError("模型配置必须指定 tokenizer（与 preprocess 使用同一配置名）")
+        raise ValueError("Model config must specify tokenizer (same name as used in preprocess)")
     return get_token_layout(str(tokenizer_name))
 
 

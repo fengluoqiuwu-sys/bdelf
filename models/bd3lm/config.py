@@ -106,7 +106,7 @@ CONFIG_CLS = FL_BD3LMConfig
 
 @dataclass
 class SamplingConfig:
-    """推理超参，默认值对齐 bd3lms 官方配置。"""
+    """Inference hyperparameters; defaults match official bd3lms config."""
 
     num_steps: int = 5000
     sampler: Literal["semi_ar"] = "semi_ar"
