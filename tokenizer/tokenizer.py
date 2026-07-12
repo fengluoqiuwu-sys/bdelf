@@ -183,6 +183,14 @@ class _FLTokenizerMixin:
             ignore_index=ignore_index,
         )
 
+    def encode_preprocess(self, text: str) -> List[int]:
+        """Encode a text segment for dataset preprocessing.
+
+        Uses the Rust backend directly so long documents are not subject to
+        ``model_max_length`` warnings or truncation checks meant for model input.
+        """
+        return self.backend_tokenizer.encode(text, add_special_tokens=False).ids
+
 
 def _get_fl_tokenizer_class(base_cls: type) -> Type["FL_Tokenizer"]:
     """Return a cached ``FL_Tokenizer`` class inheriting from ``base_cls``."""
@@ -235,8 +243,8 @@ def _build_fl_tokenizer(config: FL_TokenizerConfig) -> "FL_Tokenizer":
         num_added = tokenizer.add_special_tokens(
             {"additional_special_tokens": config.special_tokens}
         )
-        if num_added:
-            print(f"Added {num_added} special token(s)")
+        if num_added and not os.environ.get("BDELF_QUIET_TOKENIZER"):
+            print(f"[tokenizer] Added {num_added} special token(s)")
 
     model_config = AutoConfig.from_pretrained(config.base_tokenizer)
     tokenizer._embed_size = _infer_embed_size(model_config)
