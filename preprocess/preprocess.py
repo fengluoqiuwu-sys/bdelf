@@ -6,16 +6,18 @@ import hashlib
 import json
 import multiprocessing
 import os
-import random
-from concurrent.futures import ProcessPoolExecutor
+import time
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Union
+from typing import Any, Dict, Iterator, List, Literal, Set, Union
 
 import numpy as np
 import torch
 import yaml
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from config_util import load_yaml_config
 from dataset import FL_Dataset, get_dataset
@@ -28,9 +30,25 @@ OverflowMode = Literal["wrap", "discard", "pad_eos"]
 _MANIFEST_VERSION = 2
 _OVERFLOW_MODES = frozenset({"wrap", "discard", "pad_eos"})
 _DTYPE = np.int32
-_MIN_TEXTS_PER_WORKER = 8
+_DOCS_PER_TASK = 512
+_MAX_TOKENIZE_WORKERS = 16
 # Split token/chunk storage into multiple files above this size (bytes).
 _SHARD_MAX_BYTES = 1 << 30
+
+_WORKER_TOKENIZER: FL_Tokenizer | None = None
+
+
+@dataclass(frozen=True)
+class _TaggedDocBatch:
+    split: str
+    texts: List[str]
+
+
+@dataclass
+class _SplitPipeline:
+    split: str
+    chunker: "_StreamingChunker"
+    writer: "_ShardWriter"
 
 
 @dataclass
@@ -144,7 +162,34 @@ def _cache_dir(config: FL_PreprocessConfig, source: FL_Dataset) -> Path:
 
 
 def _worker_count() -> int:
-    return max(1, os.cpu_count() or 1)
+    return min(_MAX_TOKENIZE_WORKERS, max(1, os.cpu_count() or 1))
+
+
+def _log_preprocess(message: str) -> None:
+    tqdm.write(f"[preprocess] {message}")
+
+
+def _init_tokenizer_worker(tokenizer_name: str) -> None:
+    global _WORKER_TOKENIZER
+    os.environ["BDELF_QUIET_TOKENIZER"] = "1"
+    _WORKER_TOKENIZER = get_tokenizer(tokenizer_name)
+    # 先完整 tokenize，再按 token 长度切块；预处理阶段不应受 model_max_length 约束。
+    _WORKER_TOKENIZER.model_max_length = int(1e9)
+
+
+def _encode_texts(texts: List[str], tokenizer: FL_Tokenizer) -> np.ndarray:
+    """Tokenize full documents, return a concatenated token stream for chunking."""
+    if not texts:
+        return np.empty(0, dtype=_DTYPE)
+
+    encoded = tokenizer(texts, add_special_tokens=False)["input_ids"]
+    parts: List[np.ndarray] = []
+    for token_ids in encoded:
+        if token_ids:
+            parts.append(np.asarray(token_ids, dtype=_DTYPE))
+    if not parts:
+        return np.empty(0, dtype=_DTYPE)
+    return np.concatenate(parts)
 
 
 def _shard_capacity(chunk_length: int) -> int:
@@ -152,67 +197,276 @@ def _shard_capacity(chunk_length: int) -> int:
     return max(1, _SHARD_MAX_BYTES // row_bytes)
 
 
-def _even_shards(items: List[str], workers: int) -> List[List[str]]:
-    if not items:
-        return []
-    workers = min(workers, len(items))
-    base, extra = divmod(len(items), workers)
-    shards: List[List[str]] = []
-    start = 0
-    for index in range(workers):
-        size = base + (1 if index < extra else 0)
-        shards.append(items[start : start + size])
-        start += size
-    return shards
+def _tokenize_texts_shard(texts: List[str]) -> np.ndarray:
+    if _WORKER_TOKENIZER is None:
+        raise RuntimeError("Tokenizer worker is not initialized.")
+    return _encode_texts(texts, _WORKER_TOKENIZER)
 
 
-def _tokenize_texts_shard(payload: tuple[List[str], str]) -> np.ndarray:
-    texts, tokenizer_name = payload
-    tokenizer = get_tokenizer(tokenizer_name)
-    tokens: List[int] = []
+def _iter_doc_batches(
+    texts: Iterator[str],
+    *,
+    batch_size: int,
+) -> Iterator[List[str]]:
+    batch: List[str] = []
     for text in texts:
-        tokens.extend(tokenizer.encode(text, add_special_tokens=False))
-    return np.asarray(tokens, dtype=_DTYPE)
+        batch.append(text)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
-def _iter_token_parts(
-    texts: List[str],
-    tokenizer_name: str,
+def _iter_doc_batches_from_dataset(
+    hf_dataset,
+    text_column: str,
+) -> Iterator[List[str]]:
+    def _rows() -> Iterator[str]:
+        for row in hf_dataset:
+            text = row.get(text_column) if isinstance(row, dict) else row[text_column]
+            if text is None:
+                continue
+            stripped = str(text).strip()
+            if stripped:
+                yield stripped
+
+    yield from _iter_doc_batches(_rows(), batch_size=_DOCS_PER_TASK)
+
+
+def _iter_tagged_doc_batches(
+    source: FL_Dataset,
+    splits: Set[str],
+    *,
+    text_column: str,
+    total_rows: int,
+) -> Iterator[_TaggedDocBatch]:
+    eval_indices = source.holdout_eval_indices()
+    pending: Dict[str, List[str]] = {split: [] for split in splits}
+
+    with tqdm(
+        total=total_rows,
+        desc="[preprocess] 读取",
+        unit="row",
+        dynamic_ncols=True,
+    ) as row_progress:
+        for row_index, text in source.iter_parquet_rows(text_column=text_column):
+            row_progress.update(1)
+            if text is None:
+                continue
+            split = "eval" if row_index in eval_indices else "train"
+            if split not in splits:
+                continue
+            pending[split].append(text)
+            if len(pending[split]) >= _DOCS_PER_TASK:
+                yield _TaggedDocBatch(split, pending[split])
+                pending[split] = []
+
+    for split, texts in pending.items():
+        if texts:
+            yield _TaggedDocBatch(split, texts)
+
+
+def _tokenize_tagged_batch(batch: _TaggedDocBatch) -> tuple[str, int, np.ndarray]:
+    return batch.split, len(batch.texts), _tokenize_texts_shard(batch.texts)
+
+
+def _iter_token_streams_pipelined(
+    executor: ProcessPoolExecutor,
+    doc_batches: Iterator[_TaggedDocBatch],
     *,
     workers: int,
-) -> Iterator[np.ndarray]:
-    """Yield token arrays part-by-part in shuffled order to bound peak memory."""
-    if not texts:
-        return
+) -> Iterator[tuple[str, int, np.ndarray]]:
+    """Sequential submit + bounded in-flight tokenize."""
+    max_inflight = max(2, workers * 2)
+    inflight: deque[Future] = deque()
 
-    workers = min(workers, max(1, len(texts) // _MIN_TEXTS_PER_WORKER))
-    if workers <= 1:
-        yield _tokenize_texts_shard((texts, tokenizer_name))
-        return
+    for batch in doc_batches:
+        inflight.append(executor.submit(_tokenize_tagged_batch, batch))
+        while len(inflight) >= max_inflight:
+            split, doc_count, tokens = inflight.popleft().result()
+            yield split, doc_count, tokens
 
-    shards = _even_shards(texts, workers)
+    while inflight:
+        split, doc_count, tokens = inflight.popleft().result()
+        yield split, doc_count, tokens
+
+
+def _split_doc_total(source: FL_Dataset, split: str) -> int:
+    total = source.count_raw_rows()
+    eval_count = len(source.holdout_eval_indices())
+    if split == "train":
+        return total - eval_count
+    if split == "eval":
+        return eval_count
+    raise ValueError(f"Unknown split '{split}'.")
+
+
+def _run_preprocess_loop(
+    doc_batches: Iterator[List[str]],
+    *,
+    total: int,
+    split: str,
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+    special: FL_TokenLayout,
+    workers: int,
+    tokenizer_name: str,
+) -> _SplitCacheMeta:
+    def _tagged() -> Iterator[_TaggedDocBatch]:
+        for texts in doc_batches:
+            yield _TaggedDocBatch(split, texts)
+
+    pipelines = {
+        split: _make_split_pipeline(
+            split, cache_dir=cache_dir, config=config, special=special
+        )
+    }
+    metas = _run_tagged_preprocess_loop(
+        _tagged(),
+        pipelines=pipelines,
+        doc_totals={split: total},
+        workers=workers,
+        tokenizer_name=tokenizer_name,
+    )
+    return metas[split]
+
+
+def _make_split_pipeline(
+    split: str,
+    *,
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+    special: FL_TokenLayout,
+) -> _SplitPipeline:
+    return _SplitPipeline(
+        split=split,
+        chunker=_StreamingChunker(
+            chunk_length=config.chunk_length,
+            overflow_mode=config.overflow_mode,
+            special=special,
+        ),
+        writer=_ShardWriter(
+            cache_dir,
+            split,
+            chunk_length=config.chunk_length,
+            record_lengths=config.overflow_mode == "pad_eos",
+        ),
+    )
+
+
+def _run_tagged_preprocess_loop(
+    tagged_batches: Iterator[_TaggedDocBatch],
+    *,
+    pipelines: Dict[str, _SplitPipeline],
+    doc_totals: Dict[str, int],
+    workers: int,
+    tokenizer_name: str,
+) -> Dict[str, _SplitCacheMeta]:
+    progress: Dict[str, tqdm] = {}
+    metas: Dict[str, _SplitCacheMeta] = {}
+    for split, total in doc_totals.items():
+        progress[split] = tqdm(
+            total=total,
+            desc=f"[preprocess] {split}",
+            unit="doc",
+            dynamic_ncols=True,
+        )
+
     ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=len(shards), mp_context=ctx) as executor:
-        for part in executor.map(
-            _tokenize_texts_shard,
-            [(shard, tokenizer_name) for shard in shards],
-        ):
-            yield part
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_init_tokenizer_worker,
+            initargs=(tokenizer_name,),
+        ) as executor:
+            for split, doc_count, tokens in _iter_token_streams_pipelined(
+                executor, tagged_batches, workers=workers
+            ):
+                pipeline = pipelines[split]
+                rows, lengths = pipeline.chunker.feed(tokens)
+                pipeline.writer.append(rows, lengths)
+                bar = progress[split]
+                bar.update(doc_count)
+                bar.set_postfix(chunks=f"{pipeline.writer._total:,}", refresh=False)
+    finally:
+        for split, pipeline in pipelines.items():
+            rows, lengths = pipeline.chunker.finish()
+            pipeline.writer.append(rows, lengths)
+            progress[split].close()
+            meta = pipeline.writer.finalize()
+            metas[split] = meta
+            tqdm.write(f"[preprocess] split={split!r}: 完成，共 {meta.count:,} chunks")
+    return metas
 
 
-def _collect_texts(hf_dataset, text_column: str) -> List[str]:
-    if text_column in hf_dataset.column_names:
-        raw = hf_dataset[text_column]
-        return [str(text).strip() for text in raw if text and str(text).strip()]
-    return [
-        str(row[text_column]).strip()
-        for row in hf_dataset
-        if row.get(text_column) and str(row[text_column]).strip()
-    ]
+def _stream_preprocess_parquet(
+    source: FL_Dataset,
+    *,
+    splits: Set[str],
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+    special: FL_TokenLayout,
+    workers: int,
+) -> Dict[str, _SplitCacheMeta]:
+    total_rows = source.count_raw_rows()
+    doc_totals = {
+        split: _split_doc_total(source, split) for split in sorted(splits)
+    }
+    tqdm.write(
+        f"[preprocess] 单次顺序扫描 parquet: rows={total_rows:,}, "
+        f"splits={sorted(splits)}, workers={workers}, task={_DOCS_PER_TASK}, "
+        f"chunk={config.chunk_length} tokens"
+    )
+    pipelines = {
+        split: _make_split_pipeline(
+            split, cache_dir=cache_dir, config=config, special=special
+        )
+        for split in splits
+    }
+    tagged_batches = _iter_tagged_doc_batches(
+        source, splits, text_column=config.text_column, total_rows=total_rows
+    )
+    return _run_tagged_preprocess_loop(
+        tagged_batches,
+        pipelines=pipelines,
+        doc_totals=doc_totals,
+        workers=workers,
+        tokenizer_name=config.tokenizer,
+    )
+
+
+def _stream_preprocess_split_dataset(
+    hf_dataset,
+    *,
+    split: str,
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+    special: FL_TokenLayout,
+    workers: int,
+) -> _SplitCacheMeta:
+    total = len(hf_dataset)
+    doc_batches = _iter_doc_batches_from_dataset(hf_dataset, config.text_column)
+    tqdm.write(
+        f"[preprocess] split={split!r}: {total:,} 条文本 "
+        f"(workers={workers}, task={_DOCS_PER_TASK}, "
+        f"chunk={config.chunk_length} tokens)"
+    )
+    return _run_preprocess_loop(
+        doc_batches,
+        total=total,
+        split=split,
+        cache_dir=cache_dir,
+        config=config,
+        special=special,
+        workers=workers,
+        tokenizer_name=config.tokenizer,
+    )
 
 
 class _StreamingChunker:
-    """Incrementally build fixed-width chunks from a token stream."""
+    """Split a token stream into fixed-width rows after full-document tokenization."""
 
     def __init__(
         self,
@@ -413,41 +667,6 @@ def _cleanup_split(cache_dir: Path, split: str) -> None:
     (cache_dir / f"{split}.len").unlink(missing_ok=True)
 
 
-def _stream_preprocess_split(
-    hf_dataset,
-    *,
-    cache_dir: Path,
-    split: str,
-    config: FL_PreprocessConfig,
-    special: FL_TokenLayout,
-    workers: int,
-) -> _SplitCacheMeta:
-    texts = _collect_texts(hf_dataset, config.text_column)
-    random.Random(config.seed).shuffle(texts)
-
-    chunker = _StreamingChunker(
-        chunk_length=config.chunk_length,
-        overflow_mode=config.overflow_mode,
-        special=special,
-    )
-    writer = _ShardWriter(
-        cache_dir,
-        split,
-        chunk_length=config.chunk_length,
-        record_lengths=config.overflow_mode == "pad_eos",
-    )
-
-    for part in _iter_token_parts(
-        texts, config.tokenizer, workers=workers
-    ):
-        rows, lengths = chunker.feed(part)
-        writer.append(rows, lengths)
-
-    rows, lengths = chunker.finish()
-    writer.append(rows, lengths)
-    return writer.finalize()
-
-
 def _split_meta_from_manifest(raw: Dict[str, Any]) -> _SplitCacheMeta:
     shards = [
         _SplitShardMeta(file=item["file"], count=int(item["count"]))
@@ -537,6 +756,8 @@ def _build_cache(
     existing = _load_manifest(cache_dir) or {}
     split_entries: Dict[str, Any] = dict(existing.get("splits", {}))
     split_counts: Dict[str, int] = {}
+    splits_to_build: List[str] = []
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     for split in source.get_splits():
         prior = split_entries.get(split)
@@ -547,33 +768,70 @@ def _build_cache(
             ):
                 split_counts[split] = meta.count
                 continue
-
         _cleanup_split(cache_dir, split)
-        meta = _stream_preprocess_split(
-            source.load_split(split),
+        splits_to_build.append(split)
+
+    if splits_to_build and source.can_stream_parquet():
+        metas = _stream_preprocess_parquet(
+            source,
+            splits=set(splits_to_build),
             cache_dir=cache_dir,
-            split=split,
             config=config,
             special=special,
             workers=workers,
         )
-        split_entries[split] = {
-            "status": "complete",
-            **_split_meta_to_manifest(meta),
-        }
-        split_counts[split] = meta.count
-        _write_manifest(
-            cache_dir,
-            {
-                "version": _MANIFEST_VERSION,
-                "status": "partial",
-                "fingerprint": fingerprint,
-                "chunk_length": config.chunk_length,
-                "overflow_mode": config.overflow_mode,
-                "split_counts": dict(split_counts),
-                "splits": split_entries,
-            },
-        )
+        for split, meta in metas.items():
+            split_entries[split] = {
+                "status": "complete",
+                **_split_meta_to_manifest(meta),
+            }
+            split_counts[split] = meta.count
+            _write_manifest(
+                cache_dir,
+                {
+                    "version": _MANIFEST_VERSION,
+                    "status": "partial",
+                    "fingerprint": fingerprint,
+                    "chunk_length": config.chunk_length,
+                    "overflow_mode": config.overflow_mode,
+                    "split_counts": dict(split_counts),
+                    "splits": split_entries,
+                },
+            )
+    else:
+        for split in splits_to_build:
+            _log_preprocess(f"加载 split={split!r} ...")
+            load_started = time.time()
+            hf_dataset = source.load_split(split)
+            tqdm.write(
+                f"[preprocess] split={split!r} 已加载 {len(hf_dataset):,} 条 "
+                f"({time.time() - load_started:.1f}s)"
+            )
+            meta = _stream_preprocess_split_dataset(
+                hf_dataset,
+                split=split,
+                cache_dir=cache_dir,
+                config=config,
+                special=special,
+                workers=workers,
+            )
+            split_entries[split] = {
+                "status": "complete",
+                **_split_meta_to_manifest(meta),
+            }
+            split_counts[split] = meta.count
+            _write_manifest(
+                cache_dir,
+                {
+                    "version": _MANIFEST_VERSION,
+                    "status": "partial",
+                    "fingerprint": fingerprint,
+                    "chunk_length": config.chunk_length,
+                    "overflow_mode": config.overflow_mode,
+                    "split_counts": dict(split_counts),
+                    "splits": split_entries,
+                },
+            )
 
     _write_manifest(
         cache_dir,
@@ -625,7 +883,16 @@ def _ensure_cache(
                     return dict(manifest.get("split_counts", {})), splits
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    _log_preprocess(
+        f"缓存未命中，开始构建: dataset={source.config.name!r} "
+        f"preprocess={config.name!r}"
+    )
+    _log_preprocess(f"输出目录: {cache_dir}")
+    _log_preprocess(
+        f"并行 worker 数: {_worker_count()}（tokenize 阶段会占满 CPU，首次运行可能耗时较长）"
+    )
     split_counts = _build_cache(config, source, cache_dir)
+    _log_preprocess(f"缓存构建完成: {split_counts}")
     manifest = _load_manifest(cache_dir) or {}
     splits = {
         name: _split_meta_from_manifest(raw)
@@ -748,10 +1015,7 @@ class FL_PreprocessedDataset:
         self.source = source
         self._split_views: Dict[str, _PreprocessedSplitDataset] = {}
 
-        if not source.is_downloaded():
-            raise FileNotFoundError(
-                f"Source dataset '{source.config.name}' is not downloaded."
-            )
+        source.ensure_downloaded()
 
         self.cache_dir = _cache_dir(config, source)
         self.split_counts, self._split_meta = _ensure_cache(

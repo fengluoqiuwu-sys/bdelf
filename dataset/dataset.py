@@ -15,7 +15,7 @@ import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, Iterator, List, Optional, Type
 
 from torch.utils.data import Dataset
 
@@ -214,34 +214,57 @@ class FL_Dataset(Dataset):
                 f"{self.config.name}: eval_count must be non-negative."
             )
 
-        full = self._load_raw_split("train")
-        train_indices, eval_indices = self._random_holdout_indices(len(full))
+        parts = self._get_holdout_parts()
         if split == "train":
-            return full.select(train_indices)
+            return parts["train"]
         if split == "eval":
-            return full.select(eval_indices)
+            return parts["test"]
         raise ValueError(f"Unknown split '{split}'.")
 
-    def _random_holdout_indices(self, total: int) -> Tuple[List[int], List[int]]:
-        """Return (train_indices, eval_indices) cached on the instance."""
-        cached = getattr(self, "_holdout_indices", None)
-        if cached is not None and cached[0] == total:
-            return cached[1], cached[2]
+    def _get_holdout_parts(self):
+        """Return cached train/test split from the raw train split."""
+        cached = getattr(self, "_holdout_parts", None)
+        if cached is not None:
+            return cached
 
-        eval_count = min(self.config.eval_count, total)
-        rng = random.Random(self.config.eval_seed)
-        indices = list(range(total))
-        rng.shuffle(indices)
-        eval_indices = sorted(indices[:eval_count])
-        eval_set = set(eval_indices)
-        train_indices = [i for i in range(total) if i not in eval_set]
-        self._holdout_indices = (total, train_indices, eval_indices)
-        return train_indices, eval_indices
+        full = self._load_raw_split("train")
+        eval_count = min(self.config.eval_count, len(full))
+        if eval_count <= 0:
+            parts = {"train": full, "test": full.select([])}
+        else:
+            parts = full.train_test_split(
+                test_size=eval_count,
+                seed=self.config.eval_seed,
+                shuffle=True,
+            )
+        self._holdout_parts = parts
+        return parts
+
+    def _local_parquet_files(self, data_root: Path, hf_split: str) -> List[Path]:
+        plain_text = data_root / "plain_text"
+        if plain_text.is_dir():
+            files = sorted(plain_text.glob(f"{hf_split}-*.parquet"))
+            if files:
+                return files
+        return sorted(data_root.rglob(f"{hf_split}-*.parquet"))
 
     def _load_raw_split(self, hf_split: str):
         """Load one HuggingFace split name without remapping."""
         import hf_config  # noqa: F401
         from datasets import load_dataset
+
+        if self.config.download_path:
+            data_root = Path(self.config.download_path)
+            if data_root.is_dir():
+                files = self._local_parquet_files(data_root, hf_split)
+                if files:
+                    workers = max(1, os.cpu_count() or 1)
+                    return load_dataset(
+                        "parquet",
+                        data_files={hf_split: [str(path) for path in files]},
+                        split=hf_split,
+                        num_proc=workers,
+                    )
 
         kwargs: Dict[str, Any] = {
             "path": self.config.repo_id,
@@ -254,6 +277,110 @@ class FL_Dataset(Dataset):
             kwargs["data_dir"] = str(self.config.download_path)
 
         return load_dataset(**kwargs)
+
+    def can_stream_parquet(self, hf_split: str = "train") -> bool:
+        if not self.config.download_path:
+            return False
+        data_root = Path(self.config.download_path)
+        return bool(self._local_parquet_files(data_root, hf_split))
+
+    def count_raw_rows(self, hf_split: str = "train") -> int:
+        import pyarrow.parquet as pq
+
+        if not self.config.download_path:
+            raise FileNotFoundError(
+                f"{self.config.name}: download_path is required to count raw rows."
+            )
+        files = self._local_parquet_files(Path(self.config.download_path), hf_split)
+        if not files:
+            raise FileNotFoundError(
+                f"{self.config.name}: no local parquet files for split {hf_split!r}."
+            )
+        return sum(pq.ParquetFile(path).metadata.num_rows for path in files)
+
+    def holdout_eval_indices(self) -> frozenset[int]:
+        if self.config.eval_count is None or self.config.eval_seed is None:
+            return frozenset()
+        cached = getattr(self, "_holdout_eval_indices", None)
+        if cached is not None:
+            return cached
+
+        total = self.count_raw_rows("train")
+        eval_count = min(self.config.eval_count, total)
+        rng = random.Random(self.config.eval_seed)
+        eval_set = frozenset(rng.sample(range(total), eval_count))
+        self._holdout_eval_indices = eval_set
+        return eval_set
+
+    def iter_parquet_rows(
+        self,
+        *,
+        text_column: str = "text",
+        read_row_batch: int = 2048,
+        hf_split: str = "train",
+    ) -> Iterator[tuple[int, str | None]]:
+        """Yield ``(row_index, stripped_text_or_none)`` in parquet file order."""
+        import pyarrow.parquet as pq
+
+        if not self.config.download_path:
+            raise FileNotFoundError(
+                f"{self.config.name}: download_path is required for parquet streaming."
+            )
+        files = self._local_parquet_files(Path(self.config.download_path), hf_split)
+        if not files:
+            raise FileNotFoundError(
+                f"{self.config.name}: no local parquet files for split {hf_split!r}."
+            )
+
+        row_index = 0
+        for parquet_path in files:
+            parquet_file = pq.ParquetFile(parquet_path)
+            for record_batch in parquet_file.iter_batches(
+                batch_size=read_row_batch,
+                columns=[text_column],
+            ):
+                for text in record_batch.column(text_column).to_pylist():
+                    stripped = str(text).strip() if text else None
+                    if not stripped:
+                        stripped = None
+                    yield row_index, stripped
+                    row_index += 1
+
+    def iter_split_texts(
+        self,
+        split: str,
+        *,
+        text_column: str = "text",
+        read_row_batch: int = 2048,
+        hf_split: str = "train",
+    ) -> Iterator[str]:
+        """Sequentially read texts from local parquet files for one logical split."""
+        eval_indices = self.holdout_eval_indices()
+        for row_index, text in self.iter_parquet_rows(
+            text_column=text_column,
+            read_row_batch=read_row_batch,
+            hf_split=hf_split,
+        ):
+            in_eval = row_index in eval_indices
+            if split == "eval":
+                if not in_eval:
+                    continue
+            elif split == "train":
+                if in_eval:
+                    continue
+            else:
+                raise ValueError(f"Unknown split '{split}'.")
+            if text:
+                yield text
+
+    def ensure_downloaded(self) -> None:
+        """Ensure the dataset exists locally, downloading from the Hub if needed."""
+        if self._is_prototype():
+            raise ValueError("Prototype dataset cannot be downloaded.")
+        if self.is_downloaded():
+            return
+        print(f"Dataset '{self.config.name}' not found locally; downloading...")
+        self._hf_snapshot_download(local_files_only=False)
 
     def download(self) -> bool:
         """Download the dataset locally.
