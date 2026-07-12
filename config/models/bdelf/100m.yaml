@@ -1,0 +1,24 @@
+_doc: Block Diffusion + Flow LM ~100M params (12 layers x 672 dim, diffusion block 32)
+
+name: bdelf-100m
+tokenizer: gpt2
+diffusion_block_size: 32
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+attn_backend: sdpa
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+decoder_prob: 0.2
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+decoder_noise_scale: 5.0
+t_eps: 0.05
+time_schedule: logit_normal
+fix_bos: true
+
+sampling:
+  num_ode_steps: 8
+  time_schedule: logit_normal

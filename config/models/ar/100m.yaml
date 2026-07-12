@@ -1,0 +1,9 @@
+_doc: Autoregressive GPT ~100M params (12 layers x 672 dim x 12 heads)
+
+name: ar-100m
+tokenizer: gpt2
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+use_flash: true

@@ -1,0 +1,9 @@
+_doc: AR config template
+
+name: prototype
+tokenizer: gpt2
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+use_flash: true

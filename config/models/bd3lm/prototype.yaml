@@ -1,0 +1,19 @@
+_doc: BD3LM config template
+
+name: prototype
+tokenizer: gpt2
+diffusion_block_size: 32
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+attn_backend: flex
+sampling_eps_min: 0.001
+sampling_eps_max: 1.0
+fix_bos: true
+
+sampling:
+  num_steps: 5000
+  sampler: semi_ar
+  first_hitting: true
+  nucleus_p: 1.0

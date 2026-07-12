@@ -1,0 +1,9 @@
+_doc: Autoregressive GPT ~870M params (28 layers x 1536 dim x 16 heads)
+
+name: ar-900m
+tokenizer: gpt2
+n_layer: 28
+n_head: 16
+n_embd: 1536
+dropout: 0.1
+use_flash: true

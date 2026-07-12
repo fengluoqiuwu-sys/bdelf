@@ -1,0 +1,19 @@
+_doc: Block Diffusion LM ~300M params (20 layers x 1024 dim, diffusion block 32)
+
+name: bd3lm-300m
+tokenizer: gpt2
+diffusion_block_size: 32
+n_layer: 20
+n_head: 16
+n_embd: 1024
+dropout: 0.1
+attn_backend: flex
+sampling_eps_min: 0.001
+sampling_eps_max: 1.0
+fix_bos: true
+
+sampling:
+  num_steps: 5000
+  sampler: semi_ar
+  first_hitting: true
+  nucleus_p: 1.0
