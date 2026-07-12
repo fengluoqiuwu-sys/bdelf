@@ -1,0 +1,8 @@
+_doc: Preprocess config template (FL_PreprocessConfig)
+
+name: prototype
+tokenizer: gpt2
+chunk_length: 1024
+overflow_mode: discard
+seed: 42
+text_column: text
