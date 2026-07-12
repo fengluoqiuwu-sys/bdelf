@@ -1,0 +1,4 @@
+_doc: Online eval on held-out split (model loss → exp(loss) PPL)
+name: default
+eval_sample_count: 1024
+eval_sample_seed: 42

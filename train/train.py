@@ -96,23 +96,12 @@ class FL_ScheduleConfig:
 
 @dataclass
 class FL_EvalConfig:
-    _YAML_REQUIRED = frozenset(
-        {"name", "eval_model", "eval_model_dtype", "eval_model_device"}
-    )
+    _YAML_REQUIRED = frozenset({"name", "eval_sample_seed"})
 
     name: str = "prototype"
-    eval_model: str = "gpt2-large"
-    eval_model_dtype: TrainDtype = "bf16"
-    eval_model_device: str = "cuda"
-    # BDELF generate eval: defaults to legacy (full AdaLN), consistent with training
-    use_fast_infer: bool = False
     # Online eval subsample; None / omitted runs the full eval split
     eval_sample_count: Optional[int] = None
     eval_sample_seed: int = 42
-    # Prefix ratio on eval chunks for generative PPL (0 = unconditional)
-    eval_prefix_ratio: float = 0.5
-    # BD3LM sampling steps during online generative eval
-    eval_gen_steps: int = 128
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -159,14 +148,8 @@ class FL_TrainConfig:
     num_workers: int
     resume: bool
     seed: int
-    eval_model: str
-    eval_model_dtype: TrainDtype
-    eval_model_device: str
-    eval_use_fast_infer: bool
     eval_sample_count: Optional[int]
     eval_sample_seed: int
-    eval_prefix_ratio: float
-    eval_gen_steps: int
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -228,12 +211,6 @@ def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
     return match.group(1), match.group(2)  # type: ignore[return-value]
 
 
-def _resolve_eval_ref(model_config: str, variant: TrainVariant) -> str:
-    if model_config == "900m" and variant == "fast":
-        return "gpt2-large-cpu"
-    return "gpt2-large-cuda"
-
-
 def _subconfig_path(kind: str, name: str, *, model: str | None = None) -> Path:
     if kind in _MODEL_SCOPED_KINDS:
         if model is None:
@@ -286,7 +263,7 @@ def compose_train_config(
       - hardware ← variant
       - optimizer ← model size
       - schedule ← variant
-      - eval ← ``gpt2-large-cuda`` (``900m-fast`` uses CPU eval)
+      - eval ← ``default``
       - batch ← ``batch/<model>/<config_name>.yaml``
 
     ``dataset`` / ``preprocess`` are supplied at launch (not from yaml).
@@ -296,12 +273,11 @@ def compose_train_config(
     run_name = f"{model}-{config_name}"
 
     hardware_name = _HARDWARE_BY_VARIANT[variant]
-    eval_name = _resolve_eval_ref(model_config, variant)
 
     hardware = _load_subconfig("hardware", hardware_name)
     optimizer = _load_subconfig("optimizer", model_config)
     schedule = _load_subconfig("schedule", variant)
-    eval_cfg = _load_subconfig("eval", eval_name)
+    eval_cfg = _load_subconfig("eval", "default")
     batch = _load_subconfig("batch", config_name, model=model)
     chunk_length = get_preprocess(preprocess).chunk_length
 
@@ -311,21 +287,11 @@ def compose_train_config(
         )
 
     _validate_dtype(optimizer.dtype, path=run_name, label="dtype")
-    _validate_dtype(eval_cfg.eval_model_dtype, path=run_name, label="eval_model_dtype")
 
     if eval_cfg.eval_sample_count is not None and eval_cfg.eval_sample_count < 1:
         raise ValueError(
             f"{run_name}: eval_sample_count must be >= 1 when set, "
             f"got {eval_cfg.eval_sample_count}"
-        )
-    if not (0.0 <= eval_cfg.eval_prefix_ratio < 1.0):
-        raise ValueError(
-            f"{run_name}: eval_prefix_ratio must be in [0, 1), "
-            f"got {eval_cfg.eval_prefix_ratio}"
-        )
-    if eval_cfg.eval_gen_steps < 1:
-        raise ValueError(
-            f"{run_name}: eval_gen_steps must be >= 1, got {eval_cfg.eval_gen_steps}"
         )
 
     if batch.batch_size < 1 or batch.grad_accum_steps < 1 or hardware.world_size < 1:
@@ -359,7 +325,7 @@ def compose_train_config(
                 "hardware": hardware_name,
                 "optimizer": model_config,
                 "schedule": variant,
-                "eval": eval_name,
+                "eval": "default",
                 "batch": f"{model}/{config_name}",
                 "dataset": dataset,
                 "preprocess": preprocess,
@@ -394,14 +360,8 @@ def compose_train_config(
         num_workers=hardware.num_workers,
         resume=schedule.resume,
         seed=schedule.seed,
-        eval_model=eval_cfg.eval_model,
-        eval_model_dtype=eval_cfg.eval_model_dtype,
-        eval_model_device=eval_cfg.eval_model_device,
-        eval_use_fast_infer=eval_cfg.use_fast_infer,
         eval_sample_count=eval_cfg.eval_sample_count,
         eval_sample_seed=eval_cfg.eval_sample_seed,
-        eval_prefix_ratio=eval_cfg.eval_prefix_ratio,
-        eval_gen_steps=eval_cfg.eval_gen_steps,
         extra=extra,
     )
 
