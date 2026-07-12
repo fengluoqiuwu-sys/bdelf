@@ -1,0 +1,15 @@
+# Dataset config template (FL_DatasetConfig)
+# Copy this file and edit the fields to define a new dataset config.
+
+name: prototype                 # dataset name (custom identifier)
+repo_id: username/dataset-name  # repo id on HuggingFace Hub
+revision: main                  # branch / tag / commit (default: main)
+
+# Splits to download. Use "|" to download multiple, e.g. "train | test".
+download_split: train
+
+# Local download path. Defaults to "cache/datasets/{name}" when left empty.
+download_path: cache/datasets/prototype
+
+# Supported splits (may be produced after processing).
+split: train

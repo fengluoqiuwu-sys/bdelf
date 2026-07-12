@@ -1,0 +1,15 @@
+# WikiText dataset config
+
+name: wikitext                   # dataset name (custom identifier)
+repo_id: Salesforce/wikitext     # repo id on HuggingFace Hub
+revision: main                   # branch / tag / commit (default: main)
+subset: wikitext-103-v1          # subset / config name within the repo
+
+# Splits to download. Use "|" to download multiple.
+download_split: train | validation | test
+
+# Local download path. Defaults to "cache/datasets/{name}" when left empty.
+download_path: cache/datasets/wikitext
+
+# Supported splits (may be produced after processing).
+split: train | valid | test

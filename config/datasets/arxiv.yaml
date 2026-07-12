@@ -1,0 +1,14 @@
+# arXiv abstracts dataset config
+
+name: arxiv                       # dataset name (custom identifier)
+repo_id: gfissore/arxiv-abstracts-2021  # repo id on HuggingFace Hub
+revision: main                    # branch / tag / commit (default: main)
+
+# Splits to download. Use "|" to download multiple, e.g. "train | test".
+download_split: train
+
+# Local download path. Defaults to "cache/datasets/{name}" when left empty.
+download_path: cache/datasets/arxiv
+
+# Supported splits (may be produced after processing).
+split: train
