@@ -173,7 +173,7 @@ def _init_tokenizer_worker(tokenizer_name: str) -> None:
     global _WORKER_TOKENIZER
     os.environ["BDELF_QUIET_TOKENIZER"] = "1"
     _WORKER_TOKENIZER = get_tokenizer(tokenizer_name)
-    # 先完整 tokenize，再按 token 长度切块；预处理阶段不应受 model_max_length 约束。
+    # Tokenize full documents first, then chunk by token length; ignore model_max_length here.
     _WORKER_TOKENIZER.model_max_length = int(1e9)
 
 
@@ -246,7 +246,7 @@ def _iter_tagged_doc_batches(
 
     with tqdm(
         total=total_rows,
-        desc="[preprocess] 读取",
+        desc="[preprocess] reading",
         unit="row",
         dynamic_ncols=True,
     ) as row_progress:
@@ -397,7 +397,7 @@ def _run_tagged_preprocess_loop(
             progress[split].close()
             meta = pipeline.writer.finalize()
             metas[split] = meta
-            tqdm.write(f"[preprocess] split={split!r}: 完成，共 {meta.count:,} chunks")
+            tqdm.write(f"[preprocess] split={split!r}: done, {meta.count:,} chunks")
     return metas
 
 
@@ -415,7 +415,7 @@ def _stream_preprocess_parquet(
         split: _split_doc_total(source, split) for split in sorted(splits)
     }
     tqdm.write(
-        f"[preprocess] 单次顺序扫描 parquet: rows={total_rows:,}, "
+        f"[preprocess] single parquet scan: rows={total_rows:,}, "
         f"splits={sorted(splits)}, workers={workers}, task={_DOCS_PER_TASK}, "
         f"chunk={config.chunk_length} tokens"
     )
@@ -449,7 +449,7 @@ def _stream_preprocess_split_dataset(
     total = len(hf_dataset)
     doc_batches = _iter_doc_batches_from_dataset(hf_dataset, config.text_column)
     tqdm.write(
-        f"[preprocess] split={split!r}: {total:,} 条文本 "
+        f"[preprocess] split={split!r}: {total:,} texts "
         f"(workers={workers}, task={_DOCS_PER_TASK}, "
         f"chunk={config.chunk_length} tokens)"
     )
@@ -800,11 +800,11 @@ def _build_cache(
             )
     else:
         for split in splits_to_build:
-            _log_preprocess(f"加载 split={split!r} ...")
+            _log_preprocess(f"Loading split={split!r} ...")
             load_started = time.time()
             hf_dataset = source.load_split(split)
             tqdm.write(
-                f"[preprocess] split={split!r} 已加载 {len(hf_dataset):,} 条 "
+                f"[preprocess] split={split!r} loaded {len(hf_dataset):,} rows "
                 f"({time.time() - load_started:.1f}s)"
             )
             meta = _stream_preprocess_split_dataset(
@@ -884,15 +884,16 @@ def _ensure_cache(
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     _log_preprocess(
-        f"缓存未命中，开始构建: dataset={source.config.name!r} "
+        f"Cache miss; building: dataset={source.config.name!r} "
         f"preprocess={config.name!r}"
     )
-    _log_preprocess(f"输出目录: {cache_dir}")
+    _log_preprocess(f"Output directory: {cache_dir}")
     _log_preprocess(
-        f"并行 worker 数: {_worker_count()}（tokenize 阶段会占满 CPU，首次运行可能耗时较长）"
+        f"Parallel workers: {_worker_count()} "
+        f"(tokenize stage uses all CPU cores; first run may take a while)"
     )
     split_counts = _build_cache(config, source, cache_dir)
-    _log_preprocess(f"缓存构建完成: {split_counts}")
+    _log_preprocess(f"Cache build complete: {split_counts}")
     manifest = _load_manifest(cache_dir) or {}
     splits = {
         name: _split_meta_from_manifest(raw)

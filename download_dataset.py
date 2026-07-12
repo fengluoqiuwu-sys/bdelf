@@ -28,12 +28,12 @@ def download_by_name(name: str) -> bool:
     (or is the ``prototype`` template).
     """
     if name == "prototype":
-        print(f"Config {name}.yaml does not exist")
+        print(f"[download] Config {name}.yaml does not exist")
         return False
 
     config_path = CONFIG_DIR / f"{name}.yaml"
     if not config_path.exists():
-        print(f"Config {name}.yaml does not exist")
+        print(f"[download] Config {name}.yaml does not exist")
         return False
 
     dataset = get_dataset(name)

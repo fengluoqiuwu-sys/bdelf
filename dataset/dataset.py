@@ -379,7 +379,7 @@ class FL_Dataset(Dataset):
             raise ValueError("Prototype dataset cannot be downloaded.")
         if self.is_downloaded():
             return
-        print(f"Dataset '{self.config.name}' not found locally; downloading...")
+        print(f"[dataset] Dataset '{self.config.name}' not found locally; downloading...")
         self._hf_snapshot_download(local_files_only=False)
 
     def download(self) -> bool:
@@ -395,7 +395,7 @@ class FL_Dataset(Dataset):
         if self._is_prototype():
             raise ValueError("Prototype dataset cannot be downloaded.")
         if self.is_downloaded():
-            print("Already downloaded")
+            print("[dataset] Already downloaded")
             return True
 
         self._hf_snapshot_download(local_files_only=False)
