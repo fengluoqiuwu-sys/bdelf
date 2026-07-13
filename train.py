@@ -296,6 +296,24 @@ def _eval_loss_branch(model: nn.Module) -> str | None:
     return None
 
 
+def _sample_synced_train_branch(
+    model: nn.Module,
+    device: torch.device,
+    *,
+    is_distributed: bool,
+) -> str:
+    """Pick denoise/decode once per step; broadcast so every DDP rank matches."""
+    raw = unwrap_model(model)
+    p = float(raw.backbone.decoder_prob)
+    if is_distributed:
+        pick_decode = torch.zeros(1, device=device, dtype=torch.float32)
+        if dist.get_rank() == 0:
+            pick_decode[0] = float(torch.rand((), device=device) < p)
+        dist.broadcast(pick_decode, src=0)
+        return "decode" if pick_decode.item() > 0.5 else "denoise"
+    return "decode" if torch.rand((), device=device) < p else "denoise"
+
+
 @torch.no_grad()
 def eval_model_ppl(
     model: nn.Module,
@@ -396,6 +414,29 @@ def _parse_float(raw: str | None) -> float | None:
     return float(raw)
 
 
+def _decode_ce_train_series(
+    train_rows: list[dict[str, str]],
+) -> tuple[list[int], list[float], list[float]]:
+    """Train decode-CE points for plotting (BDELF dual-branch)."""
+    steps: list[int] = []
+    ppls: list[float] = []
+    lrs: list[float] = []
+    for row in train_rows:
+        if row.get("loss_branch") != "decode":
+            continue
+        ppl = _parse_float(row.get("train_ppl"))
+        if ppl is None:
+            ce = _parse_float(row.get("decode_ce"))
+            if ce is not None:
+                ppl = loss_to_ppl(ce)
+        if ppl is None:
+            continue
+        steps.append(int(row["step"]))
+        ppls.append(ppl)
+        lrs.append(float(row["lr"]))
+    return steps, ppls, lrs
+
+
 def update_ppl_plots(
     train_csv: Path,
     eval_csv: Path,
@@ -407,8 +448,14 @@ def update_ppl_plots(
         return
 
     train_steps = [int(r["step"]) for r in train_rows]
-    train_ppl = [_parse_float(r.get("train_ppl")) for r in train_rows]
     train_lr = [float(r["lr"]) for r in train_rows]
+
+    dual_branch = any(r.get("loss_branch") in ("denoise", "decode") for r in train_rows)
+    if dual_branch:
+        train_plot_steps, train_ppl, _ = _decode_ce_train_series(train_rows)
+    else:
+        train_plot_steps = train_steps
+        train_ppl = [_parse_float(r.get("train_ppl")) for r in train_rows]
 
     eval_steps = [int(r["step"]) for r in eval_rows]
     eval_ppl = [
@@ -417,7 +464,11 @@ def update_ppl_plots(
 
     for cap, filename in ((1000.0, "ppl_under_1000.png"), (100.0, "ppl_under_100.png")):
         t_steps, t_ppls = zip(
-            *[(s, p) for s, p in zip(train_steps, train_ppl) if p is not None and p <= cap]
+            *[
+                (s, p)
+                for s, p in zip(train_plot_steps, train_ppl)
+                if p is not None and p <= cap
+            ]
         ) if any(p is not None and p <= cap for p in train_ppl) else ([], [])
 
         e_steps, e_ppls = zip(
@@ -430,9 +481,14 @@ def update_ppl_plots(
         fig, ax_ppl = plt.subplots(figsize=(10, 4.5))
 
         if t_steps:
+            train_label = (
+                "train decode ppl (exp ce)"
+                if dual_branch
+                else "train ppl (exp loss)"
+            )
             ax_ppl.plot(
                 t_steps, t_ppls, color="#4C72B0", alpha=0.55, linewidth=1.2,
-                label="train ppl (exp loss)", zorder=1,
+                label=train_label, zorder=1,
             )
         if e_steps:
             ax_ppl.plot(
@@ -489,10 +545,11 @@ def build_train_row(
         row["loss_branch"] = loss_branch
         if loss_branch == "denoise":
             row["denoise_mse"] = round(train_loss, 6)
-        else:
+        elif loss_branch == "decode":
             ppl = loss_to_ppl(train_loss)
             row["decode_ce"] = round(train_loss, 6)
             row["train_ppl"] = round(ppl, 4)
+            row["train_loss"] = row["decode_ce"]
     else:
         row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
     return row
@@ -668,7 +725,13 @@ def train_loop(
             )
 
     if is_distributed:
-        model = DDP(model, device_ids=[device.index], output_device=device.index)
+        ddp_kwargs: dict[str, Any] = {
+            "device_ids": [device.index],
+            "output_device": device.index,
+        }
+        if uses_dual_branch_logging(model):
+            ddp_kwargs["find_unused_parameters"] = True
+        model = DDP(model, **ddp_kwargs)
 
     raw = unwrap_model(model)
     optimizer = build_optimizer(raw, cfg)
@@ -700,9 +763,11 @@ def train_loop(
 
     dual_branch = uses_dual_branch_logging(model)
     if rank == 0 and dual_branch:
+        decoder_prob = float(cfg.extra.get("decoder_prob", 0.2))
         _train_log(
-            "BDELF dual-branch: train log uses sampled branch; "
-            "eval uses decode CE → exp(loss) PPL",
+            f"BDELF dual-branch: random denoise/decode sampling "
+            f"(decode prob={decoder_prob:g}); "
+            "metrics/plots use decode CE; only decode steps count toward token budget",
         )
 
     model.train()
@@ -737,7 +802,14 @@ def train_loop(
                     group["lr"] = lr
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                micro_loss = forward_loss(model, batch)
+                train_branch = (
+                    _sample_synced_train_branch(
+                        model, device, is_distributed=is_distributed,
+                    )
+                    if dual_branch
+                    else None
+                )
+                micro_loss = forward_loss(model, batch, branch=train_branch)
 
             loss_ok = _all_ranks_true(
                 bool(torch.isfinite(micro_loss).item()),
@@ -782,7 +854,11 @@ def train_loop(
             seq_tokens = batch.size(0) * (
                 batch.size(1) if uses_full_sequence(model) else batch.size(1) - 1
             )
-            tokens_per_sec = seq_tokens / max(elapsed, 1e-6)
+            if dual_branch:
+                effective_tokens = seq_tokens if loss_branch == "decode" else 0
+            else:
+                effective_tokens = seq_tokens
+            tokens_per_sec = effective_tokens / max(elapsed, 1e-6)
 
             row = build_train_row(
                 step, train_loss, lr, tokens_per_sec,
@@ -791,11 +867,26 @@ def train_loop(
 
             rank0_sync = False
             if rank == 0:
-                pbar.set_postfix(
-                    loss=f"{train_loss:.3f}",
-                    lr=f"{lr:.2e}",
-                    tok_s=f"{tokens_per_sec:.0f}",
-                )
+                if dual_branch and loss_branch == "decode":
+                    postfix = {
+                        "ce": f"{train_loss:.3f}",
+                        "ppl": f"{loss_to_ppl(train_loss):.1f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
+                elif dual_branch:
+                    postfix = {
+                        "branch": "denoise",
+                        "mse": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                    }
+                else:
+                    postfix = {
+                        "loss": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
+                pbar.set_postfix(**postfix)
                 pbar.update(1)
                 append_csv_row(train_csv, TRAIN_CSV_FIELDS, row)
 
@@ -998,6 +1089,13 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
             )
         _train_log(f"Data: dataset={cfg.dataset}, preprocess={cfg.preprocess}")
         _train_log(f"Device: {device}, world_size={world_size}")
+        if cfg.model == "bdelf":
+            _train_log(
+                f"Token budget: {cfg.target_tokens:,} decode-equivalent tokens "
+                f"({cfg.effective_tokens_per_optimizer_step:,}/step decode, "
+                f"{cfg.tokens_per_optimizer_step:,}/step raw) → "
+                f"max_steps={cfg.max_steps:,}",
+            )
 
     try:
         preprocessed = get_preprocessed(cfg.preprocess, cfg.dataset)

@@ -225,7 +225,7 @@ class _BDELFBackbone(nn.Module):
 
     self._pair_sdpa_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
     self._flex_block_mask_cache: dict[tuple[int, torch.device], object] = {}
-    self.last_loss_branch = "mixed"
+    self.last_loss_branch = ""
 
   def _validate_seq_len(self, seq_len: int) -> None:
     if seq_len > self.max_seq_len:
@@ -419,11 +419,13 @@ class _BDELFBackbone(nn.Module):
       loss = self._denoise_loss(x0_emb, idx)
       self.last_loss_branch = "denoise"
     else:
-      denoise_loss = self._denoise_loss(x0_emb, idx)
-      decode_loss = self._decode_loss(x0_emb, idx)
       p = self.decoder_prob
-      loss = (1.0 - p) * denoise_loss + p * decode_loss
-      self.last_loss_branch = "mixed"
+      if torch.rand((), device=x0_emb.device) < p:
+        loss = self._decode_loss(x0_emb, idx)
+        self.last_loss_branch = "decode"
+      else:
+        loss = self._denoise_loss(x0_emb, idx)
+        self.last_loss_branch = "denoise"
     return torch.empty(0), loss
 
   # -------------------------------------------------------------------------

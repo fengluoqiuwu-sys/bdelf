@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Type, TypeVar
 
+import yaml
+
 from config_util import load_yaml_config
+from models import resolve_model_config_path
 from preprocess import get_preprocess
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "train"
@@ -182,6 +185,14 @@ class FL_TrainConfig:
         )
 
     @property
+    def effective_tokens_per_optimizer_step(self) -> int:
+        """Decode-equivalent tokens per step (BDELF: scaled by ``decoder_prob``)."""
+        raw = self.extra.get("effective_tokens_per_optimizer_step")
+        if raw is not None:
+            return int(raw)
+        return self.tokens_per_optimizer_step
+
+    @property
     def target_tokens(self) -> int | None:
         raw = self.extra.get("target_tokens")
         return int(raw) if raw is not None else None
@@ -215,6 +226,15 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
             f"Invalid config name {config_name!r}, expected {{100m,300m,900m}}-{{fast,full,ultra}}"
         )
     return model, config_name
+
+
+def _model_decoder_prob(model: str, model_config: str) -> float:
+    if model != "bdelf":
+        return 1.0
+    path = resolve_model_config_path(model, model_config)
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return float(cfg.get("decoder_prob", 0.2))
 
 
 def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
@@ -366,7 +386,7 @@ def compose_train_config(
     if batch.batch_size < 1 or batch.grad_accum_steps < 1 or hardware.world_size < 1:
         raise ValueError(f"{run_name}: batch/world_size must be >= 1")
 
-    tokens_per_step = (
+    raw_tokens_per_step = (
         batch.batch_size
         * batch.grad_accum_steps
         * hardware.world_size
@@ -376,11 +396,20 @@ def compose_train_config(
             else max(1, chunk_length - 1)
         )
     )
+    decoder_prob = _model_decoder_prob(model, model_config)
+    if model == "bdelf":
+        effective_tokens_per_step = max(
+            1, round(raw_tokens_per_step * decoder_prob),
+        )
+    else:
+        effective_tokens_per_step = raw_tokens_per_step
     resolved = _resolve_schedule(
-        schedule, run_name=run_name, tokens_per_step=tokens_per_step,
+        schedule,
+        run_name=run_name,
+        tokens_per_step=effective_tokens_per_step,
     )
     max_steps = resolved.max_steps
-    target_tokens = max_steps * tokens_per_step
+    target_tokens = max_steps * effective_tokens_per_step
 
     extra = _merge_extra(
         hardware.extra,
@@ -390,7 +419,9 @@ def compose_train_config(
         batch.extra,
         {
             "chunk_length": chunk_length,
-            "tokens_per_optimizer_step": tokens_per_step,
+            "tokens_per_optimizer_step": raw_tokens_per_step,
+            "effective_tokens_per_optimizer_step": effective_tokens_per_step,
+            "decoder_prob": decoder_prob,
             "target_tokens": target_tokens,
             "config_refs": {
                 "hardware": hardware_name,
