@@ -4,8 +4,8 @@ variant: full
 target_tokens: 20000000000
 warmup_ratio: 0.005
 eval_ratio: 0.002
-save_ratio: 0.002
-snapshot_ratio: 0.05
+save_ratio: 0.01
+snapshot_ratio: 0.1
 log_plot_ratio: 0.0002
 min_lr_ratio: 0.1
 resume: true
