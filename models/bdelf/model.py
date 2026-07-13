@@ -569,7 +569,7 @@ class _BDELFBackbone(nn.Module):
 
       if stride == 0 and bos is not None:
         bos_emb = self._tokens_to_emb(
-          torch.full((n_samples,), bos, device=device, dtype=torch.long),
+          torch.full((n_samples, 1), bos, device=device, dtype=torch.long),
         )
         z_block[:, 0] = bos_emb[:, 0]
 
@@ -641,7 +641,7 @@ class _BDELFBackbone(nn.Module):
 
       if stride == 0 and bos is not None:
         bos_emb = self._tokens_to_emb(
-          torch.full((n_samples,), bos, device=device, dtype=torch.long),
+          torch.full((n_samples, 1), bos, device=device, dtype=torch.long),
         )
         z_block[:, 0] = bos_emb[:, 0]
 
