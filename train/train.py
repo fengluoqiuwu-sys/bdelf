@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,13 +73,7 @@ class FL_ScheduleConfig:
         {
             "name",
             "variant",
-            "max_steps",
-            "warmup_steps",
             "min_lr_ratio",
-            "log_plot_every",
-            "eval_every",
-            "save_every",
-            "snapshot_every",
             "resume",
             "seed",
         }
@@ -86,13 +81,19 @@ class FL_ScheduleConfig:
 
     name: str = "prototype"
     variant: TrainVariant = "fast"
-    max_steps: int = 5000
+    max_steps: int = 0
+    target_tokens: Optional[int] = None
     warmup_steps: int = 500
+    warmup_ratio: Optional[float] = None
     min_lr_ratio: float = 0.1
     log_plot_every: int = 100
+    log_plot_ratio: Optional[float] = None
     eval_every: int = 500
+    eval_ratio: Optional[float] = None
     save_every: int = 2000
+    save_ratio: Optional[float] = None
     snapshot_every: int = 10_000
+    snapshot_ratio: Optional[float] = None
     resume: bool = True
     seed: int = 42
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -248,10 +249,64 @@ def _validate_dtype(dtype: str, *, path: str, label: str) -> None:
         raise ValueError(f"{path}: unsupported {label} {dtype!r}")
 
 
-def _resolve_max_steps(schedule: FL_ScheduleConfig) -> int:
-    if schedule.max_steps < 1:
-        raise ValueError(f"schedule {schedule.name}: max_steps must be >= 1")
-    return schedule.max_steps
+def _steps_from_ratio(max_steps: int, ratio: float | None, fallback: int) -> int:
+    if ratio is not None:
+        return max(1, round(max_steps * ratio))
+    return fallback
+
+
+@dataclass(frozen=True)
+class _ResolvedSchedule:
+    max_steps: int
+    warmup_steps: int
+    log_plot_every: int
+    eval_every: int
+    save_every: int
+    snapshot_every: int
+
+
+def _resolve_schedule(
+    schedule: FL_ScheduleConfig,
+    *,
+    run_name: str,
+    tokens_per_step: int,
+) -> _ResolvedSchedule:
+    if schedule.target_tokens is not None:
+        if tokens_per_step < 1:
+            raise ValueError(f"{run_name}: tokens_per_optimizer_step must be >= 1")
+        if schedule.warmup_ratio is None:
+            raise ValueError(f"{run_name}: target_tokens schedules require warmup_ratio")
+        for field_name in ("eval_ratio", "save_ratio", "snapshot_ratio", "log_plot_ratio"):
+            if getattr(schedule, field_name) is None:
+                raise ValueError(
+                    f"{run_name}: target_tokens schedules require {field_name}"
+                )
+        max_steps = max(1, math.ceil(schedule.target_tokens / tokens_per_step))
+    elif schedule.max_steps >= 1:
+        max_steps = schedule.max_steps
+    else:
+        raise ValueError(
+            f"{run_name}: schedule must set target_tokens or max_steps >= 1"
+        )
+
+    return _ResolvedSchedule(
+        max_steps=max_steps,
+        warmup_steps=_steps_from_ratio(
+            max_steps, schedule.warmup_ratio, schedule.warmup_steps,
+        ),
+        log_plot_every=_steps_from_ratio(
+            max_steps, schedule.log_plot_ratio, schedule.log_plot_every,
+        ),
+        eval_every=_steps_from_ratio(
+            max_steps, schedule.eval_ratio, schedule.eval_every,
+        ),
+        save_every=_steps_from_ratio(
+            max_steps, schedule.save_ratio, schedule.save_every,
+        ),
+        snapshot_every=_steps_from_ratio(
+            max_steps, schedule.snapshot_ratio, schedule.snapshot_every,
+        ),
+    )
 
 
 def compose_train_config(
@@ -266,7 +321,7 @@ def compose_train_config(
     ``config_name`` must be ``{100m,300m,900m}-{fast,full,ultra}``. Sub-config refs:
       - hardware ← variant
       - optimizer ← model size
-      - schedule ← variant
+      - schedule ← variant (``full``/``ultra`` derive ``max_steps`` from ``target_tokens``)
       - eval ← ``default``
       - batch ← ``batch/<model>/<config_name>.yaml``
 
@@ -301,8 +356,6 @@ def compose_train_config(
     if batch.batch_size < 1 or batch.grad_accum_steps < 1 or hardware.world_size < 1:
         raise ValueError(f"{run_name}: batch/world_size must be >= 1")
 
-    max_steps = _resolve_max_steps(schedule)
-
     tokens_per_step = (
         batch.batch_size
         * batch.grad_accum_steps
@@ -313,6 +366,10 @@ def compose_train_config(
             else max(1, chunk_length - 1)
         )
     )
+    resolved = _resolve_schedule(
+        schedule, run_name=run_name, tokens_per_step=tokens_per_step,
+    )
+    max_steps = resolved.max_steps
     target_tokens = max_steps * tokens_per_step
 
     extra = _merge_extra(
@@ -355,12 +412,12 @@ def compose_train_config(
         beta1=optimizer.beta1,
         beta2=optimizer.beta2,
         grad_clip=optimizer.grad_clip,
-        warmup_steps=schedule.warmup_steps,
+        warmup_steps=resolved.warmup_steps,
         min_lr_ratio=schedule.min_lr_ratio,
-        log_plot_every=schedule.log_plot_every,
-        eval_every=schedule.eval_every,
-        save_every=schedule.save_every,
-        snapshot_every=schedule.snapshot_every,
+        log_plot_every=resolved.log_plot_every,
+        eval_every=resolved.eval_every,
+        save_every=resolved.save_every,
+        snapshot_every=resolved.snapshot_every,
         num_workers=hardware.num_workers,
         resume=schedule.resume,
         seed=schedule.seed,

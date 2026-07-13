@@ -1,12 +1,12 @@
-_doc: Ultra long-run training schedule (8×4090)
+_doc: Ultra training schedule (100B tokens, 8×4090)
 name: ultra
 variant: ultra
-max_steps: 15000000
-warmup_steps: 5000
+target_tokens: 100000000000
+warmup_ratio: 0.005
+eval_ratio: 0.002
+save_ratio: 0.002
+snapshot_ratio: 0.05
+log_plot_ratio: 0.0002
 min_lr_ratio: 0.1
-log_plot_every: 200
-eval_every: 2000
-save_every: 2000
-snapshot_every: 50000
 resume: true
 seed: 42
