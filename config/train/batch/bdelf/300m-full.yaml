@@ -1,6 +1,6 @@
-_doc: bdelf/300m-full micro-batch for full-8x4090
+_doc: bdelf/300m-full micro-batch for full-4x4090
 name: 300m-full
 batch_size: 2
-grad_accum_steps: 8
+grad_accum_steps: 16
 num_params_m: 346.7
 estimated_peak_vram_gb: 9.0

@@ -1,6 +1,6 @@
-_doc: bd3lm/900m-full micro-batch for full-8x4090
+_doc: bd3lm/900m-full micro-batch for full-4x4090
 name: 900m-full
 batch_size: 1
-grad_accum_steps: 16
+grad_accum_steps: 32
 num_params_m: 870.5
 estimated_peak_vram_gb: 16.3

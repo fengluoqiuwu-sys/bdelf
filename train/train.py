@@ -14,14 +14,18 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "train"
 BATCH_DIR = CONFIG_DIR / "batch"
 CHECKPOINT_ROOT = "cache/checkpoints"
 
-TrainVariant = Literal["fast", "full"]
+TrainVariant = Literal["fast", "full", "ultra"]
 TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
 _TRAIN_MODELS = ("ar", "bd3lm", "bdelf")
-_MODEL_CONFIG_RE = re.compile(r"^(100m|300m|900m)-(fast|full)$")
-_HARDWARE_BY_VARIANT = {"fast": "fast-16gb", "full": "full-8x4090"}
+_MODEL_CONFIG_RE = re.compile(r"^(100m|300m|900m)-(fast|full|ultra)$")
+_HARDWARE_BY_VARIANT = {
+    "fast": "fast-16gb",
+    "full": "full-4x4090",
+    "ultra": "full-8x4090",
+}
 
 
 @dataclass
@@ -199,7 +203,7 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
         )
     if not _MODEL_CONFIG_RE.fullmatch(config_name):
         raise ValueError(
-            f"Invalid config name {config_name!r}, expected {{100m,300m,900m}}-{{fast,full}}"
+            f"Invalid config name {config_name!r}, expected {{100m,300m,900m}}-{{fast,full,ultra}}"
         )
     return model, config_name
 
@@ -259,7 +263,7 @@ def compose_train_config(
 ) -> FL_TrainConfig:
     """Merge sub-configs by naming convention.
 
-    ``config_name`` must be ``{100m,300m,900m}-{fast,full}``. Sub-config refs:
+    ``config_name`` must be ``{100m,300m,900m}-{fast,full,ultra}``. Sub-config refs:
       - hardware ← variant
       - optimizer ← model size
       - schedule ← variant

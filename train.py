@@ -795,11 +795,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  python train.py --model ar --config 100m-fast "
             "--dataset owt --preprocess default\n"
             "  python train.py --model bdelf --config 900m-full "
+            "--dataset owt --preprocess default\n"
+            "  python train.py --model bdelf --config 900m-ultra "
             "--dataset owt --preprocess default\n\n"
             f"Available models: {', '.join(models)}\n"
             f"Available datasets: {', '.join(datasets)}\n"
             f"Available preprocess configs: {', '.join(preprocess_names)}\n"
-            "Train configs: {{100m,300m,900m}}-{{fast,full}}"
+            "Train configs: {{100m,300m,900m}}-{{fast,full,ultra}}"
         ),
     )
     parser.add_argument(
@@ -812,7 +814,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         dest="train_config",
         metavar="CONFIG",
-        help="Train config name, e.g. 100m-fast / 900m-full",
+        help="Train config name, e.g. 100m-fast / 900m-full / 900m-ultra",
     )
     parser.add_argument(
         "--dataset",
@@ -851,7 +853,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         raise SystemExit(
             f"Unknown train config {args.train_config!r}. {args.model} available: "
             f"{', '.join(configs)}\n"
-            f"Naming format: {{100m,300m,900m}}-{{fast,full}}"
+            f"Naming format: {{100m,300m,900m}}-{{fast,full,ultra}}"
         )
 
     size = args.train_config.rsplit("-", 1)[0]

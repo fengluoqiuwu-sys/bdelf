@@ -1,7 +1,7 @@
-_doc: Full training schedule
-name: full
-variant: full
-max_steps: 1500000
+_doc: Ultra long-run training schedule (8×4090)
+name: ultra
+variant: ultra
+max_steps: 15000000
 warmup_steps: 5000
 min_lr_ratio: 0.1
 log_plot_every: 200

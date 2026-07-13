@@ -1,0 +1,6 @@
+_doc: bdelf/900m-ultra micro-batch for full-8x4090
+name: 900m-ultra
+batch_size: 1
+grad_accum_steps: 16
+num_params_m: 1005.5
+estimated_peak_vram_gb: 18.4

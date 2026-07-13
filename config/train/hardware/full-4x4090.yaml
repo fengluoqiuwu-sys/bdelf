@@ -1,0 +1,8 @@
+_doc: 4× RTX 4090 24GB, 4GB headroom per GPU; num_workers is per-rank DataLoader workers (4×12=48 total)
+name: full-4x4090
+world_size: 4
+num_workers: 12
+gpu_memory_gb: 24
+memory_headroom_gb: 4.0
+memory_budget_gb: 20
+hardware_profile: 4× RTX 4090 24GB
