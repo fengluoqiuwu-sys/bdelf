@@ -10,3 +10,4 @@ log_plot_ratio: 0.0002
 min_lr_ratio: 0.1
 resume: true
 seed: 42
+use_muon: true

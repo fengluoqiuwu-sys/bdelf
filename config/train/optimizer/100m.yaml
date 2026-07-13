@@ -1,4 +1,4 @@
-_doc: AdamW lr schedule base for ~100m models
+_doc: Muon+AdamW hybrid optimizer base for ~100m models
 name: 100m
 dtype: bf16
 learning_rate: 0.0002
@@ -6,3 +6,6 @@ weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
 grad_clip: 1.0
+muon_learning_rate: 0.02
+muon_momentum: 0.95
+muon_ns_steps: 5

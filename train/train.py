@@ -64,6 +64,9 @@ class FL_OptimizerConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    muon_learning_rate: float = 0.02
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -96,6 +99,7 @@ class FL_ScheduleConfig:
     snapshot_ratio: Optional[float] = None
     resume: bool = True
     seed: int = 42
+    use_muon: bool = True
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -155,6 +159,10 @@ class FL_TrainConfig:
     seed: int
     eval_sample_count: Optional[int]
     eval_sample_seed: int
+    use_muon: bool = True
+    muon_learning_rate: float = 0.02
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -329,13 +337,15 @@ def compose_train_config(
     """
     model, config_name = _parse_train_ref(model, config_name)
     model_config, variant = _parse_model_config_variant(config_name)
-    run_name = f"{model}-{config_name}"
 
     hardware_name = _HARDWARE_BY_VARIANT[variant]
 
     hardware = _load_subconfig("hardware", hardware_name)
     optimizer = _load_subconfig("optimizer", model_config)
     schedule = _load_subconfig("schedule", variant)
+    run_name = f"{model}-{config_name}"
+    if schedule.use_muon:
+        run_name = f"{run_name}-muon"
     eval_cfg = _load_subconfig("eval", "default")
     batch = _load_subconfig("batch", config_name, model=model)
     chunk_length = get_preprocess(preprocess).chunk_length
@@ -391,6 +401,7 @@ def compose_train_config(
                 "dataset": dataset,
                 "preprocess": preprocess,
             },
+            "use_muon": schedule.use_muon,
         },
     )
 
@@ -423,6 +434,10 @@ def compose_train_config(
         seed=schedule.seed,
         eval_sample_count=eval_cfg.eval_sample_count,
         eval_sample_seed=eval_cfg.eval_sample_seed,
+        use_muon=schedule.use_muon,
+        muon_learning_rate=optimizer.muon_learning_rate,
+        muon_momentum=optimizer.muon_momentum,
+        muon_ns_steps=optimizer.muon_ns_steps,
         extra=extra,
     )
 

@@ -10,3 +10,6 @@ save_every: 2000
 snapshot_every: 10000
 resume: true
 seed: 42
+# Hidden Linear weights use Muon; others stay AdamW.
+# Checkpoints are saved under <run-name>-muon (e.g. ar-100m-fast-muon).
+use_muon: true

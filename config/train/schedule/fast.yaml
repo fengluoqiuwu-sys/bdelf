@@ -10,3 +10,4 @@ save_every: 2000
 snapshot_every: 10000
 resume: true
 seed: 42
+use_muon: true

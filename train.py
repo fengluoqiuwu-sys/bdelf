@@ -33,6 +33,7 @@ from models import build_model, list_model_configs, list_models, resolve_model_c
 from dataset import list_datasets
 from preprocess import get_preprocessed, list_preprocess
 from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
+from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
 
 TRAIN_CSV_FIELDS = [
     "step",
@@ -212,13 +213,7 @@ def get_amp_dtype(dtype: str) -> torch.dtype:
 
 
 def get_lr(step: int, cfg: FL_TrainConfig) -> float:
-    if step < cfg.warmup_steps:
-        return cfg.learning_rate * step / max(1, cfg.warmup_steps)
-    if step >= cfg.max_steps:
-        return cfg.learning_rate * cfg.min_lr_ratio
-    progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return cfg.learning_rate * (cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * cosine)
+    return scaled_lr(step, cfg, cfg.learning_rate)
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
@@ -569,9 +564,13 @@ def save_checkpoint(
 
 
 def _move_optimizer_state_to_device(
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | Any,
     device: torch.device,
 ) -> None:
+    if hasattr(optimizer, "muon") and hasattr(optimizer, "adamw"):
+        _move_optimizer_state_to_device(optimizer.muon, device)
+        _move_optimizer_state_to_device(optimizer.adamw, device)
+        return
     for state in optimizer.state.values():
         for key, value in state.items():
             if torch.is_tensor(value):
@@ -593,6 +592,11 @@ def load_checkpoint(
         raise ValueError(
             f"checkpoint run={saved_cfg['name']!r} does not match current {cfg.name!r}"
         )
+    saved_use_muon = bool(saved_cfg.get("use_muon", False))
+    if saved_use_muon != cfg.use_muon:
+        raise ValueError(
+            f"checkpoint use_muon={saved_use_muon} does not match current {cfg.use_muon}"
+        )
     saved_meta = ck.get("model_meta") or {}
     if saved_meta.get("name") and saved_meta["name"] != model_meta.get("name"):
         raise ValueError(
@@ -602,7 +606,19 @@ def load_checkpoint(
 
     raw = unwrap_model(model)
     raw.load_state_dict(ck["model"])
-    optimizer.load_state_dict(ck["optimizer"])
+    opt_state = ck["optimizer"]
+    if cfg.use_muon:
+        if not isinstance(opt_state, dict) or opt_state.get("kind") != "muon_hybrid":
+            raise ValueError(
+                "checkpoint optimizer is not hybrid Muon state; "
+                "cannot resume with use_muon=True"
+            )
+    elif isinstance(opt_state, dict) and opt_state.get("kind") == "muon_hybrid":
+        raise ValueError(
+            "checkpoint optimizer is hybrid Muon state; "
+            "cannot resume with use_muon=False"
+        )
+    optimizer.load_state_dict(opt_state)
     _move_optimizer_state_to_device(optimizer, device)
 
     grads = ck.get("grads")
@@ -655,16 +671,7 @@ def train_loop(
         model = DDP(model, device_ids=[device.index], output_device=device.index)
 
     raw = unwrap_model(model)
-    decay_params = [p for p in raw.parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for p in raw.parameters() if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ],
-        lr=cfg.learning_rate,
-        betas=(cfg.beta1, cfg.beta2),
-    )
+    optimizer = build_optimizer(raw, cfg)
 
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
@@ -718,9 +725,16 @@ def train_loop(
             )
             batch = batch.to(device, non_blocking=True)
 
-            lr = get_lr(step, cfg)
-            for group in optimizer.param_groups:
-                group["lr"] = lr
+            lr = scaled_lr(step, cfg, cfg.learning_rate)
+            if cfg.use_muon:
+                schedule_optimizer_lrs(
+                    optimizer,
+                    adam_lr=lr,
+                    muon_lr=scaled_lr(step, cfg, cfg.muon_learning_rate),
+                )
+            else:
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 micro_loss = forward_loss(model, batch)
@@ -977,6 +991,11 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     if rank == 0:
         _train_log(f"Model: {model_name}/{model_size}")
         _train_log(f"Train config: {cfg.name} ({cfg.variant})")
+        if cfg.use_muon:
+            _train_log(
+                f"Optimizer: Muon+AdamW hybrid "
+                f"(muon_lr={cfg.muon_learning_rate}, adam_lr={cfg.learning_rate})"
+            )
         _train_log(f"Data: dataset={cfg.dataset}, preprocess={cfg.preprocess}")
         _train_log(f"Device: {device}, world_size={world_size}")
 
