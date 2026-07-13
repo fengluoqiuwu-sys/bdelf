@@ -1,7 +1,7 @@
 _doc: Full training schedule
 name: full
 variant: full
-max_steps: 1500000
+max_steps: 1000000
 warmup_steps: 5000
 min_lr_ratio: 0.1
 log_plot_every: 200
