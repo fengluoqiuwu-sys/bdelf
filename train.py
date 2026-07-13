@@ -225,6 +225,30 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _all_ranks_true(local_ok: bool, device: torch.device, is_distributed: bool) -> bool:
+    """Return True only if every rank reports ``local_ok``."""
+    if not is_distributed:
+        return local_ok
+    flag = torch.tensor([int(local_ok)], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return flag.item() > 0
+
+
+def _grads_are_finite(model: nn.Module) -> bool:
+    for param in model.parameters():
+        grad = param.grad
+        if grad is not None and not torch.isfinite(grad).all():
+            return False
+    return True
+
+
+def _params_are_finite(model: nn.Module) -> bool:
+    for param in model.parameters():
+        if not torch.isfinite(param).all():
+            return False
+    return True
+
+
 def _sync_after_rank0_work(
     *,
     is_distributed: bool,
@@ -699,18 +723,46 @@ def train_loop(
                 group["lr"] = lr
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                loss = forward_loss(model, batch)
-                loss = loss / cfg.grad_accum_steps
+                micro_loss = forward_loss(model, batch)
 
-            loss.backward()
-            step_backward_done = True
+            loss_ok = _all_ranks_true(
+                bool(torch.isfinite(micro_loss).item()),
+                device,
+                is_distributed,
+            )
+            if loss_ok:
+                (micro_loss / cfg.grad_accum_steps).backward()
+                step_backward_done = True
+            elif rank == 0:
+                if not _params_are_finite(raw):
+                    _train_log(
+                        f"Non-finite loss at step {step} with corrupted weights; "
+                        "stop and resume from an earlier checkpoint",
+                    )
+                else:
+                    _train_log(f"Skipping backward at step {step}: non-finite loss")
+            if not loss_ok and not _params_are_finite(raw):
+                raise RuntimeError(
+                    f"Non-finite model weights at step {step}; "
+                    "resume from an earlier checkpoint",
+                )
 
             if (step + 1) % cfg.grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                optimizer.step()
+                grads_ok = _all_ranks_true(
+                    _grads_are_finite(model),
+                    device,
+                    is_distributed,
+                )
+                if grads_ok:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    optimizer.step()
+                elif rank == 0:
+                    _train_log(
+                        f"Skipping optimizer step at step {step}: non-finite gradients",
+                    )
                 optimizer.zero_grad(set_to_none=True)
 
-            train_loss = loss.item() * cfg.grad_accum_steps
+            train_loss = micro_loss.item() if loss_ok else float("nan")
             loss_branch = getattr(raw, "last_loss_branch", "") if dual_branch else ""
             elapsed = time.time() - t0
             seq_tokens = batch.size(0) * (
