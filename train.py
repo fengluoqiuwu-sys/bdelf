@@ -225,6 +225,21 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _sync_after_rank0_work(
+    *,
+    is_distributed: bool,
+    device: torch.device,
+    rank0_work: bool,
+) -> None:
+    """Barrier only when rank 0 ran eval/save/plot (non-collective) work."""
+    if not is_distributed:
+        return
+    flag = torch.tensor([int(rank0_work)], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if flag.item():
+        dist.barrier()
+
+
 def uses_full_sequence(model: nn.Module) -> bool:
     return getattr(unwrap_model(model), "full_sequence_training", False)
 
@@ -708,6 +723,7 @@ def train_loop(
                 dual_branch=dual_branch, loss_branch=loss_branch,
             )
 
+            rank0_sync = False
             if rank == 0:
                 pbar.set_postfix(
                     loss=f"{train_loss:.3f}",
@@ -726,7 +742,7 @@ def train_loop(
                         and eval_loader is not None
                     ):
                         eval_loss, eval_ppl = eval_model_ppl(
-                            model,
+                            unwrap_model(model),
                             eval_loader,
                             device,
                             amp_dtype,
@@ -739,12 +755,14 @@ def train_loop(
                             "lr": lr,
                         }
                         append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
+                    rank0_sync = True
 
                     for line in format_interval_summary(step, cfg.max_steps, row):
                         _rank0_log(line, pbar)
 
                 if (step + 1) % cfg.log_plot_every == 0:
                     update_ppl_plots(train_csv, eval_csv, run_dir)
+                    rank0_sync = True
 
                 if (step + 1) % cfg.save_every == 0:
                     save_checkpoint(latest_ckpt, model, optimizer, step + 1, cfg, model_meta)
@@ -754,9 +772,13 @@ def train_loop(
                             model, optimizer, step + 1, cfg, model_meta,
                         )
                     _rank0_log(f"  [ckpt] saved at step {step + 1}", pbar)
+                    rank0_sync = True
 
-            if is_distributed:
-                dist.barrier()
+            _sync_after_rank0_work(
+                is_distributed=is_distributed,
+                device=device,
+                rank0_work=rank0_sync,
+            )
 
             step += 1
             t0 = time.time()
