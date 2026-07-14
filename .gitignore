@@ -69,4 +69,3 @@ cache
 
 # ---- Local sync script ----
 sync-ovan-server.sh
-slurm/
