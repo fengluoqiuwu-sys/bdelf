@@ -91,6 +91,9 @@ class FlowBlock(nn.Module):
     self.ln_2 = nn.LayerNorm(n_embd)
     self.mlp = MLP(n_embd, dropout)
     self.ada_ln = nn.Sequential(nn.SiLU(), nn.Linear(n_embd, n_embd * 2))
+    # adaLN-Zero: the backbone-wide _init_weights recognizes this flag and
+    # zero-inits the modulation output so scale=shift=0 at init (identity block).
+    self.ada_ln[-1]._is_adaln_modulation = True
 
   def forward(
     self,
@@ -245,6 +248,13 @@ class _BDELFBackbone(nn.Module):
 
   def _init_weights(self, module: nn.Module) -> None:
     if isinstance(module, nn.Linear):
+      if getattr(module, "_is_adaln_modulation", False):
+        # adaLN-Zero: identity modulation at init prevents the (1+scale)
+        # multiplicative gain from compounding across layers and diverging.
+        torch.nn.init.zeros_(module.weight)
+        if module.bias is not None:
+          torch.nn.init.zeros_(module.bias)
+        return
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
       if module.bias is not None:
         torch.nn.init.zeros_(module.bias)
