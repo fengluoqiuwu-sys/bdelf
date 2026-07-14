@@ -9,4 +9,6 @@ dropout: 0.1
 use_flash: true
 
 sampling:
+  temperature: 1.0
+  # top_k: null  # omit = full-vocab multinomial (AR default)
   use_kv_cache: true

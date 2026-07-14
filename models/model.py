@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Type, TypeVar
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 
 import hf_config  # noqa: F401
@@ -23,6 +24,31 @@ def ensure_token_layout(config: PretrainedConfig) -> None:
         apply_token_layout_to_config(
             config, token_layout_from_cfg({"tokenizer": config.tokenizer}),
         )
+
+
+def sample_from_logits(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+) -> torch.Tensor:
+    """Temperature + optional top-k multinomial sampling over the last dim.
+
+    Args:
+        logits: ``(..., V)`` unnormalized scores.
+    Returns:
+        ``(...)`` long token ids.
+    """
+    logits = logits / max(float(temperature), 1e-8)
+    if top_k is not None and top_k > 0:
+        k = min(int(top_k), logits.size(-1))
+        values, _ = torch.topk(logits, k)
+        cutoff = values[..., -1, None]
+        logits = logits.masked_fill(logits < cutoff, float("-inf"))
+    probs = F.softmax(logits, dim=-1)
+    flat = probs.reshape(-1, probs.size(-1))
+    sampled = torch.multinomial(flat, num_samples=1).squeeze(-1)
+    return sampled.view(*probs.shape[:-1])
 
 
 def merge_sampling_cfg(

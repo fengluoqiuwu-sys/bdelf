@@ -31,7 +31,12 @@ from models.bd3lm.model import (
 )
 from models.bdelf.config import FL_BDELFConfig
 from models.bdelf.infer import BDELFInferState, build_window_pair_mask
-from models.model import FL_PreTrainedModel, ensure_token_layout, split_model_cfg
+from models.model import (
+  FL_PreTrainedModel,
+  ensure_token_layout,
+  sample_from_logits,
+  split_model_cfg,
+)
 from models.rope import pair_positions, window_positions
 from models.tokens import FL_TokenLayout, apply_token_layout_to_config, token_layout_from_cfg
 
@@ -474,6 +479,9 @@ class _BDELFBackbone(nn.Module):
     z: torch.Tensor,
     x0_ctx: torch.Tensor,
     window_start: int,
+    *,
+    temperature: float = 1.0,
+    top_k: int | None = None,
   ) -> torch.Tensor:
     bsz, win_len, _ = z.shape
     pair = self._embed_continuous_pair(z, x0_ctx)
@@ -482,7 +490,11 @@ class _BDELFBackbone(nn.Module):
       pair, t_batch, decode=True,
       window_len=win_len, window_start=window_start,
     )
-    return logits[:, -self.diffusion_block_size:].argmax(dim=-1)
+    return sample_from_logits(
+      logits[:, -self.diffusion_block_size:],
+      temperature=temperature,
+      top_k=top_k,
+    )
 
   @torch.no_grad()
   def _build_window(
@@ -523,6 +535,8 @@ class _BDELFBackbone(nn.Module):
     bos_token_id: int | None = None,
     use_fast_infer: bool = True,
     prefix_tokens: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    top_k: int | None = None,
   ) -> tuple[torch.Tensor, int]:
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
     db = self.diffusion_block_size
@@ -538,6 +552,8 @@ class _BDELFBackbone(nn.Module):
         bos_token_id=bos_token_id,
         t_steps=t_steps,
         prefix_tokens=prefix_tokens,
+        temperature=temperature,
+        top_k=top_k,
       )
 
     state = BDELFInferState(self, n_samples, seqlen, device, dtype)
@@ -583,7 +599,9 @@ class _BDELFBackbone(nn.Module):
         z_block = state.ode_step(z_block, stride, t, t_next)
         nfe += 1
 
-      block_tokens = state.decode_block(z_block, stride)
+      block_tokens = state.decode_block(
+        z_block, stride, temperature=temperature, top_k=top_k,
+      )
       nfe += 1
 
       if stride == 0 and bos is not None:
@@ -606,6 +624,8 @@ class _BDELFBackbone(nn.Module):
     bos_token_id: int | None = None,
     t_steps: torch.Tensor | None = None,
     prefix_tokens: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    top_k: int | None = None,
   ) -> tuple[torch.Tensor, int]:
     """Unoptimized inference path for numerical alignment checks."""
     bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
@@ -666,7 +686,10 @@ class _BDELFBackbone(nn.Module):
       z_win, x0_win = self._build_window(
         emb_accum, z_block, start_idx, end_idx, device, dtype,
       )
-      block_tokens = self._decode_block(z_win, x0_win, window_start=start_idx)
+      block_tokens = self._decode_block(
+        z_win, x0_win, window_start=start_idx,
+        temperature=temperature, top_k=top_k,
+      )
       nfe += 1
 
       if stride == 0 and bos is not None:
@@ -685,6 +708,8 @@ class _BDELFBackbone(nn.Module):
     seqlen: int | None = None,
     num_steps: int | None = None,
     *,
+    temperature: float = 1.0,
+    top_k: int | None = None,
     bos_token_id: int | None = None,
     prefix_tokens: torch.Tensor | None = None,
     sampling_cfg: dict | None = None,
@@ -693,6 +718,10 @@ class _BDELFBackbone(nn.Module):
     if seqlen is None:
       raise ValueError("generate requires an explicit seqlen")
     num_ode_steps = num_steps if num_steps is not None else cfg.get("num_ode_steps", 8)
+    temperature = float(cfg.get("temperature", temperature))
+    top_k = cfg.get("top_k", top_k)
+    if top_k is not None:
+      top_k = int(top_k)
     bos = self.token_layout.bos_token_id
     if bos_token_id is not None:
       bos = bos_token_id
@@ -710,6 +739,8 @@ class _BDELFBackbone(nn.Module):
       bos_token_id=bos,
       use_fast_infer=use_fast_infer,
       prefix_tokens=prefix_tokens,
+      temperature=temperature,
+      top_k=top_k,
     )
 
 

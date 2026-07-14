@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from models.bd3lm.model import bool_mask_to_sdpa_additive
+from models.model import sample_from_logits
 from models.rope import pair_positions
 
 
@@ -332,12 +333,23 @@ class BDELFInferState:
     v = (x_pred_block - z_block) / denom
     return z_block + (t_next - t) * v
 
-  def decode_block(self, z_block: torch.Tensor, stride: int) -> torch.Tensor:
+  def decode_block(
+    self,
+    z_block: torch.Tensor,
+    stride: int,
+    *,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+  ) -> torch.Tensor:
     self.write_suffix(z_block, stride)
     bsz = z_block.size(0)
     t_batch = torch.ones(bsz, device=self.device)
     x_pred_block = self._suffix_forward(z_block, stride, t_batch, decode=True)
-    return self.bb.lm_head(x_pred_block).argmax(dim=-1)
+    return sample_from_logits(
+      self.bb.lm_head(x_pred_block),
+      temperature=temperature,
+      top_k=top_k,
+    )
 
   def on_stride_complete(self, block_emb: torch.Tensor, stride: int) -> None:
     self._extend_prefix_cache(block_emb, stride)

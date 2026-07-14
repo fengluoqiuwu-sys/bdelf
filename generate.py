@@ -150,6 +150,8 @@ def generate_tokens(
     seed: int,
     device: torch.device,
     dtype: torch.dtype,
+    temperature: float,
+    top_k: int | None,
 ) -> tuple[torch.Tensor, int]:
     set_seed(seed)
     with torch.no_grad():
@@ -158,7 +160,14 @@ def generate_tokens(
             dtype=dtype,
             enabled=device.type == "cuda",
         ):
-            return model.generate(num_samples=num_samples, seqlen=num_tokens)
+            return model.generate(
+                num_samples=num_samples,
+                seqlen=num_tokens,
+                sampling_cfg={
+                    "temperature": temperature,
+                    "top_k": top_k,
+                },
+            )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -184,6 +193,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of independent samples to generate (default: 1)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature (default: 1.0; same as AR)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Top-k filter; omit for full-vocab multinomial (default: None, same as AR)",
     )
     parser.add_argument(
         "--seed",
@@ -231,7 +252,8 @@ def main() -> None:
 
     _log(
         f"Model={model_meta['name']}, step={step}, "
-        f"device={device}, dtype={dtype}, num_tokens={args.num_tokens}, seed={args.seed}",
+        f"device={device}, dtype={dtype}, num_tokens={args.num_tokens}, "
+        f"temperature={args.temperature}, top_k={args.top_k}, seed={args.seed}",
     )
 
     tokens, nfe = generate_tokens(
@@ -241,6 +263,8 @@ def main() -> None:
         seed=args.seed,
         device=device,
         dtype=dtype,
+        temperature=args.temperature,
+        top_k=args.top_k,
     )
 
     _log(f"Generation finished (nfe={nfe})")

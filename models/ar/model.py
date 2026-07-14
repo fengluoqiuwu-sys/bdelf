@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.ar.config import FL_ARConfig
-from models.model import FL_PreTrainedModel, ensure_token_layout, split_model_cfg
+from models.model import FL_PreTrainedModel, ensure_token_layout, sample_from_logits, split_model_cfg
 from models.rope import RotaryEmbedding
 from models.tokens import apply_token_layout_to_config, token_layout_from_cfg
 
@@ -280,13 +280,9 @@ class _GPTBackbone(nn.Module):
                 pos_start=pos,
             )
             nfe += 1
-            logits = logits[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None and top_k > 0:
-                values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                cutoff = values[:, -1, None]
-                logits = logits.masked_fill(logits < cutoff, float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = sample_from_logits(
+                logits[:, -1, :], temperature=temperature, top_k=top_k,
+            ).unsqueeze(-1)
             idx = torch.cat((idx, next_token), dim=1)
 
         return idx, nfe
@@ -306,13 +302,9 @@ class _GPTBackbone(nn.Module):
         nfe = 0
         for _ in range(seqlen - 1):
             logits, _ = self(idx)
-            logits = logits[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None and top_k > 0:
-                values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                cutoff = values[:, -1, None]
-                logits = logits.masked_fill(logits < cutoff, float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = sample_from_logits(
+                logits[:, -1, :], temperature=temperature, top_k=top_k,
+            ).unsqueeze(-1)
             idx = torch.cat((idx, next_token), dim=1)
             nfe += 1
         return idx, nfe
@@ -328,9 +320,13 @@ class _GPTBackbone(nn.Module):
         bos_token_id: int | None = None,
         sampling_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, int]:
-        """Greedy / top-k autoregressive sampling."""
+        """Temperature / top-k autoregressive sampling."""
         cfg = sampling_cfg or {}
         use_kv_cache = cfg.get("use_kv_cache", True)
+        temperature = float(cfg.get("temperature", temperature))
+        top_k = cfg.get("top_k", top_k)
+        if top_k is not None:
+            top_k = int(top_k)
         seqlen = seqlen or self.max_seq_len
         if seqlen > self.max_seq_len:
             raise ValueError(
