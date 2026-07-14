@@ -67,7 +67,7 @@ class FL_OptimizerConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
-    muon_learning_rate: float = 0.02
+    muon_learning_rate: float = 0.003
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -75,7 +75,11 @@ class FL_OptimizerConfig:
 
 @dataclass
 class FL_ScheduleConfig:
-    """Unified schedule: token budget drives max_steps; intervals are absolute steps.
+    """Unified schedule: token budget drives optimizer steps; intervals are absolute.
+
+    YAML ``{eval,save,snapshot,log_plot}_step`` are in optimizer-step units.
+    ``compose_train_config`` multiplies them (and ``max_steps`` / warmup) by
+    ``grad_accum_steps`` so ``train_loop`` can count every micro-batch.
 
     The only accepted knobs are ``target_tokens`` + ``warmup_ratio`` +
     ``{eval,save,snapshot,log_plot}_step``. Legacy ``max_steps`` / ``*_every`` /
@@ -115,24 +119,46 @@ class FL_ScheduleConfig:
 
 @dataclass
 class FL_EvalConfig:
-    _YAML_REQUIRED = frozenset({"name", "eval_sample_seed"})
+    _YAML_REQUIRED = frozenset(
+        {
+            "name",
+            "eval_sample_seed",
+            "gen_eval_model",
+            "gen_eval_model_dtype",
+            "gen_eval_model_device",
+        }
+    )
 
     name: str = "prototype"
     # Online eval subsample; None / omitted runs the full eval split
     eval_sample_count: Optional[int] = None
     eval_sample_seed: int = 42
+    # One-batch generative PPL: train model samples → scored by HF causal LM
+    gen_eval_model: str = "gpt2-large"
+    gen_eval_model_dtype: TrainDtype = "bf16"
+    gen_eval_model_device: str = "cuda"
+    # BDELF generate during eval: false → legacy (full AdaLN), matches training
+    use_fast_infer: bool = False
+    # BD3LM online-eval sampling steps (full 5000 is too slow)
+    eval_gen_steps: int = 128
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FL_BatchConfig:
-    _YAML_REQUIRED = frozenset(
-        {"name", "batch_size", "grad_accum_steps", "num_params_m"}
-    )
+    """Per-run micro-batch. Exactly one of ``grad_accum_steps`` / ``global_batch_size``.
+
+    ``fast`` configs set ``grad_accum_steps``. ``full``/``ultra`` set
+    ``global_batch_size``; compose derives accum as
+    ``global_batch_size / (batch_size * world_size)``.
+    """
+
+    _YAML_REQUIRED = frozenset({"name", "batch_size", "num_params_m"})
 
     name: str = "prototype"
     batch_size: int = 4
-    grad_accum_steps: int = 1
+    grad_accum_steps: Optional[int] = None
+    global_batch_size: Optional[int] = None
     num_params_m: float = 100.0
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -169,8 +195,13 @@ class FL_TrainConfig:
     seed: int
     eval_sample_count: Optional[int]
     eval_sample_seed: int
+    gen_eval_model: str
+    gen_eval_model_dtype: TrainDtype
+    gen_eval_model_device: str
+    eval_use_fast_infer: bool
+    eval_gen_steps: int
     use_muon: bool = True
-    muon_learning_rate: float = 0.02
+    muon_learning_rate: float = 0.003
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -325,12 +356,53 @@ def _resolve_schedule(
     )
 
 
+def _resolve_grad_accum(
+    batch: FL_BatchConfig,
+    *,
+    world_size: int,
+    run_name: str,
+) -> tuple[int, Optional[int]]:
+    """Return ``(grad_accum_steps, global_batch_size|None)`` from batch yaml."""
+    has_accum = batch.grad_accum_steps is not None
+    has_global = batch.global_batch_size is not None
+    if has_accum == has_global:
+        raise ValueError(
+            f"{run_name}: batch yaml must set exactly one of "
+            f"grad_accum_steps or global_batch_size"
+        )
+    if batch.batch_size < 1 or world_size < 1:
+        raise ValueError(f"{run_name}: batch_size/world_size must be >= 1")
+
+    if has_global:
+        global_batch = int(batch.global_batch_size)  # type: ignore[arg-type]
+        if global_batch < 1:
+            raise ValueError(
+                f"{run_name}: global_batch_size must be >= 1, got {global_batch}"
+            )
+        denom = batch.batch_size * world_size
+        if global_batch % denom != 0:
+            raise ValueError(
+                f"{run_name}: global_batch_size={global_batch} must be divisible "
+                f"by batch_size*world_size={batch.batch_size}*{world_size}={denom}"
+            )
+        accum = global_batch // denom
+        if accum < 1:
+            raise ValueError(f"{run_name}: derived grad_accum_steps must be >= 1")
+        return accum, global_batch
+
+    accum = int(batch.grad_accum_steps)  # type: ignore[arg-type]
+    if accum < 1:
+        raise ValueError(f"{run_name}: grad_accum_steps must be >= 1, got {accum}")
+    return accum, None
+
+
 def compose_train_config(
     model: str,
     config_name: str | None = None,
     *,
     dataset: str,
     preprocess: str,
+    world_size: int | None = None,
 ) -> FL_TrainConfig:
     """Merge sub-configs by naming convention.
 
@@ -342,6 +414,7 @@ def compose_train_config(
       - batch ← ``batch/<model>/<config_name>.yaml``
 
     ``dataset`` / ``preprocess`` are supplied at launch (not from yaml).
+    ``world_size`` overrides hardware when set (full/ultra auto-detect at launch).
     """
     model, config_name = _parse_train_ref(model, config_name)
     model_config, variant = _parse_model_config_variant(config_name)
@@ -358,26 +431,40 @@ def compose_train_config(
     batch = _load_subconfig("batch", config_name, model=model)
     chunk_length = get_preprocess(preprocess).chunk_length
 
+    resolved_world_size = hardware.world_size if world_size is None else world_size
+    accum, global_batch = _resolve_grad_accum(
+        batch, world_size=resolved_world_size, run_name=run_name,
+    )
+
     if schedule.variant != variant:
         raise ValueError(
             f"{run_name}: schedule.variant={schedule.variant!r} != {variant!r}"
         )
 
     _validate_dtype(optimizer.dtype, path=run_name, label="dtype")
+    _validate_dtype(
+        eval_cfg.gen_eval_model_dtype, path=run_name, label="gen_eval_model_dtype",
+    )
 
     if eval_cfg.eval_sample_count is not None and eval_cfg.eval_sample_count < 1:
         raise ValueError(
             f"{run_name}: eval_sample_count must be >= 1 when set, "
             f"got {eval_cfg.eval_sample_count}"
         )
-
-    if batch.batch_size < 1 or batch.grad_accum_steps < 1 or hardware.world_size < 1:
-        raise ValueError(f"{run_name}: batch/world_size must be >= 1")
+    if eval_cfg.eval_gen_steps < 1:
+        raise ValueError(
+            f"{run_name}: eval_gen_steps must be >= 1, got {eval_cfg.eval_gen_steps}"
+        )
+    if eval_cfg.gen_eval_model_device not in ("cuda", "cpu"):
+        raise ValueError(
+            f"{run_name}: gen_eval_model_device must be 'cuda' or 'cpu', "
+            f"got {eval_cfg.gen_eval_model_device!r}"
+        )
 
     raw_tokens_per_step = (
         batch.batch_size
-        * batch.grad_accum_steps
-        * hardware.world_size
+        * accum
+        * resolved_world_size
         * (
             chunk_length
             if model in ("bd3lm", "bdelf")
@@ -396,16 +483,20 @@ def compose_train_config(
         run_name=run_name,
         tokens_per_step=effective_tokens_per_step,
     )
-    max_steps = resolved.max_steps
-    target_tokens = max_steps * effective_tokens_per_step
+    # ``_resolve_schedule`` returns optimizer-step counts (one update after
+    # ``grad_accum_steps`` micro-batches). ``train_loop`` increments ``step``
+    # every micro-batch, so convert budget/intervals to micro-steps here.
+    max_optimizer_steps = resolved.max_steps
+    target_tokens = max_optimizer_steps * effective_tokens_per_step
 
-    # BDELF max_steps is ~1/decoder_prob× longer (decode-equivalent token
-    # budget). Scale absolute eval/save/plot intervals by the same factor so
-    # wall-clock cadence stays comparable to AR/BD3LM.
+    # BDELF optimizer-step count is ~1/decoder_prob× longer (decode-equivalent
+    # token budget). Scale absolute eval/save/plot intervals by the same factor
+    # so wall-clock cadence stays comparable to AR/BD3LM.
     log_plot_step = resolved.log_plot_step
     eval_step = resolved.eval_step
     save_step = resolved.save_step
     snapshot_step = resolved.snapshot_step
+    branch_scale = 1
     if model == "bdelf":
         if decoder_prob <= 0.0 or decoder_prob > 1.0:
             raise ValueError(
@@ -416,6 +507,13 @@ def compose_train_config(
         eval_step = max(1, eval_step * branch_scale)
         save_step = max(1, save_step * branch_scale)
         snapshot_step = max(1, snapshot_step * branch_scale)
+
+    max_steps = max_optimizer_steps * accum
+    warmup_steps = resolved.warmup_steps * accum
+    log_plot_step = max(1, log_plot_step * accum)
+    eval_step = max(1, eval_step * accum)
+    save_step = max(1, save_step * accum)
+    snapshot_step = max(1, snapshot_step * accum)
 
     extra = _merge_extra(
         hardware.extra,
@@ -429,9 +527,8 @@ def compose_train_config(
             "effective_tokens_per_optimizer_step": effective_tokens_per_step,
             "decoder_prob": decoder_prob,
             "target_tokens": target_tokens,
-            "schedule_branch_scale": (
-                max(1, round(1.0 / decoder_prob)) if model == "bdelf" else 1
-            ),
+            "max_optimizer_steps": max_optimizer_steps,
+            "schedule_branch_scale": branch_scale,
             "config_refs": {
                 "hardware": hardware_name,
                 "optimizer": f"{model}/{model_config}",
@@ -444,6 +541,8 @@ def compose_train_config(
             "use_muon": schedule.use_muon,
         },
     )
+    if global_batch is not None:
+        extra["global_batch_size"] = global_batch
 
     return FL_TrainConfig(
         name=run_name,
@@ -454,8 +553,8 @@ def compose_train_config(
         preprocess=preprocess,
         checkpoint_root=CHECKPOINT_ROOT,
         batch_size=batch.batch_size,
-        grad_accum_steps=batch.grad_accum_steps,
-        world_size=hardware.world_size,
+        grad_accum_steps=accum,
+        world_size=resolved_world_size,
         dtype=optimizer.dtype,
         max_steps=max_steps,
         learning_rate=optimizer.learning_rate,
@@ -463,7 +562,7 @@ def compose_train_config(
         beta1=optimizer.beta1,
         beta2=optimizer.beta2,
         grad_clip=optimizer.grad_clip,
-        warmup_steps=resolved.warmup_steps,
+        warmup_steps=warmup_steps,
         min_lr_ratio=schedule.min_lr_ratio,
         log_plot_step=log_plot_step,
         eval_step=eval_step,
@@ -474,6 +573,11 @@ def compose_train_config(
         seed=schedule.seed,
         eval_sample_count=eval_cfg.eval_sample_count,
         eval_sample_seed=eval_cfg.eval_sample_seed,
+        gen_eval_model=eval_cfg.gen_eval_model,
+        gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
+        gen_eval_model_device=eval_cfg.gen_eval_model_device,
+        eval_use_fast_infer=eval_cfg.use_fast_infer,
+        eval_gen_steps=eval_cfg.eval_gen_steps,
         use_muon=schedule.use_muon,
         muon_learning_rate=optimizer.muon_learning_rate,
         muon_momentum=optimizer.muon_momentum,
@@ -533,9 +637,14 @@ def get_train_config(
     *,
     dataset: str,
     preprocess: str,
+    world_size: int | None = None,
 ) -> FL_TrainConfig:
     return compose_train_config(
-        model, config_name, dataset=dataset, preprocess=preprocess,
+        model,
+        config_name,
+        dataset=dataset,
+        preprocess=preprocess,
+        world_size=world_size,
     )
 
 
