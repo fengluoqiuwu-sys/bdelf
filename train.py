@@ -598,6 +598,13 @@ def save_checkpoint(
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
 ) -> None:
+    """Atomically write a checkpoint (tmp file + ``os.replace``).
+
+    Direct ``torch.save`` to the final path can leave a truncated file if the
+    process is killed mid-write; resume would then fail on a corrupt latest ckpt.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     raw = unwrap_model(model)
     grads = [
         p.grad.detach().cpu() if p.grad is not None else None
@@ -617,7 +624,13 @@ def save_checkpoint(
     }
     if torch.cuda.is_available():
         payload["rng"]["cuda"] = torch.cuda.get_rng_state_all()
-    torch.save(payload, path)
+    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def _move_optimizer_state_to_device(
@@ -642,6 +655,7 @@ def load_checkpoint(
     *,
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
+    restore_rng: bool = True,
 ) -> int:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     saved_cfg = ck.get("train_config") or {}
@@ -683,8 +697,10 @@ def load_checkpoint(
         for p, g in zip(raw.parameters(), grads):
             p.grad = g.to(device) if g is not None else None
 
+    # The RNG snapshot comes from rank 0; non-zero ranks keep their
+    # set_seed(seed + rank) state so per-rank noise stays decorrelated.
     rng = ck.get("rng")
-    if rng is not None:
+    if restore_rng and rng is not None:
         torch.set_rng_state(rng["torch"])
         np.random.set_state(rng["numpy"])
         if "cuda" in rng and torch.cuda.is_available():
@@ -743,19 +759,34 @@ def train_loop(
     step = 0
     optimizer.zero_grad(set_to_none=True)
 
-    if rank == 0 and cfg.resume and latest_ckpt.is_file():
+    resume_from_ckpt = cfg.resume and latest_ckpt.is_file()
+    if is_distributed:
+        # All ranks must agree on resuming; trust rank 0's view of the file.
+        flag = torch.tensor([int(resume_from_ckpt)], device=device, dtype=torch.int32)
+        dist.broadcast(flag, src=0)
+        resume_from_ckpt = bool(flag.item())
+
+    if resume_from_ckpt:
+        # Every rank must load weights/optimizer state: DDP only broadcasts
+        # parameters at construction time (above), so a rank-0-only load would
+        # leave the other ranks on their random init.
         step = load_checkpoint(
-            latest_ckpt, model, optimizer, device, cfg=cfg, model_meta=model_meta,
+            latest_ckpt, model, optimizer, device,
+            cfg=cfg, model_meta=model_meta, restore_rng=(rank == 0),
         )
-        kept_train = truncate_csv_for_resume(train_csv, step)
-        kept_eval = truncate_csv_for_resume(eval_csv, step)
-        update_ppl_plots(train_csv, eval_csv, run_dir)
-        _train_log(
-            f"Resuming from checkpoint: step {step} "
-            f"(train_log {kept_train} rows, eval_log {kept_eval} rows)",
-        )
+        if rank == 0:
+            kept_train = truncate_csv_for_resume(train_csv, step)
+            kept_eval = truncate_csv_for_resume(eval_csv, step)
+            update_ppl_plots(train_csv, eval_csv, run_dir)
+            _train_log(
+                f"Resuming from checkpoint: step {step} "
+                f"(train_log {kept_train} rows, eval_log {kept_eval} rows)",
+            )
         if step >= cfg.max_steps:
-            _train_log(f"Reached max_steps={cfg.max_steps}; training is already complete")
+            if rank == 0:
+                _train_log(
+                    f"Reached max_steps={cfg.max_steps}; training is already complete"
+                )
             return
 
     if is_distributed:
@@ -921,14 +952,22 @@ def train_loop(
                     update_ppl_plots(train_csv, eval_csv, run_dir)
                     rank0_sync = True
 
-                if (step + 1) % cfg.save_step == 0:
-                    save_checkpoint(latest_ckpt, model, optimizer, step + 1, cfg, model_meta)
-                    if (step + 1) % cfg.snapshot_step == 0:
+                # save_step / snapshot_step are independent intervals; do not nest
+                # snapshot under save (snapshot_step need not divide save_step).
+                next_step = step + 1
+                do_save = next_step % cfg.save_step == 0
+                do_snapshot = next_step % cfg.snapshot_step == 0
+                if do_save or do_snapshot:
+                    # Always refresh latest when writing any durable checkpoint.
+                    save_checkpoint(
+                        latest_ckpt, model, optimizer, next_step, cfg, model_meta,
+                    )
+                    if do_snapshot:
                         save_checkpoint(
-                            run_dir / f"checkpoint_step_{step + 1:07d}.pt",
-                            model, optimizer, step + 1, cfg, model_meta,
+                            run_dir / f"checkpoint_step_{next_step:07d}.pt",
+                            model, optimizer, next_step, cfg, model_meta,
                         )
-                    _rank0_log(f"  [ckpt] saved at step {step + 1}", pbar)
+                    _rank0_log(f"  [ckpt] saved at step {next_step}", pbar)
                     rank0_sync = True
 
             _sync_after_rank0_work(
@@ -954,12 +993,24 @@ def train_loop(
             dist.barrier()
         return
 
+    # Always persist the finished run. Periodic saves only fire when
+    # max_steps is a multiple of save_step/snapshot_step; the final write
+    # covers the common case where it is not.
     if rank == 0:
         if pbar is not None:
             pbar.close()
         save_checkpoint(latest_ckpt, model, optimizer, step, cfg, model_meta)
+        final_snapshot = run_dir / f"checkpoint_step_{step:07d}.pt"
+        save_checkpoint(final_snapshot, model, optimizer, step, cfg, model_meta)
         update_ppl_plots(train_csv, eval_csv, run_dir)
-        _train_log(f"Training finished after {step} steps; results in {run_dir}")
+        _train_log(
+            f"Training finished after {step} steps; "
+            f"saved {latest_ckpt.name} and {final_snapshot.name} in {run_dir}"
+        )
+    if is_distributed:
+        # Keep peers alive until rank 0 finishes the (often multi-GB) write;
+        # otherwise destroy_process_group can race with the final save.
+        dist.barrier()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1098,7 +1149,14 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
             )
 
     try:
+        # On a cache miss only rank 0 downloads/builds; the other ranks wait
+        # and then attach to the finished cache. Concurrent builds would write
+        # the same shard/manifest files and corrupt the cache.
+        if is_distributed and rank != 0:
+            dist.barrier()
         preprocessed = get_preprocessed(cfg.preprocess, cfg.dataset)
+        if is_distributed and rank == 0:
+            dist.barrier()
     except FileNotFoundError as exc:
         msg = (
             f"Preprocessed data unavailable: {exc}\n"
@@ -1193,6 +1251,14 @@ def main() -> None:
                 f"but this machine has only {n_gpu} GPU(s)."
             )
         import torch.multiprocessing as mp
+
+        # Build the dataset/preprocess cache once in the parent so workers hit
+        # a warm cache; a cold build inside a worker could exceed the NCCL
+        # barrier timeout that the other ranks wait on.
+        try:
+            get_preprocessed(cfg.preprocess, cfg.dataset)
+        except FileNotFoundError as exc:
+            raise SystemExit(f"Preprocessed data unavailable: {exc}") from exc
 
         try:
             mp.set_start_method("spawn", force=True)
