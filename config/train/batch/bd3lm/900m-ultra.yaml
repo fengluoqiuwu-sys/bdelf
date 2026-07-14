@@ -1,6 +1,7 @@
-_doc: bd3lm/900m-ultra micro-batch for full-8x4090
+_doc: >
+  bd3lm/900m-ultra for 48GB×8; independent variant. Train budget ≤42.5GB (card - 4GB head - 1.5GB gpt2). batch_size is power-of-two or multiple of 8 (extrap).
 name: 900m-ultra
-batch_size: 1
-grad_accum_steps: 16
+batch_size: 8
+global_batch_size: 64
 num_params_m: 870.5
-estimated_peak_vram_gb: 16.3
+estimated_peak_vram_gb: 42.0

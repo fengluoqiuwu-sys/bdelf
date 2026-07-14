@@ -1,6 +1,7 @@
-_doc: ar/300m-ultra micro-batch for full-8x4090
+_doc: >
+  ar/300m-ultra for 48GB×8; independent variant. Train budget ≤42.5GB (card - 4GB head - 1.5GB gpt2). batch_size is power-of-two or multiple of 8 (extrap).
 name: 300m-ultra
-batch_size: 4
-grad_accum_steps: 4
+batch_size: 32
+global_batch_size: 256
 num_params_m: 303.4
-estimated_peak_vram_gb: 7.8
+estimated_peak_vram_gb: 38.8

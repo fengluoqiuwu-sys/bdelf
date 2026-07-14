@@ -1,8 +1,9 @@
-_doc: 8× RTX 4090 24GB, 4GB headroom per GPU; num_workers is per-rank DataLoader workers (8×12=96 total)
+_doc: 8× 48GB GPUs (ultra); 4GB headroom/GPU; num_workers per-rank (8×12=96 total)
 name: full-8x4090
 world_size: 8
 num_workers: 12
-gpu_memory_gb: 24
+gpu_memory_gb: 48
 memory_headroom_gb: 4.0
-memory_budget_gb: 20
-hardware_profile: 8× RTX 4090 24GB
+# train usable ≈ gpu - headroom - gpt2-large(~1.5) on rank0 → ~42.5GB
+memory_budget_gb: 42.5
+hardware_profile: 8× 48GB

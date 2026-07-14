@@ -1,6 +1,7 @@
-_doc: ar/100m-ultra micro-batch for full-8x4090
+_doc: >
+  ar/100m-ultra for 48GB×8; independent variant. Train budget ≤42.5GB (card - 4GB head - 1.5GB gpt2). batch_size is power-of-two or multiple of 8 (extrap).
 name: 100m-ultra
-batch_size: 12
-grad_accum_steps: 2
+batch_size: 64
+global_batch_size: 512
 num_params_m: 98.9
-estimated_peak_vram_gb: 5.4
+estimated_peak_vram_gb: 40.5
