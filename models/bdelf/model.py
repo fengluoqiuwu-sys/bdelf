@@ -441,6 +441,10 @@ class _BDELFBackbone(nn.Module):
       else:
         loss = self._denoise_loss(x0_emb, idx)
         self.last_loss_branch = "denoise"
+    # 每步只走一个分支,另一个 mode embedding 会成为未用参数并逼迫 DDP 开
+    # find_unused_parameters=True(每步遍历一次 autograd 图)。用 0 权重触碰让两者
+    # 每步都进图,从而可用 find_unused_parameters=False。
+    loss = loss + 0.0 * (self.mode_denoise.sum() + self.mode_decode.sum())
     return torch.empty(0), loss
 
   # -------------------------------------------------------------------------

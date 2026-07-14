@@ -29,11 +29,61 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 import hf_config  # noqa: F401
-from models import build_model, list_model_configs, list_models, resolve_model_config_path
+from models import (
+    build_model,
+    get_hf_model,
+    list_model_configs,
+    list_models,
+    resolve_model_config_path,
+)
+from models.tokens import FL_TokenLayout, token_layout_from_cfg
 from dataset import list_datasets
 from preprocess import get_preprocessed, list_preprocess
 from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
+
+
+def _patch_inductor_bool_eq() -> None:
+    """Work around a torch.compile/Inductor bug on boolean value ranges.
+
+    ``SymPyValueRangeAnalysis.eq`` runs ``a.lower > b.upper`` to test for
+    disjoint ranges, but when the operands are boolean (e.g. the ``mode_*``
+    embeddings and timestep embedding feed a bool-typed indexing expr), sympy
+    forbids ordered comparison on Booleans and raises "A Boolean argument can
+    only be used in Eq and Ne". Sibling ops (lt/gt/mul/...) already special-case
+    ``is_bool``; only ``eq`` was missed (fixed upstream, not in this torch).
+    Patch ``eq`` to mirror that handling; ``ne`` delegates to ``eq`` and is
+    fixed for free. See https://github.com/pytorch/pytorch/issues/188231.
+    """
+    try:
+        import sympy
+        from torch.utils._sympy.value_ranges import (
+            SymPyValueRangeAnalysis,
+            ValueRanges,
+        )
+    except Exception:
+        return
+
+    @staticmethod
+    def _eq(a, b):  # type: ignore[no-untyped-def]
+        a = ValueRanges.wrap(a)
+        b = ValueRanges.wrap(b)
+        if a.is_singleton() and b.is_singleton() and a.lower == b.lower:
+            return ValueRanges.wrap(sympy.true)
+        if a.is_bool or b.is_bool:
+            # Booleans are unorderable; two unequal singletons are disjoint,
+            # otherwise the result is an unknown bool.
+            if a.is_singleton() and b.is_singleton():
+                return ValueRanges.wrap(sympy.false)
+            return ValueRanges(sympy.false, sympy.true)
+        if a.lower > b.upper or b.lower > a.upper:  # ranges disjoint
+            return ValueRanges.wrap(sympy.false)
+        return ValueRanges(sympy.false, sympy.true)
+
+    SymPyValueRangeAnalysis.eq = _eq
+
+
+_patch_inductor_bool_eq()
 
 TRAIN_CSV_FIELDS = [
     "step",
@@ -45,7 +95,7 @@ TRAIN_CSV_FIELDS = [
     "lr",
     "tokens_per_sec",
 ]
-EVAL_CSV_FIELDS = ["step", "eval_loss", "eval_ppl", "lr"]
+EVAL_CSV_FIELDS = ["step", "eval_loss", "eval_ppl", "gen_loss", "gen_ppl", "lr"]
 
 _TRAIN_LOG = "[train]"
 
@@ -156,17 +206,74 @@ def fetch_train_batch(
     return collate_input_ids(rows)
 
 
+def _local_compile_root() -> str | None:
+    """Pick a writable node-local directory for Triton/Inductor caches.
+
+    Triton and Inductor rely on temp-file + rename; that protocol breaks on
+    BeeGFS/NFS (missing ``*.cubin`` / cache files under concurrent compile
+    workers). Prefer Slurm node scratch, then TMPDIR, then /tmp.
+    """
+    job = os.environ.get("SLURM_JOB_ID") or f"pid{os.getpid()}"
+    for candidate in (
+        os.environ.get("SLURM_TMPDIR"),
+        os.environ.get("TMPDIR"),
+        "/tmp",
+    ):
+        if not candidate:
+            continue
+        try:
+            if not os.path.isdir(candidate) or not os.access(candidate, os.W_OK):
+                continue
+            root = os.path.join(candidate, f"bdelf-compile-{job}")
+            os.makedirs(root, exist_ok=True)
+            return root
+        except OSError:
+            continue
+    return None
+
+
+def _isolate_compile_cache(local_rank: int) -> None:
+    """Point each local rank at its own Triton/Inductor cache on local disk.
+
+    Always prefer node-local scratch over any shared-FS path set by Slurm
+    (BeeGFS). Per-rank subdirs additionally avoid same-node contention.
+    """
+    local_root = _local_compile_root()
+    for var, subdir in (
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+        ("TRITON_CACHE_DIR", "triton"),
+    ):
+        if local_root is not None:
+            base = os.path.join(local_root, subdir)
+        else:
+            base = os.environ.get(var)
+            if not base:
+                continue
+        per_rank = os.path.join(base, f"rank{local_rank}")
+        os.makedirs(per_rank, exist_ok=True)
+        os.environ[var] = per_rank
+
+
 def setup_distributed(cfg: FL_TrainConfig) -> tuple[int, int, torch.device, bool]:
     if cfg.world_size <= 1:
         if not torch.cuda.is_available():
             raise RuntimeError("No CUDA device found. Single-GPU training requires a GPU.")
+        _isolate_compile_cache(0)
         return 0, 1, torch.device("cuda"), False
 
     if "RANK" not in os.environ:
         raise RuntimeError("Distributed worker missing RANK environment variable")
 
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ["RANK"]))
+    torch.cuda.set_device(local_rank)
+    # Isolate compile caches before any torch.compile happens in train_loop.
+    _isolate_compile_cache(local_rank)
+
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -175,9 +282,28 @@ def setup_distributed(cfg: FL_TrainConfig) -> tuple[int, int, torch.device, bool
             f"Configured world_size={cfg.world_size}, but {world_size} processes were launched."
         )
 
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
     return rank, world_size, torch.device(f"cuda:{local_rank}"), True
+
+
+ALLOWED_FULL_ULTRA_WORLD_SIZES = frozenset({1, 2, 4, 8})
+
+
+def _resolve_launch_world_size(train_config: str) -> int | None:
+    """Auto-detect GPU count for full/ultra; ``None`` means keep hardware default."""
+    variant = train_config.rsplit("-", 1)[-1]
+    if variant not in ("full", "ultra"):
+        return None
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            f"{variant} training requires CUDA; no GPU detected "
+            f"(torch.cuda.is_available() is False)."
+        )
+    n = torch.cuda.device_count()
+    if n not in ALLOWED_FULL_ULTRA_WORLD_SIZES:
+        raise SystemExit(
+            f"full/ultra 需要 1/2/4/8 张可见 GPU，当前 device_count={n}"
+        )
+    return n
 
 
 def _spawn_worker(
@@ -196,7 +322,11 @@ def _spawn_worker(
     os.environ.setdefault("MASTER_PORT", "29500")
 
     cfg = get_train_config(
-        model_name, train_config, dataset=dataset, preprocess=preprocess,
+        model_name,
+        train_config,
+        dataset=dataset,
+        preprocess=preprocess,
+        world_size=world_size,
     )
     if run_name:
         cfg.name = run_name
@@ -217,7 +347,19 @@ def get_lr(step: int, cfg: FL_TrainConfig) -> float:
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
-    return model.module if isinstance(model, DDP) else model
+    """剥离 DDP 与 torch.compile 包装,拿到原始模块。
+
+    torch.compile 返回的 OptimizedModule 通过 _orig_mod 暴露原模块,DDP 通过 module 暴露。
+    先 compile 再 DDP 会嵌套两层,故迭代解包直到没有包装为止。
+    """
+    m = model
+    while True:
+        if isinstance(m, DDP):
+            m = m.module
+        elif hasattr(m, "_orig_mod"):
+            m = m._orig_mod
+        else:
+            return m
 
 
 def _all_ranks_true(local_ok: bool, device: torch.device, is_distributed: bool) -> bool:
@@ -371,8 +513,127 @@ def eval_model_ppl(
     return avg_loss, avg_ppl
 
 
+def prepare_gpt2_eval_batch(
+    batch: torch.Tensor,
+    layout: FL_TokenLayout,
+    *,
+    gpt2_vocab_size: int,
+    fill_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map extended-vocab token ids into the GPT-2 baseline range for CE/PPL."""
+    input_ids = batch.clone()
+    labels = batch.clone()
+    oov = input_ids >= gpt2_vocab_size
+    input_ids[oov] = fill_token_id
+    for token_id in (layout.bos_token_id, layout.eos_token_id, layout.pad_token_id):
+        labels[labels == token_id] = -100
+    return input_ids, labels
+
+
+def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
+    sampling_cfg: dict[str, Any] = {"use_fast_infer": cfg.eval_use_fast_infer}
+    if cfg.model == "bd3lm":
+        sampling_cfg["num_steps"] = cfg.eval_gen_steps
+    return sampling_cfg
+
+
+def load_gen_eval_baseline(cfg: FL_TrainConfig) -> nn.Module:
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    torch_dtype = dtype_map[cfg.gen_eval_model_dtype]
+    device = cfg.gen_eval_model_device
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("gen_eval_model_device=cuda but no CUDA device was found")
+    model = get_hf_model(cfg.gen_eval_model, torch_dtype=torch_dtype, device=device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+@torch.no_grad()
+def eval_one_batch_gen_ppl(
+    train_model: nn.Module,
+    gpt2_model: nn.Module,
+    *,
+    cfg: FL_TrainConfig,
+    train_device: torch.device,
+    train_amp_dtype: torch.dtype,
+    token_layout: FL_TokenLayout,
+    seed: int,
+    pbar_parent: tqdm | None = None,
+) -> tuple[float, float]:
+    """Unconditional one-batch gen. PPL: sample with train model, score via gpt2-large."""
+    was_training = train_model.training
+    train_model.eval()
+    gpt2_model.eval()
+    gpt2_device = next(gpt2_model.parameters()).device
+    gpt2_vocab_size = int(getattr(gpt2_model.config, "vocab_size", 50257))
+    fill_token_id = int(
+        getattr(gpt2_model.config, "eos_token_id", None) or 50256,
+    )
+    seqlen = int(cfg.extra.get("chunk_length", 1024))
+    use_train_amp = train_device.type == "cuda"
+    use_gpt2_amp = gpt2_device.type == "cuda"
+    gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
+
+    if pbar_parent is not None:
+        pbar_parent.clear()
+        tqdm.write(
+            f"{_TRAIN_LOG} eval/gen: sampling {cfg.batch_size} x {seqlen} "
+            f"(seed={seed}) ...",
+        )
+
+    # Isolate sampling RNG from the training loop.
+    devices = [train_device] if train_device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        if train_device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        gen_model = unwrap_model(train_model)
+        with torch.amp.autocast(
+            "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
+        ):
+            generated, _nfe = gen_model.generate(
+                num_samples=cfg.batch_size,
+                seqlen=seqlen,
+                for_eval=True,
+                sampling_cfg=_gen_eval_sampling_cfg(cfg),
+            )
+
+    generated = generated.to(gpt2_device, non_blocking=True)
+    input_ids, labels = prepare_gpt2_eval_batch(
+        generated,
+        token_layout,
+        gpt2_vocab_size=gpt2_vocab_size,
+        fill_token_id=fill_token_id,
+    )
+    with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
+        outputs = gpt2_model(input_ids, labels=labels)
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        gen_loss = float(loss.item())
+    gen_ppl = loss_to_ppl(gen_loss)
+
+    if was_training:
+        train_model.train()
+    if pbar_parent is not None:
+        pbar_parent.refresh()
+
+    summary = (
+        f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} ppl {gen_ppl:.2f}"
+    )
+    if pbar_parent is not None:
+        tqdm.write(f"{_TRAIN_LOG} {summary}")
+    else:
+        _train_log(summary)
+    return gen_loss, gen_ppl
+
+
 def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> None:
-    write_header = not csv_path.exists()
+    if csv_path.exists():
+        ensure_csv_schema(csv_path, fields)
+        write_header = False
+    else:
+        write_header = True
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         if write_header:
@@ -380,14 +641,33 @@ def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> No
         writer.writerow({k: row.get(k, "") for k in fields})
 
 
+def ensure_csv_schema(csv_path: Path, fields: list[str]) -> None:
+    """Rewrite CSV if the on-disk header is missing newly added columns."""
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        old_fields = list(reader.fieldnames or [])
+        if old_fields == fields:
+            return
+        rows = list(reader)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+
+
 def truncate_csv_for_resume(csv_path: Path, start_step: int) -> int:
     if not csv_path.exists():
         return 0
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames
-        if fieldnames is None:
+        old_fields = list(reader.fieldnames or [])
+        if not old_fields:
             return 0
+        # Prefer the canonical schema so resume can introduce new columns.
+        fieldnames = EVAL_CSV_FIELDS if csv_path.name == "eval_log.csv" else old_fields
+        if csv_path.name == "train_log.csv":
+            fieldnames = TRAIN_CSV_FIELDS
         rows_by_step: dict[int, dict[str, str]] = {}
         for row in reader:
             step = int(row["step"])
@@ -395,9 +675,10 @@ def truncate_csv_for_resume(csv_path: Path, start_step: int) -> int:
                 rows_by_step[step] = row
     rows = [rows_by_step[s] for s in sorted(rows_by_step)]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
     return len(rows)
 
 
@@ -461,6 +742,7 @@ def update_ppl_plots(
     eval_ppl = [
         _parse_float(r.get("eval_ppl") or r.get("gpt2_ppl")) for r in eval_rows
     ]
+    gen_ppl = [_parse_float(r.get("gen_ppl")) for r in eval_rows]
 
     for cap, filename in ((1000.0, "ppl_under_1000.png"), (100.0, "ppl_under_100.png")):
         t_steps, t_ppls = zip(
@@ -475,7 +757,11 @@ def update_ppl_plots(
             *[(s, p) for s, p in zip(eval_steps, eval_ppl) if p is not None and p <= cap]
         ) if any(p is not None and p <= cap for p in eval_ppl) else ([], [])
 
-        if not t_steps and not e_steps:
+        g_steps, g_ppls = zip(
+            *[(s, p) for s, p in zip(eval_steps, gen_ppl) if p is not None and p <= cap]
+        ) if any(p is not None and p <= cap for p in gen_ppl) else ([], [])
+
+        if not t_steps and not e_steps and not g_steps:
             continue
 
         fig, ax_ppl = plt.subplots(figsize=(10, 4.5))
@@ -494,6 +780,11 @@ def update_ppl_plots(
             ax_ppl.plot(
                 e_steps, e_ppls, color="#D62728", linewidth=2.8, marker="o",
                 markersize=4, label="eval ppl (exp loss)", zorder=5,
+            )
+        if g_steps:
+            ax_ppl.plot(
+                g_steps, g_ppls, color="#2CA02C", linewidth=2.4, marker="s",
+                markersize=4, label="gen ppl (gpt2-large)", zorder=6,
             )
 
         ax_lr = ax_ppl.twinx()
@@ -722,6 +1013,8 @@ def train_loop(
     model_meta: dict[str, Any],
     train_ds: TokenChunkDataset,
     eval_loader: DataLoader | None,
+    gpt2_model: nn.Module | None,
+    gen_token_layout: FL_TokenLayout | None,
     *,
     rank: int,
     world_size: int,
@@ -740,13 +1033,25 @@ def train_loop(
                 ensure_ascii=False,
             )
 
+    # 在 DDP 之前 compile:backbone 是固定的 2*chunk_length 序列 + 静态 branch kwarg,
+    # Inductor 能拿到稳定 shape、每个分支一张图。所有参数每步都被使用(mode embedding 在
+    # forward 里被触碰),故 DDP 可不带 find_unused_parameters。
+    compile_model = bool(cfg.extra.get("compile", False)) and device.type == "cuda"
+    if compile_model:
+        if rank == 0:
+            _train_log(
+                "torch.compile enabled; the first denoise/decode steps are slow "
+                "while Inductor compiles kernels "
+                f"(triton={os.environ.get('TRITON_CACHE_DIR')}, "
+                f"inductor={os.environ.get('TORCHINDUCTOR_CACHE_DIR')})",
+            )
+        model = torch.compile(model)
+
     if is_distributed:
         ddp_kwargs: dict[str, Any] = {
             "device_ids": [device.index],
             "output_device": device.index,
         }
-        if uses_dual_branch_logging(model):
-            ddp_kwargs["find_unused_parameters"] = True
         model = DDP(model, **ddp_kwargs)
 
     raw = unwrap_model(model)
@@ -936,10 +1241,29 @@ def train_loop(
                             amp_dtype,
                             pbar_parent=pbar,
                         )
+                        gen_loss: float | None = None
+                        gen_ppl: float | None = None
+                        if gpt2_model is not None and gen_token_layout is not None:
+                            gen_loss, gen_ppl = eval_one_batch_gen_ppl(
+                                model,
+                                gpt2_model,
+                                cfg=cfg,
+                                train_device=device,
+                                train_amp_dtype=amp_dtype,
+                                token_layout=gen_token_layout,
+                                seed=cfg.seed + step,
+                                pbar_parent=pbar,
+                            )
                         eval_row = {
                             "step": step,
                             "eval_loss": round(eval_loss, 6),
                             "eval_ppl": round(eval_ppl, 4),
+                            "gen_loss": (
+                                round(gen_loss, 6) if gen_loss is not None else ""
+                            ),
+                            "gen_ppl": (
+                                round(gen_ppl, 4) if gen_ppl is not None else ""
+                            ),
                             "lr": lr,
                         }
                         append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
@@ -1112,11 +1436,13 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         )
 
     try:
+        launch_world_size = _resolve_launch_world_size(args.train_config)
         cfg = get_train_config(
             args.model,
             args.train_config,
             dataset=args.dataset,
             preprocess=args.preprocess,
+            world_size=launch_world_size,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"Failed to load train config: {exc}") from exc
@@ -1140,13 +1466,25 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
             )
         _train_log(f"Data: dataset={cfg.dataset}, preprocess={cfg.preprocess}")
         _train_log(f"Device: {device}, world_size={world_size}")
-        if cfg.model == "bdelf":
-            _train_log(
-                f"Token budget: {cfg.target_tokens:,} decode-equivalent tokens "
-                f"({cfg.effective_tokens_per_optimizer_step:,}/step decode, "
-                f"{cfg.tokens_per_optimizer_step:,}/step raw) → "
-                f"max_steps={cfg.max_steps:,}",
+        if cfg.target_tokens is not None:
+            opt_steps = int(cfg.extra.get("max_optimizer_steps", 0)) or (
+                cfg.max_steps // max(1, cfg.grad_accum_steps)
             )
+            if cfg.model == "bdelf":
+                _train_log(
+                    f"Token budget: {cfg.target_tokens:,} decode-equivalent tokens "
+                    f"({cfg.effective_tokens_per_optimizer_step:,}/opt-step decode, "
+                    f"{cfg.tokens_per_optimizer_step:,}/opt-step raw) → "
+                    f"{opt_steps:,} optimizer steps "
+                    f"({cfg.max_steps:,} micro-steps, accum={cfg.grad_accum_steps})",
+                )
+            else:
+                _train_log(
+                    f"Token budget: {cfg.target_tokens:,} tokens "
+                    f"({cfg.tokens_per_optimizer_step:,}/opt-step) → "
+                    f"{opt_steps:,} optimizer steps "
+                    f"({cfg.max_steps:,} micro-steps, accum={cfg.grad_accum_steps})",
+                )
 
     try:
         # On a cache miss only rank 0 downloads/builds; the other ranks wait
@@ -1219,6 +1557,20 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 f"eval subsample: {eval_run_size:,} / {len(eval_ds_full):,} "
                 f"(seed={cfg.eval_sample_seed})",
             )
+        _train_log(
+            f"gen. ppl: 1 batch / eval via {cfg.gen_eval_model} "
+            f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device})",
+        )
+
+    gpt2_model: nn.Module | None = None
+    gen_token_layout: FL_TokenLayout | None = None
+    if rank == 0:
+        gen_token_layout = token_layout_from_cfg(model_cfg)
+        gpt2_model = load_gen_eval_baseline(cfg)
+        _train_log(
+            f"Loaded gen-eval baseline {cfg.gen_eval_model} "
+            f"on {cfg.gen_eval_model_device}",
+        )
 
     train_loop(
         model,
@@ -1226,6 +1578,8 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         model_meta,
         train_ds,
         eval_loader,
+        gpt2_model,
+        gen_token_layout,
         rank=rank,
         world_size=world_size,
         device=device,
