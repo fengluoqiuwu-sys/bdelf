@@ -1,13 +1,16 @@
-_doc: Schedule template
+_doc: Schedule template (unified token-budget scheme)
 name: prototype
 variant: fast
-max_steps: 5000
-warmup_steps: 500
+# Token budget drives max_steps; bdelf counts decode-equivalent tokens.
+target_tokens: 160000000
+# Warmup as a fraction of the derived max_steps.
+warmup_ratio: 0.1
 min_lr_ratio: 0.1
-log_plot_every: 100
-eval_every: 500
-save_every: 2000
-snapshot_every: 10000
+# Absolute step intervals (not ratios).
+eval_step: 500
+save_step: 2000
+snapshot_step: 10000
+log_plot_step: 100
 resume: true
 seed: 42
 # Hidden Linear weights use Muon; others stay AdamW.

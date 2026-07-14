@@ -75,11 +75,24 @@ class FL_OptimizerConfig:
 
 @dataclass
 class FL_ScheduleConfig:
+    """Unified schedule: token budget drives max_steps; intervals are absolute steps.
+
+    The only accepted knobs are ``target_tokens`` + ``warmup_ratio`` +
+    ``{eval,save,snapshot,log_plot}_step``. Legacy ``max_steps`` / ``*_every`` /
+    ``*_ratio`` fields are no longer supported.
+    """
+
     _YAML_REQUIRED = frozenset(
         {
             "name",
             "variant",
+            "target_tokens",
+            "warmup_ratio",
             "min_lr_ratio",
+            "eval_step",
+            "save_step",
+            "snapshot_step",
+            "log_plot_step",
             "resume",
             "seed",
         }
@@ -87,19 +100,13 @@ class FL_ScheduleConfig:
 
     name: str = "prototype"
     variant: TrainVariant = "fast"
-    max_steps: int = 0
     target_tokens: Optional[int] = None
-    warmup_steps: int = 500
     warmup_ratio: Optional[float] = None
     min_lr_ratio: float = 0.1
-    log_plot_every: int = 100
-    log_plot_ratio: Optional[float] = None
-    eval_every: int = 500
-    eval_ratio: Optional[float] = None
-    save_every: int = 2000
-    save_ratio: Optional[float] = None
-    snapshot_every: int = 10_000
-    snapshot_ratio: Optional[float] = None
+    log_plot_step: int = 100
+    eval_step: int = 500
+    save_step: int = 2000
+    snapshot_step: int = 10_000
     resume: bool = True
     seed: int = 42
     use_muon: bool = True
@@ -153,10 +160,10 @@ class FL_TrainConfig:
     grad_clip: float
     warmup_steps: int
     min_lr_ratio: float
-    log_plot_every: int
-    eval_every: int
-    save_every: int
-    snapshot_every: int
+    log_plot_step: int
+    eval_step: int
+    save_step: int
+    snapshot_step: int
     num_workers: int
     resume: bool
     seed: int
@@ -277,20 +284,14 @@ def _validate_dtype(dtype: str, *, path: str, label: str) -> None:
         raise ValueError(f"{path}: unsupported {label} {dtype!r}")
 
 
-def _steps_from_ratio(max_steps: int, ratio: float | None, fallback: int) -> int:
-    if ratio is not None:
-        return max(1, round(max_steps * ratio))
-    return fallback
-
-
 @dataclass(frozen=True)
 class _ResolvedSchedule:
     max_steps: int
     warmup_steps: int
-    log_plot_every: int
-    eval_every: int
-    save_every: int
-    snapshot_every: int
+    log_plot_step: int
+    eval_step: int
+    save_step: int
+    snapshot_step: int
 
 
 def _resolve_schedule(
@@ -299,41 +300,28 @@ def _resolve_schedule(
     run_name: str,
     tokens_per_step: int,
 ) -> _ResolvedSchedule:
-    if schedule.target_tokens is not None:
-        if tokens_per_step < 1:
-            raise ValueError(f"{run_name}: tokens_per_optimizer_step must be >= 1")
-        if schedule.warmup_ratio is None:
-            raise ValueError(f"{run_name}: target_tokens schedules require warmup_ratio")
-        for field_name in ("eval_ratio", "save_ratio", "snapshot_ratio", "log_plot_ratio"):
-            if getattr(schedule, field_name) is None:
-                raise ValueError(
-                    f"{run_name}: target_tokens schedules require {field_name}"
-                )
-        max_steps = max(1, math.ceil(schedule.target_tokens / tokens_per_step))
-    elif schedule.max_steps >= 1:
-        max_steps = schedule.max_steps
-    else:
-        raise ValueError(
-            f"{run_name}: schedule must set target_tokens or max_steps >= 1"
-        )
+    """Derive absolute steps from the token budget; intervals pass through."""
+    if schedule.target_tokens is None or schedule.target_tokens < 1:
+        raise ValueError(f"{run_name}: schedule.target_tokens must be set (>= 1)")
+    if schedule.warmup_ratio is None:
+        raise ValueError(f"{run_name}: schedule.warmup_ratio must be set")
+    if tokens_per_step < 1:
+        raise ValueError(f"{run_name}: tokens_per_optimizer_step must be >= 1")
+
+    max_steps = max(1, math.ceil(schedule.target_tokens / tokens_per_step))
+    warmup_steps = max(1, round(max_steps * schedule.warmup_ratio))
+
+    for field_name in ("eval_step", "save_step", "snapshot_step", "log_plot_step"):
+        if getattr(schedule, field_name) < 1:
+            raise ValueError(f"{run_name}: schedule.{field_name} must be >= 1")
 
     return _ResolvedSchedule(
         max_steps=max_steps,
-        warmup_steps=_steps_from_ratio(
-            max_steps, schedule.warmup_ratio, schedule.warmup_steps,
-        ),
-        log_plot_every=_steps_from_ratio(
-            max_steps, schedule.log_plot_ratio, schedule.log_plot_every,
-        ),
-        eval_every=_steps_from_ratio(
-            max_steps, schedule.eval_ratio, schedule.eval_every,
-        ),
-        save_every=_steps_from_ratio(
-            max_steps, schedule.save_ratio, schedule.save_every,
-        ),
-        snapshot_every=_steps_from_ratio(
-            max_steps, schedule.snapshot_ratio, schedule.snapshot_every,
-        ),
+        warmup_steps=warmup_steps,
+        log_plot_step=schedule.log_plot_step,
+        eval_step=schedule.eval_step,
+        save_step=schedule.save_step,
+        snapshot_step=schedule.snapshot_step,
     )
 
 
@@ -411,6 +399,24 @@ def compose_train_config(
     max_steps = resolved.max_steps
     target_tokens = max_steps * effective_tokens_per_step
 
+    # BDELF max_steps is ~1/decoder_prob× longer (decode-equivalent token
+    # budget). Scale absolute eval/save/plot intervals by the same factor so
+    # wall-clock cadence stays comparable to AR/BD3LM.
+    log_plot_step = resolved.log_plot_step
+    eval_step = resolved.eval_step
+    save_step = resolved.save_step
+    snapshot_step = resolved.snapshot_step
+    if model == "bdelf":
+        if decoder_prob <= 0.0 or decoder_prob > 1.0:
+            raise ValueError(
+                f"{run_name}: decoder_prob must be in (0, 1], got {decoder_prob}"
+            )
+        branch_scale = max(1, round(1.0 / decoder_prob))
+        log_plot_step = max(1, log_plot_step * branch_scale)
+        eval_step = max(1, eval_step * branch_scale)
+        save_step = max(1, save_step * branch_scale)
+        snapshot_step = max(1, snapshot_step * branch_scale)
+
     extra = _merge_extra(
         hardware.extra,
         optimizer.extra,
@@ -423,6 +429,9 @@ def compose_train_config(
             "effective_tokens_per_optimizer_step": effective_tokens_per_step,
             "decoder_prob": decoder_prob,
             "target_tokens": target_tokens,
+            "schedule_branch_scale": (
+                max(1, round(1.0 / decoder_prob)) if model == "bdelf" else 1
+            ),
             "config_refs": {
                 "hardware": hardware_name,
                 "optimizer": model_config,
@@ -456,10 +465,10 @@ def compose_train_config(
         grad_clip=optimizer.grad_clip,
         warmup_steps=resolved.warmup_steps,
         min_lr_ratio=schedule.min_lr_ratio,
-        log_plot_every=resolved.log_plot_every,
-        eval_every=resolved.eval_every,
-        save_every=resolved.save_every,
-        snapshot_every=resolved.snapshot_every,
+        log_plot_step=log_plot_step,
+        eval_step=eval_step,
+        save_step=save_step,
+        snapshot_step=snapshot_step,
         num_workers=hardware.num_workers,
         resume=schedule.resume,
         seed=schedule.seed,

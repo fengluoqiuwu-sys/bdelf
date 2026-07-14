@@ -1,13 +1,13 @@
-_doc: Ultra training schedule (100B tokens, 8×4090)
+_doc: Ultra training schedule (100B token budget, 8×4090)
 name: ultra
 variant: ultra
 target_tokens: 100000000000
 warmup_ratio: 0.005
-eval_ratio: 0.002
-save_ratio: 0.01
-snapshot_ratio: 0.1
-log_plot_ratio: 0.0002
 min_lr_ratio: 0.1
+eval_step: 1000
+save_step: 5000
+snapshot_step: 50000
+log_plot_step: 200
 resume: true
 seed: 42
 use_muon: true

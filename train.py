@@ -891,11 +891,11 @@ def train_loop(
                 append_csv_row(train_csv, TRAIN_CSV_FIELDS, row)
 
                 interval_done = (
-                    (step + 1) % cfg.eval_every == 0 or (step + 1) >= cfg.max_steps
+                    (step + 1) % cfg.eval_step == 0 or (step + 1) >= cfg.max_steps
                 )
                 if interval_done:
                     if (
-                        (step + 1) % cfg.eval_every == 0
+                        (step + 1) % cfg.eval_step == 0
                         and eval_loader is not None
                     ):
                         eval_loss, eval_ppl = eval_model_ppl(
@@ -917,13 +917,13 @@ def train_loop(
                     for line in format_interval_summary(step, cfg.max_steps, row):
                         _rank0_log(line, pbar)
 
-                if (step + 1) % cfg.log_plot_every == 0:
+                if (step + 1) % cfg.log_plot_step == 0:
                     update_ppl_plots(train_csv, eval_csv, run_dir)
                     rank0_sync = True
 
-                if (step + 1) % cfg.save_every == 0:
+                if (step + 1) % cfg.save_step == 0:
                     save_checkpoint(latest_ckpt, model, optimizer, step + 1, cfg, model_meta)
-                    if (step + 1) % cfg.snapshot_every == 0:
+                    if (step + 1) % cfg.snapshot_step == 0:
                         save_checkpoint(
                             run_dir / f"checkpoint_step_{step + 1:07d}.pt",
                             model, optimizer, step + 1, cfg, model_meta,
