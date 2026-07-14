@@ -87,7 +87,7 @@ class Muon(torch.optim.Optimizer):
         self,
         params,
         *,
-        lr: float = 0.02,
+        lr: float = 0.003,
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
