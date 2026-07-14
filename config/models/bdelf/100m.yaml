@@ -7,7 +7,7 @@ n_layer: 12
 n_head: 12
 n_embd: 672
 dropout: 0.1
-attn_backend: sdpa
+attn_backend: flex
 denoiser_p_mean: -1.5
 denoiser_p_std: 0.8
 denoiser_noise_scale: 2.0

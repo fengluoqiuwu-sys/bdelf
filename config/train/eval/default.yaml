@@ -1,4 +1,11 @@
-_doc: Online eval on held-out split (model loss → exp(loss) PPL)
+_doc: >
+  Online eval: held-out model-loss PPL, plus one-batch generative PPL
+  (train model samples random text of chunk length, scored by gpt2-large)
 name: default
 eval_sample_count: 1024
 eval_sample_seed: 42
+gen_eval_model: gpt2-large
+gen_eval_model_dtype: bf16
+gen_eval_model_device: cuda
+use_fast_infer: false
+eval_gen_steps: 128

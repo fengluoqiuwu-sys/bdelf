@@ -5,9 +5,11 @@ target_tokens: 20000000000
 warmup_ratio: 0.005
 min_lr_ratio: 0.1
 eval_step: 500
-save_step: 2000
-snapshot_step: 20000
+save_step: 1000
+snapshot_step: 5000
 log_plot_step: 100
 resume: true
 seed: 42
 use_muon: true
+# torch.compile(Inductor)用于多卡训练;首个 step 有编译开销,稳态吞吐提升。设 false 回退 eager。
+compile: true

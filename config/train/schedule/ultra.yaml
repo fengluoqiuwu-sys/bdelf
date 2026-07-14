@@ -1,4 +1,4 @@
-_doc: Ultra training schedule (100B token budget, 8×4090)
+_doc: Ultra training schedule (100B token budget, 8×48GB)
 name: ultra
 variant: ultra
 target_tokens: 100000000000
@@ -11,3 +11,5 @@ log_plot_step: 200
 resume: true
 seed: 42
 use_muon: true
+# torch.compile(Inductor)用于多卡训练;首个 step 有编译开销,稳态吞吐提升。设 false 回退 eager。
+compile: true
