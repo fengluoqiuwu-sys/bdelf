@@ -1,4 +1,4 @@
-_doc: bdelf/900m Muon+AdamW hybrid optimizer
+_doc: bdelf/900m Muon+AdamW hybrid optimizer (lower muon_lr pairs with adaLN-Zero to avoid decode-branch divergence)
 name: 900m
 dtype: bf16
 learning_rate: 0.0001
@@ -6,6 +6,6 @@ weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
 grad_clip: 1.0
-muon_learning_rate: 0.02
+muon_learning_rate: 0.003
 muon_momentum: 0.95
 muon_ns_steps: 5
