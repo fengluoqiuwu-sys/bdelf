@@ -213,7 +213,7 @@ _SUBCONFIG: Dict[str, tuple[Type[Any], frozenset[str]]] = {
     "batch": (FL_BatchConfig, FL_BatchConfig._YAML_REQUIRED),
 }
 
-_MODEL_SCOPED_KINDS = frozenset({"batch"})
+_MODEL_SCOPED_KINDS = frozenset({"batch", "optimizer"})
 
 
 def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, str]:
@@ -336,7 +336,7 @@ def compose_train_config(
 
     ``config_name`` must be ``{100m,300m,900m}-{fast,full,ultra}``. Sub-config refs:
       - hardware ← variant
-      - optimizer ← model size
+      - optimizer ← ``optimizer/<model>/<model size>.yaml``
       - schedule ← variant (``full``/``ultra`` derive ``max_steps`` from ``target_tokens``)
       - eval ← ``default``
       - batch ← ``batch/<model>/<config_name>.yaml``
@@ -349,7 +349,7 @@ def compose_train_config(
     hardware_name = _HARDWARE_BY_VARIANT[variant]
 
     hardware = _load_subconfig("hardware", hardware_name)
-    optimizer = _load_subconfig("optimizer", model_config)
+    optimizer = _load_subconfig("optimizer", model_config, model=model)
     schedule = _load_subconfig("schedule", variant)
     run_name = f"{model}-{config_name}"
     if schedule.use_muon:
@@ -434,7 +434,7 @@ def compose_train_config(
             ),
             "config_refs": {
                 "hardware": hardware_name,
-                "optimizer": model_config,
+                "optimizer": f"{model}/{model_config}",
                 "schedule": variant,
                 "eval": "default",
                 "batch": f"{model}/{config_name}",

@@ -1,4 +1,4 @@
-_doc: Muon+AdamW hybrid optimizer base for ~300m models
+_doc: bd3lm/300m Muon+AdamW hybrid optimizer
 name: 300m
 dtype: bf16
 learning_rate: 0.0002
