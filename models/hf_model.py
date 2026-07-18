@@ -64,12 +64,22 @@ def download_hf_model(
         return local_dir
 
     local_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=repo_id,
-        revision=revision,
-        local_dir=str(local_dir),
-        allow_patterns=list(_EVAL_MODEL_ALLOW_PATTERNS),
+    # SOCKS/HTTP proxies often break hf-mirror / LFS CDN fetches even when
+    # NO_PROXY is set; clear them for the duration of this download only.
+    proxy_keys = (
+        "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+        "all_proxy", "ALL_PROXY",
     )
+    saved_proxy = {k: os.environ.pop(k) for k in proxy_keys if k in os.environ}
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            local_dir=str(local_dir),
+            allow_patterns=list(_EVAL_MODEL_ALLOW_PATTERNS),
+        )
+    finally:
+        os.environ.update(saved_proxy)
     return local_dir
 
 

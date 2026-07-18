@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 import hf_config  # noqa: F401
+from models.hf_model import download_hf_model, is_hf_model_cached, resolve_hf_model_cache_path
 
 
 _T5_DEFAULTS = {
@@ -25,6 +26,17 @@ _T5_DEFAULTS = {
         num_layers=24, num_heads=16,
     ),
 }
+
+# Env vars that block HuggingFace downloads; cleared only while auto-fetching.
+_OFFLINE_KEYS = (
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "HF_DATASETS_OFFLINE",
+)
+_PROXY_KEYS = (
+    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+    "all_proxy", "ALL_PROXY",
+)
 
 
 class T5EncoderConfig:
@@ -44,6 +56,43 @@ class T5EncoderConfig:
         return cls(model_name, dtype)
 
 
+def ensure_t5_encoder_cached(model_name: str = "t5-small") -> str:
+    """Return local snapshot path, downloading into ``cache/models/`` if missing."""
+    local_dir = resolve_hf_model_cache_path(model_name)
+    if is_hf_model_cached(model_name, local_dir):
+        return str(local_dir)
+
+    print(
+        f"[elf] Local T5 encoder not found at {local_dir}; "
+        f"auto-downloading '{model_name}' ..."
+    )
+    # Offline / proxy flags often remain set from Slurm templates or the shell;
+    # clear them for this fetch so a missing cache can still be populated.
+    saved = {
+        k: os.environ.pop(k)
+        for k in (*_OFFLINE_KEYS, *_PROXY_KEYS)
+        if k in os.environ
+    }
+    try:
+        download_hf_model(model_name, cache_path=local_dir)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to auto-download T5 encoder '{model_name}' into {local_dir}. "
+            f"Check network / hf-mirror access, then retry. Underlying error: {exc}"
+        ) from exc
+    finally:
+        os.environ.update(saved)
+
+    if not is_hf_model_cached(model_name, local_dir):
+        raise RuntimeError(
+            f"Auto-download of '{model_name}' finished but {local_dir} "
+            f"still has no usable weights (config.json + model.safetensors/"
+            f"pytorch_model.bin)."
+        )
+    print(f"[elf] T5 encoder ready at {local_dir}")
+    return str(local_dir)
+
+
 class T5Encoder(nn.Module):
     """Frozen ``T5EncoderModel`` wrapper."""
 
@@ -51,22 +100,15 @@ class T5Encoder(nn.Module):
         super().__init__()
         from transformers import T5Config, T5EncoderModel
 
-        cache_dir = os.environ.get("TRANSFORMERS_CACHE") or os.environ.get("HF_HOME")
-        load_kwargs: dict[str, Any] = {}
-        if cache_dir:
-            load_kwargs["cache_dir"] = cache_dir
-
         if pretrained:
-            try:
-                self.model = T5EncoderModel.from_pretrained(
-                    config.model_name, local_files_only=True, **load_kwargs,
-                )
-            except (OSError, ValueError):
-                self.model = T5EncoderModel.from_pretrained(
-                    config.model_name, **load_kwargs,
-                )
+            local_dir = ensure_t5_encoder_cached(config.model_name)
+            # Always load from the project snapshot so training never hits Hub
+            # again after a successful cache populate.
+            self.model = T5EncoderModel.from_pretrained(
+                local_dir, local_files_only=True,
+            )
         else:
-            hf_config_obj = T5Config.from_pretrained(config.model_name, **load_kwargs)
+            hf_config_obj = T5Config.from_pretrained(config.model_name)
             self.model = T5EncoderModel(hf_config_obj)
 
         hf = self.model.config

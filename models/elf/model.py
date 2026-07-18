@@ -27,7 +27,12 @@ from models.elf.layers import (
     _normal_002_,
     make_linear,
 )
-from models.elf.t5_encoder import T5Encoder, encode_text, load_t5_encoder
+from models.elf.t5_encoder import (
+    T5Encoder,
+    encode_text,
+    ensure_t5_encoder_cached,
+    load_t5_encoder,
+)
 from models.model import (
     FL_PreTrainedModel,
     ensure_token_layout,
@@ -576,6 +581,8 @@ class FL_ELFModel(FL_PreTrainedModel):
 
 def build_model_from_config(config: FL_ELFConfig) -> FL_ELFModel:
     ensure_token_layout(config)
+    # Populate cache before training starts (auto-download if missing).
+    ensure_t5_encoder_cached(config.encoder_model_name)
     return FL_ELFModel(config)
 
 

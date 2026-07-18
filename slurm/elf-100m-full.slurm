@@ -27,7 +27,9 @@ export XDG_CACHE_HOME="$PROJECT/cache/compile/xdg"
 mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
 
 # 计算节点无外网，使用 BeeGFS 上已缓存的 HuggingFace 数据。
-# ELF 额外依赖：t5-small tokenizer + T5EncoderModel 权重（训练时冻结编码）。
+# ELF 额外依赖：t5-small tokenizer + cache/models/t5-small 编码器权重。
+# 登录节点预热：
+#   python -c "from models.elf.t5_encoder import ensure_t5_encoder_cached; ensure_t5_encoder_cached()"
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HOME="$PROJECT/cache/huggingface"
