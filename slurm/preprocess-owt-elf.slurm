@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=owt-preprocess
+#SBATCH --job-name=owt-preprocess-elf
 #SBATCH --partition=cls1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -20,7 +20,7 @@ export TORCHINDUCTOR_CACHE_DIR="$PROJECT/cache/compile/inductor"
 export MPLCONFIGDIR="$PROJECT/cache/compile/mpl"
 export XDG_CACHE_HOME="$PROJECT/cache/compile/xdg"
 
-# 计算节点无外网；原始 parquet 与 tokenizer 需已缓存在 BeeGFS。
+# 计算节点无外网；原始 parquet 与 t5-small tokenizer 需已缓存在 BeeGFS。
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HOME="$PROJECT/cache/huggingface"
@@ -29,8 +29,9 @@ echo "=== preprocess start: $(date -Is) | host: $(hostname) | job: ${SLURM_JOB_I
 echo "cpus=$(nproc) mem=$(grep MemTotal /proc/meminfo)"
 
 # 必须用磁盘上的 .py 文件：预处理内部 multiprocessing spawn 无法从 <stdin> 启动子进程。
-python slurm/preprocess-owt-default.py --dataset owt --preprocess default
+# 复用通用入口；ELF 使用 T5-small 分词（config/preprocess/elf.yaml）。
+python slurm/preprocess-owt-default.py --dataset owt --preprocess elf
 
 echo "=== disk usage ==="
-du -sh cache/preprocessed_datasets/owt_default_* 2>/dev/null || true
+du -sh cache/preprocessed_datasets/owt_elf_* 2>/dev/null || true
 echo "=== preprocess end: $(date -Is) ==="
