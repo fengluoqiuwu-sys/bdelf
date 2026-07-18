@@ -29,7 +29,6 @@ from models import (
     list_models,
     resolve_model_config_path,
 )
-from models.tokens import FL_TokenLayout, token_layout_from_cfg
 from dataset import list_datasets
 from preprocess import get_preprocessed, list_preprocess
 from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
@@ -331,7 +330,6 @@ def train_loop(
     train_ds: TokenChunkDataset,
     eval_loader: DataLoader | None,
     gpt2_model: nn.Module | None,
-    gen_token_layout: FL_TokenLayout | None,
     *,
     rank: int,
     world_size: int,
@@ -558,14 +556,13 @@ def train_loop(
                         )
                         gen_loss: float | None = None
                         gen_ppl: float | None = None
-                        if gpt2_model is not None and gen_token_layout is not None:
+                        if gpt2_model is not None:
                             gen_loss, gen_ppl = eval_one_batch_gen_ppl(
                                 model,
                                 gpt2_model,
                                 cfg=cfg,
                                 train_device=device,
                                 train_amp_dtype=amp_dtype,
-                                token_layout=gen_token_layout,
                                 seed=cfg.seed + step,
                                 pbar_parent=pbar,
                             )
@@ -881,9 +878,7 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         )
 
     gpt2_model: nn.Module | None = None
-    gen_token_layout: FL_TokenLayout | None = None
     if rank == 0:
-        gen_token_layout = token_layout_from_cfg(model_cfg)
         gpt2_model = load_gen_eval_baseline(cfg)
         _train_log(
             f"Loaded gen-eval baseline {cfg.gen_eval_model} "
@@ -897,7 +892,6 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         train_ds,
         eval_loader,
         gpt2_model,
-        gen_token_layout,
         rank=rank,
         world_size=world_size,
         device=device,

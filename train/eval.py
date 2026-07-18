@@ -10,11 +10,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models import get_hf_model
-from models.tokens import FL_TokenLayout
 from preprocess import get_preprocess
 from train import FL_TrainConfig
 from train.checkpoint import unwrap_model
 from train.metrics import _TRAIN_LOG, _train_log, loss_to_ppl
+
+# Process-local tokenizer cache for gen-eval retokenization.
+_SRC_TOKENIZER_CACHE: dict[str, Any] = {}
+_GPT2_TOKENIZER: Any | None = None
 
 
 def get_amp_dtype(dtype: str) -> torch.dtype:
@@ -115,24 +118,29 @@ def eval_model_ppl(
     return avg_loss, avg_ppl
 
 
+def _get_src_tokenizer(name: str) -> Any:
+    tok = _SRC_TOKENIZER_CACHE.get(name)
+    if tok is None:
+        from tokenizer import get_tokenizer
+
+        tok = get_tokenizer(name)
+        _SRC_TOKENIZER_CACHE[name] = tok
+    return tok
+
+
+def _get_gpt2_tokenizer() -> Any:
+    global _GPT2_TOKENIZER
+    if _GPT2_TOKENIZER is None:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained("gpt2")
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+        _GPT2_TOKENIZER = tok
+    return _GPT2_TOKENIZER
+
+
 def prepare_gpt2_eval_batch(
-    batch: torch.Tensor,
-    layout: FL_TokenLayout,
-    *,
-    gpt2_vocab_size: int,
-    fill_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map extended-vocab token ids into the GPT-2 baseline range for CE/PPL."""
-    input_ids = batch.clone()
-    labels = batch.clone()
-    oov = input_ids >= gpt2_vocab_size
-    input_ids[oov] = fill_token_id
-    for token_id in (layout.bos_token_id, layout.eos_token_id, layout.pad_token_id):
-        labels[labels == token_id] = -100
-    return input_ids, labels
-
-
-def prepare_gpt2_eval_batch_retokenize(
     batch: torch.Tensor,
     *,
     src_tokenizer_name: str,
@@ -140,19 +148,16 @@ def prepare_gpt2_eval_batch_retokenize(
     fill_token_id: int,
     device: torch.device,
     max_length: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Decode with the train tokenizer, then re-encode with GPT-2 for Gen. PPL.
 
-    Required when the train model uses a non-GPT-2 vocabulary (e.g. ELF / T5).
+    Unified path for all train tokenizers (GPT-2, T5, …): score text under the
+    gpt2-large baseline rather than assuming shared token ids.
+
+    Returns ``(input_ids, labels, attention_mask)``.
     """
-    from transformers import AutoTokenizer
-
-    from tokenizer import get_tokenizer
-
-    src_tok = get_tokenizer(src_tokenizer_name)
-    gpt2_tok = AutoTokenizer.from_pretrained("gpt2")
-    if gpt2_tok.pad_token_id is None:
-        gpt2_tok.pad_token = gpt2_tok.eos_token
+    src_tok = _get_src_tokenizer(src_tokenizer_name)
+    gpt2_tok = _get_gpt2_tokenizer()
 
     texts = [
         src_tok.decode(row.tolist(), skip_special_tokens=True)
@@ -167,12 +172,14 @@ def prepare_gpt2_eval_batch_retokenize(
         return_tensors="pt",
     )
     input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
     labels = input_ids.clone()
-    pad_id = int(gpt2_tok.pad_token_id)
-    labels[labels == pad_id] = -100
+    # Mask pads via attention_mask (GPT-2 pad_id == eos_id, so id equality
+    # would also drop real </s> tokens inside the text).
+    labels[attention_mask == 0] = -100
     oov = input_ids >= gpt2_vocab_size
     input_ids[oov] = fill_token_id
-    return input_ids, labels
+    return input_ids, labels, attention_mask
 
 
 def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
@@ -208,7 +215,6 @@ def eval_one_batch_gen_ppl(
     cfg: FL_TrainConfig,
     train_device: torch.device,
     train_amp_dtype: torch.dtype,
-    token_layout: FL_TokenLayout,
     seed: int,
     pbar_parent: tqdm | None = None,
 ) -> tuple[float, float]:
@@ -250,29 +256,26 @@ def eval_one_batch_gen_ppl(
                 sampling_cfg=_gen_eval_sampling_cfg(cfg),
             )
 
-    if cfg.model == "elf":
-        src_tok_name = get_preprocess(cfg.preprocess).tokenizer
-        input_ids, labels = prepare_gpt2_eval_batch_retokenize(
-            generated,
-            src_tokenizer_name=src_tok_name,
-            gpt2_vocab_size=gpt2_vocab_size,
-            fill_token_id=fill_token_id,
-            device=gpt2_device,
-            max_length=seqlen,
-        )
+    src_tok_name = get_preprocess(cfg.preprocess).tokenizer
+    input_ids, labels, attention_mask = prepare_gpt2_eval_batch(
+        generated,
+        src_tokenizer_name=src_tok_name,
+        gpt2_vocab_size=gpt2_vocab_size,
+        fill_token_id=fill_token_id,
+        device=gpt2_device,
+        max_length=seqlen,
+    )
+    if not bool((labels != -100).any().item()):
+        gen_loss = float("nan")
+        gen_ppl = float("nan")
     else:
-        generated = generated.to(gpt2_device, non_blocking=True)
-        input_ids, labels = prepare_gpt2_eval_batch(
-            generated,
-            token_layout,
-            gpt2_vocab_size=gpt2_vocab_size,
-            fill_token_id=fill_token_id,
-        )
-    with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
-        outputs = gpt2_model(input_ids, labels=labels)
-        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-        gen_loss = float(loss.item())
-    gen_ppl = loss_to_ppl(gen_loss)
+        with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
+            outputs = gpt2_model(
+                input_ids, attention_mask=attention_mask, labels=labels,
+            )
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+            gen_loss = float(loss.item())
+        gen_ppl = loss_to_ppl(gen_loss)
 
     if was_training:
         train_model.train()
