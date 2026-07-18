@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import math
 import os
 import sys
 import time
@@ -16,10 +14,6 @@ from typing import Any
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,20 +25,40 @@ from tqdm import tqdm
 import hf_config  # noqa: F401
 from models import (
     build_model,
-    get_hf_model,
     list_model_configs,
     list_models,
     resolve_model_config_path,
 )
 from models.tokens import FL_TokenLayout, token_layout_from_cfg
 from dataset import list_datasets
-from preprocess import get_preprocess, get_preprocessed, list_preprocess
+from preprocess import get_preprocessed, list_preprocess
 from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
 from train.batching import (
     TokenChunkDataset,
     build_eval_subset,
     collate_input_ids,
     fetch_train_batch,
+)
+from train.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
+from train.eval import (
+    eval_model_ppl,
+    eval_one_batch_gen_ppl,
+    forward_loss,
+    get_amp_dtype,
+    load_gen_eval_baseline,
+    uses_dual_branch_logging,
+)
+from train.metrics import (
+    EVAL_CSV_FIELDS,
+    TRAIN_CSV_FIELDS,
+    _rank0_log,
+    _train_log,
+    append_csv_row,
+    build_train_row,
+    format_interval_summary,
+    loss_to_ppl,
+    truncate_csv_for_resume,
+    update_ppl_plots,
 )
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
 
@@ -95,31 +109,6 @@ def _patch_inductor_bool_eq() -> None:
 
 
 _patch_inductor_bool_eq()
-
-
-# =============================================================================
-# Logging constants
-# =============================================================================
-
-TRAIN_CSV_FIELDS = [
-    "step",
-    "train_loss",
-    "train_ppl",
-    "loss_branch",
-    "denoise_mse",
-    "decode_ce",
-    "lr",
-    "tokens_per_sec",
-]
-EVAL_CSV_FIELDS = ["step", "eval_loss", "eval_ppl", "gen_loss", "gen_ppl", "lr"]
-
-_TRAIN_LOG = "[train]"
-
-
-def _train_log(msg: str, *, file: Any = None) -> None:
-    if file is None:
-        file = sys.stdout
-    print(f"{_TRAIN_LOG} {msg}", file=file, flush=True)
 
 
 # =============================================================================
@@ -260,32 +249,8 @@ def _spawn_worker(
 # =============================================================================
 
 
-def get_amp_dtype(dtype: str) -> torch.dtype:
-    if dtype == "bf16":
-        return torch.bfloat16
-    if dtype == "fp16":
-        return torch.float16
-    return torch.float32
-
-
 def get_lr(step: int, cfg: FL_TrainConfig) -> float:
     return scaled_lr(step, cfg, cfg.learning_rate)
-
-
-def unwrap_model(model: nn.Module) -> nn.Module:
-    """剥离 DDP 与 torch.compile 包装,拿到原始模块。
-
-    torch.compile 返回的 OptimizedModule 通过 _orig_mod 暴露原模块,DDP 通过 module 暴露。
-    先 compile 再 DDP 会嵌套两层,故迭代解包直到没有包装为止。
-    """
-    m = model
-    while True:
-        if isinstance(m, DDP):
-            m = m.module
-        elif hasattr(m, "_orig_mod"):
-            m = m._orig_mod
-        else:
-            return m
 
 
 def _all_ranks_true(local_ok: bool, device: torch.device, is_distributed: bool) -> bool:
@@ -327,43 +292,6 @@ def _sync_after_rank0_work(
         dist.barrier()
 
 
-def uses_full_sequence(model: nn.Module) -> bool:
-    return getattr(unwrap_model(model), "full_sequence_training", False)
-
-
-def uses_dual_branch_logging(model: nn.Module) -> bool:
-    return getattr(unwrap_model(model), "dual_branch_logging", False)
-
-
-def forward_loss(
-    model: nn.Module,
-    batch: torch.Tensor,
-    *,
-    branch: str | None = None,
-) -> torch.Tensor:
-    kwargs: dict[str, Any] = {}
-    if branch is not None:
-        if not uses_dual_branch_logging(model):
-            raise ValueError(f"Model does not support branch={branch!r}")
-        kwargs["branch"] = branch
-    if uses_full_sequence(model):
-        _, loss = model(batch, None, **kwargs)
-    else:
-        _, loss = model(batch[:, :-1], batch[:, 1:], **kwargs)
-    return loss
-
-
-def loss_to_ppl(loss: float) -> float:
-    return math.exp(min(loss, 20.0))
-
-
-def _eval_loss_branch(model: nn.Module) -> str | None:
-    """BDELF/ELF eval uses decode CE; AR/BD3LM use the default training loss."""
-    if uses_dual_branch_logging(model):
-        return "decode"
-    return None
-
-
 def _sample_synced_train_branch(
     model: nn.Module,
     device: torch.device,
@@ -380,623 +308,6 @@ def _sample_synced_train_branch(
         dist.broadcast(pick_decode, src=0)
         return "decode" if pick_decode.item() > 0.5 else "denoise"
     return "decode" if torch.rand((), device=device) < p else "denoise"
-
-
-# =============================================================================
-# Evaluation
-# =============================================================================
-
-
-@torch.no_grad()
-def eval_model_ppl(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-    *,
-    pbar_parent: tqdm | None = None,
-) -> tuple[float, float]:
-    """Eval split loss and exp(loss) PPL from the training model."""
-    was_training = model.training
-    model.eval()
-    branch = _eval_loss_branch(model)
-    use_amp = device.type == "cuda"
-    total_loss = 0.0
-    batches = 0
-    if len(loader) == 0:
-        return float("nan"), float("nan")
-
-    batch_iter: DataLoader | tqdm = loader
-    if pbar_parent is not None:
-        pbar_parent.clear()
-        batch_iter = tqdm(
-            loader,
-            desc="eval",
-            unit="batch",
-            leave=False,
-            dynamic_ncols=True,
-            total=len(loader),
-        )
-    try:
-        for eval_batch in batch_iter:
-            eval_batch = eval_batch.to(device, non_blocking=True)
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                loss = forward_loss(model, eval_batch, branch=branch)
-            total_loss += float(loss.item())
-            batches += 1
-    finally:
-        if isinstance(batch_iter, tqdm):
-            batch_iter.close()
-        if pbar_parent is not None:
-            pbar_parent.refresh()
-        if was_training:
-            model.train()
-
-    avg_loss = total_loss / max(1, batches)
-    avg_ppl = loss_to_ppl(avg_loss)
-    if batches > 0:
-        label = "decode ce" if branch == "decode" else "loss"
-        summary = f"eval: {label} {avg_loss:.4f} ppl {avg_ppl:.2f}"
-        if pbar_parent is not None:
-            tqdm.write(f"{_TRAIN_LOG} {summary}")
-        else:
-            _train_log(summary)
-    return avg_loss, avg_ppl
-
-
-def prepare_gpt2_eval_batch(
-    batch: torch.Tensor,
-    layout: FL_TokenLayout,
-    *,
-    gpt2_vocab_size: int,
-    fill_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map extended-vocab token ids into the GPT-2 baseline range for CE/PPL."""
-    input_ids = batch.clone()
-    labels = batch.clone()
-    oov = input_ids >= gpt2_vocab_size
-    input_ids[oov] = fill_token_id
-    for token_id in (layout.bos_token_id, layout.eos_token_id, layout.pad_token_id):
-        labels[labels == token_id] = -100
-    return input_ids, labels
-
-
-def prepare_gpt2_eval_batch_retokenize(
-    batch: torch.Tensor,
-    *,
-    src_tokenizer_name: str,
-    gpt2_vocab_size: int,
-    fill_token_id: int,
-    device: torch.device,
-    max_length: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Decode with the train tokenizer, then re-encode with GPT-2 for Gen. PPL.
-
-    Required when the train model uses a non-GPT-2 vocabulary (e.g. ELF / T5).
-    """
-    from transformers import AutoTokenizer
-
-    from tokenizer import get_tokenizer
-
-    src_tok = get_tokenizer(src_tokenizer_name)
-    gpt2_tok = AutoTokenizer.from_pretrained("gpt2")
-    if gpt2_tok.pad_token_id is None:
-        gpt2_tok.pad_token = gpt2_tok.eos_token
-
-    texts = [
-        src_tok.decode(row.tolist(), skip_special_tokens=True)
-        for row in batch.detach().cpu()
-    ]
-    encoded = gpt2_tok(
-        texts,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_length,
-        padding="max_length",
-        return_tensors="pt",
-    )
-    input_ids = encoded["input_ids"].to(device)
-    labels = input_ids.clone()
-    pad_id = int(gpt2_tok.pad_token_id)
-    labels[labels == pad_id] = -100
-    oov = input_ids >= gpt2_vocab_size
-    input_ids[oov] = fill_token_id
-    return input_ids, labels
-
-
-def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
-    sampling_cfg: dict[str, Any] = {"use_fast_infer": cfg.eval_use_fast_infer}
-    if cfg.model == "bd3lm":
-        sampling_cfg["num_steps"] = cfg.eval_gen_steps
-    elif cfg.model == "elf":
-        # Keep eval sampling lighter than the default 32–64-step SDE.
-        sampling_cfg["num_sampling_steps"] = min(16, cfg.eval_gen_steps)
-        sampling_cfg["sampling_method"] = "ode"
-        sampling_cfg["temperature"] = 0.0  # paper decode: argmax
-    return sampling_cfg
-
-
-def load_gen_eval_baseline(cfg: FL_TrainConfig) -> nn.Module:
-    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-    torch_dtype = dtype_map[cfg.gen_eval_model_dtype]
-    device = cfg.gen_eval_model_device
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("gen_eval_model_device=cuda but no CUDA device was found")
-    model = get_hf_model(cfg.gen_eval_model, torch_dtype=torch_dtype, device=device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    return model
-
-
-@torch.no_grad()
-def eval_one_batch_gen_ppl(
-    train_model: nn.Module,
-    gpt2_model: nn.Module,
-    *,
-    cfg: FL_TrainConfig,
-    train_device: torch.device,
-    train_amp_dtype: torch.dtype,
-    token_layout: FL_TokenLayout,
-    seed: int,
-    pbar_parent: tqdm | None = None,
-) -> tuple[float, float]:
-    """Unconditional one-batch gen. PPL: sample with train model, score via gpt2-large."""
-    was_training = train_model.training
-    train_model.eval()
-    gpt2_model.eval()
-    gpt2_device = next(gpt2_model.parameters()).device
-    gpt2_vocab_size = int(getattr(gpt2_model.config, "vocab_size", 50257))
-    fill_token_id = int(
-        getattr(gpt2_model.config, "eos_token_id", None) or 50256,
-    )
-    seqlen = int(cfg.extra.get("chunk_length", 1024))
-    use_train_amp = train_device.type == "cuda"
-    use_gpt2_amp = gpt2_device.type == "cuda"
-    gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
-
-    if pbar_parent is not None:
-        pbar_parent.clear()
-        tqdm.write(
-            f"{_TRAIN_LOG} eval/gen: sampling {cfg.batch_size} x {seqlen} "
-            f"(seed={seed}) ...",
-        )
-
-    # Isolate sampling RNG from the training loop.
-    devices = [train_device] if train_device.type == "cuda" else []
-    with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(seed)
-        if train_device.type == "cuda":
-            torch.cuda.manual_seed_all(seed)
-        gen_model = unwrap_model(train_model)
-        with torch.amp.autocast(
-            "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
-        ):
-            generated, _nfe = gen_model.generate(
-                num_samples=cfg.batch_size,
-                seqlen=seqlen,
-                for_eval=True,
-                sampling_cfg=_gen_eval_sampling_cfg(cfg),
-            )
-
-    if cfg.model == "elf":
-        src_tok_name = get_preprocess(cfg.preprocess).tokenizer
-        input_ids, labels = prepare_gpt2_eval_batch_retokenize(
-            generated,
-            src_tokenizer_name=src_tok_name,
-            gpt2_vocab_size=gpt2_vocab_size,
-            fill_token_id=fill_token_id,
-            device=gpt2_device,
-            max_length=seqlen,
-        )
-    else:
-        generated = generated.to(gpt2_device, non_blocking=True)
-        input_ids, labels = prepare_gpt2_eval_batch(
-            generated,
-            token_layout,
-            gpt2_vocab_size=gpt2_vocab_size,
-            fill_token_id=fill_token_id,
-        )
-    with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
-        outputs = gpt2_model(input_ids, labels=labels)
-        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-        gen_loss = float(loss.item())
-    gen_ppl = loss_to_ppl(gen_loss)
-
-    if was_training:
-        train_model.train()
-    if pbar_parent is not None:
-        pbar_parent.refresh()
-
-    summary = (
-        f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} ppl {gen_ppl:.2f}"
-    )
-    if pbar_parent is not None:
-        tqdm.write(f"{_TRAIN_LOG} {summary}")
-    else:
-        _train_log(summary)
-    return gen_loss, gen_ppl
-
-
-# =============================================================================
-# Metrics logging and plots
-# =============================================================================
-
-
-def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> None:
-    if csv_path.exists():
-        ensure_csv_schema(csv_path, fields)
-        write_header = False
-    else:
-        write_header = True
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in fields})
-
-
-def ensure_csv_schema(csv_path: Path, fields: list[str]) -> None:
-    """Rewrite CSV if the on-disk header is missing newly added columns."""
-    with open(csv_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        old_fields = list(reader.fieldnames or [])
-        if old_fields == fields:
-            return
-        rows = list(reader)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fields})
-
-
-def truncate_csv_for_resume(csv_path: Path, start_step: int) -> int:
-    if not csv_path.exists():
-        return 0
-    with open(csv_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        old_fields = list(reader.fieldnames or [])
-        if not old_fields:
-            return 0
-        # Prefer the canonical schema so resume can introduce new columns.
-        fieldnames = EVAL_CSV_FIELDS if csv_path.name == "eval_log.csv" else old_fields
-        if csv_path.name == "train_log.csv":
-            fieldnames = TRAIN_CSV_FIELDS
-        rows_by_step: dict[int, dict[str, str]] = {}
-        for row in reader:
-            step = int(row["step"])
-            if step < start_step:
-                rows_by_step[step] = row
-    rows = [rows_by_step[s] for s in sorted(rows_by_step)]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
-    return len(rows)
-
-
-def _read_csv_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with open(path, encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
-def _parse_float(raw: str | None) -> float | None:
-    if raw is None or raw == "":
-        return None
-    return float(raw)
-
-
-def _decode_ce_train_series(
-    train_rows: list[dict[str, str]],
-) -> tuple[list[int], list[float], list[float]]:
-    """Train decode-CE points for plotting (BDELF/ELF dual-branch)."""
-    steps: list[int] = []
-    ppls: list[float] = []
-    lrs: list[float] = []
-    for row in train_rows:
-        if row.get("loss_branch") != "decode":
-            continue
-        ppl = _parse_float(row.get("train_ppl"))
-        if ppl is None:
-            ce = _parse_float(row.get("decode_ce"))
-            if ce is not None:
-                ppl = loss_to_ppl(ce)
-        if ppl is None:
-            continue
-        steps.append(int(row["step"]))
-        ppls.append(ppl)
-        lrs.append(float(row["lr"]))
-    return steps, ppls, lrs
-
-
-def update_ppl_plots(
-    train_csv: Path,
-    eval_csv: Path,
-    out_dir: Path,
-) -> None:
-    train_rows = _read_csv_rows(train_csv)
-    eval_rows = _read_csv_rows(eval_csv)
-    if not train_rows:
-        return
-
-    train_steps = [int(r["step"]) for r in train_rows]
-    train_lr = [float(r["lr"]) for r in train_rows]
-
-    dual_branch = any(r.get("loss_branch") in ("denoise", "decode") for r in train_rows)
-    if dual_branch:
-        train_plot_steps, train_ppl, _ = _decode_ce_train_series(train_rows)
-    else:
-        train_plot_steps = train_steps
-        train_ppl = [_parse_float(r.get("train_ppl")) for r in train_rows]
-
-    eval_steps = [int(r["step"]) for r in eval_rows]
-    eval_ppl = [
-        _parse_float(r.get("eval_ppl") or r.get("gpt2_ppl")) for r in eval_rows
-    ]
-    gen_ppl = [_parse_float(r.get("gen_ppl")) for r in eval_rows]
-
-    for cap, filename in ((1000.0, "ppl_under_1000.png"), (100.0, "ppl_under_100.png")):
-        t_steps, t_ppls = zip(
-            *[
-                (s, p)
-                for s, p in zip(train_plot_steps, train_ppl)
-                if p is not None and p <= cap
-            ]
-        ) if any(p is not None and p <= cap for p in train_ppl) else ([], [])
-
-        e_steps, e_ppls = zip(
-            *[(s, p) for s, p in zip(eval_steps, eval_ppl) if p is not None and p <= cap]
-        ) if any(p is not None and p <= cap for p in eval_ppl) else ([], [])
-
-        g_steps, g_ppls = zip(
-            *[(s, p) for s, p in zip(eval_steps, gen_ppl) if p is not None and p <= cap]
-        ) if any(p is not None and p <= cap for p in gen_ppl) else ([], [])
-
-        if not t_steps and not e_steps and not g_steps:
-            continue
-
-        fig, ax_ppl = plt.subplots(figsize=(10, 4.5))
-
-        if t_steps:
-            train_label = (
-                "train decode ppl (exp ce)"
-                if dual_branch
-                else "train ppl (exp loss)"
-            )
-            ax_ppl.plot(
-                t_steps, t_ppls, color="#4C72B0", alpha=0.55, linewidth=1.2,
-                label=train_label, zorder=1,
-            )
-        if e_steps:
-            ax_ppl.plot(
-                e_steps, e_ppls, color="#D62728", linewidth=2.8, marker="o",
-                markersize=4, label="eval ppl (exp loss)", zorder=5,
-            )
-        if g_steps:
-            ax_ppl.plot(
-                g_steps, g_ppls, color="#2CA02C", linewidth=2.4, marker="s",
-                markersize=4, label="gen ppl (gpt2-large)", zorder=6,
-            )
-
-        ax_lr = ax_ppl.twinx()
-        lr_steps, lr_vals = zip(
-            *[(s, lr) for s, lr in zip(train_steps, train_lr) if lr > 0]
-        ) if train_lr else ([], [])
-        if lr_steps:
-            ax_lr.plot(
-                lr_steps, lr_vals, color="#7F7F7F", linestyle="--",
-                linewidth=1.0, alpha=0.9, label="lr", zorder=2,
-            )
-            ax_lr.set_ylabel("learning rate")
-            ax_lr.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
-
-        ax_ppl.set_xlabel("data step" if dual_branch else "step")
-        ax_ppl.set_ylabel("perplexity")
-        ax_ppl.set_title(f"PPL & LR (ppl ≤ {cap:g})")
-        ax_ppl.grid(True, alpha=0.25)
-
-        handles, labels = ax_ppl.get_legend_handles_labels()
-        h2, l2 = ax_lr.get_legend_handles_labels()
-        ax_ppl.legend(handles + h2, labels + l2, loc="upper right")
-
-        fig.tight_layout()
-        fig.savefig(out_dir / filename, dpi=120)
-        plt.close(fig)
-
-
-def build_train_row(
-    step: int,
-    train_loss: float,
-    lr: float,
-    tokens_per_sec: float,
-    *,
-    dual_branch: bool,
-    loss_branch: str = "",
-) -> dict[str, Any]:
-    row: dict[str, Any] = {
-        "step": step,
-        "train_loss": round(train_loss, 6),
-        "train_ppl": "",
-        "loss_branch": "",
-        "denoise_mse": "",
-        "decode_ce": "",
-        "lr": lr,
-        "tokens_per_sec": round(tokens_per_sec, 2),
-    }
-    if dual_branch:
-        row["loss_branch"] = loss_branch
-        if loss_branch == "denoise":
-            row["denoise_mse"] = round(train_loss, 6)
-        elif loss_branch == "decode":
-            ppl = loss_to_ppl(train_loss)
-            row["decode_ce"] = round(train_loss, 6)
-            row["train_ppl"] = round(ppl, 4)
-            row["train_loss"] = row["decode_ce"]
-    else:
-        row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
-    return row
-
-
-def _train_metrics_text(row: dict[str, Any]) -> str:
-    branch = row.get("loss_branch") or ""
-    if branch == "denoise":
-        return (
-            f"[denoise] mse {row['train_loss']:.4f} | "
-            f"lr {row['lr']:.2e} | {row['tokens_per_sec']:.0f} tok/s"
-        )
-    if branch == "decode":
-        return (
-            f"[decode] ce {row['train_loss']:.4f} ppl {row['train_ppl']} | "
-            f"lr {row['lr']:.2e} | {row['tokens_per_sec']:.0f} tok/s"
-        )
-    return (
-        f"loss {row['train_loss']:.4f} ppl {row['train_ppl']} | "
-        f"lr {row['lr']:.2e} | {row['tokens_per_sec']:.0f} tok/s"
-    )
-
-
-def format_interval_summary(
-    step: int,
-    max_steps: int,
-    row: dict[str, Any],
-) -> list[str]:
-    pct = 100.0 * (step + 1) / max_steps
-    return [f"[{step + 1}/{max_steps} ({pct:.1f}%)] {_train_metrics_text(row)}"]
-
-
-def _rank0_log(msg: str, pbar: tqdm | None) -> None:
-    line = f"{_TRAIN_LOG} {msg}"
-    if pbar is not None:
-        tqdm.write(line)
-    else:
-        print(line, flush=True)
-
-
-# =============================================================================
-# Checkpointing
-# =============================================================================
-
-
-def save_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    cfg: FL_TrainConfig,
-    model_meta: dict[str, Any],
-) -> None:
-    """Atomically write a checkpoint (tmp file + ``os.replace``).
-
-    Direct ``torch.save`` to the final path can leave a truncated file if the
-    process is killed mid-write; resume would then fail on a corrupt latest ckpt.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw = unwrap_model(model)
-    grads = [
-        p.grad.detach().cpu() if p.grad is not None else None
-        for p in raw.parameters()
-    ]
-    payload: dict[str, Any] = {
-        "step": step,
-        "model": raw.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "grads": grads,
-        "rng": {
-            "torch": torch.get_rng_state(),
-            "numpy": np.random.get_state(),
-        },
-        "train_config": asdict(cfg),
-        "model_meta": model_meta,
-    }
-    if torch.cuda.is_available():
-        payload["rng"]["cuda"] = torch.cuda.get_rng_state_all()
-    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    try:
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-
-def _move_optimizer_state_to_device(
-    optimizer: torch.optim.Optimizer | Any,
-    device: torch.device,
-) -> None:
-    if hasattr(optimizer, "muon") and hasattr(optimizer, "adamw"):
-        _move_optimizer_state_to_device(optimizer.muon, device)
-        _move_optimizer_state_to_device(optimizer.adamw, device)
-        return
-    for state in optimizer.state.values():
-        for key, value in state.items():
-            if torch.is_tensor(value):
-                state[key] = value.to(device)
-
-
-def load_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    *,
-    cfg: FL_TrainConfig,
-    model_meta: dict[str, Any],
-    restore_rng: bool = True,
-) -> int:
-    ck = torch.load(path, map_location="cpu", weights_only=False)
-    saved_cfg = ck.get("train_config") or {}
-    if saved_cfg.get("name") and saved_cfg["name"] != cfg.name:
-        raise ValueError(
-            f"checkpoint run={saved_cfg['name']!r} does not match current {cfg.name!r}"
-        )
-    saved_use_muon = bool(saved_cfg.get("use_muon", False))
-    if saved_use_muon != cfg.use_muon:
-        raise ValueError(
-            f"checkpoint use_muon={saved_use_muon} does not match current {cfg.use_muon}"
-        )
-    saved_meta = ck.get("model_meta") or {}
-    if saved_meta.get("name") and saved_meta["name"] != model_meta.get("name"):
-        raise ValueError(
-            f"checkpoint model {saved_meta.get('name')!r} "
-            f"does not match current {model_meta.get('name')!r}"
-        )
-
-    raw = unwrap_model(model)
-    raw.load_state_dict(ck["model"])
-    opt_state = ck["optimizer"]
-    if cfg.use_muon:
-        if not isinstance(opt_state, dict) or opt_state.get("kind") != "muon_hybrid":
-            raise ValueError(
-                "checkpoint optimizer is not hybrid Muon state; "
-                "cannot resume with use_muon=True"
-            )
-    elif isinstance(opt_state, dict) and opt_state.get("kind") == "muon_hybrid":
-        raise ValueError(
-            "checkpoint optimizer is hybrid Muon state; "
-            "cannot resume with use_muon=False"
-        )
-    optimizer.load_state_dict(opt_state)
-    _move_optimizer_state_to_device(optimizer, device)
-
-    grads = ck.get("grads")
-    if grads is not None:
-        for p, g in zip(raw.parameters(), grads):
-            p.grad = g.to(device) if g is not None else None
-
-    # The RNG snapshot comes from rank 0; non-zero ranks keep their
-    # set_seed(seed + rank) state so per-rank noise stays decorrelated.
-    rng = ck.get("rng")
-    if restore_rng and rng is not None:
-        torch.set_rng_state(rng["torch"])
-        np.random.set_state(rng["numpy"])
-        if "cuda" in rng and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng["cuda"])
-    return int(ck["step"])
 
 
 # =============================================================================
