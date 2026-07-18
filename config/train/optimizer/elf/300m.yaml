@@ -1,0 +1,11 @@
+_doc: elf/300m Muon+AdamW hybrid (paper Muon lr=0.002, weight_decay=0)
+name: 300m
+dtype: bf16
+learning_rate: 0.002
+weight_decay: 0.0
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+muon_learning_rate: 0.002
+muon_momentum: 0.95
+muon_ns_steps: 5

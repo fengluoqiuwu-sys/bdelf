@@ -38,9 +38,14 @@ from models import (
 )
 from models.tokens import FL_TokenLayout, token_layout_from_cfg
 from dataset import list_datasets
-from preprocess import get_preprocessed, list_preprocess
+from preprocess import get_preprocess, get_preprocessed, list_preprocess
 from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
+
+
+# =============================================================================
+# Inductor workaround
+# =============================================================================
 
 
 def _patch_inductor_bool_eq() -> None:
@@ -85,6 +90,11 @@ def _patch_inductor_bool_eq() -> None:
 
 _patch_inductor_bool_eq()
 
+
+# =============================================================================
+# Logging constants
+# =============================================================================
+
 TRAIN_CSV_FIELDS = [
     "step",
     "train_loss",
@@ -104,6 +114,11 @@ def _train_log(msg: str, *, file: Any = None) -> None:
     if file is None:
         file = sys.stdout
     print(f"{_TRAIN_LOG} {msg}", file=file, flush=True)
+
+
+# =============================================================================
+# Dataset and batching
+# =============================================================================
 
 
 class TokenChunkDataset(Dataset):
@@ -204,6 +219,11 @@ def fetch_train_batch(
     rank_indices = indices[start : start + batch_size]
     rows = [dataset[int(i)] for i in rank_indices]
     return collate_input_ids(rows)
+
+
+# =============================================================================
+# Distributed setup and process launch
+# =============================================================================
 
 
 def _local_compile_root() -> str | None:
@@ -334,6 +354,11 @@ def _spawn_worker(
     run_training(model_name, size, cfg)
 
 
+# =============================================================================
+# Training helpers
+# =============================================================================
+
+
 def get_amp_dtype(dtype: str) -> torch.dtype:
     if dtype == "bf16":
         return torch.bfloat16
@@ -456,6 +481,11 @@ def _sample_synced_train_branch(
     return "decode" if torch.rand((), device=device) < p else "denoise"
 
 
+# =============================================================================
+# Evaluation
+# =============================================================================
+
+
 @torch.no_grad()
 def eval_model_ppl(
     model: nn.Module,
@@ -530,10 +560,58 @@ def prepare_gpt2_eval_batch(
     return input_ids, labels
 
 
+def prepare_gpt2_eval_batch_retokenize(
+    batch: torch.Tensor,
+    *,
+    src_tokenizer_name: str,
+    gpt2_vocab_size: int,
+    fill_token_id: int,
+    device: torch.device,
+    max_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode with the train tokenizer, then re-encode with GPT-2 for Gen. PPL.
+
+    Required when the train model uses a non-GPT-2 vocabulary (e.g. ELF / T5).
+    """
+    from transformers import AutoTokenizer
+
+    from tokenizer import get_tokenizer
+
+    src_tok = get_tokenizer(src_tokenizer_name)
+    gpt2_tok = AutoTokenizer.from_pretrained("gpt2")
+    if gpt2_tok.pad_token_id is None:
+        gpt2_tok.pad_token = gpt2_tok.eos_token
+
+    texts = [
+        src_tok.decode(row.tolist(), skip_special_tokens=True)
+        for row in batch.detach().cpu()
+    ]
+    encoded = gpt2_tok(
+        texts,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_length,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"].to(device)
+    labels = input_ids.clone()
+    pad_id = int(gpt2_tok.pad_token_id)
+    labels[labels == pad_id] = -100
+    oov = input_ids >= gpt2_vocab_size
+    input_ids[oov] = fill_token_id
+    return input_ids, labels
+
+
 def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
     sampling_cfg: dict[str, Any] = {"use_fast_infer": cfg.eval_use_fast_infer}
     if cfg.model == "bd3lm":
         sampling_cfg["num_steps"] = cfg.eval_gen_steps
+    elif cfg.model == "elf":
+        # Keep eval sampling lighter than the default 32–64-step SDE.
+        sampling_cfg["num_sampling_steps"] = min(16, cfg.eval_gen_steps)
+        sampling_cfg["sampling_method"] = "ode"
+        sampling_cfg["temperature"] = 0.0  # paper decode: argmax
     return sampling_cfg
 
 
@@ -600,13 +678,24 @@ def eval_one_batch_gen_ppl(
                 sampling_cfg=_gen_eval_sampling_cfg(cfg),
             )
 
-    generated = generated.to(gpt2_device, non_blocking=True)
-    input_ids, labels = prepare_gpt2_eval_batch(
-        generated,
-        token_layout,
-        gpt2_vocab_size=gpt2_vocab_size,
-        fill_token_id=fill_token_id,
-    )
+    if cfg.model == "elf":
+        src_tok_name = get_preprocess(cfg.preprocess).tokenizer
+        input_ids, labels = prepare_gpt2_eval_batch_retokenize(
+            generated,
+            src_tokenizer_name=src_tok_name,
+            gpt2_vocab_size=gpt2_vocab_size,
+            fill_token_id=fill_token_id,
+            device=gpt2_device,
+            max_length=seqlen,
+        )
+    else:
+        generated = generated.to(gpt2_device, non_blocking=True)
+        input_ids, labels = prepare_gpt2_eval_batch(
+            generated,
+            token_layout,
+            gpt2_vocab_size=gpt2_vocab_size,
+            fill_token_id=fill_token_id,
+        )
     with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
         outputs = gpt2_model(input_ids, labels=labels)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
@@ -626,6 +715,11 @@ def eval_one_batch_gen_ppl(
     else:
         _train_log(summary)
     return gen_loss, gen_ppl
+
+
+# =============================================================================
+# Metrics logging and plots
+# =============================================================================
 
 
 def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> None:
@@ -881,6 +975,11 @@ def _rank0_log(msg: str, pbar: tqdm | None) -> None:
         print(line, flush=True)
 
 
+# =============================================================================
+# Checkpointing
+# =============================================================================
+
+
 def save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -999,6 +1098,11 @@ def load_checkpoint(
     return int(ck["step"])
 
 
+# =============================================================================
+# Train loop
+# =============================================================================
+
+
 def set_seed(seed: int, rank: int) -> None:
     s = seed + rank
     torch.manual_seed(s)
@@ -1101,7 +1205,7 @@ def train_loop(
     if rank == 0 and dual_branch:
         decoder_prob = float(cfg.extra.get("decoder_prob", 0.2))
         _train_log(
-            f"BDELF dual-branch: random denoise/decode sampling "
+            f"{cfg.model.upper()} dual-branch: random denoise/decode sampling "
             f"(decode prob={decoder_prob:g}); "
             "metrics/plots use decode CE; only decode steps count toward token budget",
         )
@@ -1337,6 +1441,11 @@ def train_loop(
         dist.barrier()
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     models = list_models() or ["<none>"]
     datasets = list_datasets() or ["<none>"]
@@ -1350,8 +1459,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--dataset owt --preprocess default\n"
             "  python train.py --model bdelf --config 900m-full "
             "--dataset owt --preprocess default\n"
-            "  python train.py --model bdelf --config 900m-ultra "
-            "--dataset owt --preprocess default\n\n"
+            "  python train.py --model elf --config 100m-fast "
+            "--dataset owt --preprocess elf\n"
+            "  python train.py --model elf --config 100m-full "
+            "--dataset owt --preprocess elf\n\n"
             f"Available models: {', '.join(models)}\n"
             f"Available datasets: {', '.join(datasets)}\n"
             f"Available preprocess configs: {', '.join(preprocess_names)}\n"
@@ -1452,6 +1563,11 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
     return args.model, size, cfg
 
 
+# =============================================================================
+# Entrypoint
+# =============================================================================
+
+
 def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     rank, world_size, device, is_distributed = setup_distributed(cfg)
     set_seed(cfg.seed, rank)
@@ -1470,7 +1586,7 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
             opt_steps = int(cfg.extra.get("max_optimizer_steps", 0)) or (
                 cfg.max_steps // max(1, cfg.grad_accum_steps)
             )
-            if cfg.model == "bdelf":
+            if cfg.model in ("bdelf", "elf"):
                 _train_log(
                     f"Token budget: {cfg.target_tokens:,} decode-equivalent tokens "
                     f"({cfg.effective_tokens_per_optimizer_step:,}/opt-step decode, "

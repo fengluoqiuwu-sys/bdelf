@@ -1,0 +1,7 @@
+_doc: >
+  elf/900m-full for 24GB×4; ELF-L VRAM-limited micro-batch.
+name: 900m-full
+batch_size: 2
+global_batch_size: 32
+num_params_m: 652.0
+estimated_peak_vram_gb: 18.5

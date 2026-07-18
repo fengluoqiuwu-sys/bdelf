@@ -1,0 +1,8 @@
+_doc: >
+  elf/100m-full for 24GB×4; global_batch_size=512 matches ELF paper.
+  Train budget ≤18.5GB (card - 4GB head - 1.5GB gpt2-large eval).
+name: 100m-full
+batch_size: 8
+global_batch_size: 512
+num_params_m: 105.0
+estimated_peak_vram_gb: 16.0

@@ -1,0 +1,7 @@
+_doc: >
+  elf/900m-ultra for 48GB×8; ELF-L scaled batch.
+name: 900m-ultra
+batch_size: 4
+global_batch_size: 64
+num_params_m: 652.0
+estimated_peak_vram_gb: 36.0

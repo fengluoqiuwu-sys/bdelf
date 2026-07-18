@@ -23,7 +23,7 @@ TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
-_TRAIN_MODELS = ("ar", "bd3lm", "bdelf")
+_TRAIN_MODELS = ("ar", "bd3lm", "bdelf", "elf")
 _MODEL_CONFIG_RE = re.compile(r"^(100m|300m|900m)-(fast|full|ultra)$")
 _HARDWARE_BY_VARIANT = {
     "fast": "fast-16gb",
@@ -209,7 +209,7 @@ class FL_TrainConfig:
     @property
     def seq_tokens(self) -> int:
         chunk = int(self.extra.get("chunk_length", 1024))
-        if self.model in ("bd3lm", "bdelf"):
+        if self.model in ("bd3lm", "bdelf", "elf"):
             return chunk
         return max(1, chunk - 1)
 
@@ -224,7 +224,7 @@ class FL_TrainConfig:
 
     @property
     def effective_tokens_per_optimizer_step(self) -> int:
-        """Decode-equivalent tokens per step (BDELF: scaled by ``decoder_prob``)."""
+        """Decode-equivalent tokens per step (BDELF/ELF: scaled by ``decoder_prob``)."""
         raw = self.extra.get("effective_tokens_per_optimizer_step")
         if raw is not None:
             return int(raw)
@@ -267,7 +267,7 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
 
 
 def _model_decoder_prob(model: str, model_config: str) -> float:
-    if model != "bdelf":
+    if model not in ("bdelf", "elf"):
         return 1.0
     path = resolve_model_config_path(model, model_config)
     with open(path, encoding="utf-8") as f:
@@ -467,12 +467,12 @@ def compose_train_config(
         * resolved_world_size
         * (
             chunk_length
-            if model in ("bd3lm", "bdelf")
+            if model in ("bd3lm", "bdelf", "elf")
             else max(1, chunk_length - 1)
         )
     )
     decoder_prob = _model_decoder_prob(model, model_config)
-    if model == "bdelf":
+    if model in ("bdelf", "elf"):
         effective_tokens_per_step = max(
             1, round(raw_tokens_per_step * decoder_prob),
         )
@@ -489,7 +489,7 @@ def compose_train_config(
     max_optimizer_steps = resolved.max_steps
     target_tokens = max_optimizer_steps * effective_tokens_per_step
 
-    # BDELF optimizer-step count is ~1/decoder_prob× longer (decode-equivalent
+    # BDELF/ELF optimizer-step count is ~1/decoder_prob× longer (decode-equivalent
     # token budget). Scale absolute eval/save/plot intervals by the same factor
     # so wall-clock cadence stays comparable to AR/BD3LM.
     log_plot_step = resolved.log_plot_step
@@ -497,7 +497,7 @@ def compose_train_config(
     save_step = resolved.save_step
     snapshot_step = resolved.snapshot_step
     branch_scale = 1
-    if model == "bdelf":
+    if model in ("bdelf", "elf"):
         if decoder_prob <= 0.0 or decoder_prob > 1.0:
             raise ValueError(
                 f"{run_name}: decoder_prob must be in (0, 1], got {decoder_prob}"

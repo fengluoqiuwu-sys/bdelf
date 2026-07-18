@@ -1,0 +1,8 @@
+_doc: ELF preprocessing (T5-small tokenizer, 1024-token chunks; matches paper L=1024)
+
+name: elf
+tokenizer: t5-small
+chunk_length: 1024
+overflow_mode: discard
+seed: 42
+text_column: text

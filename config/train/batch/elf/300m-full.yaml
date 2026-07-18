@@ -1,0 +1,7 @@
+_doc: >
+  elf/300m-full for 24GB×4; reduced global batch vs ELF-B for VRAM.
+name: 300m-full
+batch_size: 4
+global_batch_size: 128
+num_params_m: 342.0
+estimated_peak_vram_gb: 18.0

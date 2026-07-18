@@ -1,0 +1,6 @@
+_doc: elf/300m-fast micro-batch for fast-16gb (ELF-M)
+name: 300m-fast
+batch_size: 1
+grad_accum_steps: 8
+num_params_m: 342.0
+estimated_peak_vram_gb: 12.0

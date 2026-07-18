@@ -11,8 +11,9 @@ from torch import nn
 
 from train.train import FL_TrainConfig
 
+# AR/BD3LM/BDELF: c_attn/c_proj/c_fc; ELF: qkv/proj/w12/w3
 _HIDDEN_LINEAR_WEIGHT_RE = re.compile(
-    r"\.(attn|mlp)\.(c_attn|c_proj|c_fc)\.weight$"
+    r"\.(attn|mlp)\.(c_attn|c_proj|c_fc|qkv|proj|w12|w3)\.weight$"
 )
 
 

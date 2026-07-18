@@ -1,0 +1,12 @@
+_doc: >
+  T5-small tokenizer for ELF. Uses native T5 specials (no vocab expansion) so
+  the frozen T5 encoder sees in-distribution token ids. bos maps to <pad>
+  because T5 has no dedicated BOS; preprocess still prefixes each chunk.
+
+name: t5-small
+base_tokenizer: t5-small
+base_tokenizer_cache_path: cache/tokenizers/t5-small
+special_tokens: []
+bos_token: "<pad>"
+eos_token: "</s>"
+pad_token: "<pad>"

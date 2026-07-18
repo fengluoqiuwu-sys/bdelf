@@ -163,7 +163,24 @@ class _FLTokenizerMixin:
         return path.exists() and (path / "tokenizer_config.json").exists()
 
     def get_special_token_id(self, name: str) -> int:
-        """Return the ID for ``<|name|>`` (e.g. ``bos`` → ``<|bos|>``)."""
+        """Return the ID for a layout role (``bos`` / ``eos`` / ``pad``).
+
+        Resolution order:
+        1. YAML override ``{name}_token`` in config ``extra`` (e.g. ``bos_token: "<pad>"``)
+        2. Added special ``<|{name}|>`` (e.g. ``<|bos|>``)
+        """
+        override = self.config.extra.get(f"{name}_token")
+        if override is not None:
+            token = str(override)
+            token_id = self.convert_tokens_to_ids(token)
+            unk = getattr(self, "unk_token_id", None)
+            if token_id is None or (unk is not None and token_id == unk):
+                raise ValueError(
+                    f"Tokenizer '{self.config.name}' override {name}_token={token!r} "
+                    f"is missing from the vocabulary."
+                )
+            return int(token_id)
+
         token = f"<|{name}|>"
         token_id = self.convert_tokens_to_ids(token)
         unk = getattr(self, "unk_token_id", None)

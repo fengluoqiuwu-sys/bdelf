@@ -1,0 +1,33 @@
+_doc: ELF config template (Embedded Language Flows, no CFG)
+
+name: prototype
+tokenizer: t5-small
+max_seq_len: 1024
+encoder_model_name: t5-small
+text_encoder_dim: 512
+bottleneck_dim: 128
+n_layer: 12
+n_head: 12
+n_embd: 768
+dropout: 0.0
+num_time_tokens: 4
+num_model_mode_tokens: 4
+self_cond_prob: 0.5
+latent_mean: 0.0
+latent_std: 0.2
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+decoder_prob: 0.2
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+decoder_noise_scale: 5.0
+t_eps: 0.05
+time_schedule: logit_normal
+
+sampling:
+  sampling_method: sde
+  num_sampling_steps: 32
+  sde_gamma: 1.5
+  time_schedule: logit_normal
+  temperature: 0.0
