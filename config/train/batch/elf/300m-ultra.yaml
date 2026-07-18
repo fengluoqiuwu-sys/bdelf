@@ -1,7 +1,8 @@
 _doc: >
-  elf/300m-ultra for 48GB×8; global_batch closer to paper 512.
+  elf/300m-ultra for 48GB×8; independent variant. Train budget ≤42.5GB (card - 4GB head - 1.5GB gpt2).
+  batch_size is power-of-two or multiple of 8 (extrap). global_batch_size=512 matches ELF paper.
 name: 300m-ultra
-batch_size: 8
-global_batch_size: 256
-num_params_m: 342.0
-estimated_peak_vram_gb: 32.0
+batch_size: 16
+global_batch_size: 512
+num_params_m: 341.2
+estimated_peak_vram_gb: 37.2

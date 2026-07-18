@@ -358,7 +358,7 @@ def loss_to_ppl(loss: float) -> float:
 
 
 def _eval_loss_branch(model: nn.Module) -> str | None:
-    """BDELF eval uses decode CE; AR/BD3LM use the default training loss."""
+    """BDELF/ELF eval uses decode CE; AR/BD3LM use the default training loss."""
     if uses_dual_branch_logging(model):
         return "decode"
     return None
@@ -693,7 +693,7 @@ def _parse_float(raw: str | None) -> float | None:
 def _decode_ce_train_series(
     train_rows: list[dict[str, str]],
 ) -> tuple[list[int], list[float], list[float]]:
-    """Train decode-CE points for plotting (BDELF dual-branch)."""
+    """Train decode-CE points for plotting (BDELF/ELF dual-branch)."""
     steps: list[int] = []
     ppls: list[float] = []
     lrs: list[float] = []
@@ -794,7 +794,7 @@ def update_ppl_plots(
             ax_lr.set_ylabel("learning rate")
             ax_lr.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
 
-        ax_ppl.set_xlabel("step")
+        ax_ppl.set_xlabel("data step" if dual_branch else "step")
         ax_ppl.set_ylabel("perplexity")
         ax_ppl.set_title(f"PPL & LR (ppl ≤ {cap:g})")
         ax_ppl.grid(True, alpha=0.25)
@@ -1105,10 +1105,11 @@ def train_loop(
     dual_branch = uses_dual_branch_logging(model)
     if rank == 0 and dual_branch:
         decoder_prob = float(cfg.extra.get("decoder_prob", 0.2))
+        denoise_prob = max(0.0, 1.0 - decoder_prob)
         _train_log(
-            f"{cfg.model.upper()} dual-branch: random denoise/decode sampling "
-            f"(decode prob={decoder_prob:g}); "
-            "metrics/plots use decode CE; only decode steps count toward token budget",
+            f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
+            f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
+            "each micro-step is a data step; metrics/plots use decode CE",
         )
 
     model.train()
@@ -1192,14 +1193,11 @@ def train_loop(
             train_loss = micro_loss.item() if loss_ok else float("nan")
             loss_branch = getattr(raw, "last_loss_branch", "") if dual_branch else ""
             elapsed = time.time() - t0
+            # Every micro-step consumes a full data batch (dual-branch 4:1 is loss mix).
             seq_tokens = batch.size(0) * (
                 batch.size(1) if uses_full_sequence(model) else batch.size(1) - 1
             )
-            if dual_branch:
-                effective_tokens = seq_tokens if loss_branch == "decode" else 0
-            else:
-                effective_tokens = seq_tokens
-            tokens_per_sec = effective_tokens / max(elapsed, 1e-6)
+            tokens_per_sec = seq_tokens / max(elapsed, 1e-6)
 
             row = build_train_row(
                 step, train_loss, lr, tokens_per_sec,
@@ -1217,9 +1215,9 @@ def train_loop(
                     }
                 elif dual_branch:
                     postfix = {
-                        "branch": "denoise",
                         "mse": f"{train_loss:.3f}",
                         "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
                     }
                 else:
                     postfix = {
@@ -1487,21 +1485,12 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
             opt_steps = int(cfg.extra.get("max_optimizer_steps", 0)) or (
                 cfg.max_steps // max(1, cfg.grad_accum_steps)
             )
-            if cfg.model in ("bdelf", "elf"):
-                _train_log(
-                    f"Token budget: {cfg.target_tokens:,} decode-equivalent tokens "
-                    f"({cfg.effective_tokens_per_optimizer_step:,}/opt-step decode, "
-                    f"{cfg.tokens_per_optimizer_step:,}/opt-step raw) → "
-                    f"{opt_steps:,} optimizer steps "
-                    f"({cfg.max_steps:,} micro-steps, accum={cfg.grad_accum_steps})",
-                )
-            else:
-                _train_log(
-                    f"Token budget: {cfg.target_tokens:,} tokens "
-                    f"({cfg.tokens_per_optimizer_step:,}/opt-step) → "
-                    f"{opt_steps:,} optimizer steps "
-                    f"({cfg.max_steps:,} micro-steps, accum={cfg.grad_accum_steps})",
-                )
+            _train_log(
+                f"Token budget: {cfg.target_tokens:,} data tokens "
+                f"({cfg.tokens_per_optimizer_step:,}/opt-step) → "
+                f"{opt_steps:,} optimizer steps "
+                f"({cfg.max_steps:,} data micro-steps, accum={cfg.grad_accum_steps})",
+            )
 
     try:
         # On a cache miss only rank 0 downloads/builds; the other ranks wait

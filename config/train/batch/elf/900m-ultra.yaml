@@ -1,7 +1,8 @@
 _doc: >
-  elf/900m-ultra for 48GB×8; ELF-L scaled batch.
+  elf/900m-ultra for 48GB×8; independent variant. Train budget ≤42.5GB (card - 4GB head - 1.5GB gpt2).
+  batch_size is power-of-two or multiple of 8 (extrap).
 name: 900m-ultra
-batch_size: 4
+batch_size: 8
 global_batch_size: 64
-num_params_m: 652.0
-estimated_peak_vram_gb: 36.0
+num_params_m: 650.1
+estimated_peak_vram_gb: 30.2

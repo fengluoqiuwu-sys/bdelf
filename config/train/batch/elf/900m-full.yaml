@@ -1,7 +1,8 @@
 _doc: >
-  elf/900m-full for 24GB×4; ELF-L VRAM-limited micro-batch.
+  elf/900m-full for 24GB×4; independent variant. Train budget ≤18.5GB (card - 4GB head - 1.5GB gpt2).
+  batch_size is power-of-two or multiple of 8 (meas). bs=4 is too tight (~18.2 alloc / ~19.9 reserved).
 name: 900m-full
 batch_size: 2
 global_batch_size: 32
-num_params_m: 652.0
-estimated_peak_vram_gb: 18.5
+num_params_m: 650.1
+estimated_peak_vram_gb: 12.4

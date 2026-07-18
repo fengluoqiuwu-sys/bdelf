@@ -1,7 +1,7 @@
 _doc: Schedule template (unified token-budget scheme)
 name: prototype
 variant: fast
-# Token budget drives max_steps; bdelf counts decode-equivalent tokens.
+# Token budget drives max_steps (raw data tokens; BDELF/ELF 4:1 is loss mix only).
 target_tokens: 160000000
 # Warmup as a fraction of the derived max_steps.
 warmup_ratio: 0.1

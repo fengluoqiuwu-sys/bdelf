@@ -224,7 +224,7 @@ class FL_TrainConfig:
 
     @property
     def effective_tokens_per_optimizer_step(self) -> int:
-        """Decode-equivalent tokens per step (BDELF/ELF: scaled by ``decoder_prob``)."""
+        """Data tokens per optimizer step (same as raw; dual-branch 4:1 is loss mix only)."""
         raw = self.extra.get("effective_tokens_per_optimizer_step")
         if raw is not None:
             return int(raw)
@@ -471,42 +471,30 @@ def compose_train_config(
             else max(1, chunk_length - 1)
         )
     )
+    # Dual-branch (BDELF/ELF) uses denoise:decode ≈ 4:1 as a loss mix only:
+    # every micro-step still consumes a full data batch, so the token budget and
+    # schedule intervals match AR/BD3LM (raw data tokens / optimizer steps).
     decoder_prob = _model_decoder_prob(model, model_config)
-    if model in ("bdelf", "elf"):
-        effective_tokens_per_step = max(
-            1, round(raw_tokens_per_step * decoder_prob),
-        )
-    else:
-        effective_tokens_per_step = raw_tokens_per_step
-    resolved = _resolve_schedule(
-        schedule,
-        run_name=run_name,
-        tokens_per_step=effective_tokens_per_step,
-    )
-    # ``_resolve_schedule`` returns optimizer-step counts (one update after
-    # ``grad_accum_steps`` micro-batches). ``train_loop`` increments ``step``
-    # every micro-batch, so convert budget/intervals to micro-steps here.
-    max_optimizer_steps = resolved.max_steps
-    target_tokens = max_optimizer_steps * effective_tokens_per_step
-
-    # BDELF/ELF optimizer-step count is ~1/decoder_prob× longer (decode-equivalent
-    # token budget). Scale absolute eval/save/plot intervals by the same factor
-    # so wall-clock cadence stays comparable to AR/BD3LM.
-    log_plot_step = resolved.log_plot_step
-    eval_step = resolved.eval_step
-    save_step = resolved.save_step
-    snapshot_step = resolved.snapshot_step
-    branch_scale = 1
     if model in ("bdelf", "elf"):
         if decoder_prob <= 0.0 or decoder_prob > 1.0:
             raise ValueError(
                 f"{run_name}: decoder_prob must be in (0, 1], got {decoder_prob}"
             )
-        branch_scale = max(1, round(1.0 / decoder_prob))
-        log_plot_step = max(1, log_plot_step * branch_scale)
-        eval_step = max(1, eval_step * branch_scale)
-        save_step = max(1, save_step * branch_scale)
-        snapshot_step = max(1, snapshot_step * branch_scale)
+    resolved = _resolve_schedule(
+        schedule,
+        run_name=run_name,
+        tokens_per_step=raw_tokens_per_step,
+    )
+    # ``_resolve_schedule`` returns optimizer-step counts (one update after
+    # ``grad_accum_steps`` micro-batches). ``train_loop`` increments ``step``
+    # every micro-batch, so convert budget/intervals to micro-steps here.
+    max_optimizer_steps = resolved.max_steps
+    target_tokens = max_optimizer_steps * raw_tokens_per_step
+
+    log_plot_step = resolved.log_plot_step
+    eval_step = resolved.eval_step
+    save_step = resolved.save_step
+    snapshot_step = resolved.snapshot_step
 
     max_steps = max_optimizer_steps * accum
     warmup_steps = resolved.warmup_steps * accum
@@ -524,11 +512,11 @@ def compose_train_config(
         {
             "chunk_length": chunk_length,
             "tokens_per_optimizer_step": raw_tokens_per_step,
-            "effective_tokens_per_optimizer_step": effective_tokens_per_step,
+            "effective_tokens_per_optimizer_step": raw_tokens_per_step,
             "decoder_prob": decoder_prob,
             "target_tokens": target_tokens,
             "max_optimizer_steps": max_optimizer_steps,
-            "schedule_branch_scale": branch_scale,
+            "schedule_branch_scale": 1,
             "config_refs": {
                 "hardware": hardware_name,
                 "optimizer": f"{model}/{model_config}",
