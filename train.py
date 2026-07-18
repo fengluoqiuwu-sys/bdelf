@@ -47,6 +47,7 @@ from train.eval import (
     get_amp_dtype,
     load_gen_eval_baseline,
     uses_dual_branch_logging,
+    uses_full_sequence,
 )
 from train.metrics import (
     EVAL_CSV_FIELDS,
