@@ -1,7 +1,7 @@
 _doc: >
   ar1_5/300m-ultra for ≤42.5GB.
 name: 300m-ultra
-batch_size: 8
+batch_size: 16
 global_batch_size: 128
 num_params_m: 303.4
-estimated_peak_vram_gb: 28.0
+estimated_peak_vram_gb: 34.0

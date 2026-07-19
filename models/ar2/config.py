@@ -1,4 +1,4 @@
-"""AR2 (anchor + block-parallel refinement LM) configuration.
+"""AR2 (anchor + intra-block causal AR) configuration.
 
 Spec: temp/ar2.md. Hyperparameters live in config/models/ar2/*.yaml; nothing
 architecture-related is hard-coded in the model.
@@ -14,7 +14,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_AR2Config(PretrainedConfig):
-    """Configuration for the AR2 semi-autoregressive anchor model."""
+    """Configuration for the AR2 anchor + block-causal LM."""
 
     model_type = "fl_ar2"
     _YAML_REQUIRED = frozenset(
@@ -29,8 +29,6 @@ class FL_AR2Config(PretrainedConfig):
             "n_embd",
             "dropout",
             "attn_backend",
-            "mask_ratio_min",
-            "num_noise_copies",
             "attn_type_bias",
             "fix_bos",
         }
@@ -54,13 +52,14 @@ class FL_AR2Config(PretrainedConfig):
         n_embd: int = 672,
         dropout: float = 0.1,
         attn_backend: str = "flex",
-        mask_ratio_min: float = 0.05,
-        num_noise_copies: int = 2,
         attn_type_bias: bool = True,
         fix_bos: bool = True,
         sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        # Drop legacy mask-predict keys so old yaml/checkpoint configs still load.
+        kwargs.pop("mask_ratio_min", None)
+        kwargs.pop("num_noise_copies", None)
         super().__init__(**kwargs)
         self.name = name
         self.tokenizer = tokenizer
@@ -78,8 +77,6 @@ class FL_AR2Config(PretrainedConfig):
         self.n_embd = n_embd
         self.dropout = dropout
         self.attn_backend = attn_backend
-        self.mask_ratio_min = mask_ratio_min
-        self.num_noise_copies = num_noise_copies
         self.attn_type_bias = attn_type_bias
         self.fix_bos = fix_bos
         self.sampling = sampling or {}
@@ -105,8 +102,6 @@ class FL_AR2Config(PretrainedConfig):
             "n_embd": self.n_embd,
             "dropout": self.dropout,
             "attn_backend": self.attn_backend,
-            "mask_ratio_min": self.mask_ratio_min,
-            "num_noise_copies": self.num_noise_copies,
             "attn_type_bias": self.attn_type_bias,
             "fix_bos": self.fix_bos,
         }

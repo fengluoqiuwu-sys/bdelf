@@ -1,4 +1,4 @@
-_doc: AR1.5 ~870M params (28x1536, block 16, no t_window)
+_doc: AR1.5 ~870M (28x1536, block-causal, B=16, no t_window)
 
 name: ar1_5-900m
 tokenizer: gpt2
@@ -10,11 +10,7 @@ n_head: 16
 n_embd: 1536
 dropout: 0.1
 attn_backend: flex
-mask_ratio_min: 0.05
-num_noise_copies: 2
 fix_bos: true
 
 sampling:
   temperature: 1.0
-  commit_threshold: 0.9
-  max_refine_iters: 16

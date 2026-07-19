@@ -1,8 +1,7 @@
 _doc: >
-  ar2/300m-fast micro-batch for fast-16gb. 相对 bd3lm 100m 实测峰值比约 1.17x
-  （有效序列更长），按 bd3lm 300m-fast(7.9GB) 折算。
+  ar2/300m-fast for fast-16gb. 块内因果，batch 对齐 AR 300m-fast。
 name: 300m-fast
-batch_size: 1
-grad_accum_steps: 8
+batch_size: 2
+grad_accum_steps: 4
 num_params_m: 303.4
-estimated_peak_vram_gb: 9.2
+estimated_peak_vram_gb: 8.5

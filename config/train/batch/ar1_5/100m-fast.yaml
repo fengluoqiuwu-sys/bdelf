@@ -1,7 +1,7 @@
 _doc: >
-  ar1_5/100m-fast for fast-16gb. denser t-attn than ar2; bs matches ar2 100m-fast.
+  ar1_5/100m-fast for fast-16gb. 无 t_window、t 注意力更密；bs 同 ar2。
 name: 100m-fast
-batch_size: 4
-grad_accum_steps: 4
+batch_size: 8
+grad_accum_steps: 2
 num_params_m: 99.0
-estimated_peak_vram_gb: 8.5
+estimated_peak_vram_gb: 7.0

@@ -1,8 +1,9 @@
 _doc: >
-  ar2/100m-full for 24GB (single card or ×N); train budget ≤18.5GB
-  (card - 4GB head - 1.5GB gpt2-large). 实测 bs=8 峰值 14.6GB（含优化器状态）。
+  ar2/100m-full for 24GB (single card or ×N); budget ≤18.5GB
+  (card - 4GB head - 1.5GB gpt2-large). 块内因果后对齐 AR 100m-full 的
+  global_batch；估计峰值略高于 AR（FlexAttention + 锚点）。
 name: 100m-full
-batch_size: 8
-global_batch_size: 64
+batch_size: 24
+global_batch_size: 192
 num_params_m: 99.0
-estimated_peak_vram_gb: 14.6
+estimated_peak_vram_gb: 17.0

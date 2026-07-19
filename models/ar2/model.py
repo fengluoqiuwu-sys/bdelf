@@ -1,26 +1,29 @@
-"""AR2: semantic-anchor semi-autoregressive LM with block-parallel refinement.
+"""AR2: semantic-anchor block-causal LM (intra-block token-by-token AR).
 
-Spec: temp/ar2.md.
+Spec: temp/ar2.md (revised: intra-block mask-predict replaced by causal AR).
 
-Sequence layout (training, single forward):
-  [ copy A | copy B_0 | ... | copy B_{M-1} ]
-  - copy A (clean stream): anchors interleaved with clean tokens,
-    per block: [s_0..s_{ns-1}, t_0..t_{B-1}]; provides KV only, no loss.
-  - copy B_m (noise streams): the K*B token positions with per-block random
-    masking; loss on masked positions only (NELBO with 1/t_k weighting).
+Sequence layout (training, single clean stream):
+  per block: [s_0..s_{ns-1}, t_0..t_{B-1}], total K*(B+ns) positions.
 
 Attention visibility (mask_mod, pure arithmetic on indices):
-  (a) any query sees anchors of blocks <= its own block (copy A);
-  (b) any query sees clean t of the previous W blocks (copy A);
-  (c) t queries see their own block bidirectionally (A within A, B_m within B_m).
+  (a) any query sees anchors of blocks <= its own block;
+  (b) any query sees t of the previous W blocks;
+  (c) t queries see own-block t causally (kv offset <= query offset);
+      anchors never see own-block t (they predict its first token).
+
+Prediction targets (exact NLL, directly comparable to the AR baseline):
+  - the last anchor slot of block k predicts the block's first token
+    (skipped for block 0 when fix_bos: BOS is given, never predicted);
+  - t at in-block offset j < B-1 predicts offset j+1;
+  - the last t of each block has no target (next block starts at its anchor).
 
 Positions (dual-coordinate RoPE): t tokens use original text indices; anchors
-share their block's start index. Roles (s / t_clean / t_mask) get an additive
-type embedding at layer 0 and fusion-safe per-layer role additives on Q/K.
+share their block's start index. Roles (s / t) get an additive type embedding
+at layer 0 and fusion-safe per-layer role additives on Q/K.
 
-Inference is blockwise: one anchor step, then iterative confidence-based
-parallel unmasking, then one finalize pass that pushes clean KV into a
-sliding W-block t-cache. Long-range context keeps only anchor KV.
+Inference is blockwise: one anchor step (whose logits sample the block's first
+token), then B token-by-token steps; the final token step only realizes KV.
+Long-range context keeps anchor KV only; t KV lives in a sliding W-block cache.
 """
 
 from __future__ import annotations
@@ -42,8 +45,7 @@ except ImportError:
     FLEX_ATTN_AVAILABLE = False
 
 ROLE_S = 0
-ROLE_T_CLEAN = 1
-ROLE_T_MASK = 2
+ROLE_T = 1
 
 _flex_attention_compiled = None
 
@@ -58,7 +60,7 @@ def fused_flex_attention(
 
     Eager (fast / no whole-model compile): wrap once with ``torch.compile`` so
     FlexAttention does **not** fall back to the unfused path that materializes
-    the full ``L×L`` score matrix (OOM at AR2 seq len ≈ 3k).
+    the full ``L×L`` score matrix.
     Never pass a ``score_mod`` that indexes data tensors by ``q_idx``/``kv_idx``
     — that commonly breaks fusion and triggers the same OOM.
     """
@@ -75,50 +77,31 @@ def make_ar2_mask_mod(
     block_size: int,
     num_anchors: int,
     t_window: int,
-    num_blocks: int,
-    num_noise_copies: int,
 ):
-    """Visibility predicate over the concatenated [A | B_0..B_{M-1}] layout."""
+    """Visibility predicate over the single [s.. t..] * K training layout."""
     bs = block_size
     ns = num_anchors
     w = t_window
-    la = num_blocks * (bs + ns)
-    kb = num_blocks * bs
 
     def mask_mod(b, h, q_idx, kv_idx):
         del b, h
-        q_in_a = q_idx < la
-        kv_in_a = kv_idx < la
+        q_off = q_idx % (bs + ns)
+        q_blk = q_idx // (bs + ns)
+        q_is_s = q_off < ns
 
-        q_off_a = q_idx % (bs + ns)
-        q_blk_a = q_idx // (bs + ns)
-        q_is_s = q_in_a & (q_off_a < ns)
-
-        kv_off_a = kv_idx % (bs + ns)
-        kv_blk_a = kv_idx // (bs + ns)
-        kv_is_s = kv_in_a & (kv_off_a < ns)
-
-        qb = q_idx - la
-        q_copy = qb // kb
-        q_blk_b = (qb % kb) // bs
-        kvb = kv_idx - la
-        kv_copy = kvb // kb
-        kv_blk_b = (kvb % kb) // bs
-
-        q_blk = torch.where(q_in_a, q_blk_a, q_blk_b)
-        kv_blk = torch.where(kv_in_a, kv_blk_a, kv_blk_b)
+        kv_off = kv_idx % (bs + ns)
+        kv_blk = kv_idx // (bs + ns)
+        kv_is_s = kv_off < ns
 
         # (a) anchors of current and previous blocks
         see_s = kv_is_s & (kv_blk <= q_blk)
-        # (b) clean t of the previous W blocks (copy A only)
-        kv_clean_t = kv_in_a & ~kv_is_s
-        see_window = kv_clean_t & (kv_blk >= q_blk - w) & (kv_blk <= q_blk - 1)
-        # (c) own block, bidirectional, t queries only
-        same_blk_a = q_in_a & ~q_is_s & kv_clean_t & (kv_blk_a == q_blk_a)
-        same_blk_b = (
-            (~q_in_a) & (~kv_in_a) & (q_copy == kv_copy) & (q_blk_b == kv_blk_b)
+        # (b) t of the previous W blocks
+        see_window = ~kv_is_s & (kv_blk >= q_blk - w) & (kv_blk <= q_blk - 1)
+        # (c) own-block t, causal, t queries only (anchors must not leak)
+        same_blk_causal = (
+            ~q_is_s & ~kv_is_s & (kv_blk == q_blk) & (kv_off <= q_off)
         )
-        return see_s | see_window | same_blk_a | same_blk_b
+        return see_s | see_window | same_blk_causal
 
     return mask_mod
 
@@ -146,8 +129,8 @@ class Ar2Attention(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim)
         # Fusion-safe role signal: add per-role vectors to Q/K (not a score_mod
         # table lookup, which breaks FlexAttention fusion and OOMs).
-        self.role_q = nn.Embedding(3, n_embd) if attn_type_bias else None
-        self.role_k = nn.Embedding(3, n_embd) if attn_type_bias else None
+        self.role_q = nn.Embedding(2, n_embd) if attn_type_bias else None
+        self.role_k = nn.Embedding(2, n_embd) if attn_type_bias else None
         if self.role_q is not None:
             nn.init.zeros_(self.role_q.weight)
             nn.init.zeros_(self.role_k.weight)
@@ -267,7 +250,7 @@ class Block(nn.Module):
 
 
 class _AR2Backbone(nn.Module):
-    """AR2 backbone: anchor-token semi-AR training and blockwise inference."""
+    """AR2 backbone: anchor-token block-causal training and blockwise inference."""
 
     full_sequence_training = True
 
@@ -283,8 +266,6 @@ class _AR2Backbone(nn.Module):
         n_embd: int = 672,
         dropout: float = 0.1,
         attn_backend: str = "flex",
-        mask_ratio_min: float = 0.05,
-        num_noise_copies: int = 2,
         attn_type_bias: bool = True,
         fix_bos: bool = True,
     ) -> None:
@@ -302,18 +283,15 @@ class _AR2Backbone(nn.Module):
         self.num_anchors = num_anchors
         self.t_window = t_window
         self.n_head = n_head
-        self.mask_ratio_min = mask_ratio_min
-        self.num_noise_copies = num_noise_copies
         self.fix_bos = fix_bos
 
-        # Vocab layout: [tokenizer vocab | [MASK] | <s_0>..<s_{ns-1}>]
+        # Vocab layout: [tokenizer vocab | <s_0>..<s_{ns-1}>]
         self.vocab_size = token_layout.vocab_size
-        self.mask_index = token_layout.vocab_size
-        self.anchor_index0 = token_layout.vocab_size + 1
-        self.model_vocab_size = token_layout.vocab_size + 1 + num_anchors
+        self.anchor_index0 = token_layout.vocab_size
+        self.model_vocab_size = token_layout.vocab_size + num_anchors
 
         self.wte = nn.Embedding(self.model_vocab_size, n_embd)
-        self.type_emb = nn.Embedding(3, n_embd)
+        self.type_emb = nn.Embedding(2, n_embd)
         self.drop = nn.Dropout(dropout)
         self.h = nn.ModuleList(
             Block(n_embd, n_head, dropout, attn_type_bias) for _ in range(n_layer)
@@ -350,40 +328,52 @@ class _AR2Backbone(nn.Module):
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
 
     def _get_layout(self, n: int, device: torch.device) -> dict[str, torch.Tensor]:
-        """Static per-(seq_len) tensors: positions, copy-A template/roles."""
+        """Static per-(seq_len) tensors: ids template, roles, positions, loss map."""
         key = (n, device)
         cached = self._layout_cache.get(key)
         if cached is not None:
             return cached
 
-        bs, ns, m = self.block_size, self.num_anchors, self.num_noise_copies
+        bs, ns = self.block_size, self.num_anchors
         k = n // bs
-        # Copy A: per block [anchors | tokens]
-        idx_a = torch.arange(k * (bs + ns), device=device)
-        off_a = idx_a % (bs + ns)
-        blk_a = idx_a // (bs + ns)
-        a_is_anchor = off_a < ns
+        idx = torch.arange(k * (bs + ns), device=device)
+        off = idx % (bs + ns)
+        blk = idx // (bs + ns)
+        is_anchor = off < ns
         # anchors take the block-start original index; t tokens their own index
-        pos_a = torch.where(a_is_anchor, blk_a * bs, blk_a * bs + off_a - ns)
-        # gather index from x0 for copy-A t positions (dummy 0 at anchors)
-        gather_a = (blk_a * bs + (off_a - ns).clamp(min=0)).long()
+        positions = torch.where(is_anchor, blk * bs, blk * bs + off - ns).long()
+        # gather index from x0 for t positions (dummy 0 at anchors)
+        gather_t = (blk * bs + (off - ns).clamp(min=0)).long()
         anchor_ids = self.anchor_index0 + torch.where(
-            a_is_anchor, off_a, torch.zeros_like(off_a),
+            is_anchor, off, torch.zeros_like(off),
         )
-        rho_a = torch.where(
-            a_is_anchor,
-            torch.full_like(off_a, ROLE_S),
-            torch.full_like(off_a, ROLE_T_CLEAN),
-        )
-        pos_b = torch.arange(n, device=device).repeat(m)
-        positions = torch.cat([pos_a, pos_b]).long()
+        rho = torch.where(
+            is_anchor,
+            torch.full_like(off, ROLE_S),
+            torch.full_like(off, ROLE_T),
+        ).long()
+
+        # Loss positions:
+        #   last anchor slot of block k -> target x0[k*bs] (skip k=0 if fix_bos);
+        #   t offset j in [0, bs-2]     -> target x0[k*bs + j + 1].
+        is_last_anchor = off == (ns - 1)
+        is_pred_t = (~is_anchor) & (off - ns < bs - 1)
+        if self.fix_bos:
+            is_last_anchor = is_last_anchor & (blk > 0)
+        loss_mask = is_last_anchor | is_pred_t
+        loss_pos = torch.nonzero(loss_mask, as_tuple=False).squeeze(-1)
+        tgt_gather = torch.where(
+            is_anchor, blk * bs, blk * bs + off - ns + 1,
+        )[loss_pos].long()
 
         cached = {
-            "a_is_anchor": a_is_anchor,
-            "gather_a": gather_a,
+            "is_anchor": is_anchor,
+            "gather_t": gather_t,
             "anchor_ids": anchor_ids.long(),
-            "rho_a": rho_a.long(),
+            "rho": rho,
             "positions": positions,
+            "loss_pos": loss_pos.long(),
+            "tgt_gather": tgt_gather,
         }
         if len(self._layout_cache) >= 8:
             self._layout_cache.pop(next(iter(self._layout_cache)))
@@ -394,15 +384,12 @@ class _AR2Backbone(nn.Module):
         key = (n, device)
         cached = self._block_mask_cache.get(key)
         if cached is None:
-            bs, ns, m = self.block_size, self.num_anchors, self.num_noise_copies
-            k = n // bs
-            total = k * (bs + ns) + m * n
+            bs, ns = self.block_size, self.num_anchors
+            total = (n // bs) * (bs + ns)
             mask_mod = make_ar2_mask_mod(
                 block_size=bs,
                 num_anchors=ns,
                 t_window=self.t_window,
-                num_blocks=k,
-                num_noise_copies=m,
             )
             cached = create_block_mask(
                 mask_mod, B=None, H=None, Q_LEN=total, KV_LEN=total, device=device,
@@ -412,98 +399,16 @@ class _AR2Backbone(nn.Module):
             self._block_mask_cache[key] = cached
         return cached
 
-    def _sample_block_masks(
-        self, x0: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample per-block mask ratios and Bernoulli masks for the M noise copies.
-
-        Returns:
-          mask: (bt, M, N) bool — True where the position is masked
-          t_blk: (bt, M, K) float — per-block mask ratio (NELBO weight is 1/t)
-        """
-        bt, n = x0.shape
-        bs = self.block_size
-        k = n // bs
-        m = self.num_noise_copies
-        device = x0.device
-
-        t_blk = torch.rand(bt, m, k, device=device)
-        t_blk = self.mask_ratio_min + t_blk * (1.0 - self.mask_ratio_min)
-        mask = (
-            torch.rand(bt, m, k, bs, device=device) < t_blk.unsqueeze(-1)
-        )
-
-        # Force >= 1 masked position per block (loss signal for every block).
-        forced = torch.randint(0, bs, (bt, m, k), device=device)
-        empty = ~mask.any(dim=-1)
-        mask.scatter_(
-            -1, forced.unsqueeze(-1), (empty | mask.gather(-1, forced.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1),
-        )
-
-        if self.fix_bos:
-            # Never mask the BOS at position 0; re-force block 0 if it went empty.
-            mask[:, :, 0, 0] = False
-            empty0 = ~mask[:, :, 0, :].any(dim=-1)
-            forced0 = torch.randint(1, bs, (bt, m), device=device)
-            mask[:, :, 0, :].scatter_(
-                -1, forced0.unsqueeze(-1), (empty0 | mask[:, :, 0, :].gather(-1, forced0.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1),
-            )
-
-        return mask.view(bt, m, n), t_blk
-
     # -------------------------------------------------------------------------
     # Training forward
     # -------------------------------------------------------------------------
-
-    def _train_hidden(
-        self, x0: torch.Tensor, mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Hidden states of the noise copies for a given mask.
-
-        Args:
-          x0: (bt, N) clean tokens; mask: (bt, M, N) bool.
-        Returns:
-          (bt, M, N, d) post-ln_f hidden states of copies B_0..B_{M-1}.
-        """
-        bt, n = x0.shape
-        device = x0.device
-        bs, ns, m = self.block_size, self.num_anchors, self.num_noise_copies
-
-        layout = self._get_layout(n, device)
-        block_mask = self._get_block_mask(n, device)
-
-        # Copy A ids: anchors + clean tokens
-        ids_a = torch.where(
-            layout["a_is_anchor"].unsqueeze(0),
-            layout["anchor_ids"].unsqueeze(0),
-            x0[:, layout["gather_a"]],
-        )
-        # Noise copies: masked positions replaced by [MASK]
-        ids_b = torch.where(
-            mask, self.mask_index, x0.unsqueeze(1).expand(bt, m, n),
-        ).reshape(bt, m * n)
-        input_ids = torch.cat([ids_a, ids_b], dim=1)
-
-        rho_b = torch.where(mask, ROLE_T_MASK, ROLE_T_CLEAN).reshape(bt, m * n)
-        rho = torch.cat(
-            [layout["rho_a"].unsqueeze(0).expand(bt, -1), rho_b], dim=1,
-        ).long()
-
-        x = self.drop(self.wte(input_ids) + self.type_emb(rho))
-        positions = layout["positions"]
-        for block in self.h:
-            x = block(x, positions, block_mask, rho)
-        x = self.ln_f(x)
-
-        la = (n // bs) * (bs + ns)
-        return x[:, la:, :].reshape(bt, m, n, -1)
 
     def forward(
         self,
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """NELBO training loss on the [A | B_0..B_{M-1}] concatenated sequence.
+        """Exact-NLL training loss over the anchored clean stream.
 
         Args:
           idx: (bt, N) clean token chunk; N divisible by block_size.
@@ -513,29 +418,35 @@ class _AR2Backbone(nn.Module):
         x0 = idx
         bt, n = x0.shape
         self._validate_seq_len(n)
-        bs, m = self.block_size, self.num_noise_copies
+        device = x0.device
 
-        mask, t_blk = self._sample_block_masks(x0)
-        h_b = self._train_hidden(x0, mask)
+        layout = self._get_layout(n, device)
+        block_mask = self._get_block_mask(n, device)
 
-        x0_rep = x0.unsqueeze(1).expand(bt, m, n)
-        mask_flat = mask.reshape(-1)
-        h_sel = h_b.reshape(-1, h_b.size(-1))[mask_flat]
-        tgt_sel = x0_rep.reshape(-1)[mask_flat]
-        w_sel = (
-            (1.0 / t_blk)
-            .unsqueeze(-1)
-            .expand(bt, m, n // bs, bs)
-            .reshape(-1)[mask_flat]
+        input_ids = torch.where(
+            layout["is_anchor"].unsqueeze(0),
+            layout["anchor_ids"].unsqueeze(0),
+            x0[:, layout["gather_t"]],
         )
+        rho = layout["rho"].unsqueeze(0).expand(bt, -1)
+
+        x = self.drop(self.wte(input_ids) + self.type_emb(rho))
+        positions = layout["positions"]
+        for block in self.h:
+            x = block(x, positions, block_mask, rho)
+        x = self.ln_f(x)
+
+        h_sel = x[:, layout["loss_pos"], :]
+        tgt_sel = x0[:, layout["tgt_gather"]]
 
         logits = self.lm_head(h_sel)
-        # fp32 for the wide-vocab CE; special tokens are never valid targets.
+        # fp32 for the wide-vocab CE; anchor tokens are never valid targets.
         with torch.amp.autocast("cuda", enabled=False):
             logits = logits.float()
-            logits[:, self.vocab_size :] = float("-inf")
-            ce = F.cross_entropy(logits, tgt_sel, reduction="none")
-            loss = (ce * w_sel.float()).sum() / (bt * m * n)
+            logits[..., self.vocab_size :] = float("-inf")
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), tgt_sel.reshape(-1),
+            )
         return torch.empty(0), loss
 
     # -------------------------------------------------------------------------
@@ -547,18 +458,14 @@ class _AR2Backbone(nn.Module):
         ids: torch.Tensor,
         rho_q: torch.Tensor,
         positions: torch.Tensor,
-        cache_s: list[tuple[torch.Tensor, torch.Tensor]] | None,
-        cache_t: list[tuple[torch.Tensor, torch.Tensor]] | None,
-        rho_ctx: torch.Tensor | None,
+        caches: list[list[tuple[torch.Tensor, torch.Tensor]] | None],
         *,
         need_logits: bool,
     ) -> tuple[torch.Tensor | None, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """One forward over a short segment with [cache_s | cache_t] context.
+        """One forward over a short segment with concatenated cache context.
 
         Returns (logits or None, per-layer self K/V of this segment).
-        ``rho_ctx`` is unused (role is baked into cached K via role_k).
         """
-        del rho_ctx
         bt = ids.size(0)
         if rho_q.dim() == 1:
             rho_q_b = rho_q.unsqueeze(0).expand(bt, -1)
@@ -567,18 +474,14 @@ class _AR2Backbone(nn.Module):
         x = self.wte(ids) + self.type_emb(rho_q_b)
         self_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for li, block in enumerate(self.h):
-            ctx_k = ctx_v = None
             parts_k = []
             parts_v = []
-            if cache_s is not None and cache_s[li][0].size(2) > 0:
-                parts_k.append(cache_s[li][0])
-                parts_v.append(cache_s[li][1])
-            if cache_t is not None and cache_t[li][0].size(2) > 0:
-                parts_k.append(cache_t[li][0])
-                parts_v.append(cache_t[li][1])
-            if parts_k:
-                ctx_k = torch.cat(parts_k, dim=2)
-                ctx_v = torch.cat(parts_v, dim=2)
+            for cache in caches:
+                if cache is not None and cache[li][0].size(2) > 0:
+                    parts_k.append(cache[li][0])
+                    parts_v.append(cache[li][1])
+            ctx_k = torch.cat(parts_k, dim=2) if parts_k else None
+            ctx_v = torch.cat(parts_v, dim=2) if parts_v else None
             x, k_self, v_self = block.forward_infer(
                 x, positions, ctx_k, ctx_v, rho_q_b,
             )
@@ -590,6 +493,46 @@ class _AR2Backbone(nn.Module):
         logits[..., self.vocab_size :] = float("-inf")
         return logits, self_kv
 
+    def _empty_kv(
+        self, bt: int, device: torch.device, dtype: torch.dtype,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        return [
+            (
+                torch.empty(bt, self.n_head, 0, self.h[0].attn.head_dim, device=device, dtype=dtype),
+                torch.empty(bt, self.n_head, 0, self.h[0].attn.head_dim, device=device, dtype=dtype),
+            )
+            for _ in self.h
+        ]
+
+    @staticmethod
+    def _append_kv(
+        cache: list[tuple[torch.Tensor, torch.Tensor]],
+        new: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        return [
+            (torch.cat([cache[li][0], new[li][0]], dim=2),
+             torch.cat([cache[li][1], new[li][1]], dim=2))
+            for li in range(len(cache))
+        ]
+
+    @staticmethod
+    def _sample_token(
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        top_k,
+    ) -> torch.Tensor:
+        """Sample from (bt, V) logits; temperature <= 0 means argmax."""
+        if temperature <= 0.0:
+            return logits.argmax(dim=-1)
+        scaled = logits / temperature
+        if top_k is not None and int(top_k) > 0:
+            kk = min(int(top_k), scaled.size(-1))
+            vals, _ = torch.topk(scaled, kk)
+            scaled = scaled.masked_fill(scaled < vals[..., -1, None], float("-inf"))
+        probs = F.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, 1).squeeze(-1)
+
     @torch.no_grad()
     def generate(
         self,
@@ -599,15 +542,14 @@ class _AR2Backbone(nn.Module):
         bos_token_id: int | None = None,
         sampling_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, int]:
-        """Blockwise generation per temp/ar2.md §5.
+        """Blockwise generation: anchor step samples the block's first token,
+        then token-by-token causal decoding within the block.
 
         Returns (tokens (num_samples, seqlen), nfe).
         """
         cfg = sampling_cfg or {}
         temperature = float(cfg.get("temperature", 1.0))
         top_k = cfg.get("top_k")
-        commit_threshold = float(cfg.get("commit_threshold", 0.9))
-        max_refine_iters = int(cfg.get("max_refine_iters", self.block_size))
 
         if seqlen is None:
             raise ValueError("generate requires an explicit seqlen")
@@ -621,117 +563,63 @@ class _AR2Backbone(nn.Module):
         n_blocks = seqlen // bs
         nfe = 0
 
-        def empty_kv() -> list[tuple[torch.Tensor, torch.Tensor]]:
-            return [
-                (
-                    torch.empty(bt, self.n_head, 0, self.h[0].attn.head_dim, device=device, dtype=dtype),
-                    torch.empty(bt, self.n_head, 0, self.h[0].attn.head_dim, device=device, dtype=dtype),
-                )
-                for _ in self.h
-            ]
-
-        cache_s = empty_kv()   # all anchors so far, role s
-        cache_t = empty_kv()   # last W blocks of clean t, role t_clean
-        rho_s_len = 0
-        rho_t_len = 0
+        cache_s = self._empty_kv(bt, device, dtype)   # all anchors so far
+        cache_t = self._empty_kv(bt, device, dtype)   # last W blocks of t
 
         anchor_ids = (
             torch.arange(ns, device=device) + self.anchor_index0
         ).unsqueeze(0).expand(bt, -1)
         rho_anchor = torch.full((ns,), ROLE_S, device=device, dtype=torch.long)
+        rho_t = torch.full((1,), ROLE_T, device=device, dtype=torch.long)
 
         out = torch.empty(bt, seqlen, dtype=torch.long, device=device)
 
         for g in range(n_blocks):
-            # ---- anchor step ---------------------------------------------------
+            # ---- anchor step: realize s KV and sample the block's first token
             pos_anchor = torch.full((ns,), g * bs, device=device, dtype=torch.long)
-            rho_ctx = torch.cat([
-                torch.full((rho_s_len,), ROLE_S, device=device, dtype=torch.long),
-                torch.full((rho_t_len,), ROLE_T_CLEAN, device=device, dtype=torch.long),
-            ])
-            _, kv_anchor = self._infer_pass(
+            logits, kv_anchor = self._infer_pass(
                 anchor_ids, rho_anchor, pos_anchor,
-                cache_s, cache_t, rho_ctx, need_logits=False,
+                [cache_s, cache_t], need_logits=True,
             )
             nfe += 1
-            cache_s = [
-                (torch.cat([cache_s[li][0], kv_anchor[li][0]], dim=2),
-                 torch.cat([cache_s[li][1], kv_anchor[li][1]], dim=2))
-                for li in range(len(self.h))
-            ]
-            rho_s_len += ns
-            rho_ctx = torch.cat([
-                torch.full((rho_s_len,), ROLE_S, device=device, dtype=torch.long),
-                torch.full((rho_t_len,), ROLE_T_CLEAN, device=device, dtype=torch.long),
-            ])
+            cache_s = self._append_kv(cache_s, kv_anchor)
 
-            # ---- iterative block infill ----------------------------------------
-            pos_block = g * bs + torch.arange(bs, device=device, dtype=torch.long)
-            y = torch.full((bt, bs), self.mask_index, dtype=torch.long, device=device)
-            committed = torch.zeros(bt, bs, dtype=torch.bool, device=device)
             if g == 0 and self.fix_bos:
-                y[:, 0] = bos
-                committed[:, 0] = True
-            cand = y.clone()
+                cur = torch.full((bt,), bos, dtype=torch.long, device=device)
+            else:
+                cur = self._sample_token(
+                    logits[:, -1, :], temperature=temperature, top_k=top_k,
+                )
 
-            for _ in range(max_refine_iters):
-                if bool(committed.all()):
-                    break
-                rho_q = torch.where(committed, ROLE_T_CLEAN, ROLE_T_MASK).long()
-                logits, _ = self._infer_pass(
-                    y, rho_q, pos_block, cache_s, cache_t, rho_ctx, need_logits=True,
+            # ---- intra-block token-by-token decoding -----------------------
+            blk_kv = self._empty_kv(bt, device, dtype)
+            for j in range(bs):
+                out[:, g * bs + j] = cur
+                pos_j = torch.full((1,), g * bs + j, device=device, dtype=torch.long)
+                # Last token's forward only realizes its KV for the t window.
+                need = j < bs - 1
+                logits, kv_j = self._infer_pass(
+                    cur.unsqueeze(1), rho_t, pos_j,
+                    [cache_s, cache_t, blk_kv], need_logits=need,
                 )
                 nfe += 1
-                if temperature <= 0.0:
-                    probs = F.softmax(logits, dim=-1)
-                    conf, cand = probs.max(dim=-1)
-                else:
-                    scaled = logits / temperature
-                    if top_k is not None and int(top_k) > 0:
-                        kk = min(int(top_k), scaled.size(-1))
-                        vals, _ = torch.topk(scaled, kk)
-                        scaled = scaled.masked_fill(
-                            scaled < vals[..., -1, None], float("-inf"),
-                        )
-                    probs = F.softmax(scaled, dim=-1)
-                    cand = torch.multinomial(
-                        probs.view(-1, probs.size(-1)), 1,
-                    ).view(bt, bs)
-                    conf = probs.gather(-1, cand.unsqueeze(-1)).squeeze(-1)
+                blk_kv = self._append_kv(blk_kv, kv_j)
+                if need:
+                    cur = self._sample_token(
+                        logits[:, -1, :], temperature=temperature, top_k=top_k,
+                    )
 
-                conf = conf.masked_fill(committed, float("-inf"))
-                commit = (conf >= commit_threshold) & ~committed
-                # Guarantee progress: commit at least the most confident position.
-                none_new = ~commit.any(dim=-1) & ~committed.all(dim=-1)
-                best = conf.argmax(dim=-1)
-                commit[none_new, best[none_new]] = True
-
-                y = torch.where(commit, cand, y)
-                committed |= commit
-
-            if not bool(committed.all()):
-                # R_max fallback: commit remaining positions from the last proposal.
-                y = torch.where(committed, y, cand)
-
-            out[:, g * bs : (g + 1) * bs] = y
-
-            # ---- finalize block: clean KV into the sliding t-cache -------------
-            rho_clean = torch.full((bs,), ROLE_T_CLEAN, device=device, dtype=torch.long)
-            _, kv_clean = self._infer_pass(
-                y, rho_clean, pos_block, cache_s, cache_t, rho_ctx, need_logits=False,
-            )
-            nfe += 1
+            # ---- slide the t window ----------------------------------------
             keep = (w - 1) * bs  # existing cache tail so total stays <= W blocks
             cache_t = [
                 (
-                    torch.cat([cache_t[li][0][:, :, -keep:], kv_clean[li][0]], dim=2)
-                    if keep > 0 else kv_clean[li][0],
-                    torch.cat([cache_t[li][1][:, :, -keep:], kv_clean[li][1]], dim=2)
-                    if keep > 0 else kv_clean[li][1],
+                    torch.cat([cache_t[li][0][:, :, -keep:], blk_kv[li][0]], dim=2)
+                    if keep > 0 else blk_kv[li][0],
+                    torch.cat([cache_t[li][1][:, :, -keep:], blk_kv[li][1]], dim=2)
+                    if keep > 0 else blk_kv[li][1],
                 )
                 for li in range(len(self.h))
             ]
-            rho_t_len = cache_t[0][0].size(2)
 
         return out, nfe
 

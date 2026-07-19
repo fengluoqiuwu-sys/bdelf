@@ -1,7 +1,7 @@
 _doc: >
   ar1_5/300m-full for ≤18.5GB.
 name: 300m-full
-batch_size: 4
-global_batch_size: 32
+batch_size: 6
+global_batch_size: 48
 num_params_m: 303.4
-estimated_peak_vram_gb: 16.0
+estimated_peak_vram_gb: 15.5

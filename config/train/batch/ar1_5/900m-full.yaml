@@ -1,7 +1,7 @@
 _doc: >
   ar1_5/900m-full for ≤18.5GB.
 name: 900m-full
-batch_size: 1
+batch_size: 2
 global_batch_size: 16
 num_params_m: 870.5
-estimated_peak_vram_gb: 16.5
+estimated_peak_vram_gb: 17.0

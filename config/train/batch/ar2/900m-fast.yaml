@@ -1,8 +1,7 @@
 _doc: >
-  ar2/900m-fast micro-batch for fast-16gb. 相对 bd3lm 900m-fast(13.8GB)×1.17≈16.1GB，
-  贴近 16GB 上限，仅作 smoke。
+  ar2/900m-fast for fast-16gb（偏紧）。
 name: 900m-fast
 batch_size: 1
 grad_accum_steps: 4
 num_params_m: 870.5
-estimated_peak_vram_gb: 16.1
+estimated_peak_vram_gb: 15.0

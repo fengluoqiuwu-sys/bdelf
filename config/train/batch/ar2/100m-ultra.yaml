@@ -1,9 +1,8 @@
 _doc: >
-  ar2/100m-ultra for 48GB (single card or ×8); train budget ≤42.5GB
-  (card - 4GB head - 1.5GB gpt2-large). bs=24 由实测线性外推 ≈41GB
-  (bs=4→8.0GB, bs=8→14.6GB, ~1.65GB/样本)。bs*ws 需整除 192。
+  ar2/100m-ultra for 48GB (single card or ×8); budget ≤42.5GB
+  (card - 4GB head - 1.5GB gpt2-large). 对齐 AR 100m-ultra；bs*ws 整除 512。
 name: 100m-ultra
-batch_size: 24
-global_batch_size: 192
+batch_size: 64
+global_batch_size: 512
 num_params_m: 99.0
-estimated_peak_vram_gb: 41.0
+estimated_peak_vram_gb: 42.0

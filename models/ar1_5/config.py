@@ -1,10 +1,11 @@
-"""AR1.5: AR2-like anchors without long-range s KV / t window.
+"""AR1.5: AR2-like anchors without long-range s KV / t window (block-causal).
 
 Differences vs AR2:
   - Historical anchors are never attended (train & infer). Only the current
     block's s is visible to that block's t (and sibling anchors).
-  - No t_window: every s/t query sees all previous clean t tokens.
+  - No t_window: every s/t query sees all previous t tokens.
   - Inference discards s KV after each block finishes; cache_t grows unbounded.
+  - Same training objective as AR2: exact NLL, intra-block causal AR.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_AR15Config(PretrainedConfig):
-    """Configuration for the AR1.5 semi-autoregressive anchor model."""
+    """Configuration for the AR1.5 anchor + block-causal LM."""
 
     model_type = "fl_ar1_5"
     _YAML_REQUIRED = frozenset(
@@ -31,8 +32,6 @@ class FL_AR15Config(PretrainedConfig):
             "n_embd",
             "dropout",
             "attn_backend",
-            "mask_ratio_min",
-            "num_noise_copies",
             "attn_type_bias",
             "fix_bos",
         }
@@ -55,15 +54,15 @@ class FL_AR15Config(PretrainedConfig):
         n_embd: int = 672,
         dropout: float = 0.1,
         attn_backend: str = "flex",
-        mask_ratio_min: float = 0.05,
-        num_noise_copies: int = 2,
         attn_type_bias: bool = True,
         fix_bos: bool = True,
         sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        # Drop AR2-only keys if a shared yaml fragment is reused.
+        # Drop AR2-only / legacy mask-predict keys if a shared yaml is reused.
         kwargs.pop("t_window", None)
+        kwargs.pop("mask_ratio_min", None)
+        kwargs.pop("num_noise_copies", None)
         super().__init__(**kwargs)
         self.name = name
         self.tokenizer = tokenizer
@@ -80,8 +79,6 @@ class FL_AR15Config(PretrainedConfig):
         self.n_embd = n_embd
         self.dropout = dropout
         self.attn_backend = attn_backend
-        self.mask_ratio_min = mask_ratio_min
-        self.num_noise_copies = num_noise_copies
         self.attn_type_bias = attn_type_bias
         self.fix_bos = fix_bos
         self.sampling = sampling or {}
@@ -106,8 +103,6 @@ class FL_AR15Config(PretrainedConfig):
             "n_embd": self.n_embd,
             "dropout": self.dropout,
             "attn_backend": self.attn_backend,
-            "mask_ratio_min": self.mask_ratio_min,
-            "num_noise_copies": self.num_noise_copies,
             "attn_type_bias": self.attn_type_bias,
             "fix_bos": self.fix_bos,
         }
