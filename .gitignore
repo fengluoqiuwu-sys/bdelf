@@ -63,6 +63,7 @@ Thumbs.db
 *.log
 *.tmp
 tmp/
+temp/
 
 # ---- Data ----
 cache

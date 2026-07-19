@@ -157,12 +157,29 @@ def prepare_gpt2_eval_batch(
     Returns ``(input_ids, labels, attention_mask)``.
     """
     src_tok = _get_src_tokenizer(src_tokenizer_name)
-    gpt2_tok = _get_gpt2_tokenizer()
-
     texts = [
         src_tok.decode(row.tolist(), skip_special_tokens=True)
         for row in batch.detach().cpu()
     ]
+    return prepare_gpt2_eval_texts(
+        texts,
+        gpt2_vocab_size=gpt2_vocab_size,
+        fill_token_id=fill_token_id,
+        device=device,
+        max_length=max_length,
+    )
+
+
+def prepare_gpt2_eval_texts(
+    texts: list[str],
+    *,
+    gpt2_vocab_size: int,
+    fill_token_id: int,
+    device: torch.device,
+    max_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Re-encode decoded texts with GPT-2 for Gen. PPL scoring."""
+    gpt2_tok = _get_gpt2_tokenizer()
     encoded = gpt2_tok(
         texts,
         add_special_tokens=False,
@@ -191,6 +208,7 @@ def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
         sampling_cfg["num_sampling_steps"] = min(16, cfg.eval_gen_steps)
         sampling_cfg["sampling_method"] = "ode"
         sampling_cfg["temperature"] = 0.0  # paper decode: argmax
+        sampling_cfg["time_schedule"] = "uniform"
     return sampling_cfg
 
 
@@ -257,18 +275,36 @@ def eval_one_batch_gen_ppl(
             )
 
     src_tok_name = get_preprocess(cfg.preprocess).tokenizer
-    input_ids, labels, attention_mask = prepare_gpt2_eval_batch(
-        generated,
-        src_tokenizer_name=src_tok_name,
-        gpt2_vocab_size=gpt2_vocab_size,
-        fill_token_id=fill_token_id,
-        device=gpt2_device,
-        max_length=seqlen,
-    )
-    if not bool((labels != -100).any().item()):
+    src_tok = _get_src_tokenizer(src_tok_name)
+    texts = [
+        src_tok.decode(row.tolist(), skip_special_tokens=True)
+        for row in generated.detach().cpu()
+    ]
+    # Match official ELF: score only nonempty decoded strings.
+    nonempty = [t for t in texts if isinstance(t, str) and t.strip()]
+    skipped = len(texts) - len(nonempty)
+    if skipped > 0:
+        msg = f"eval/gen: skipped {skipped}/{len(texts)} empty samples"
+        if pbar_parent is not None:
+            tqdm.write(f"{_TRAIN_LOG} {msg}")
+        else:
+            _train_log(msg)
+
+    if not nonempty:
         gen_loss = float("nan")
         gen_ppl = float("nan")
+        summary = (
+            f"eval/gen ({cfg.gen_eval_model}): all samples empty; "
+            f"loss nan ppl nan"
+        )
     else:
+        input_ids, labels, attention_mask = prepare_gpt2_eval_texts(
+            nonempty,
+            gpt2_vocab_size=gpt2_vocab_size,
+            fill_token_id=fill_token_id,
+            device=gpt2_device,
+            max_length=seqlen,
+        )
         with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
             outputs = gpt2_model(
                 input_ids, attention_mask=attention_mask, labels=labels,
@@ -276,15 +312,16 @@ def eval_one_batch_gen_ppl(
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             gen_loss = float(loss.item())
         gen_ppl = loss_to_ppl(gen_loss)
+        summary = (
+            f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} "
+            f"ppl {gen_ppl:.2f} (n={len(nonempty)})"
+        )
 
     if was_training:
         train_model.train()
     if pbar_parent is not None:
         pbar_parent.refresh()
 
-    summary = (
-        f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} ppl {gen_ppl:.2f}"
-    )
     if pbar_parent is not None:
         tqdm.write(f"{_TRAIN_LOG} {summary}")
     else:

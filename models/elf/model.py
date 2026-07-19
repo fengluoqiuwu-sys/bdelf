@@ -476,6 +476,15 @@ class _ELFBackbone(nn.Module):
         v, x_pred = self._forward_sample(z_back, t_back, x_pred_prev)
         return z_back + (t_next - t_back) * v, x_pred
 
+    @staticmethod
+    def _mask_after_eos(
+        tokens: torch.Tensor, *, eos_token_id: int, pad_token_id: int,
+    ) -> torch.Tensor:
+        """Replace the first EOS and everything after it with pad (official ELF)."""
+        eos_mask = tokens == eos_token_id
+        keep_mask = eos_mask.to(torch.int32).cumsum(dim=1) == 0
+        return torch.where(keep_mask, tokens, torch.full_like(tokens, pad_token_id))
+
     @torch.no_grad()
     def _decode_tokens(
         self,
@@ -494,6 +503,8 @@ class _ELFBackbone(nn.Module):
             model_in, t, decoder_step_active=True, deterministic=True,
         )
         assert logits is not None
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("ELF decode produced non-finite logits")
         if temperature <= 0:
             return logits.argmax(dim=-1)
         return sample_from_logits(logits, temperature=temperature, top_k=top_k)
@@ -561,9 +572,16 @@ class _ELFBackbone(nn.Module):
         t_next = float(t_steps[-1].item())
         z, x_pred = self._ode_step(z, t, t_next, x_pred)
         nfe += 1
+        if not torch.isfinite(z).all():
+            raise RuntimeError("ELF sampling produced non-finite latents")
 
         tokens = self._decode_tokens(z, temperature=temperature, top_k=top_k)
         nfe += 1
+        tokens = self._mask_after_eos(
+            tokens,
+            eos_token_id=self.token_layout.eos_token_id,
+            pad_token_id=self.token_layout.pad_token_id,
+        )
         return tokens, nfe
 
 

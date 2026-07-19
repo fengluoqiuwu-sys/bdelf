@@ -501,7 +501,9 @@ def train_loop(
                 optimizer.zero_grad(set_to_none=True)
 
             train_loss = micro_loss.item() if loss_ok else float("nan")
-            loss_branch = getattr(raw, "last_loss_branch", "") if dual_branch else ""
+            # Prefer the sampled branch over model.last_loss_branch so logging
+            # stays correct under torch.compile / DDP wrappers.
+            loss_branch = train_branch if dual_branch else ""
             elapsed = time.time() - t0
             # Every micro-step consumes a full data batch (dual-branch 4:1 is loss mix).
             seq_tokens = batch.size(0) * (

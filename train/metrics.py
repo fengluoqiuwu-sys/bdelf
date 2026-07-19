@@ -188,9 +188,14 @@ def update_ppl_plots(
                 label=train_label, zorder=1,
             )
         if e_steps:
+            eval_label = (
+                "eval decode ppl (exp ce)"
+                if dual_branch
+                else "eval ppl (exp loss)"
+            )
             ax_ppl.plot(
                 e_steps, e_ppls, color="#D62728", linewidth=2.8, marker="o",
-                markersize=4, label="eval ppl (exp loss)", zorder=5,
+                markersize=4, label=eval_label, zorder=5,
             )
         if g_steps:
             ax_ppl.plot(
@@ -246,12 +251,18 @@ def build_train_row(
     if dual_branch:
         row["loss_branch"] = loss_branch
         if loss_branch == "denoise":
+            # MSE is not a CE; leave train_ppl empty (same as BDELF).
             row["denoise_mse"] = round(train_loss, 6)
         elif loss_branch == "decode":
-            ppl = loss_to_ppl(train_loss)
+            # PPL only from decode CE (exp(ce)), never from denoise MSE.
             row["decode_ce"] = round(train_loss, 6)
-            row["train_ppl"] = round(ppl, 4)
+            row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
             row["train_loss"] = row["decode_ce"]
+        else:
+            raise ValueError(
+                f"dual_branch logging requires loss_branch "
+                f"'denoise' or 'decode', got {loss_branch!r}"
+            )
     else:
         row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
     return row
