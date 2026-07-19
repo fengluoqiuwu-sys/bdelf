@@ -16,7 +16,7 @@ Attention visibility (mask_mod, pure arithmetic on indices):
 
 Positions (dual-coordinate RoPE): t tokens use original text indices; anchors
 share their block's start index. Roles (s / t_clean / t_mask) get an additive
-type embedding at layer 0 and a learnable per-layer per-head 3x3 attention bias.
+type embedding at layer 0 and fusion-safe per-layer role additives on Q/K.
 
 Inference is blockwise: one anchor step, then iterative confidence-based
 parallel unmasking, then one finalize pass that pushes clean KV into a
@@ -48,20 +48,26 @@ ROLE_T_MASK = 2
 _flex_attention_compiled = None
 
 
-def _call_flex_attention(q, k, v, *, score_mod, block_mask):
-    """flex_attention needs torch.compile for fused kernels in eager mode.
+def fused_flex_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask=None,
+) -> torch.Tensor:
+    """BD3LM-style entry: outer ``torch.compile(model)`` fuses this under Dynamo.
 
-    When the whole model is already being traced by Dynamo (full/ultra set
-    ``compile: true``), call the raw op so we do not nest compiled functions.
+    Eager (fast / no whole-model compile): wrap once with ``torch.compile`` so
+    FlexAttention does **not** fall back to the unfused path that materializes
+    the full ``L×L`` score matrix (OOM at AR2 seq len ≈ 3k).
+    Never pass a ``score_mod`` that indexes data tensors by ``q_idx``/``kv_idx``
+    — that commonly breaks fusion and triggers the same OOM.
     """
     if torch.compiler.is_dynamo_compiling():
-        return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
+        return flex_attention(q, k, v, block_mask=block_mask)
     global _flex_attention_compiled
     if _flex_attention_compiled is None:
         _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
-    return _flex_attention_compiled(
-        q, k, v, score_mod=score_mod, block_mask=block_mask,
-    )
+    return _flex_attention_compiled(q, k, v, block_mask=block_mask)
 
 
 def make_ar2_mask_mod(
@@ -138,19 +144,26 @@ class Ar2Attention(nn.Module):
         self.c_proj = nn.Linear(n_embd, n_embd)
         self.resid_dropout = nn.Dropout(dropout)
         self.rope = RotaryEmbedding(self.head_dim)
-        # Per-head 3x3 role bias (query role x key role); 3D so Muon skips it.
-        self.type_bias = (
-            nn.Parameter(torch.zeros(n_head, 3, 3)) if attn_type_bias else None
-        )
+        # Fusion-safe role signal: add per-role vectors to Q/K (not a score_mod
+        # table lookup, which breaks FlexAttention fusion and OOMs).
+        self.role_q = nn.Embedding(3, n_embd) if attn_type_bias else None
+        self.role_k = nn.Embedding(3, n_embd) if attn_type_bias else None
+        if self.role_q is not None:
+            nn.init.zeros_(self.role_q.weight)
+            nn.init.zeros_(self.role_k.weight)
 
     def _project_qkv(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
+        rho: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len, _ = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
+        if self.role_q is not None and rho is not None:
+            q = q + self.role_q(rho)
+            k = k + self.role_k(rho)
 
         def heads(t: torch.Tensor) -> torch.Tensor:
             return t.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2)
@@ -166,17 +179,9 @@ class Ar2Attention(nn.Module):
         block_mask,
         rho: torch.Tensor,
     ) -> torch.Tensor:
-        """Training path: FlexAttention with role score bias."""
-        q, k, v = self._project_qkv(x, positions)
-        if self.type_bias is not None:
-            bias = self.type_bias
-
-            def score_mod(score, b, h, q_idx, kv_idx):
-                return score + bias[h, rho[b, q_idx], rho[b, kv_idx]]
-
-        else:
-            score_mod = None
-        y = _call_flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
+        """Training path: fused FlexAttention (no score_mod)."""
+        q, k, v = self._project_qkv(x, positions, rho)
+        y = fused_flex_attention(q, k, v, block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.n_embd)
         return self.resid_dropout(self.c_proj(y))
 
@@ -186,20 +191,20 @@ class Ar2Attention(nn.Module):
         positions: torch.Tensor,
         ctx_k: torch.Tensor | None,
         ctx_v: torch.Tensor | None,
-        attn_bias: torch.Tensor | None,
+        rho: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Inference: queries attend over [context KV; own KV], all visible.
 
-        Returns (output, self_k, self_v); self K/V already carry RoPE.
+        Returns (output, self_k, self_v); self K/V already carry RoPE + role.
         """
-        q, k_self, v_self = self._project_qkv(x, positions)
+        q, k_self, v_self = self._project_qkv(x, positions, rho)
         if ctx_k is None:
             k, v = k_self, v_self
         else:
             k = torch.cat([ctx_k, k_self], dim=2)
             v = torch.cat([ctx_v, v_self], dim=2)
         y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_bias, dropout_p=0.0, is_causal=False,
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
         )
         y = y.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.n_embd)
         return self.c_proj(y), k_self, v_self
@@ -251,10 +256,10 @@ class Block(nn.Module):
         positions: torch.Tensor,
         ctx_k: torch.Tensor | None,
         ctx_v: torch.Tensor | None,
-        attn_bias: torch.Tensor | None,
+        rho: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_out, k_self, v_self = self.attn.forward_infer(
-            self.ln_1(x), positions, ctx_k, ctx_v, attn_bias,
+            self.ln_1(x), positions, ctx_k, ctx_v, rho,
         )
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
@@ -537,24 +542,6 @@ class _AR2Backbone(nn.Module):
     # Inference
     # -------------------------------------------------------------------------
 
-    def _infer_bias(
-        self,
-        rho_q: torch.Tensor,
-        rho_kv: torch.Tensor,
-        layer: Block,
-        dtype: torch.dtype,
-    ) -> torch.Tensor | None:
-        """Additive SDPA bias replicating the training role score bias.
-
-        rho_q: (bt, Lq), rho_kv: (bt, Lkv); returns (bt, H, Lq, Lkv) or None.
-        """
-        bias = layer.attn.type_bias
-        if bias is None:
-            return None
-        # out[b, h, i, j] = bias[h, rho_q[b, i], rho_kv[b, j]]
-        out = bias[:, rho_q.unsqueeze(-1), rho_kv.unsqueeze(-2)]  # (H, bt, Lq, Lkv)
-        return out.permute(1, 0, 2, 3).to(dtype)
-
     def _infer_pass(
         self,
         ids: torch.Tensor,
@@ -569,7 +556,9 @@ class _AR2Backbone(nn.Module):
         """One forward over a short segment with [cache_s | cache_t] context.
 
         Returns (logits or None, per-layer self K/V of this segment).
+        ``rho_ctx`` is unused (role is baked into cached K via role_k).
         """
+        del rho_ctx
         bt = ids.size(0)
         if rho_q.dim() == 1:
             rho_q_b = rho_q.unsqueeze(0).expand(bt, -1)
@@ -577,12 +566,6 @@ class _AR2Backbone(nn.Module):
             rho_q_b = rho_q
         x = self.wte(ids) + self.type_emb(rho_q_b)
         self_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
-        if rho_ctx is not None:
-            rho_kv = torch.cat(
-                [rho_ctx.unsqueeze(0).expand(bt, -1), rho_q_b], dim=1,
-            )
-        else:
-            rho_kv = rho_q_b
         for li, block in enumerate(self.h):
             ctx_k = ctx_v = None
             parts_k = []
@@ -596,9 +579,8 @@ class _AR2Backbone(nn.Module):
             if parts_k:
                 ctx_k = torch.cat(parts_k, dim=2)
                 ctx_v = torch.cat(parts_v, dim=2)
-            attn_bias = self._infer_bias(rho_q_b, rho_kv, block, x.dtype)
             x, k_self, v_self = block.forward_infer(
-                x, positions, ctx_k, ctx_v, attn_bias,
+                x, positions, ctx_k, ctx_v, rho_q_b,
             )
             self_kv.append((k_self, v_self))
         if not need_logits:
