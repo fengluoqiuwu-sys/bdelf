@@ -1,0 +1,22 @@
+_doc: >
+  AR1.5 模型配置模板（不参与实例化）。相对 AR2：历史 s 不可见、无 t 窗口，
+  推理每块结束后丢弃 s KV，cache_t 无限增长。其余训练目标 / 块内迭代与 AR2 相同。
+
+name: ar1_5-prototype
+tokenizer: gpt2
+block_size: 16
+num_anchors: 1
+attn_type_bias: true
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+attn_backend: flex
+mask_ratio_min: 0.05
+num_noise_copies: 2
+fix_bos: true
+
+sampling:
+  temperature: 1.0
+  commit_threshold: 0.9
+  max_refine_iters: 16

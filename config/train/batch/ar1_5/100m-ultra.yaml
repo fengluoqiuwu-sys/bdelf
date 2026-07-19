@@ -1,0 +1,8 @@
+_doc: >
+  ar1_5/100m-ultra for ≤42.5GB. denser t-attn → bs=16 (ar2 用 24).
+  global_batch_size=256 保证整除 bs*world_size(16×8)。
+name: 100m-ultra
+batch_size: 16
+global_batch_size: 256
+num_params_m: 99.0
+estimated_peak_vram_gb: 38.0

@@ -23,7 +23,7 @@ TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
-_TRAIN_MODELS = ("ar", "ar2", "bd3lm", "bdelf", "elf")
+_TRAIN_MODELS = ("ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf")
 _MODEL_CONFIG_RE = re.compile(r"^(100m|300m|900m)-(fast|full|ultra)$")
 _HARDWARE_BY_VARIANT = {
     "fast": "fast-16gb",
@@ -209,7 +209,7 @@ class FL_TrainConfig:
     @property
     def seq_tokens(self) -> int:
         chunk = int(self.extra.get("chunk_length", 1024))
-        if self.model in ("ar2", "bd3lm", "bdelf", "elf"):
+        if self.model in ("ar1_5", "ar2", "bd3lm", "bdelf", "elf"):
             return chunk
         return max(1, chunk - 1)
 
@@ -467,7 +467,7 @@ def compose_train_config(
         * resolved_world_size
         * (
             chunk_length
-            if model in ("ar2", "bd3lm", "bdelf", "elf")
+            if model in ("ar1_5", "ar2", "bd3lm", "bdelf", "elf")
             else max(1, chunk_length - 1)
         )
     )
