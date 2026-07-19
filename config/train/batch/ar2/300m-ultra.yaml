@@ -1,0 +1,9 @@
+_doc: >
+  ar2/300m-ultra for 48GB (single card or ×8); train budget ≤42.5GB
+  (card - 4GB head - 1.5GB gpt2-large). bd3lm 同档 bs=16→41.8GB×1.17 会超预算，
+  降为 bs=8；global_batch_size=128 与 bd3lm 对齐。
+name: 300m-ultra
+batch_size: 8
+global_batch_size: 128
+num_params_m: 303.4
+estimated_peak_vram_gb: 24.5

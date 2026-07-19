@@ -1,0 +1,8 @@
+_doc: >
+  ar2/100m-fast micro-batch for fast-16gb. 有效序列 K*(B+ns)+M*N=3136/样本
+  (chunk 1024, B=16, ns=1, M=2)，约为 bd3lm(2048) 的 1.53x。
+name: 100m-fast
+batch_size: 4
+grad_accum_steps: 4
+num_params_m: 99.0
+estimated_peak_vram_gb: 8.0

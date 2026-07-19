@@ -1,0 +1,21 @@
+_doc: AR2 ~870M params (28 layers x 1536 dim, block 16, anchors 1, window 4)
+
+name: ar2-900m
+tokenizer: gpt2
+block_size: 16
+num_anchors: 1
+t_window: 4
+attn_type_bias: true
+n_layer: 28
+n_head: 16
+n_embd: 1536
+dropout: 0.1
+attn_backend: flex
+mask_ratio_min: 0.05
+num_noise_copies: 2
+fix_bos: true
+
+sampling:
+  temperature: 1.0
+  commit_threshold: 0.9
+  max_refine_iters: 16

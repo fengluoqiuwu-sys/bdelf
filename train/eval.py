@@ -203,6 +203,10 @@ def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
     sampling_cfg: dict[str, Any] = {"use_fast_infer": cfg.eval_use_fast_infer}
     if cfg.model == "bd3lm":
         sampling_cfg["num_steps"] = cfg.eval_gen_steps
+    elif cfg.model == "ar2":
+        # Cap refinement rounds so online eval stays cheap; offline generation
+        # uses the model-yaml default (block_size rounds).
+        sampling_cfg["max_refine_iters"] = 4
     elif cfg.model == "elf":
         # Keep eval sampling lighter than the default 32–64-step SDE.
         sampling_cfg["num_sampling_steps"] = min(16, cfg.eval_gen_steps)

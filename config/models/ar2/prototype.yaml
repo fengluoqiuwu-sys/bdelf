@@ -1,0 +1,26 @@
+_doc: >
+  AR2 模型配置模板（不参与实例化）。语义锚点 + 块内并行迭代解码，规格见 temp/ar2.md。
+  所有超参数集中于 yaml，模型代码不写死。
+
+name: ar2-prototype
+tokenizer: gpt2
+# 结构超参数（temp/ar2.md §6.1）
+block_size: 16          # B：块长
+num_anchors: 1          # n_s：每块锚点 <s> 个数
+t_window: 4             # W：t 列可见窗口（块数）
+attn_type_bias: true    # 每层每头 3x3 注意力角色偏置
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+attn_backend: flex
+# 训练超参数（§6.2）
+mask_ratio_min: 0.05    # ε：mask 比例下限
+num_noise_copies: 2     # M：每份干净流配的噪声流份数
+fix_bos: true
+
+# 推理超参数（§6.3）
+sampling:
+  temperature: 1.0
+  commit_threshold: 0.9   # τ_c
+  max_refine_iters: 16    # R_max

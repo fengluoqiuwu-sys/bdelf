@@ -1,0 +1,9 @@
+_doc: >
+  ar2/900m-ultra for 48GB (single card or ×8); train budget ≤42.5GB
+  (card - 4GB head - 1.5GB gpt2-large). bd3lm 同档 bs=8→42.0GB×1.17 超预算，
+  降为 bs=4；global_batch_size=64 与 bd3lm 对齐。
+name: 900m-ultra
+batch_size: 4
+global_batch_size: 64
+num_params_m: 870.5
+estimated_peak_vram_gb: 24.6
