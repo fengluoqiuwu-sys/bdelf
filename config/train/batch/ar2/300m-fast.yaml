@@ -1,7 +1,7 @@
 _doc: >
-  ar2/300m-fast for fast-16gb. 块内因果，batch 对齐 AR 300m-fast。
+  ar2/300m-fast for fast-16gb. 对齐 AR 300m-fast；FlexAttention 略增。
 name: 300m-fast
 batch_size: 2
 grad_accum_steps: 4
 num_params_m: 303.4
-estimated_peak_vram_gb: 8.5
+estimated_peak_vram_gb: 9.0

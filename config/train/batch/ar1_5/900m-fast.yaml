@@ -4,4 +4,4 @@ name: 900m-fast
 batch_size: 1
 grad_accum_steps: 4
 num_params_m: 870.5
-estimated_peak_vram_gb: 15.5
+estimated_peak_vram_gb: 15.0

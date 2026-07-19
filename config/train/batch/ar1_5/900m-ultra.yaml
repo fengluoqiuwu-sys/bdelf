@@ -1,7 +1,7 @@
 _doc: >
-  ar1_5/900m-ultra for ≤42.5GB.
+  ar1_5/900m-ultra for ≤42.5GB. 与 ar2 对齐。
 name: 900m-ultra
 batch_size: 8
 global_batch_size: 64
 num_params_m: 870.5
-estimated_peak_vram_gb: 34.0
+estimated_peak_vram_gb: 32.0

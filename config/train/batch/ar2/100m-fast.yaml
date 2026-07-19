@@ -1,8 +1,7 @@
 _doc: >
-  ar2/100m-fast for fast-16gb. 块内因果 AR，有效序列 K*(B+ns)=1088/样本
-  (chunk 1024, B=16, ns=1)，与 AR 同量级；略留 FlexAttention 余量。
+  ar2/100m-fast for fast-16gb. 块内因果，有效序列 1088。Muon 实测 bs=8 ≈8.1GB。
 name: 100m-fast
 batch_size: 8
 grad_accum_steps: 2
 num_params_m: 99.0
-estimated_peak_vram_gb: 6.5
+estimated_peak_vram_gb: 8.1

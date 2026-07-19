@@ -1,5 +1,5 @@
 _doc: >
-  ar1_5/300m-fast for fast-16gb.
+  ar1_5/300m-fast for fast-16gb. 与 ar2 对齐。
 name: 300m-fast
 batch_size: 2
 grad_accum_steps: 4

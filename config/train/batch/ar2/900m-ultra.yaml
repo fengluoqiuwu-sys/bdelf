@@ -1,5 +1,5 @@
 _doc: >
-  ar2/900m-ultra for ≤42.5GB. 相对 AR 略降 bs。
+  ar2/900m-ultra for ≤42.5GB. 相对 AR(bs=16) 降为 8。
 name: 900m-ultra
 batch_size: 8
 global_batch_size: 64

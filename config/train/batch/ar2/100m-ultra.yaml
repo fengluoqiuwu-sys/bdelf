@@ -1,8 +1,8 @@
 _doc: >
-  ar2/100m-ultra for 48GB (single card or ×8); budget ≤42.5GB
-  (card - 4GB head - 1.5GB gpt2-large). 对齐 AR 100m-ultra；bs*ws 整除 512。
+  ar2/100m-ultra for ≤42.5GB. 由 bs16/24 实测线性外推 bs=40≈37.7GB；
+  bs=48≈45.2 超预算。gbs=320 → 8 卡 accum=1。
 name: 100m-ultra
-batch_size: 64
-global_batch_size: 512
+batch_size: 40
+global_batch_size: 320
 num_params_m: 99.0
-estimated_peak_vram_gb: 42.0
+estimated_peak_vram_gb: 37.7

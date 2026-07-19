@@ -1,7 +1,7 @@
 _doc: >
-  ar2/300m-full for ≤18.5GB. 块内因果，对齐 AR 300m-full。
+  ar2/300m-full for ≤18.5GB. 对齐 AR 300m-full bs=8；相对 100m 比例保守估计。
 name: 300m-full
 batch_size: 8
 global_batch_size: 64
 num_params_m: 303.4
-estimated_peak_vram_gb: 13.5
+estimated_peak_vram_gb: 14.0
