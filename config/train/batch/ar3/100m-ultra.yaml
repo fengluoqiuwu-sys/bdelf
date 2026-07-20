@@ -1,0 +1,8 @@
+_doc: >
+  ar3/100m-ultra for ≤42.5GB. 外推 bs=32≈36.0GB；bs=40≈44.8 超预算。
+  gbs=256 → 8 卡 accum=1。
+name: 100m-ultra
+batch_size: 32
+global_batch_size: 256
+num_params_m: 99.0
+estimated_peak_vram_gb: 36.0
