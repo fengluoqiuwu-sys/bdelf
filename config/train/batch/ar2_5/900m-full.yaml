@@ -1,0 +1,8 @@
+_doc: >
+  ar2_5/900m-full for ≤18.5GB. 由 bs=1 实测 + act 外推 bs=4≈17.2GB；
+  bs=8≈26 超预算。gbs=32 → 4 卡 accum=2。
+name: 900m-full
+batch_size: 4
+global_batch_size: 32
+num_params_m: 870.5
+estimated_peak_vram_gb: 17.2

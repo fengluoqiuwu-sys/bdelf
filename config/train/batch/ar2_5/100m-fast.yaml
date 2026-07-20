@@ -1,0 +1,8 @@
+_doc: >
+  ar2_5/100m-fast for ≤10.5GB (16 - 4 head - 1.5 gpt2).
+  本地 Muon 实测 bs=8≈9.0GB；bs=12≈13.0 超预算。
+name: 100m-fast
+batch_size: 8
+grad_accum_steps: 2
+num_params_m: 99.0
+estimated_peak_vram_gb: 9.0

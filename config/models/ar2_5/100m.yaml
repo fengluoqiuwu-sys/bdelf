@@ -1,0 +1,17 @@
+_doc: AR2.5 ~100M (12x672, B=16, ns=1, W=4)
+
+name: ar2_5-100m
+tokenizer: gpt2
+block_size: 16
+num_anchors: 1
+t_window: 4
+attn_type_bias: true
+n_layer: 12
+n_head: 12
+n_embd: 672
+dropout: 0.1
+attn_backend: flex
+fix_bos: true
+
+sampling:
+  temperature: 1.0
