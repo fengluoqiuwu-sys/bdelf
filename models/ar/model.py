@@ -258,6 +258,30 @@ class _GPTBackbone(nn.Module):
         x = self.ln_f(x)
         return self.lm_head(x), new_caches
 
+    def _init_generate_idx(
+        self,
+        num_samples: int,
+        seqlen: int,
+        *,
+        bos: int,
+        prefix_tokens: torch.Tensor | None,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, int]:
+        if prefix_tokens is None:
+            idx = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
+            return idx, 1
+        if prefix_tokens.dim() != 2:
+            raise ValueError("prefix_tokens must have shape (num_samples, prefix_len)")
+        if prefix_tokens.size(0) != num_samples:
+            raise ValueError("prefix_tokens batch size must match num_samples")
+        prefix_len = int(prefix_tokens.size(1))
+        if prefix_len < 1 or prefix_len >= seqlen:
+            raise ValueError(
+                f"prefix length {prefix_len} must be in [1, seqlen) "
+                f"(seqlen={seqlen})"
+            )
+        return prefix_tokens.to(device=device, dtype=torch.long).clone(), prefix_len
+
     @torch.no_grad()
     def _generate_with_kv_cache(
         self,
@@ -267,13 +291,25 @@ class _GPTBackbone(nn.Module):
         temperature: float,
         top_k: int | None,
         bos: int,
+        prefix_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         device = next(self.parameters()).device
-        idx = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
+        idx, prefix_len = self._init_generate_idx(
+            num_samples, seqlen, bos=bos, prefix_tokens=prefix_tokens, device=device,
+        )
         kv_caches: list[ARKVCache | None] | None = None
         nfe = 0
 
-        for pos in range(seqlen - 1):
+        # Warm KV on the given prefix (token-by-token; cache path assumes len=1).
+        for pos in range(prefix_len - 1):
+            _, kv_caches = self._forward_with_kv_cache(
+                idx[:, pos : pos + 1],
+                kv_caches,
+                pos_start=pos,
+            )
+            nfe += 1
+
+        for pos in range(prefix_len - 1, seqlen - 1):
             logits, kv_caches = self._forward_with_kv_cache(
                 idx[:, -1:],
                 kv_caches,
@@ -296,11 +332,14 @@ class _GPTBackbone(nn.Module):
         temperature: float,
         top_k: int | None,
         bos: int,
+        prefix_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         device = next(self.parameters()).device
-        idx = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
+        idx, prefix_len = self._init_generate_idx(
+            num_samples, seqlen, bos=bos, prefix_tokens=prefix_tokens, device=device,
+        )
         nfe = 0
-        for _ in range(seqlen - 1):
+        for _ in range(seqlen - prefix_len):
             logits, _ = self(idx)
             next_token = sample_from_logits(
                 logits[:, -1, :], temperature=temperature, top_k=top_k,
@@ -318,9 +357,14 @@ class _GPTBackbone(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         bos_token_id: int | None = None,
+        prefix_tokens: torch.Tensor | None = None,
         sampling_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, int]:
-        """Temperature / top-k autoregressive sampling."""
+        """Temperature / top-k autoregressive sampling.
+
+        ``prefix_tokens`` (optional, shape ``(num_samples, L)``) conditions
+        generation; output length is still ``seqlen`` (``L < seqlen``).
+        """
         cfg = sampling_cfg or {}
         use_kv_cache = cfg.get("use_kv_cache", True)
         temperature = float(cfg.get("temperature", temperature))
@@ -337,6 +381,7 @@ class _GPTBackbone(nn.Module):
             temperature=temperature,
             top_k=top_k,
             bos=bos,
+            prefix_tokens=prefix_tokens,
         )
         if use_kv_cache:
             return self._generate_with_kv_cache(num_samples, seqlen, **gen_kwargs)

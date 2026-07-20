@@ -6,11 +6,14 @@ Usage:
     python generate.py --run bdelf-100m-full-muon
     python generate.py --checkpoint cache/checkpoints/bdelf-100m-full-muon/checkpoint_latest.pt
     python generate.py --num-tokens 1024 --seed 42
+    python generate.py --prompt "Once upon a time" --num-tokens 256
+    python generate.py --prompt-file prompt.txt --run ar-100m-full-muon
 """
 
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -19,7 +22,7 @@ import torch
 
 import hf_config  # noqa: F401
 from models import build_model
-from tokenizer import get_tokenizer
+from tokenizer import get_token_layout, get_tokenizer
 from train import CHECKPOINT_ROOT
 
 _GENERATE_LOG = "[generate]"
@@ -142,6 +145,44 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_prompt_text(prompt: str | None, prompt_file: str | None) -> str | None:
+    if prompt is not None and prompt_file is not None:
+        raise ValueError("Pass only one of --prompt / --prompt-file")
+    if prompt_file is not None:
+        path = Path(prompt_file)
+        if not path.is_file():
+            raise FileNotFoundError(f"Prompt file not found: {path}")
+        return path.read_text(encoding="utf-8")
+    if prompt is not None:
+        return prompt
+    return None
+
+
+def encode_prefix_tokens(
+    prompt: str,
+    *,
+    tokenizer,
+    tokenizer_name: str,
+    num_samples: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Encode prompt as ``(num_samples, L)`` prefix, prepending BOS like training."""
+    layout = get_token_layout(tokenizer_name)
+    ids = tokenizer.encode_preprocess(prompt)
+    prefix_ids = [layout.bos_token_id, *ids]
+    return (
+        torch.tensor(prefix_ids, dtype=torch.long, device=device)
+        .unsqueeze(0)
+        .expand(num_samples, -1)
+        .contiguous()
+    )
+
+
+def model_supports_prefix(model: torch.nn.Module) -> bool:
+    backbone = getattr(model, "backbone", model)
+    return "prefix_tokens" in inspect.signature(backbone.generate).parameters
+
+
 def generate_tokens(
     model: torch.nn.Module,
     *,
@@ -152,6 +193,7 @@ def generate_tokens(
     dtype: torch.dtype,
     temperature: float | None,
     top_k: int | None,
+    prefix_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
     set_seed(seed)
     # Only override model YAML sampling when the user explicitly passes values.
@@ -162,17 +204,25 @@ def generate_tokens(
         sampling_cfg["temperature"] = temperature
     if top_k is not None:
         sampling_cfg["top_k"] = top_k
+    gen_kwargs: dict = dict(
+        num_samples=num_samples,
+        seqlen=num_tokens,
+        sampling_cfg=sampling_cfg or None,
+    )
+    if prefix_tokens is not None:
+        if not model_supports_prefix(model):
+            raise ValueError(
+                "This model does not support prompt completion "
+                "(generate lacks prefix_tokens)."
+            )
+        gen_kwargs["prefix_tokens"] = prefix_tokens
     with torch.no_grad():
         with torch.amp.autocast(
             device.type,
             dtype=dtype,
             enabled=device.type == "cuda",
         ):
-            return model.generate(
-                num_samples=num_samples,
-                seqlen=num_tokens,
-                sampling_cfg=sampling_cfg or None,
-            )
+            return model.generate(**gen_kwargs)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -191,13 +241,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--num-tokens",
         type=int,
         default=1024,
-        help="Number of tokens to generate (default: 1024)",
+        help=(
+            "Total sequence length including the prompt prefix "
+            "(default: 1024)"
+        ),
     )
     parser.add_argument(
         "--num-samples",
         type=int,
         default=1,
         help="Number of independent samples to generate (default: 1)",
+    )
+    parser.add_argument(
+        "--prompt",
+        help="Prompt text to continue (BOS is prepended automatically)",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        help="Read prompt text from a UTF-8 file",
     )
     parser.add_argument(
         "--temperature",
@@ -258,9 +319,30 @@ def main() -> None:
         raise ValueError("Model config is missing tokenizer name")
     tokenizer = get_tokenizer(tokenizer_name)
 
+    prompt_text = resolve_prompt_text(args.prompt, args.prompt_file)
+    prefix_tokens = None
+    prefix_len = 0
+    if prompt_text is not None:
+        if model_meta["name"] == "elf":
+            raise ValueError("ELF generation is unconditional; --prompt is not supported")
+        prefix_tokens = encode_prefix_tokens(
+            prompt_text,
+            tokenizer=tokenizer,
+            tokenizer_name=tokenizer_name,
+            num_samples=args.num_samples,
+            device=device,
+        )
+        prefix_len = int(prefix_tokens.size(1))
+        if prefix_len >= args.num_tokens:
+            raise ValueError(
+                f"Prompt encodes to {prefix_len} tokens (with BOS), which must be "
+                f"shorter than --num-tokens={args.num_tokens}"
+            )
+
     _log(
         f"Model={model_meta['name']}, step={step}, "
         f"device={device}, dtype={dtype}, num_tokens={args.num_tokens}, "
+        f"prefix_len={prefix_len}, "
         f"temperature={args.temperature if args.temperature is not None else 'yaml'}, "
         f"top_k={args.top_k if args.top_k is not None else 'yaml'}, seed={args.seed}",
     )
@@ -274,14 +356,29 @@ def main() -> None:
         dtype=dtype,
         temperature=args.temperature,
         top_k=args.top_k,
+        prefix_tokens=prefix_tokens,
     )
 
     _log(f"Generation finished (nfe={nfe})")
     for sample_idx in range(tokens.size(0)):
         if args.num_samples > 1:
             _log(f"--- sample {sample_idx + 1}/{args.num_samples} ---")
-        text = tokenizer.decode(tokens[sample_idx].tolist(), skip_special_tokens=False)
-        print(text)
+        if prefix_len > 0:
+            prompt_decoded = tokenizer.decode(
+                tokens[sample_idx, :prefix_len].tolist(),
+                skip_special_tokens=False,
+            )
+            completion = tokenizer.decode(
+                tokens[sample_idx, prefix_len:].tolist(),
+                skip_special_tokens=False,
+            )
+            print(f"[prompt] {prompt_decoded}")
+            print(f"[completion] {completion}")
+        else:
+            text = tokenizer.decode(
+                tokens[sample_idx].tolist(), skip_special_tokens=False,
+            )
+            print(text)
 
 
 if __name__ == "__main__":

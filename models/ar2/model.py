@@ -540,10 +540,14 @@ class _AR2Backbone(nn.Module):
         seqlen: int | None = None,
         *,
         bos_token_id: int | None = None,
+        prefix_tokens: torch.Tensor | None = None,
         sampling_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Blockwise generation: anchor step samples the block's first token,
         then token-by-token causal decoding within the block.
+
+        ``prefix_tokens`` (optional) conditions generation; covered positions
+        are taken from the prefix instead of being sampled.
 
         Returns (tokens (num_samples, seqlen), nfe).
         """
@@ -563,6 +567,20 @@ class _AR2Backbone(nn.Module):
         n_blocks = seqlen // bs
         nfe = 0
 
+        prefix_len = 0
+        if prefix_tokens is not None:
+            if prefix_tokens.dim() != 2:
+                raise ValueError("prefix_tokens must have shape (num_samples, prefix_len)")
+            if prefix_tokens.size(0) != num_samples:
+                raise ValueError("prefix_tokens batch size must match num_samples")
+            prefix_len = int(prefix_tokens.size(1))
+            if prefix_len < 1 or prefix_len >= seqlen:
+                raise ValueError(
+                    f"prefix length {prefix_len} must be in [1, seqlen) "
+                    f"(seqlen={seqlen})"
+                )
+            prefix_tokens = prefix_tokens.to(device=device, dtype=torch.long)
+
         cache_s = self._empty_kv(bt, device, dtype)   # all anchors so far
         cache_t = self._empty_kv(bt, device, dtype)   # last W blocks of t
 
@@ -574,6 +592,11 @@ class _AR2Backbone(nn.Module):
 
         out = torch.empty(bt, seqlen, dtype=torch.long, device=device)
 
+        def _token_at(pos: int, sampled: torch.Tensor) -> torch.Tensor:
+            if pos < prefix_len:
+                return prefix_tokens[:, pos]
+            return sampled
+
         for g in range(n_blocks):
             # ---- anchor step: realize s KV and sample the block's first token
             pos_anchor = torch.full((ns,), g * bs, device=device, dtype=torch.long)
@@ -584,7 +607,10 @@ class _AR2Backbone(nn.Module):
             nfe += 1
             cache_s = self._append_kv(cache_s, kv_anchor)
 
-            if g == 0 and self.fix_bos:
+            pos0 = g * bs
+            if pos0 < prefix_len:
+                cur = prefix_tokens[:, pos0]
+            elif g == 0 and self.fix_bos:
                 cur = torch.full((bt,), bos, dtype=torch.long, device=device)
             else:
                 cur = self._sample_token(
@@ -605,9 +631,11 @@ class _AR2Backbone(nn.Module):
                 nfe += 1
                 blk_kv = self._append_kv(blk_kv, kv_j)
                 if need:
-                    cur = self._sample_token(
+                    next_pos = g * bs + j + 1
+                    sampled = self._sample_token(
                         logits[:, -1, :], temperature=temperature, top_k=top_k,
                     )
+                    cur = _token_at(next_pos, sampled)
 
             # ---- slide the t window ----------------------------------------
             keep = (w - 1) * bs  # existing cache tail so total stays <= W blocks
