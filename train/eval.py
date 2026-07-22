@@ -1,4 +1,4 @@
-"""Eval-split PPL and one-batch generative PPL scoring."""
+"""Eval-split PPL and generative PPL scoring."""
 
 from __future__ import annotations
 
@@ -247,7 +247,11 @@ def eval_one_batch_gen_ppl(
     seed: int,
     pbar_parent: tqdm | None = None,
 ) -> tuple[float, float]:
-    """Unconditional one-batch gen. PPL: sample with train model, score via gpt2-large."""
+    """Unconditional gen. PPL: sample with train model, score via gpt2-large.
+
+    Draws ``cfg.gen_eval_batches`` generate() batches of size ``cfg.batch_size``,
+    then scores all nonempty decoded strings together.
+    """
     was_training = train_model.training
     train_model.eval()
     gpt2_model.eval()
@@ -260,30 +264,38 @@ def eval_one_batch_gen_ppl(
     use_train_amp = train_device.type == "cuda"
     use_gpt2_amp = gpt2_device.type == "cuda"
     gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
+    n_batches = int(cfg.gen_eval_batches)
+    n_total = n_batches * cfg.batch_size
 
     if pbar_parent is not None:
         pbar_parent.clear()
         tqdm.write(
-            f"{_TRAIN_LOG} eval/gen: sampling {cfg.batch_size} x {seqlen} "
-            f"(seed={seed}) ...",
+            f"{_TRAIN_LOG} eval/gen: sampling {n_batches} x "
+            f"{cfg.batch_size} x {seqlen} (seed={seed}) ...",
         )
 
     # Isolate sampling RNG from the training loop.
     devices = [train_device] if train_device.type == "cuda" else []
+    chunks: list[torch.Tensor] = []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         if train_device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
         gen_model = unwrap_model(train_model)
+        sampling_cfg = _gen_eval_sampling_cfg(cfg)
         with torch.amp.autocast(
             "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
         ):
-            generated, _nfe = gen_model.generate(
-                num_samples=cfg.batch_size,
-                seqlen=seqlen,
-                for_eval=True,
-                sampling_cfg=_gen_eval_sampling_cfg(cfg),
-            )
+            for _ in range(n_batches):
+                generated, _nfe = gen_model.generate(
+                    num_samples=cfg.batch_size,
+                    seqlen=seqlen,
+                    for_eval=True,
+                    sampling_cfg=sampling_cfg,
+                )
+                chunks.append(generated.detach())
+    generated = torch.cat(chunks, dim=0)
+    assert generated.size(0) == n_total
 
     src_tok_name = get_preprocess(cfg.preprocess).tokenizer
     src_tok = _get_src_tokenizer(src_tok_name)
@@ -309,24 +321,42 @@ def eval_one_batch_gen_ppl(
             f"loss nan ppl nan"
         )
     else:
-        input_ids, labels, attention_mask = prepare_gpt2_eval_texts(
-            nonempty,
-            gpt2_vocab_size=gpt2_vocab_size,
-            fill_token_id=fill_token_id,
-            device=gpt2_device,
-            max_length=seqlen,
-        )
+        # Score in micro-batches to keep gpt2 peak memory near one train batch.
+        score_bs = max(1, int(cfg.batch_size))
+        loss_sum = 0.0
+        token_sum = 0
         with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
-            outputs = gpt2_model(
-                input_ids, attention_mask=attention_mask, labels=labels,
+            for i in range(0, len(nonempty), score_bs):
+                chunk = nonempty[i : i + score_bs]
+                input_ids, labels, attention_mask = prepare_gpt2_eval_texts(
+                    chunk,
+                    gpt2_vocab_size=gpt2_vocab_size,
+                    fill_token_id=fill_token_id,
+                    device=gpt2_device,
+                    max_length=seqlen,
+                )
+                outputs = gpt2_model(
+                    input_ids, attention_mask=attention_mask, labels=labels,
+                )
+                loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+                n_tok = int((labels != -100).sum().item())
+                if n_tok > 0:
+                    loss_sum += float(loss.item()) * n_tok
+                    token_sum += n_tok
+        if token_sum == 0:
+            gen_loss = float("nan")
+            gen_ppl = float("nan")
+            summary = (
+                f"eval/gen ({cfg.gen_eval_model}): no scorable tokens; "
+                f"loss nan ppl nan"
             )
-            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-            gen_loss = float(loss.item())
-        gen_ppl = loss_to_ppl(gen_loss)
-        summary = (
-            f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} "
-            f"ppl {gen_ppl:.2f} (n={len(nonempty)})"
-        )
+        else:
+            gen_loss = loss_sum / token_sum
+            gen_ppl = loss_to_ppl(gen_loss)
+            summary = (
+                f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} "
+                f"ppl {gen_ppl:.2f} (n={len(nonempty)})"
+            )
 
     if was_training:
         train_model.train()

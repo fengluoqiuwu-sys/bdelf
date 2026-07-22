@@ -885,7 +885,8 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 f"(seed={cfg.eval_sample_seed})",
             )
         _train_log(
-            f"gen. ppl: 1 batch / eval via {cfg.gen_eval_model} "
+            f"gen. ppl: {cfg.gen_eval_batches} batches / eval via "
+            f"{cfg.gen_eval_model} "
             f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device})",
         )
 

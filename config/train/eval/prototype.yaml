@@ -5,5 +5,6 @@ eval_sample_seed: 42
 gen_eval_model: gpt2-large
 gen_eval_model_dtype: bf16
 gen_eval_model_device: cuda
+gen_eval_batches: 32
 use_fast_infer: false
 eval_gen_steps: 128

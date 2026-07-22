@@ -1,5 +1,5 @@
 _doc: >
-  Online eval: held-out model-loss PPL, plus one-batch generative PPL
+  Online eval: held-out model-loss PPL, plus generative PPL
   (train model samples random text of chunk length, scored by gpt2-large)
 name: default
 eval_sample_count: 1024
@@ -7,5 +7,7 @@ eval_sample_seed: 42
 gen_eval_model: gpt2-large
 gen_eval_model_dtype: bf16
 gen_eval_model_device: cuda
+# How many generate() batches to draw per gen-PPL eval (was 1)
+gen_eval_batches: 32
 use_fast_infer: false
 eval_gen_steps: 128

@@ -133,10 +133,12 @@ class FL_EvalConfig:
     # Online eval subsample; None / omitted runs the full eval split
     eval_sample_count: Optional[int] = None
     eval_sample_seed: int = 42
-    # One-batch generative PPL: train model samples → scored by HF causal LM
+    # Generative PPL: train model samples → scored by HF causal LM
     gen_eval_model: str = "gpt2-large"
     gen_eval_model_dtype: TrainDtype = "bf16"
     gen_eval_model_device: str = "cuda"
+    # Number of generate() batches per gen-PPL eval
+    gen_eval_batches: int = 32
     # BDELF generate during eval: false → legacy (full AdaLN), matches training
     use_fast_infer: bool = False
     # BD3LM online-eval sampling steps (full 5000 is too slow)
@@ -198,6 +200,7 @@ class FL_TrainConfig:
     gen_eval_model: str
     gen_eval_model_dtype: TrainDtype
     gen_eval_model_device: str
+    gen_eval_batches: int
     eval_use_fast_infer: bool
     eval_gen_steps: int
     use_muon: bool = True
@@ -455,6 +458,11 @@ def compose_train_config(
         raise ValueError(
             f"{run_name}: eval_gen_steps must be >= 1, got {eval_cfg.eval_gen_steps}"
         )
+    if eval_cfg.gen_eval_batches < 1:
+        raise ValueError(
+            f"{run_name}: gen_eval_batches must be >= 1, "
+            f"got {eval_cfg.gen_eval_batches}"
+        )
     if eval_cfg.gen_eval_model_device not in ("cuda", "cpu"):
         raise ValueError(
             f"{run_name}: gen_eval_model_device must be 'cuda' or 'cpu', "
@@ -564,6 +572,7 @@ def compose_train_config(
         gen_eval_model=eval_cfg.gen_eval_model,
         gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
         gen_eval_model_device=eval_cfg.gen_eval_model_device,
+        gen_eval_batches=eval_cfg.gen_eval_batches,
         eval_use_fast_infer=eval_cfg.use_fast_infer,
         eval_gen_steps=eval_cfg.eval_gen_steps,
         use_muon=schedule.use_muon,
