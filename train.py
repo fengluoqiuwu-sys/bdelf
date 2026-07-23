@@ -461,13 +461,7 @@ def train_loop(
                     if dual_branch
                     else None
                 )
-                micro_loss = forward_loss(
-                    model,
-                    batch,
-                    branch=train_branch,
-                    align_step=step,
-                    align_total=cfg.max_steps,
-                )
+                micro_loss = forward_loss(model, batch, branch=train_branch)
 
             loss_ok = _all_ranks_true(
                 bool(torch.isfinite(micro_loss).item()),

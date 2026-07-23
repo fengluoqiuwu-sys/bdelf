@@ -41,23 +41,12 @@ def forward_loss(
     batch: torch.Tensor,
     *,
     branch: str | None = None,
-    align_step: int | None = None,
-    align_total: int | None = None,
 ) -> torch.Tensor:
     kwargs: dict[str, Any] = {}
     if branch is not None:
         if not uses_dual_branch_logging(model):
             raise ValueError(f"Model does not support branch={branch!r}")
         kwargs["branch"] = branch
-    raw = unwrap_model(model)
-    bb = getattr(raw, "backbone", None)
-    if (
-        bb is not None
-        and hasattr(bb, "set_align_progress")
-        and align_step is not None
-        and align_total is not None
-    ):
-        bb.set_align_progress(align_step, align_total)
     if uses_full_sequence(model):
         _, loss = model(batch, None, **kwargs)
     else:

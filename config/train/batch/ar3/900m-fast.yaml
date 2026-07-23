@@ -1,8 +1,0 @@
-_doc: >
-  ar3/900m-fast for ≤10.5GB（超预算偏紧）。本地实测 bs=1≈12.3GB，
-  与 gpt2-large 同卡时需关评估基线或更大显卡；仍提供配置对齐 ar2 矩阵。
-name: 900m-fast
-batch_size: 1
-grad_accum_steps: 4
-num_params_m: 870.5
-estimated_peak_vram_gb: 12.3

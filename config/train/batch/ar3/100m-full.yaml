@@ -1,8 +1,0 @@
-_doc: >
-  ar3/100m-full for ≤18.5GB. 本地实测 bs=12≈14.3GB；bs=16 外推≈18.6 贴边超预算。
-  gbs=96 → 4 卡 accum=2。
-name: 100m-full
-batch_size: 12
-global_batch_size: 96
-num_params_m: 99.0
-estimated_peak_vram_gb: 14.3

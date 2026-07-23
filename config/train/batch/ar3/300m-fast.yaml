@@ -1,7 +1,0 @@
-_doc: >
-  ar3/300m-fast for ≤10.5GB. 本地实测 bs=2≈6.8GB；bs=4 外推≈10.7 超预算。
-name: 300m-fast
-batch_size: 2
-grad_accum_steps: 4
-num_params_m: 303.4
-estimated_peak_vram_gb: 6.8

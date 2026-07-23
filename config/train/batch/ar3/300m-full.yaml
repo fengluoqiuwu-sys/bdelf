@@ -1,8 +1,0 @@
-_doc: >
-  ar3/300m-full for ≤18.5GB. 由 bs=1/2 外推 bs=4≈10.7GB；bs=8≈18.5 贴边。
-  取 bs=4。gbs=64 → 4 卡 accum=4。
-name: 300m-full
-batch_size: 4
-global_batch_size: 64
-num_params_m: 303.4
-estimated_peak_vram_gb: 10.7

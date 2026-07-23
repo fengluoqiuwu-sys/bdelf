@@ -113,7 +113,7 @@ class Ar25Attention(nn.Module):
         q, k, v = self._project_qkv(x, positions, rho)
         y = fused_flex_attention(q, k, v, block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.n_embd)
-        return self.resid_dropout(self.c_proj(y)), q, k, v
+        return self.resid_dropout(self.c_proj(y))
 
     def forward_infer(self, x, positions, ctx_k, ctx_v, rho=None, causal_self=False):
         q, k_self, v_self = self._project_qkv(x, positions, rho)
@@ -162,9 +162,8 @@ class Block(nn.Module):
         self.mlp = MLP(n_embd, dropout)
 
     def forward(self, x, positions, block_mask, rho):
-        attn_out, q, k, v = self.attn(self.ln_1(x), positions, block_mask, rho)
-        x = x + attn_out
-        return x + self.mlp(self.ln_2(x)), q, k, v
+        x = x + self.attn(self.ln_1(x), positions, block_mask, rho)
+        return x + self.mlp(self.ln_2(x))
 
     def forward_infer(self, x, positions, ctx_k, ctx_v, rho=None, causal_self=False):
         attn_out, k_self, v_self = self.attn.forward_infer(
@@ -209,8 +208,6 @@ class _AR25Backbone(nn.Module):
         self.t_window = t_window
         self.n_head = n_head
         self.fix_bos = fix_bos
-        # AR3 sets True so checkpoint outputs retain QKV for oracle align.
-        self.collect_qkv = False
         self.vocab_size = token_layout.vocab_size
         self.anchor_index0 = token_layout.vocab_size
         self.model_vocab_size = token_layout.vocab_size + 1
@@ -365,33 +362,14 @@ class _AR25Backbone(nn.Module):
         x = self.drop(self.wte(input_ids) + self.type_emb(rho))
         positions = layout["positions"]
 
-        layer_qkv: list = []
-        collect_qkv = self.collect_qkv and self.training
         for block in self.h:
             if self.training:
-                if collect_qkv:
-                    x, q, k, v = checkpoint(
-                        block, x, positions, block_mask, rho, use_reentrant=False,
-                    )
-                    layer_qkv.append((q, k, v))
-                else:
-                    # Drop QKV so checkpoint does not retain them for backward.
-                    x = checkpoint(
-                        lambda *args: block(*args)[0],
-                        x, positions, block_mask, rho, use_reentrant=False,
-                    )
+                x = checkpoint(
+                    block, x, positions, block_mask, rho, use_reentrant=False,
+                )
             else:
-                out = block(x, positions, block_mask, rho)
-                x = out[0]
-                if collect_qkv:
-                    layer_qkv.append(out[1:])
-        if collect_qkv:
-            self._last_layer_qkv = layer_qkv
-            self._last_layout = layout
-            self._last_n = n
-        else:
-            self._last_layer_qkv = None
-            self._last_n = n
+                x = block(x, positions, block_mask, rho)
+        self._last_n = n
         x = self.ln_f(x)
 
         loss_pos = layout["loss_pos"]
