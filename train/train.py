@@ -68,6 +68,8 @@ class FL_OptimizerConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
     muon_learning_rate: float = 0.003
+    # Official Muon default; separate from AdamW weight_decay.
+    muon_weight_decay: float = 0.01
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -205,6 +207,7 @@ class FL_TrainConfig:
     eval_gen_steps: int
     use_muon: bool = True
     muon_learning_rate: float = 0.003
+    muon_weight_decay: float = 0.01
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -577,6 +580,7 @@ def compose_train_config(
         eval_gen_steps=eval_cfg.eval_gen_steps,
         use_muon=schedule.use_muon,
         muon_learning_rate=optimizer.muon_learning_rate,
+        muon_weight_decay=optimizer.muon_weight_decay,
         muon_momentum=optimizer.muon_momentum,
         muon_ns_steps=optimizer.muon_ns_steps,
         extra=extra,

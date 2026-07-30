@@ -89,6 +89,7 @@ class Muon(torch.optim.Optimizer):
         params,
         *,
         lr: float = 0.003,
+        weight_decay: float = 0.0,
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
@@ -96,6 +97,7 @@ class Muon(torch.optim.Optimizer):
     ) -> None:
         defaults = {
             "lr": lr,
+            "weight_decay": weight_decay,
             "momentum": momentum,
             "nesterov": nesterov,
             "ns_steps": ns_steps,
@@ -112,6 +114,7 @@ class Muon(torch.optim.Optimizer):
 
         for group in self.param_groups:
             lr = group["lr"]
+            weight_decay = group.get("weight_decay", 0.0)
             momentum = group["momentum"]
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
@@ -128,6 +131,9 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(grad)
                 update = grad.add(buf, alpha=momentum) if nesterov else buf
                 orth = zeropower_via_newtonschulz5(update, steps=ns_steps, eps=eps)
+                # Decoupled WD (AdamW-style), matching KellerJordan/Muon.
+                if weight_decay != 0:
+                    param.mul_(1 - lr * weight_decay)
                 param.add_(orth, alpha=-lr * _muon_lr_scale(param))
 
         return loss
@@ -199,6 +205,7 @@ def build_optimizer(
     muon = Muon(
         muon_params,
         lr=cfg.muon_learning_rate,
+        weight_decay=cfg.muon_weight_decay,
         momentum=cfg.muon_momentum,
         ns_steps=cfg.muon_ns_steps,
     )
