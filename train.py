@@ -40,6 +40,7 @@ from train.batching import (
     fetch_train_batch,
 )
 from train.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
+from train.ema import ema_update, init_ema, swap_ema_weights
 from train.eval import (
     eval_model_ppl,
     eval_one_batch_gen_ppl,
@@ -349,9 +350,8 @@ def train_loop(
                 ensure_ascii=False,
             )
 
-    # 在 DDP 之前 compile:backbone 是固定的 2*chunk_length 序列 + 静态 branch kwarg,
-    # Inductor 能拿到稳定 shape、每个分支一张图。所有参数每步都被使用(mode embedding 在
-    # forward 里被触碰),故 DDP 可不带 find_unused_parameters。
+    # Compile before DDP. ELF mixed-branch keeps a single dynamic graph;
+    # BDELF still uses a synced denoise/decode branch kwarg per step.
     compile_model = bool(cfg.extra.get("compile", False)) and device.type == "cuda"
     if compile_model:
         if rank == 0:
@@ -379,6 +379,12 @@ def train_loop(
 
     step = 0
     optimizer.zero_grad(set_to_none=True)
+    ema_decay = float(cfg.extra.get("ema_decay", 0.0) or 0.0)
+    ema_state: dict[str, torch.Tensor] | None = (
+        init_ema(model) if ema_decay > 0.0 else None
+    )
+    if rank == 0 and ema_state is not None:
+        _train_log(f"EMA enabled: decay={ema_decay:g}")
 
     resume_from_ckpt = cfg.resume and latest_ckpt.is_file()
     if is_distributed:
@@ -391,10 +397,20 @@ def train_loop(
         # Every rank must load weights/optimizer state: DDP only broadcasts
         # parameters at construction time (above), so a rank-0-only load would
         # leave the other ranks on their random init.
-        step = load_checkpoint(
+        step, loaded_ema = load_checkpoint(
             latest_ckpt, model, optimizer, device,
             cfg=cfg, model_meta=model_meta, restore_rng=(rank == 0),
         )
+        if ema_state is not None:
+            if loaded_ema:
+                for k, v in loaded_ema.items():
+                    if k in ema_state:
+                        ema_state[k].copy_(v.to(device=ema_state[k].device))
+            elif rank == 0:
+                _train_log(
+                    "Checkpoint has no EMA state; re-initialized EMA from model weights",
+                )
+                ema_state = init_ema(model)
         if rank == 0:
             kept_train = truncate_csv_for_resume(train_csv, step)
             kept_eval = truncate_csv_for_resume(eval_csv, step)
@@ -414,14 +430,22 @@ def train_loop(
         dist.barrier()
 
     dual_branch = uses_dual_branch_logging(model)
+    mixed_branch = bool(getattr(unwrap_model(model), "mixed_branch_training", False))
     if rank == 0 and dual_branch:
         decoder_prob = float(cfg.extra.get("decoder_prob", 0.2))
         denoise_prob = max(0.0, 1.0 - decoder_prob)
-        _train_log(
-            f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
-            f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
-            "each micro-step is a data step; metrics/plots use decode CE",
-        )
+        if mixed_branch:
+            _train_log(
+                f"{cfg.model.upper()} dual-branch: per-example mix "
+                f"denoise:decode ≈ {denoise_prob:g}:{decoder_prob:g} "
+                "(official ELF train_step); metrics/plots use decode CE",
+            )
+        else:
+            _train_log(
+                f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
+                f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
+                "each micro-step is a data step; metrics/plots use decode CE",
+            )
 
     model.train()
     t0 = time.time()
@@ -455,13 +479,14 @@ def train_loop(
                     group["lr"] = lr
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                train_branch = (
-                    _sample_synced_train_branch(
+                # ELF: mixed_branch_training → model mixes per-example internally.
+                # BDELF: synced exclusive branch per step.
+                if dual_branch and not mixed_branch:
+                    train_branch: str | None = _sample_synced_train_branch(
                         model, device, is_distributed=is_distributed,
                     )
-                    if dual_branch
-                    else None
-                )
+                else:
+                    train_branch = None
                 micro_loss = forward_loss(model, batch, branch=train_branch)
 
             loss_ok = _all_ranks_true(
@@ -503,6 +528,8 @@ def train_loop(
                 if grads_ok:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                     optimizer.step()
+                    if ema_state is not None:
+                        ema_update(ema_state, model, ema_decay)
                 elif rank == 0:
                     _train_log(
                         f"Skipping optimizer step at step {step}: non-finite gradients",
@@ -511,8 +538,21 @@ def train_loop(
 
             train_loss = micro_loss.item() if loss_ok else float("nan")
             # Prefer the sampled branch over model.last_loss_branch so logging
-            # stays correct under torch.compile / DDP wrappers.
-            loss_branch = train_branch if dual_branch else ""
+            # stays correct under torch.compile / DDP wrappers for BDELF.
+            # ELF mixed path reads branch metrics from the backbone.
+            raw_for_log = unwrap_model(model)
+            if mixed_branch:
+                loss_branch = "mixed"
+                denoise_mse = float(getattr(raw_for_log, "last_l2_loss", float("nan")))
+                decode_ce = float(getattr(raw_for_log, "last_ce_loss", float("nan")))
+            elif dual_branch:
+                loss_branch = train_branch if train_branch else ""
+                denoise_mse = None
+                decode_ce = None
+            else:
+                loss_branch = ""
+                denoise_mse = None
+                decode_ce = None
             elapsed = time.time() - t0
             # Every micro-step consumes a full data batch (dual-branch 4:1 is loss mix).
             seq_tokens = batch.size(0) * (
@@ -523,11 +563,23 @@ def train_loop(
             row = build_train_row(
                 step, train_loss, lr, tokens_per_sec,
                 dual_branch=dual_branch, loss_branch=loss_branch,
+                denoise_mse=denoise_mse, decode_ce=decode_ce,
             )
 
             rank0_sync = False
             if rank == 0:
-                if dual_branch and loss_branch == "decode":
+                if mixed_branch:
+                    postfix = {
+                        "loss": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
+                    if decode_ce == decode_ce:
+                        postfix["ce"] = f"{decode_ce:.3f}"
+                        postfix["ppl"] = f"{loss_to_ppl(decode_ce):.1f}"
+                    if denoise_mse == denoise_mse:
+                        postfix["mse"] = f"{denoise_mse:.3f}"
+                elif dual_branch and loss_branch == "decode":
                     postfix = {
                         "ce": f"{train_loss:.3f}",
                         "ppl": f"{loss_to_ppl(train_loss):.1f}",
@@ -558,25 +610,26 @@ def train_loop(
                         (step + 1) % cfg.eval_step == 0
                         and eval_loader is not None
                     ):
-                        eval_loss, eval_ppl = eval_model_ppl(
-                            unwrap_model(model),
-                            eval_loader,
-                            device,
-                            amp_dtype,
-                            pbar_parent=pbar,
-                        )
-                        gen_loss: float | None = None
-                        gen_ppl: float | None = None
-                        if gpt2_model is not None:
-                            gen_loss, gen_ppl = eval_one_batch_gen_ppl(
-                                model,
-                                gpt2_model,
-                                cfg=cfg,
-                                train_device=device,
-                                train_amp_dtype=amp_dtype,
-                                seed=cfg.seed + step,
+                        with swap_ema_weights(model, ema_state):
+                            eval_loss, eval_ppl = eval_model_ppl(
+                                unwrap_model(model),
+                                eval_loader,
+                                device,
+                                amp_dtype,
                                 pbar_parent=pbar,
                             )
+                            gen_loss: float | None = None
+                            gen_ppl: float | None = None
+                            if gpt2_model is not None:
+                                gen_loss, gen_ppl = eval_one_batch_gen_ppl(
+                                    model,
+                                    gpt2_model,
+                                    cfg=cfg,
+                                    train_device=device,
+                                    train_amp_dtype=amp_dtype,
+                                    seed=cfg.seed + step,
+                                    pbar_parent=pbar,
+                                )
                         eval_row = {
                             "step": step,
                             "eval_loss": round(eval_loss, 6),
@@ -608,11 +661,13 @@ def train_loop(
                     # Always refresh latest when writing any durable checkpoint.
                     save_checkpoint(
                         latest_ckpt, model, optimizer, next_step, cfg, model_meta,
+                        ema_state=ema_state,
                     )
                     if do_snapshot:
                         save_checkpoint(
                             run_dir / f"checkpoint_step_{next_step:07d}.pt",
                             model, optimizer, next_step, cfg, model_meta,
+                            ema_state=ema_state,
                         )
                     _rank0_log(f"  [ckpt] saved at step {next_step}", pbar)
                     rank0_sync = True
@@ -633,7 +688,10 @@ def train_loop(
                 pbar = None
             next_step = step + 1 if step_backward_done else step
             _train_log(f"Interrupted at step {step}; saving checkpoint ...")
-            save_checkpoint(latest_ckpt, model, optimizer, next_step, cfg, model_meta)
+            save_checkpoint(
+                latest_ckpt, model, optimizer, next_step, cfg, model_meta,
+                ema_state=ema_state,
+            )
             update_ppl_plots(train_csv, eval_csv, run_dir)
             _train_log(f"Saved; resume from step {next_step} on next run")
         if is_distributed:
@@ -646,9 +704,15 @@ def train_loop(
     if rank == 0:
         if pbar is not None:
             pbar.close()
-        save_checkpoint(latest_ckpt, model, optimizer, step, cfg, model_meta)
+        save_checkpoint(
+            latest_ckpt, model, optimizer, step, cfg, model_meta,
+            ema_state=ema_state,
+        )
         final_snapshot = run_dir / f"checkpoint_step_{step:07d}.pt"
-        save_checkpoint(final_snapshot, model, optimizer, step, cfg, model_meta)
+        save_checkpoint(
+            final_snapshot, model, optimizer, step, cfg, model_meta,
+            ema_state=ema_state,
+        )
         update_ppl_plots(train_csv, eval_csv, run_dir)
         _train_log(
             f"Training finished after {step} steps; "

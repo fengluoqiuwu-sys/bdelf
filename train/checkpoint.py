@@ -38,6 +38,8 @@ def save_checkpoint(
     step: int,
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
+    *,
+    ema_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """Atomically write a checkpoint (tmp file + ``os.replace``).
 
@@ -63,6 +65,8 @@ def save_checkpoint(
         "train_config": asdict(cfg),
         "model_meta": model_meta,
     }
+    if ema_state:
+        payload["ema"] = {k: v.detach().cpu() for k, v in ema_state.items()}
     if torch.cuda.is_available():
         payload["rng"]["cuda"] = torch.cuda.get_rng_state_all()
     tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -97,7 +101,7 @@ def load_checkpoint(
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
     restore_rng: bool = True,
-) -> int:
+) -> tuple[int, dict[str, torch.Tensor] | None]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     saved_cfg = ck.get("train_config") or {}
     if saved_cfg.get("name") and saved_cfg["name"] != cfg.name:
@@ -138,6 +142,13 @@ def load_checkpoint(
         for p, g in zip(raw.parameters(), grads):
             p.grad = g.to(device) if g is not None else None
 
+    ema_raw = ck.get("ema")
+    ema_state: dict[str, torch.Tensor] | None = None
+    if isinstance(ema_raw, dict) and ema_raw:
+        ema_state = {
+            k: v.to(device=device) for k, v in ema_raw.items()
+        }
+
     # The RNG snapshot comes from rank 0; non-zero ranks keep their
     # set_seed(seed + rank) state so per-rank noise stays decorrelated.
     rng = ck.get("rng")
@@ -146,4 +157,4 @@ def load_checkpoint(
         np.random.set_state(rng["numpy"])
         if "cuda" in rng and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(rng["cuda"])
-    return int(ck["step"])
+    return int(ck["step"]), ema_state

@@ -179,8 +179,20 @@ class FL_PreTrainedModel(PreTrainedModel):
         return getattr(self.backbone, "dual_branch_logging", False)
 
     @property
+    def mixed_branch_training(self) -> bool:
+        return getattr(self.backbone, "mixed_branch_training", False)
+
+    @property
     def last_loss_branch(self) -> str:
         return getattr(self.backbone, "last_loss_branch", "")
+
+    @property
+    def last_l2_loss(self) -> float:
+        return float(getattr(self.backbone, "last_l2_loss", float("nan")))
+
+    @property
+    def last_ce_loss(self) -> float:
+        return float(getattr(self.backbone, "last_ce_loss", float("nan")))
 
     def generate(
         self,

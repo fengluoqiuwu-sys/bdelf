@@ -109,12 +109,13 @@ def _parse_float(raw: str | None) -> float | None:
 def _decode_ce_train_series(
     train_rows: list[dict[str, str]],
 ) -> tuple[list[int], list[float], list[float]]:
-    """Train decode-CE points for plotting (BDELF/ELF dual-branch)."""
+    """Train decode-CE points for plotting (BDELF exclusive / ELF mixed)."""
     steps: list[int] = []
     ppls: list[float] = []
     lrs: list[float] = []
     for row in train_rows:
-        if row.get("loss_branch") != "decode":
+        branch = row.get("loss_branch") or ""
+        if branch not in ("decode", "mixed"):
             continue
         ppl = _parse_float(row.get("train_ppl"))
         if ppl is None:
@@ -142,7 +143,9 @@ def update_ppl_plots(
     train_steps = [int(r["step"]) for r in train_rows]
     train_lr = [float(r["lr"]) for r in train_rows]
 
-    dual_branch = any(r.get("loss_branch") in ("denoise", "decode") for r in train_rows)
+    dual_branch = any(
+        r.get("loss_branch") in ("denoise", "decode", "mixed") for r in train_rows
+    )
     if dual_branch:
         train_plot_steps, train_ppl, _ = _decode_ce_train_series(train_rows)
     else:
@@ -237,6 +240,8 @@ def build_train_row(
     *,
     dual_branch: bool,
     loss_branch: str = "",
+    denoise_mse: float | None = None,
+    decode_ce: float | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "step": step,
@@ -250,7 +255,14 @@ def build_train_row(
     }
     if dual_branch:
         row["loss_branch"] = loss_branch
-        if loss_branch == "denoise":
+        if loss_branch == "mixed":
+            # Official-style combined loss; still record both branch metrics.
+            if denoise_mse is not None and denoise_mse == denoise_mse:
+                row["denoise_mse"] = round(denoise_mse, 6)
+            if decode_ce is not None and decode_ce == decode_ce:
+                row["decode_ce"] = round(decode_ce, 6)
+                row["train_ppl"] = round(loss_to_ppl(decode_ce), 4)
+        elif loss_branch == "denoise":
             # MSE is not a CE; leave train_ppl empty (same as BDELF).
             row["denoise_mse"] = round(train_loss, 6)
         elif loss_branch == "decode":
@@ -261,7 +273,7 @@ def build_train_row(
         else:
             raise ValueError(
                 f"dual_branch logging requires loss_branch "
-                f"'denoise' or 'decode', got {loss_branch!r}"
+                f"'denoise', 'decode', or 'mixed', got {loss_branch!r}"
             )
     else:
         row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
@@ -270,6 +282,17 @@ def build_train_row(
 
 def _train_metrics_text(row: dict[str, Any]) -> str:
     branch = row.get("loss_branch") or ""
+    if branch == "mixed":
+        mse = row.get("denoise_mse")
+        ce = row.get("decode_ce")
+        parts = [f"[mixed] loss {row['train_loss']:.4f}"]
+        if mse not in ("", None):
+            parts.append(f"mse {mse}")
+        if ce not in ("", None):
+            parts.append(f"ce {ce} ppl {row.get('train_ppl', '')}")
+        parts.append(f"lr {row['lr']:.2e}")
+        parts.append(f"{row['tokens_per_sec']:.0f} tok/s")
+        return " | ".join(parts)
     if branch == "denoise":
         return (
             f"[denoise] mse {row['train_loss']:.4f} | "

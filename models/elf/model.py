@@ -1,8 +1,9 @@
-"""Embedded Language Flows (ELF) — continuous diffusion LM (no CFG).
+"""Embedded Language Flows (ELF) — continuous diffusion LM (no CFG / no SC-CFG).
 
-Follows arXiv:2605.10938 with self-conditioning but without classifier-free
-guidance. Training uses a frozen T5 encoder for clean embeddings; inference
-only needs the denoiser + unembedding head.
+Follows arXiv:2605.10938 with self-conditioning and official per-example
+denoise/decode mixing, but without classifier-free guidance or SC-CFG tokens.
+Training uses a frozen T5 encoder for clean embeddings; inference only needs
+the denoiser + unembedding head.
 
 References:
   - ELF: https://arxiv.org/abs/2605.10938
@@ -48,6 +49,8 @@ class _ELFBackbone(nn.Module):
 
     full_sequence_training = True
     dual_branch_logging = True
+    # Official train_step: one forward mixes per-example denoise/decode rows.
+    mixed_branch_training = True
 
     def __init__(
         self,
@@ -104,6 +107,8 @@ class _ELFBackbone(nn.Module):
         self.t_eps = t_eps
         self.time_schedule = time_schedule
         self.last_loss_branch = ""
+        self.last_l2_loss = float("nan")
+        self.last_ce_loss = float("nan")
 
         # Lazy frozen T5; held in a list so PyTorch does not auto-register it
         # as a submodule (avoids DDP / checkpoint surprises).
@@ -179,17 +184,28 @@ class _ELFBackbone(nn.Module):
                 self._encoder_holder[0] = enc.to(device)
         return self._encoder_holder[0]
 
-    def encode_tokens(self, idx: torch.Tensor) -> torch.Tensor:
+    def encode_tokens(
+        self,
+        idx: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         encoder = self._ensure_encoder()
         return encode_text(
             idx,
             encoder,
+            attention_mask=attention_mask,
             latent_mean=self.latent_mean,
             latent_std=self.latent_std,
         ).to(dtype=next(self.parameters()).dtype)
 
     def trainable_parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def _token_loss_mask(self, idx: torch.Tensor) -> torch.Tensor:
+        """(B, S) float mask: 1 = valid token (exclude pad), matching official."""
+        return (idx != self.token_layout.pad_token_id).to(
+            dtype=next(self.parameters()).dtype
+        )
 
     # ------------------------------------------------------------------
     # Network forward
@@ -260,19 +276,16 @@ class _ELFBackbone(nn.Module):
 
         with torch.amp.autocast("cuda", enabled=False):
             decoder_logits = None
+            # Official: whenever decoder_step_active is provided (incl. a (B,)
+            # tensor that may be all zeros), always run the unembed head so
+            # mixed-branch DDP never sees unused parameters.
             if decoder_step_active is not None:
-                need_logits = True
-                if isinstance(decoder_step_active, torch.Tensor):
-                    need_logits = bool(decoder_step_active.any().item())
-                elif decoder_step_active is False:
-                    need_logits = False
-                if need_logits:
-                    xf = x_h.float()
-                    hidden = F.gelu(
-                        xf @ self.proj_kernel + self.proj_bias,
-                        approximate="tanh",
-                    )
-                    decoder_logits = hidden @ self.unembed_kernel + self.unembed_bias
+                xf = x_h.float()
+                hidden = F.gelu(
+                    xf @ self.proj_kernel + self.proj_bias,
+                    approximate="tanh",
+                )
+                decoder_logits = hidden @ self.unembed_kernel + self.unembed_bias
             x_pred = self.final_layer(x_h.float())
         return x_pred, decoder_logits
 
@@ -281,16 +294,14 @@ class _ELFBackbone(nn.Module):
     # ------------------------------------------------------------------
 
     def _sample_train_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Match official ``sample_timesteps`` (no upper clamp on t)."""
         if self.time_schedule == "logit_normal":
             z = (
                 torch.randn(batch_size, device=device) * self.denoiser_p_std
                 + self.denoiser_p_mean
             )
-            t = torch.sigmoid(z)
-        else:
-            t = torch.rand(batch_size, device=device)
-        # Avoid singular (1-t) in v-target; matches BDELF / Flow Matching practice.
-        return t.clamp(max=1.0 - self.t_eps)
+            return torch.sigmoid(z)
+        return torch.rand(batch_size, device=device)
 
     def _x_to_v(
         self, x_pred: torch.Tensor, z: torch.Tensor, t: torch.Tensor,
@@ -298,7 +309,19 @@ class _ELFBackbone(nn.Module):
         t_exp = t.reshape(-1, 1, 1)
         return (x_pred - z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
 
-    def _denoise_loss(self, x0: torch.Tensor) -> torch.Tensor:
+    def _masked_mean(
+        self, per_token: torch.Tensor, mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean of ``per_token`` (B, S) over positions where ``mask`` (B, S) > 0."""
+        mask_f = mask.to(dtype=per_token.dtype)
+        return (per_token * mask_f).sum() / torch.clamp(mask_f.sum(), min=1.0)
+
+    def _denoise_loss(
+        self,
+        x0: torch.Tensor,
+        *,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
         bsz = x0.shape[0]
         device = x0.device
         t = self._sample_train_t(bsz, device).to(dtype=x0.dtype)
@@ -307,19 +330,20 @@ class _ELFBackbone(nn.Module):
         z = t_exp * x0 + (1.0 - t_exp) * noise
         v_target = (x0 - z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
 
-        use_sc = (
-            self.self_cond_prob > 0
-            and torch.rand((), device=device) < self.self_cond_prob
-        )
-        if use_sc:
+        # Per-example self-conditioning (official), not a single batch coin flip.
+        if self.self_cond_prob > 0:
+            use_sc = (
+                (torch.rand((bsz,), device=device, dtype=x0.dtype) < self.self_cond_prob)
+                .reshape(-1, 1, 1)
+                .to(dtype=x0.dtype)
+            )
             with torch.no_grad():
                 z_sc0 = torch.cat([z, torch.zeros_like(z)], dim=-1)
                 x_init, _ = self.net_forward(
                     z_sc0, t, decoder_step_active=False, deterministic=True,
                 )
-            model_in = torch.cat([z, x_init.detach()], dim=-1)
-        elif self.self_cond_prob > 0:
-            model_in = torch.cat([z, torch.zeros_like(z)], dim=-1)
+            sc_half = x_init.detach() * use_sc
+            model_in = torch.cat([z, sc_half], dim=-1)
         else:
             model_in = z
 
@@ -327,9 +351,16 @@ class _ELFBackbone(nn.Module):
             model_in, t, decoder_step_active=False, deterministic=False,
         )
         v_pred = self._x_to_v(x_pred, z, t)
-        return ((v_pred - v_target) ** 2).mean()
+        l2_per_token = ((v_pred - v_target) ** 2).mean(dim=-1)
+        return self._masked_mean(l2_per_token, loss_mask)
 
-    def _decode_loss(self, x0: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    def _decode_loss(
+        self,
+        x0: torch.Tensor,
+        tokens: torch.Tensor,
+        *,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
         bsz, seq_len, _ = x0.shape
         device = x0.device
         z_vals = (
@@ -351,11 +382,121 @@ class _ELFBackbone(nn.Module):
             model_in, t, decoder_step_active=True, deterministic=False,
         )
         assert logits is not None
-        return F.cross_entropy(
-            logits.reshape(-1, self.vocab_size),
-            tokens.reshape(-1),
-            ignore_index=self.token_layout.ignore_index,
+        # Official: per-token NLL then mask; pad positions excluded via loss_mask.
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        ce_per_token = -log_probs.gather(
+            -1, tokens.unsqueeze(-1),
+        ).squeeze(-1)
+        return self._masked_mean(ce_per_token, loss_mask)
+
+    def _mixed_branch_loss(
+        self,
+        x0: torch.Tensor,
+        tokens: torch.Tensor,
+        *,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Official-style per-example denoise/decode mix in one forward (no SC-CFG)."""
+        bsz, seq_len, _ = x0.shape
+        device = x0.device
+        dtype = x0.dtype
+
+        t = self._sample_train_t(bsz, device).to(dtype=dtype)
+        noise = torch.randn_like(x0) * self.denoiser_noise_scale
+        t_exp = t.reshape(-1, 1, 1)
+        denoiser_z = t_exp * x0 + (1.0 - t_exp) * noise
+        v_target = (x0 - denoiser_z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
+
+        decoder_step_active = torch.bernoulli(
+            torch.full((bsz,), self.decoder_prob, dtype=torch.float32, device=device),
+        ).to(dtype=dtype)
+        decoder_mask_b11 = decoder_step_active.view(-1, 1, 1)
+        decoder_mask_b1 = decoder_step_active.view(-1, 1)
+
+        decoder_z_vals = (
+            torch.randn((bsz * seq_len,), dtype=dtype, device=device)
+            * self.decoder_p_std
+            + self.decoder_p_mean
         )
+        decoder_lam = torch.sigmoid(decoder_z_vals).reshape(bsz, seq_len, 1)
+        decoder_noise = torch.randn_like(x0) * self.decoder_noise_scale
+        decoder_z = decoder_lam * x0 + (1.0 - decoder_lam) * decoder_noise
+
+        decoder_t = torch.ones_like(t)
+        t_mixed = decoder_step_active * decoder_t + (1.0 - decoder_step_active) * t
+        z_mixed = decoder_mask_b11 * decoder_z + (1.0 - decoder_mask_b11) * denoiser_z
+
+        if self.self_cond_prob > 0:
+            use_sc = (
+                (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
+                .reshape(-1, 1, 1)
+                .to(dtype=dtype)
+            )
+            with torch.no_grad():
+                z_sc0 = torch.cat([denoiser_z, torch.zeros_like(denoiser_z)], dim=-1)
+                x_init, _ = self.net_forward(
+                    z_sc0, t, decoder_step_active=False, deterministic=True,
+                )
+            # Decoder rows zero the self-cond half (official).
+            sc_half = x_init.detach() * use_sc * (1.0 - decoder_mask_b11)
+            model_in = torch.cat([z_mixed, sc_half], dim=-1)
+        else:
+            model_in = z_mixed
+
+        x_pred, logits = self.net_forward(
+            model_in,
+            t_mixed,
+            decoder_step_active=decoder_step_active,
+            deterministic=False,
+        )
+
+        v_pred = self._x_to_v(x_pred, denoiser_z, t)
+        l2_per_token = ((v_pred - v_target) ** 2).mean(dim=-1)
+
+        assert logits is not None
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        ce_per_token = -log_probs.gather(
+            -1, tokens.unsqueeze(-1),
+        ).squeeze(-1)
+
+        loss_mask_f = loss_mask.to(dtype=ce_per_token.dtype)
+        ce_mask = loss_mask_f * decoder_mask_b1
+        l2_mask = loss_mask_f * (1.0 - decoder_mask_b1)
+        total_sum = (ce_per_token * ce_mask).sum() + (l2_per_token * l2_mask).sum()
+        loss = total_sum / torch.clamp(loss_mask_f.sum(), min=1.0)
+
+        self.last_ce_loss = float(
+            ((ce_per_token * ce_mask).sum() / torch.clamp(ce_mask.sum(), min=1.0))
+            .detach()
+            .item()
+        )
+        self.last_l2_loss = float(
+            ((l2_per_token * l2_mask).sum() / torch.clamp(l2_mask.sum(), min=1.0))
+            .detach()
+            .item()
+        )
+        return loss
+
+    def _touch_unused_heads(self, loss: torch.Tensor) -> torch.Tensor:
+        """Keep both heads in the graph for single-branch forced eval/debug."""
+        touch = (
+            self.final_layer.linear.weight.sum()
+            + self.final_layer.linear.bias.sum()
+            + self.final_layer.norm_final.weight.sum()
+            + self.proj_kernel.sum()
+            + self.proj_bias.sum()
+            + self.unembed_kernel.sum()
+            + self.unembed_bias.sum()
+        )
+        if self.mode_tokens is not None:
+            touch = touch + self.mode_tokens.sum()
+        if self.self_cond_prob > 0:
+            touch = (
+                touch
+                + self.self_cond_proj.weight.sum()
+                + self.self_cond_proj.bias.sum()
+            )
+        return loss + 0.0 * touch
 
     def forward(
         self,
@@ -369,38 +510,26 @@ class _ELFBackbone(nn.Module):
             raise ValueError(
                 f"sequence length {idx.size(1)} exceeds max_seq_len {self.max_seq_len}"
             )
-        x0 = self.encode_tokens(idx)
-        if branch == "decode":
-            loss = self._decode_loss(x0, idx)
-            self.last_loss_branch = "decode"
-        elif branch == "denoise":
-            loss = self._denoise_loss(x0)
-            self.last_loss_branch = "denoise"
-        else:
-            if torch.rand((), device=idx.device) < self.decoder_prob:
-                loss = self._decode_loss(x0, idx)
-                self.last_loss_branch = "decode"
-            else:
-                loss = self._denoise_loss(x0)
-                self.last_loss_branch = "denoise"
+        loss_mask = self._token_loss_mask(idx)
+        x0 = self.encode_tokens(idx, attention_mask=loss_mask.long())
 
-        # Keep both heads + mode tokens in the graph every step so DDP can run
-        # with find_unused_parameters=False (denoise skips unembed; decode skips
-        # final_layer).
-        touch = (
-            self.final_layer.linear.weight.sum()
-            + self.final_layer.linear.bias.sum()
-            + self.final_layer.norm_final.weight.sum()
-            + self.proj_kernel.sum()
-            + self.proj_bias.sum()
-            + self.unembed_kernel.sum()
-            + self.unembed_bias.sum()
-        )
-        if self.mode_tokens is not None:
-            touch = touch + self.mode_tokens.sum()
-        if self.self_cond_prob > 0:
-            touch = touch + self.self_cond_proj.weight.sum() + self.self_cond_proj.bias.sum()
-        loss = loss + 0.0 * touch
+        if branch == "decode":
+            loss = self._decode_loss(x0, idx, loss_mask=loss_mask)
+            self.last_loss_branch = "decode"
+            self.last_ce_loss = float(loss.detach().item())
+            self.last_l2_loss = float("nan")
+            loss = self._touch_unused_heads(loss)
+        elif branch == "denoise":
+            loss = self._denoise_loss(x0, loss_mask=loss_mask)
+            self.last_loss_branch = "denoise"
+            self.last_l2_loss = float(loss.detach().item())
+            self.last_ce_loss = float("nan")
+            loss = self._touch_unused_heads(loss)
+        else:
+            # Default / training: official per-example mix (both heads used).
+            loss = self._mixed_branch_loss(x0, idx, loss_mask=loss_mask)
+            self.last_loss_branch = "mixed"
+
         return torch.empty(0), loss
 
     # ------------------------------------------------------------------

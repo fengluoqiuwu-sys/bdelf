@@ -11,7 +11,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_ELFConfig(PretrainedConfig):
-    """Configuration for Embedded Language Flows (no CFG)."""
+    """Configuration for Embedded Language Flows (no CFG / no SC-CFG)."""
 
     model_type = "fl_elf"
     _YAML_REQUIRED = frozenset(

@@ -1,4 +1,4 @@
-_doc: ELF config template (Embedded Language Flows, no CFG)
+_doc: ELF config template (Embedded Language Flows, no CFG / no SC-CFG)
 
 name: prototype
 tokenizer: t5-small
