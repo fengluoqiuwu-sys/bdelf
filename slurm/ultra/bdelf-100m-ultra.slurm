@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=ar2-100m-full
+#SBATCH --job-name=bdelf-100m-ultra
 #SBATCH --partition=cls1
+#SBATCH --nodelist=cls1-srv1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=8
-#SBATCH --mem=128G
+#SBATCH --mem=256G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.out
 #SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.err
@@ -53,8 +54,8 @@ GPU_MON_PID=$!
 trap 'kill "$GPU_MON_PID" 2>/dev/null || true' EXIT
 
 python train.py \
-  --model ar2 \
-  --config 100m-full \
+  --model bdelf \
+  --config 100m-ultra \
   --dataset owt \
   --preprocess default
 

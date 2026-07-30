@@ -1,6 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=bdelf-100m-full
+#SBATCH --job-name=bd3lm-100m-full
 #SBATCH --partition=cls1
+#SBATCH --nodelist=cls1-srv[2-4]
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
@@ -53,7 +54,7 @@ GPU_MON_PID=$!
 trap 'kill "$GPU_MON_PID" 2>/dev/null || true' EXIT
 
 python train.py \
-  --model bdelf \
+  --model bd3lm \
   --config 100m-full \
   --dataset owt \
   --preprocess default

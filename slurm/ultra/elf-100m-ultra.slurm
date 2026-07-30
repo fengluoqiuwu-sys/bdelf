@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=ar1_5-100m-full
+#SBATCH --job-name=elf-100m-ultra
 #SBATCH --partition=cls1
+#SBATCH --nodelist=cls1-srv1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=8
-#SBATCH --mem=128G
+#SBATCH --mem=256G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.out
 #SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.err
@@ -27,6 +28,9 @@ export XDG_CACHE_HOME="$PROJECT/cache/compile/xdg"
 mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
 
 # 计算节点无外网，使用 BeeGFS 上已缓存的 HuggingFace 数据。
+# ELF 额外依赖：t5-small tokenizer + cache/models/t5-small 编码器权重。
+# 登录节点预热：
+#   python -c "from models.elf.t5_encoder import ensure_t5_encoder_cached; ensure_t5_encoder_cached()"
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HOME="$PROJECT/cache/huggingface"
@@ -53,9 +57,9 @@ GPU_MON_PID=$!
 trap 'kill "$GPU_MON_PID" 2>/dev/null || true' EXIT
 
 python train.py \
-  --model ar1_5 \
-  --config 100m-full \
+  --model elf \
+  --config 100m-ultra \
   --dataset owt \
-  --preprocess default
+  --preprocess elf
 
 echo "=== job end: $(date -Is) ==="
