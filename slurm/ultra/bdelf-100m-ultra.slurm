@@ -4,7 +4,7 @@
 #SBATCH --nodelist=cls1-srv1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=8
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem=256G
 #SBATCH --time=2-00:00:00
