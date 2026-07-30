@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -469,7 +470,15 @@ def train_loop(
                 is_distributed,
             )
             if loss_ok:
-                (micro_loss / cfg.grad_accum_steps).backward()
+                # Skip DDP all-reduce until the last micro-step of the accum
+                # window; math is unchanged, communication drops ~accum×.
+                sync_ctx = (
+                    model.no_sync()
+                    if is_distributed and (step + 1) % cfg.grad_accum_steps != 0
+                    else nullcontext()
+                )
+                with sync_ctx:
+                    (micro_loss / cfg.grad_accum_steps).backward()
                 step_backward_done = True
             elif rank == 0:
                 if not _params_are_finite(raw):
