@@ -1,7 +1,7 @@
-_doc: Ultra training schedule (100B token budget, 8×48GB)
+_doc: Ultra training schedule (20B token budget, 8×48GB)
 name: ultra
 variant: ultra
-target_tokens: 100000000000
+target_tokens: 20000000000
 warmup_ratio: 0.005
 min_lr_ratio: 0.1
 eval_step: 1000
