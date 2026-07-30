@@ -1,8 +1,0 @@
-_doc: >
-  ar2_5/100m-full for ≤18.5GB. 本地 Muon 实测 bs=16≈17.0GB；
-  bs=20 外推≈21 超预算。gbs=128 → 4 卡 accum=2。
-name: 100m-full
-batch_size: 16
-global_batch_size: 128
-num_params_m: 99.0
-estimated_peak_vram_gb: 17.0
