@@ -543,8 +543,8 @@ def train_loop(
             raw_for_log = unwrap_model(model)
             if mixed_branch:
                 loss_branch = "mixed"
-                denoise_mse = float(getattr(raw_for_log, "last_l2_loss", float("nan")))
-                decode_ce = float(getattr(raw_for_log, "last_ce_loss", float("nan")))
+                denoise_mse = raw_for_log.last_l2_loss
+                decode_ce = raw_for_log.last_ce_loss
             elif dual_branch:
                 loss_branch = train_branch if train_branch else ""
                 denoise_mse = None

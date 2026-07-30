@@ -26,6 +26,13 @@ def ensure_token_layout(config: PretrainedConfig) -> None:
         )
 
 
+def _metric_to_float(value: Any) -> float:
+    """Convert a logged branch metric to float outside torch.compile."""
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().item())
+    return float(value)
+
+
 def sample_from_logits(
     logits: torch.Tensor,
     *,
@@ -188,11 +195,11 @@ class FL_PreTrainedModel(PreTrainedModel):
 
     @property
     def last_l2_loss(self) -> float:
-        return float(getattr(self.backbone, "last_l2_loss", float("nan")))
+        return _metric_to_float(getattr(self.backbone, "last_l2_loss", float("nan")))
 
     @property
     def last_ce_loss(self) -> float:
-        return float(getattr(self.backbone, "last_ce_loss", float("nan")))
+        return _metric_to_float(getattr(self.backbone, "last_ce_loss", float("nan")))
 
     def generate(
         self,

@@ -465,16 +465,14 @@ class _ELFBackbone(nn.Module):
         total_sum = (ce_per_token * ce_mask).sum() + (l2_per_token * l2_mask).sum()
         loss = total_sum / torch.clamp(loss_mask_f.sum(), min=1.0)
 
-        self.last_ce_loss = float(
-            ((ce_per_token * ce_mask).sum() / torch.clamp(ce_mask.sum(), min=1.0))
-            .detach()
-            .item()
-        )
-        self.last_l2_loss = float(
-            ((l2_per_token * l2_mask).sum() / torch.clamp(l2_mask.sum(), min=1.0))
-            .detach()
-            .item()
-        )
+        # Keep detached tensors (no .item()) so torch.compile does not graph-break
+        # and re-specialize on the Python float each step.
+        self.last_ce_loss = (
+            (ce_per_token * ce_mask).sum() / torch.clamp(ce_mask.sum(), min=1.0)
+        ).detach()
+        self.last_l2_loss = (
+            (l2_per_token * l2_mask).sum() / torch.clamp(l2_mask.sum(), min=1.0)
+        ).detach()
         return loss
 
     def _touch_unused_heads(self, loss: torch.Tensor) -> torch.Tensor:
@@ -516,13 +514,13 @@ class _ELFBackbone(nn.Module):
         if branch == "decode":
             loss = self._decode_loss(x0, idx, loss_mask=loss_mask)
             self.last_loss_branch = "decode"
-            self.last_ce_loss = float(loss.detach().item())
+            self.last_ce_loss = loss.detach()
             self.last_l2_loss = float("nan")
             loss = self._touch_unused_heads(loss)
         elif branch == "denoise":
             loss = self._denoise_loss(x0, loss_mask=loss_mask)
             self.last_loss_branch = "denoise"
-            self.last_l2_loss = float(loss.detach().item())
+            self.last_l2_loss = loss.detach()
             self.last_ce_loss = float("nan")
             loss = self._touch_unused_heads(loss)
         else:
