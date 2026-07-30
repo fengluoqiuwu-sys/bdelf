@@ -15,6 +15,9 @@ from typing import Any
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import logging
+import warnings
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -64,10 +67,39 @@ from train.metrics import (
 )
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
 
+# TF32: follow Inductor's recommendation. Filters: residual Dynamo/HF noise.
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Dynamo does not know how to trace the builtin.*posix\.(l?stat).*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Dynamo detected a call to a `functools\.lru_cache`-wrapped function.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled.*",
+)
+logging.getLogger("torch._dynamo.backends.distributed").setLevel(logging.ERROR)
 
 # =============================================================================
-# Inductor workaround
+# Inductor workaround / compile helpers
 # =============================================================================
+
+
+def _preload_frozen_encoders(model: nn.Module) -> None:
+    """Load frozen HF encoders in eager mode before ``torch.compile``.
+
+    ELF keeps T5 in a non-registered holder and loads it on first encode; if
+    that happens under Dynamo, HF ``from_pretrained`` / peft / posix.stat paths
+    get traced and spam warnings (and may re-load weights mid-compile).
+    """
+    backbone = getattr(model, "backbone", None)
+    ensure = getattr(backbone, "_ensure_encoder", None)
+    if callable(ensure):
+        ensure()
 
 
 def _patch_inductor_bool_eq() -> None:
@@ -349,6 +381,9 @@ def train_loop(
                 indent=2,
                 ensure_ascii=False,
             )
+
+    # Eager-load frozen HF encoders before Dynamo can trace into from_pretrained.
+    _preload_frozen_encoders(model)
 
     # Compile before DDP. ELF mixed-branch keeps a single dynamic graph;
     # BDELF still uses a synced denoise/decode branch kwarg per step.

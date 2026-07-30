@@ -172,7 +172,9 @@ class _ELFBackbone(nn.Module):
     # Encoder / checkpoint helpers
     # ------------------------------------------------------------------
 
+    @torch.compiler.disable
     def _ensure_encoder(self) -> T5Encoder:
+        # Must not run under Dynamo: load_t5_encoder → HF from_pretrained.
         device = next(self.parameters()).device
         if not self._encoder_holder:
             _, enc = load_t5_encoder(self.encoder_model_name)
@@ -184,6 +186,7 @@ class _ELFBackbone(nn.Module):
                 self._encoder_holder[0] = enc.to(device)
         return self._encoder_holder[0]
 
+    @torch.compiler.disable
     def encode_tokens(
         self,
         idx: torch.Tensor,

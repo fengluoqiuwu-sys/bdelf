@@ -119,11 +119,14 @@ class T5Encoder(nn.Module):
         for param in self.model.parameters():
             param.requires_grad = False
 
+    @torch.compiler.disable
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Keep frozen HF T5 out of Dynamo: its from_pretrained / peft / fs
+        # helpers are not graph-friendly and spam graph-break warnings.
         with torch.no_grad():
             out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         return out.last_hidden_state
@@ -140,6 +143,7 @@ def load_t5_encoder(
     return config, encoder
 
 
+@torch.compiler.disable
 def encode_text(
     input_ids: torch.Tensor,
     encoder: T5Encoder,
