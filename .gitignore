@@ -50,7 +50,6 @@ coverage.xml
 .idea/
 *.iml
 .vscode/
-.cursor/
 *.swp
 *.swo
 *~

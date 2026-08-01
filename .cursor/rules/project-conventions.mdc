@@ -1,0 +1,66 @@
+---
+description: bdelf 项目结构与编码规范
+alwaysApply: true
+---
+
+# bdelf 项目规范
+
+## 项目结构
+
+```
+config/
+  datasets/      # 数据集 YAML 配置
+  tokenizers/    # Tokenizer YAML 配置
+dataset/         # FL_Dataset 基类与具体实现
+tokenizer/       # FL_Tokenizer 基类与具体实现
+cache/           # 本地缓存（已在 .gitignore 中）
+hf_config.py     # HuggingFace 全局设置（镜像、禁用 XET）
+```
+
+## 命名约定
+
+- 基类 / 配置类使用 `FL_` 前缀：`FL_Dataset`、`FL_DatasetConfig`、`FL_Tokenizer`、`FL_TokenizerConfig`
+- 配置文件名与 `name` 字段一致：`config/datasets/wikitext.yaml` → `name: wikitext`
+- 具体实现类可私有命名：`_WikiText_Dataset`
+
+## 配置模式
+
+**Dataset** 使用注册表模式：
+
+1. 在 `config/datasets/` 下新增 `<name>.yaml`（可复制 `prototype.yaml`）
+2. 实现继承 `FL_Dataset` 的具体类
+3. 在 `dataset/__init__.py` 中调用 `register_dataset(name, cls)`
+4. 外部通过 `get_dataset(name)` 获取实例
+
+**Tokenizer** 无需注册，统一使用 `FL_Tokenizer`：
+
+1. 在 `config/tokenizers/` 下新增 `<name>.yaml`（可复制 `prototype.yaml`）
+2. 外部通过 `get_tokenizer(name)` 获取实例
+
+`prototype.yaml` 仅作模板，不参与实例化。
+
+**YAML 配置规则**：
+
+- 非属性信息以 YAML 键值对书写（如 `_doc`），加载时存入配置的 ``extra`` 字段
+- 缺少 `_YAML_REQUIRED` 中定义的必需属性时加载报错退出
+
+## HuggingFace 使用
+
+访问 HuggingFace 前必须先 `import hf_config`，再导入 `huggingface_hub` / `transformers` / `datasets`，以确保镜像与 XET 设置生效。
+
+## 依赖安装
+
+PyTorch 从 CUDA 13.0 wheel 源安装：
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` 中通过 `--extra-index-url https://download.pytorch.org/whl/cu130` 指定 torch/torchvision 源。
+
+## 编码原则
+
+- 最小改动：只改与任务相关的代码
+- 复用现有抽象，不重复实现 registry / config 加载逻辑
+- 注释只解释非显而易见的业务或技术细节
+- 不主动添加未被要求的测试或文档
