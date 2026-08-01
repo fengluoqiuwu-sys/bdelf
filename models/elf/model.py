@@ -1,7 +1,8 @@
-"""Embedded Language Flows (ELF) — continuous diffusion LM (no CFG / no SC-CFG).
+"""Embedded Language Flows (ELF) — continuous diffusion LM with SC-CFG.
 
-Follows arXiv:2605.10938 with self-conditioning and official per-example
-denoise/decode mixing, but without classifier-free guidance or SC-CFG tokens.
+Follows arXiv:2605.10938 with per-example denoise/decode mixing and
+self-conditioning CFG (SC-CFG): training-time guidance matches Algorithm 3/4,
+and inference uses ``v_cfg = v_uncond + w * (v_cond - v_uncond)``.
 Training uses a frozen T5 encoder for clean embeddings; inference only needs
 the denoiser + unembedding head.
 
@@ -65,8 +66,11 @@ class _ELFBackbone(nn.Module):
         dropout: float = 0.0,
         mlp_ratio: float = 4.0,
         num_time_tokens: int = 4,
+        num_self_cond_cfg_tokens: int = 4,
         num_model_mode_tokens: int = 4,
         self_cond_prob: float = 0.5,
+        self_cond_cfg_min: float = 0.5,
+        self_cond_cfg_max: float = 5.0,
         latent_mean: float = 0.0,
         latent_std: float = 0.2,
         denoiser_p_mean: float = -1.5,
@@ -93,8 +97,11 @@ class _ELFBackbone(nn.Module):
         self.n_layer = n_layer
         self.n_head = n_head
         self.num_time_tokens = num_time_tokens
+        self.num_self_cond_cfg_tokens = num_self_cond_cfg_tokens
         self.num_model_mode_tokens = num_model_mode_tokens
         self.self_cond_prob = self_cond_prob
+        self.self_cond_cfg_min = self_cond_cfg_min
+        self.self_cond_cfg_max = self_cond_cfg_max
         self.latent_mean = latent_mean
         self.latent_std = latent_std
         self.denoiser_p_mean = denoiser_p_mean
@@ -125,6 +132,12 @@ class _ELFBackbone(nn.Module):
         self.t_emb_tokens = nn.Parameter(torch.empty(1, num_time_tokens, n_embd))
         _normal_002_(self.t_emb_tokens)
 
+        self.self_cond_cfg_embedder = TimestepEmbedder(n_embd)
+        self.self_cond_cfg_tokens = nn.Parameter(
+            torch.empty(1, num_self_cond_cfg_tokens, n_embd)
+        )
+        _normal_002_(self.self_cond_cfg_tokens)
+
         if num_model_mode_tokens > 0:
             self.mode_tokens = nn.Parameter(
                 torch.empty(1, num_model_mode_tokens, n_embd)
@@ -133,7 +146,9 @@ class _ELFBackbone(nn.Module):
         else:
             self.mode_tokens = None
 
-        prefix_total = num_model_mode_tokens + num_time_tokens
+        prefix_total = (
+            num_model_mode_tokens + num_time_tokens + num_self_cond_cfg_tokens
+        )
         head_dim = n_embd // n_head
         self.rope = TextRotaryEmbedding(
             head_dim, max_seq_len, num_prefix_tokens=prefix_total,
@@ -214,10 +229,31 @@ class _ELFBackbone(nn.Module):
     # Network forward
     # ------------------------------------------------------------------
 
-    def _build_time_prefix(self, t: torch.Tensor) -> torch.Tensor:
+    def build_context(
+        self,
+        t: torch.Tensor,
+        self_cond_cfg_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """In-context conditioning prefix: time + optional SC-CFG scale tokens.
+
+        Mirrors official ``ELF.build_context``; both use TimestepEmbedder +
+        learned prefix tokens added to the embedding.
+        """
         bsz = t.shape[0]
         time_emb = self.t_embedder(t)
-        return self.t_emb_tokens.expand(bsz, -1, -1) + time_emb.unsqueeze(1)
+        prefix_tokens = [
+            self.t_emb_tokens.expand(bsz, -1, -1) + time_emb.unsqueeze(1)
+        ]
+        if (
+            self_cond_cfg_scale is not None
+            and self.num_self_cond_cfg_tokens > 0
+        ):
+            sc_emb = self.self_cond_cfg_embedder(self_cond_cfg_scale)
+            prefix_tokens.append(
+                self.self_cond_cfg_tokens.expand(bsz, -1, -1)
+                + sc_emb.unsqueeze(1)
+            )
+        return torch.cat(prefix_tokens, dim=1)
 
     def net_forward(
         self,
@@ -227,8 +263,13 @@ class _ELFBackbone(nn.Module):
         decoder_step_active: bool | torch.Tensor | None = None,
         deterministic: bool = True,
         attention_mask: Optional[torch.Tensor] = None,
+        self_cond_cfg_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """``x`` is (B, S, C) or (B, S, 2C) with self-conditioning."""
+        """``x`` is (B, S, C) or (B, S, 2C) with self-conditioning.
+
+        ``self_cond_cfg_scale`` is an optional (B,) SC-CFG scale prepended as
+        in-context prefix tokens.
+        """
         bsz = x.shape[0]
         # Match official ELF: keep embedding projections in fp32 under AMP.
         with torch.amp.autocast("cuda", enabled=False):
@@ -236,7 +277,15 @@ class _ELFBackbone(nn.Module):
             if x_f.shape[-1] == 2 * self.text_encoder_dim:
                 x_f = self.self_cond_proj(x_f)
             x_h = self.text_proj(x_f)
-            prefix = self._build_time_prefix(t.float()).to(dtype=x_h.dtype)
+            sc_cfg_scale_emb = (
+                self_cond_cfg_scale.float()
+                if self_cond_cfg_scale is not None
+                else None
+            )
+            prefix = self.build_context(
+                t.float(),
+                self_cond_cfg_scale=sc_cfg_scale_emb,
+            ).to(dtype=x_h.dtype)
 
         if self.mode_tokens is not None:
             mode = self.mode_tokens.expand(bsz, -1, -1).to(dtype=x_h.dtype)
@@ -295,6 +344,17 @@ class _ELFBackbone(nn.Module):
     # ------------------------------------------------------------------
     # Training helpers
     # ------------------------------------------------------------------
+
+    def _sample_cfg_scale(
+        self, batch_size: int, device: torch.device,
+    ) -> torch.Tensor:
+        """Log-uniform CFG scale in [1+min, 1+max] - 1 (official sample_cfg_scale)."""
+        u = torch.rand(batch_size, device=device, dtype=torch.float32)
+        a = torch.as_tensor(1.0 + self.self_cond_cfg_min, device=device, dtype=u.dtype)
+        b = torch.as_tensor(1.0 + self.self_cond_cfg_max, device=device, dtype=u.dtype)
+        return (a * torch.exp(u * torch.log(b / a)) - 1.0).to(
+            dtype=next(self.parameters()).dtype,
+        )
 
     def _sample_train_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Match official ``sample_timesteps`` (no upper clamp on t)."""
@@ -429,28 +489,50 @@ class _ELFBackbone(nn.Module):
         t_mixed = decoder_step_active * decoder_t + (1.0 - decoder_step_active) * t
         z_mixed = decoder_mask_b11 * decoder_z + (1.0 - decoder_mask_b11) * denoiser_z
 
-        if self.self_cond_prob > 0:
-            use_sc = (
-                (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
-                .reshape(-1, 1, 1)
-                .to(dtype=dtype)
+        # SC-CFG scale (official: sampled log-uniform per example, fed to the
+        # in-context prefix of every forward that consumes denoiser rows).
+        self_cond_cfg = self._sample_cfg_scale(bsz, device)
+
+        use_sc = (
+            (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
+            .reshape(-1, 1, 1)
+            .to(dtype=dtype)
+        )
+        # Unconditional self-cond forward (shared): condition half = zeros.
+        with torch.no_grad():
+            z_sc0 = torch.cat([denoiser_z, torch.zeros_like(denoiser_z)], dim=-1)
+            x_init, _ = self.net_forward(
+                z_sc0, t, decoder_step_active=False, deterministic=True,
+                self_cond_cfg_scale=self_cond_cfg,
             )
-            with torch.no_grad():
-                z_sc0 = torch.cat([denoiser_z, torch.zeros_like(denoiser_z)], dim=-1)
-                x_init, _ = self.net_forward(
-                    z_sc0, t, decoder_step_active=False, deterministic=True,
-                )
-            # Decoder rows zero the self-cond half (official).
-            sc_half = x_init.detach() * use_sc * (1.0 - decoder_mask_b11)
-            model_in = torch.cat([z_mixed, sc_half], dim=-1)
-        else:
-            model_in = z_mixed
+        # v_uncond + x_uncond from the shared unconditional forward.
+        v_uncond = self._x_to_v(x_init, denoiser_z, t)
+        x_uncond = x_init.detach()
+        # Conditional self-cond forward: condition half = x_uncond (stop-grad).
+        with torch.no_grad():
+            z_sc1 = torch.cat([denoiser_z, x_uncond], dim=-1)
+            x_cond, _ = self.net_forward(
+                z_sc1, t, decoder_step_active=False, deterministic=True,
+                self_cond_cfg_scale=self_cond_cfg,
+            )
+        v_cond = self._x_to_v(x_cond, denoiser_z, t)
+
+        # SC-CFG target: v + (1 - 1/w) * (v_cond - v_uncond), masked to self-cond rows.
+        sc_w = self_cond_cfg.reshape(-1, 1, 1)
+        sc_guidance = (1.0 - 1.0 / sc_w) * (v_cond - v_uncond)
+        sc_guidance = torch.where(use_sc.bool(), sc_guidance, torch.zeros_like(sc_guidance))
+        v_target = (v_target + sc_guidance).detach()
+
+        # Decoder rows zero the self-cond half (official).
+        sc_half = x_uncond * use_sc * (1.0 - decoder_mask_b11)
+        model_in = torch.cat([z_mixed, sc_half], dim=-1)
 
         x_pred, logits = self.net_forward(
             model_in,
             t_mixed,
             decoder_step_active=decoder_step_active,
             deterministic=False,
+            self_cond_cfg_scale=self_cond_cfg,
         )
 
         v_pred = self._x_to_v(x_pred, denoiser_z, t)
@@ -491,6 +573,13 @@ class _ELFBackbone(nn.Module):
         )
         if self.mode_tokens is not None:
             touch = touch + self.mode_tokens.sum()
+        if self.self_cond_cfg_tokens is not None:
+            touch = (
+                touch
+                + self.self_cond_cfg_embedder.mlp_0.weight.sum()
+                + self.self_cond_cfg_embedder.mlp_2.weight.sum()
+                + self.self_cond_cfg_tokens.sum()
+            )
         if self.self_cond_prob > 0:
             touch = (
                 touch
@@ -557,28 +646,53 @@ class _ELFBackbone(nn.Module):
             )
         return torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
 
-    def _forward_sample(
+    def _forward_self_cond(
         self,
         z: torch.Tensor,
-        t: float,
-        x_pred_prev: torch.Tensor | None,
+        t_batch: torch.Tensor,
+        sc_prev: torch.Tensor | None,
+        self_cond_cfg_scale: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        bsz = z.shape[0]
-        t_batch = torch.full((bsz,), t, dtype=z.dtype, device=z.device)
+        """One SC-CFG-aware denoiser forward; returns (v, x_pred)."""
         if self.self_cond_prob > 0:
-            sc = (
-                torch.zeros_like(z)
-                if x_pred_prev is None
-                else x_pred_prev
-            )
+            sc = torch.zeros_like(z) if sc_prev is None else sc_prev
             model_in = torch.cat([z, sc], dim=-1)
         else:
             model_in = z
         x_pred, _ = self.net_forward(
             model_in, t_batch, decoder_step_active=False, deterministic=True,
+            self_cond_cfg_scale=self_cond_cfg_scale,
         )
         v = self._x_to_v(x_pred, z, t_batch)
         return v, x_pred
+
+    def _forward_sample(
+        self,
+        z: torch.Tensor,
+        t: float,
+        x_pred_prev: torch.Tensor | None,
+        self_cond_cfg_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Conditional denoiser forward with optional SC-CFG guidance.
+
+        w == 1 (or absent): single forward with the previous self-cond estimate.
+        w != 1: two forwards (uncond uses zero self-cond) extrapolated as
+        ``v_cfg = v_uncond + w * (v_cond - v_uncond)``.
+        """
+        bsz = z.shape[0]
+        t_batch = torch.full((bsz,), t, dtype=z.dtype, device=z.device)
+        w = (
+            float(self_cond_cfg_scale[0].item())
+            if self_cond_cfg_scale is not None
+            else 1.0
+        )
+        if w == 1.0 or self.self_cond_prob <= 0:
+            return self._forward_self_cond(z, t_batch, x_pred_prev, self_cond_cfg_scale)
+
+        v_cond, x_cond = self._forward_self_cond(z, t_batch, x_pred_prev, self_cond_cfg_scale)
+        v_uncond, _ = self._forward_self_cond(z, t_batch, None, self_cond_cfg_scale)
+        v_out = v_uncond + w * (v_cond - v_uncond)
+        return v_out, x_cond
 
     def _ode_step(
         self,
@@ -586,8 +700,11 @@ class _ELFBackbone(nn.Module):
         t: float,
         t_next: float,
         x_pred_prev: torch.Tensor | None,
+        self_cond_cfg_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        v, x_pred = self._forward_sample(z, t, x_pred_prev)
+        v, x_pred = self._forward_sample(
+            z, t, x_pred_prev, self_cond_cfg_scale=self_cond_cfg_scale,
+        )
         return z + (t_next - t) * v, x_pred
 
     def _sde_step(
@@ -597,13 +714,16 @@ class _ELFBackbone(nn.Module):
         t_next: float,
         x_pred_prev: torch.Tensor | None,
         gamma: float,
+        self_cond_cfg_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         h = float(t_next - t)
         alpha = max(0.0, min(1.0, 1.0 - gamma * h))
         t_back = alpha * float(t)
         eps = torch.randn_like(z) * self.denoiser_noise_scale
         z_back = alpha * z + (1.0 - alpha) * eps
-        v, x_pred = self._forward_sample(z_back, t_back, x_pred_prev)
+        v, x_pred = self._forward_sample(
+            z_back, t_back, x_pred_prev, self_cond_cfg_scale=self_cond_cfg_scale,
+        )
         return z_back + (t_next - t_back) * v, x_pred
 
     @staticmethod
@@ -673,6 +793,7 @@ class _ELFBackbone(nn.Module):
         infer_schedule = cfg.get("time_schedule")
         if infer_schedule is not None:
             self._infer_time_schedule = infer_schedule
+        sc_cfg_w = float(cfg.get("self_cond_cfg_scale", 1.0))
 
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
@@ -683,6 +804,11 @@ class _ELFBackbone(nn.Module):
             )
             * self.denoiser_noise_scale
         )
+        self_cond_cfg_scale = (
+            torch.full((num_samples,), sc_cfg_w, dtype=dtype, device=device)
+            if sc_cfg_w != 1.0
+            else None
+        )
         x_pred: torch.Tensor | None = None
         nfe = 0
 
@@ -691,16 +817,25 @@ class _ELFBackbone(nn.Module):
             t = float(t_steps[i].item())
             t_next = float(t_steps[i + 1].item())
             if method == "sde":
-                z, x_pred = self._sde_step(z, t, t_next, x_pred, sde_gamma)
+                z, x_pred = self._sde_step(
+                    z, t, t_next, x_pred, sde_gamma,
+                    self_cond_cfg_scale=self_cond_cfg_scale,
+                )
             elif method == "ode":
-                z, x_pred = self._ode_step(z, t, t_next, x_pred)
+                z, x_pred = self._ode_step(
+                    z, t, t_next, x_pred,
+                    self_cond_cfg_scale=self_cond_cfg_scale,
+                )
             else:
                 raise ValueError(f"unknown sampling_method: {method}")
             nfe += 1
 
         t = float(t_steps[-2].item())
         t_next = float(t_steps[-1].item())
-        z, x_pred = self._ode_step(z, t, t_next, x_pred)
+        z, x_pred = self._ode_step(
+            z, t, t_next, x_pred,
+            self_cond_cfg_scale=self_cond_cfg_scale,
+        )
         nfe += 1
         if not torch.isfinite(z).all():
             raise RuntimeError("ELF sampling produced non-finite latents")

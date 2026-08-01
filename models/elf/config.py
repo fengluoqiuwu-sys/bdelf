@@ -11,7 +11,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_ELFConfig(PretrainedConfig):
-    """Configuration for Embedded Language Flows (no CFG / no SC-CFG)."""
+    """Configuration for Embedded Language Flows (SC-CFG / CFG)."""
 
     model_type = "fl_elf"
     _YAML_REQUIRED = frozenset(
@@ -26,8 +26,11 @@ class FL_ELFConfig(PretrainedConfig):
             "n_embd",
             "dropout",
             "num_time_tokens",
+            "num_self_cond_cfg_tokens",
             "num_model_mode_tokens",
             "self_cond_prob",
+            "self_cond_cfg_min",
+            "self_cond_cfg_max",
             "latent_mean",
             "latent_std",
             "denoiser_p_mean",
@@ -61,8 +64,11 @@ class FL_ELFConfig(PretrainedConfig):
         dropout: float = 0.0,
         mlp_ratio: float = 4.0,
         num_time_tokens: int = 4,
+        num_self_cond_cfg_tokens: int = 4,
         num_model_mode_tokens: int = 4,
         self_cond_prob: float = 0.5,
+        self_cond_cfg_min: float = 0.5,
+        self_cond_cfg_max: float = 5.0,
         latent_mean: float = 0.0,
         latent_std: float = 0.2,
         denoiser_p_mean: float = -1.5,
@@ -97,8 +103,11 @@ class FL_ELFConfig(PretrainedConfig):
         self.dropout = dropout
         self.mlp_ratio = mlp_ratio
         self.num_time_tokens = num_time_tokens
+        self.num_self_cond_cfg_tokens = num_self_cond_cfg_tokens
         self.num_model_mode_tokens = num_model_mode_tokens
         self.self_cond_prob = self_cond_prob
+        self.self_cond_cfg_min = self_cond_cfg_min
+        self.self_cond_cfg_max = self_cond_cfg_max
         self.latent_mean = latent_mean
         self.latent_std = latent_std
         self.denoiser_p_mean = denoiser_p_mean
@@ -134,8 +143,11 @@ class FL_ELFConfig(PretrainedConfig):
             "dropout": self.dropout,
             "mlp_ratio": self.mlp_ratio,
             "num_time_tokens": self.num_time_tokens,
+            "num_self_cond_cfg_tokens": self.num_self_cond_cfg_tokens,
             "num_model_mode_tokens": self.num_model_mode_tokens,
             "self_cond_prob": self.self_cond_prob,
+            "self_cond_cfg_min": self.self_cond_cfg_min,
+            "self_cond_cfg_max": self.self_cond_cfg_max,
             "latent_mean": self.latent_mean,
             "latent_std": self.latent_std,
             "denoiser_p_mean": self.denoiser_p_mean,
@@ -155,7 +167,7 @@ CONFIG_CLS = FL_ELFConfig
 
 @dataclass
 class ELFSamplingConfig:
-    """ELF inference configuration (no CFG)."""
+    """ELF inference configuration (supports SC-CFG guidance)."""
 
     sampling_method: str = "sde"
     num_sampling_steps: int = 32
@@ -163,6 +175,7 @@ class ELFSamplingConfig:
     time_schedule: str | None = None
     temperature: float = 1.0
     top_k: int | None = None
+    self_cond_cfg_scale: float = 1.0  # SC-CFG scale (>1 sharpens; 1 = no guidance)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "ELFSamplingConfig":
