@@ -94,7 +94,7 @@ ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
 1. fork 想法根分支（或从当前分支 fork 新变体，继承已有实现）
 2. 在 temp/<idea>/README.md 记录口径
 3. 实现思路
-4. 本地验证：fast 训练 + generate/ppl 跑通
+4. 本地验证：fast 冒烟（起训练看到首批 loss 正常、2–3 分钟后停）+ generate/ppl 跑通
 5. push 到 ovan-server（sync 脚本）→ train-ops 登记互斥 → sbatch full
    → 起「5 分钟首次唤醒」后台调度（确认拉起）
 6. 唤醒循环：每 15 分钟
@@ -124,10 +124,13 @@ git switch master && git switch -c <idea>
 
 按项目规范复写模型/配置；复用 registry / config 加载逻辑，不重复造轮子。改动尽量最小。
 
-**4. 本地验证（5080 / fast）**
+**4. 本地验证（5080 / fast）—— 只做冒烟，不跑满**
 
-- 先用 `fast` / 本机配置跑通训练与推理（本机 GPU 互斥，一次一个进程，见 train-ops）。
-- 验证通过后**清理本机中间产物**（快照/调试文件不提交），只保留有意义的改动。
+- `fast` **仅用于验证改动能跑通**，不是正式训练：起训练后观察到**首批训练步 loss 正常打印、
+  无报错 / 崩溃 / segfault** 即可，通常 **2–3 分钟**内确认后就**主动停掉该进程**（kill），
+  不要让 fast 跑满整个 token 预算（正式训练只在远端 full 跑）。
+- 本机 GPU 互斥，一次一个进程（见 train-ops）。
+- 验证通过后**清理本机中间产物**（快照/调试文件/临时 run 的 checkpoint 不提交），只保留有意义的改动。
 
 **4.5 强制提交（推送到远端前必做）**
 

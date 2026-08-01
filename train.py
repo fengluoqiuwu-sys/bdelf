@@ -13,7 +13,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Do not set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here:
+# on RTX 5080 + WSL2 + torch cu130 it segfaults at the first CUDA alloc.
 
 import logging
 import warnings
