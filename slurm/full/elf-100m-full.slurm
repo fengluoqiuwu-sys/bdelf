@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=elf-100m-full
+#SBATCH --job-name=elf-cfg-100m-full
 #SBATCH --partition=cls1
 #SBATCH --nodelist=cls1-srv[2-4]
 #SBATCH --nodes=1
@@ -60,6 +60,7 @@ python train.py \
   --model elf \
   --config 100m-full \
   --dataset owt \
-  --preprocess elf
+  --preprocess elf \
+  --run-name elf-cfg-100m-full-muon
 
 echo "=== job end: $(date -Is) ==="
