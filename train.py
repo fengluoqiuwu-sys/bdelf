@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -215,9 +217,13 @@ def setup_distributed(cfg: FL_TrainConfig) -> tuple[int, int, torch.device, bool
     _isolate_compile_cache(local_rank)
 
     if not dist.is_initialized():
+        # Rank0 ELF gen-eval (SDE/32 + GPT-2 score) can exceed the default
+        # 10min NCCL watchdog while peers wait on a 1-element all_reduce in
+        # _sync_after_rank0_work; use a longer PG timeout to avoid false hangs.
         dist.init_process_group(
             backend="nccl",
             device_id=torch.device(f"cuda:{local_rank}"),
+            timeout=timedelta(minutes=60),
         )
 
     rank = dist.get_rank()
@@ -295,6 +301,45 @@ def _all_ranks_true(local_ok: bool, device: torch.device, is_distributed: bool) 
     flag = torch.tensor([int(local_ok)], device=device, dtype=torch.int32)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return flag.item() > 0
+
+
+def _wait_for_file(
+    path: Path, *, timeout_s: float = 180.0, interval_s: float = 0.5,
+) -> Path:
+    """Wait until ``path`` is openable (BeeGFS: ``is_file`` can lie vs ``open``)."""
+    path = path.resolve()
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            os.close(fd)
+            return path
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # ESTALE / transient BeeGFS client errors — keep polling.
+            pass
+        if time.time() >= deadline:
+            raise FileNotFoundError(f"Timed out waiting for checkpoint: {path}")
+        time.sleep(interval_s)
+
+
+def _stage_ckpt_to_local(
+    src: Path, *, rank: int, is_distributed: bool,
+) -> Path:
+    """Rank0 copies BeeGFS ckpt to node-local /tmp; all ranks load from there."""
+    job = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
+    local = Path(f"/tmp/bdelf-resume-{job}") / src.name
+    if rank == 0:
+        src = _wait_for_file(src)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        partial = local.with_suffix(local.suffix + ".partial")
+        shutil.copyfile(src, partial)
+        partial.replace(local)
+        _train_log(f"Staged resume checkpoint to {local}")
+    if is_distributed:
+        dist.barrier()
+    return _wait_for_file(local)
 
 
 def _grads_are_finite(model: nn.Module) -> bool:
@@ -411,7 +456,9 @@ def train_loop(
 
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
-    latest_ckpt = run_dir / "checkpoint_latest.pt"
+    # Absolute path: relative cache/ can race under BeeGFS when ranks disagree
+    # on cwd visibility right after a cross-node resume.
+    latest_ckpt = (run_dir / "checkpoint_latest.pt").resolve()
 
     step = 0
     optimizer.zero_grad(set_to_none=True)
@@ -422,9 +469,9 @@ def train_loop(
     if rank == 0 and ema_state is not None:
         _train_log(f"EMA enabled: decay={ema_decay:g}")
 
-    resume_from_ckpt = cfg.resume and latest_ckpt.is_file()
+    # Only rank 0's filesystem view decides resume; peers wait for the file.
+    resume_from_ckpt = cfg.resume and latest_ckpt.is_file() if rank == 0 else False
     if is_distributed:
-        # All ranks must agree on resuming; trust rank 0's view of the file.
         flag = torch.tensor([int(resume_from_ckpt)], device=device, dtype=torch.int32)
         dist.broadcast(flag, src=0)
         resume_from_ckpt = bool(flag.item())
@@ -433,8 +480,13 @@ def train_loop(
         # Every rank must load weights/optimizer state: DDP only broadcasts
         # parameters at construction time (above), so a rank-0-only load would
         # leave the other ranks on their random init.
+        # Stage off BeeGFS first: concurrent multi-rank open of a ~1GB file
+        # has hit FileNotFoundError even after is_file()/short waits.
+        resume_path = _stage_ckpt_to_local(
+            latest_ckpt, rank=rank, is_distributed=is_distributed,
+        )
         step, loaded_ema = load_checkpoint(
-            latest_ckpt, model, optimizer, device,
+            resume_path, model, optimizer, device,
             cfg=cfg, model_meta=model_meta, restore_rng=(rank == 0),
         )
         if ema_state is not None:

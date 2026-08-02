@@ -2,6 +2,7 @@
 #SBATCH --job-name=elf-cfg-100m-full
 #SBATCH --partition=cls1
 #SBATCH --nodelist=cls1-srv[2-4]
+#SBATCH --exclude=cls1-srv2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
@@ -37,6 +38,11 @@ export HF_HOME="$PROJECT/cache/huggingface"
 
 # 避免同节点多作业 MASTER_PORT 冲突。
 export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
+
+# Rank0 gen-eval 期间 peer 会卡在短 all_reduce；拉长 NCCL/PG 超时，避免 10min 误杀。
+# 与 train.py init_process_group(timeout=60min) 配套。
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
+export NCCL_TIMEOUT=3600
 
 echo "=== job start: $(date -Is) | host: $(hostname) | job: ${SLURM_JOB_ID} ==="
 echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
