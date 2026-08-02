@@ -24,7 +24,16 @@ TRAIN_CSV_FIELDS = [
     "lr",
     "tokens_per_sec",
 ]
-EVAL_CSV_FIELDS = ["step", "eval_loss", "eval_ppl", "gen_loss", "gen_ppl", "lr"]
+EVAL_CSV_FIELDS = [
+    "step",
+    "eval_loss",
+    "eval_ppl",
+    "gen_loss",
+    "gen_ppl",
+    "gen_uniq_mean",
+    "gen_nonempty_frac",
+    "lr",
+]
 
 _TRAIN_LOG = "[train]"
 

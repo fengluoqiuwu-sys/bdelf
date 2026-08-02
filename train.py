@@ -656,8 +656,15 @@ def train_loop(
                             )
                             gen_loss: float | None = None
                             gen_ppl: float | None = None
+                            gen_uniq_mean: float | None = None
+                            gen_nonempty_frac: float | None = None
                             if gpt2_model is not None:
-                                gen_loss, gen_ppl = eval_one_batch_gen_ppl(
+                                (
+                                    gen_loss,
+                                    gen_ppl,
+                                    gen_uniq_mean,
+                                    gen_nonempty_frac,
+                                ) = eval_one_batch_gen_ppl(
                                     model,
                                     gpt2_model,
                                     cfg=cfg,
@@ -675,6 +682,16 @@ def train_loop(
                             ),
                             "gen_ppl": (
                                 round(gen_ppl, 4) if gen_ppl is not None else ""
+                            ),
+                            "gen_uniq_mean": (
+                                round(gen_uniq_mean, 2)
+                                if gen_uniq_mean is not None
+                                else ""
+                            ),
+                            "gen_nonempty_frac": (
+                                round(gen_nonempty_frac, 4)
+                                if gen_nonempty_frac is not None
+                                else ""
                             ),
                             "lr": lr,
                         }

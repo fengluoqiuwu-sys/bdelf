@@ -175,7 +175,7 @@ class ELFSamplingConfig:
     time_schedule: str | None = None
     temperature: float = 1.0
     top_k: int | None = None
-    self_cond_cfg_scale: float = 1.0  # SC-CFG scale (>1 sharpens; 1 = no guidance)
+    self_cond_cfg_scale: float = 3.0  # training-time SC-CFG scale (paper default)
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "ELFSamplingConfig":

@@ -1,15 +1,3 @@
-_doc: ELF-B ~105M (12 layers x 768 dim, frozen T5-small encoder, no CFG)
-
-name: elf-100m
-tokenizer: t5-small
-max_seq_len: 1024
-encoder_model_name: t5-small
-text_encoder_dim: 512
-bottleneck_dim: 128
-n_layer: 12
-n_head: 12
-n_embd: 768
-dropout: 0.0
 _doc: ELF-B ~105M (12 layers x 768 dim, frozen T5-small encoder, SC-CFG)
 
 name: elf-100m

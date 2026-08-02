@@ -1,8 +1,10 @@
 """Embedded Language Flows (ELF) — continuous diffusion LM with SC-CFG.
 
 Follows arXiv:2605.10938 with per-example denoise/decode mixing and
-self-conditioning CFG (SC-CFG): training-time guidance matches Algorithm 3/4,
-and inference uses ``v_cfg = v_uncond + w * (v_cond - v_uncond)``.
+self-conditioning CFG (SC-CFG): training-time guidance matches Algorithm 3/4.
+When ``num_self_cond_cfg_tokens > 0``, inference is a single forward that
+conditions on scale ``w`` (training-time CFG); only the no-scale-token path
+uses inference-time ``v_uncond + w * (v_cond - v_uncond)``.
 Training uses a frozen T5 encoder for clean embeddings; inference only needs
 the denoiser + unembedding head.
 
@@ -459,7 +461,7 @@ class _ELFBackbone(nn.Module):
         *,
         loss_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Official-style per-example denoise/decode mix in one forward (no SC-CFG)."""
+        """Official-style per-example denoise/decode mix with training-time SC-CFG."""
         bsz, seq_len, _ = x0.shape
         device = x0.device
         dtype = x0.dtype
@@ -673,26 +675,45 @@ class _ELFBackbone(nn.Module):
         x_pred_prev: torch.Tensor | None,
         self_cond_cfg_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Conditional denoiser forward with optional SC-CFG guidance.
+        """Denoiser forward with SC-CFG (matches official ``_forward_sample_self_cond``).
 
-        w == 1 (or absent): single forward with the previous self-cond estimate.
-        w != 1: two forwards (uncond uses zero self-cond) extrapolated as
-        ``v_cfg = v_uncond + w * (v_cond - v_uncond)``.
+        With training-time scale tokens (``num_self_cond_cfg_tokens > 0``): one
+        forward conditioned on ``w`` and the previous self-cond estimate.
+        Without scale tokens: optional inference-time extrapolation
+        ``v/x = uncond + w * (cond - uncond)``.
         """
         bsz = z.shape[0]
         t_batch = torch.full((bsz,), t, dtype=z.dtype, device=z.device)
+
+        # Official: training-time SC-CFG → single forward; network already
+        # learned guided v for the provided w.
+        if self.num_self_cond_cfg_tokens > 0:
+            return self._forward_self_cond(
+                z, t_batch, x_pred_prev, self_cond_cfg_scale,
+            )
+
         w = (
             float(self_cond_cfg_scale[0].item())
             if self_cond_cfg_scale is not None
             else 1.0
         )
-        if w == 1.0 or self.self_cond_prob <= 0:
-            return self._forward_self_cond(z, t_batch, x_pred_prev, self_cond_cfg_scale)
+        if self.self_cond_prob <= 0:
+            return self._forward_self_cond(z, t_batch, x_pred_prev, None)
 
-        v_cond, x_cond = self._forward_self_cond(z, t_batch, x_pred_prev, self_cond_cfg_scale)
-        v_uncond, _ = self._forward_self_cond(z, t_batch, None, self_cond_cfg_scale)
+        need_uncond = w != 1.0 or x_pred_prev is None
+        v_uncond = x_uncond = None
+        if need_uncond:
+            v_uncond, x_uncond = self._forward_self_cond(z, t_batch, None, None)
+            if w == 0.0 or x_pred_prev is None:
+                return v_uncond, x_uncond
+
+        v_cond, x_cond = self._forward_self_cond(z, t_batch, x_pred_prev, None)
+        if w == 1.0:
+            return v_cond, x_cond
+        assert v_uncond is not None and x_uncond is not None
         v_out = v_uncond + w * (v_cond - v_uncond)
-        return v_out, x_cond
+        x_out = x_uncond + w * (x_cond - x_uncond)
+        return v_out, x_out
 
     def _ode_step(
         self,
@@ -804,11 +825,17 @@ class _ELFBackbone(nn.Module):
             )
             * self.denoiser_noise_scale
         )
-        self_cond_cfg_scale = (
-            torch.full((num_samples,), sc_cfg_w, dtype=dtype, device=device)
-            if sc_cfg_w != 1.0
-            else None
-        )
+        # Always feed w when scale tokens exist (incl. w=1); else only if w!=1.
+        if self.num_self_cond_cfg_tokens > 0:
+            self_cond_cfg_scale = torch.full(
+                (num_samples,), sc_cfg_w, dtype=dtype, device=device,
+            )
+        elif sc_cfg_w != 1.0:
+            self_cond_cfg_scale = torch.full(
+                (num_samples,), sc_cfg_w, dtype=dtype, device=device,
+            )
+        else:
+            self_cond_cfg_scale = None
         x_pred: torch.Tensor | None = None
         nfe = 0
 

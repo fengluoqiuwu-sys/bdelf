@@ -204,11 +204,14 @@ def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
     if cfg.model == "bd3lm":
         sampling_cfg["num_steps"] = cfg.eval_gen_steps
     elif cfg.model == "elf":
-        # Keep eval sampling lighter than the default 32–64-step SDE.
-        sampling_cfg["num_sampling_steps"] = min(16, cfg.eval_gen_steps)
-        sampling_cfg["sampling_method"] = "ode"
+        # Align online gen-eval with the paper's main sampler (not a cheap ODE
+        # proxy). gen_ppl is only meaningful with this + correct single-fwd SC-CFG.
+        sampling_cfg["num_sampling_steps"] = min(32, max(1, int(cfg.eval_gen_steps)))
+        sampling_cfg["sampling_method"] = "sde"
+        sampling_cfg["sde_gamma"] = 1.5
         sampling_cfg["temperature"] = 0.0  # paper decode: argmax
-        sampling_cfg["time_schedule"] = "uniform"
+        sampling_cfg["time_schedule"] = "logit_normal"
+        sampling_cfg["self_cond_cfg_scale"] = 3.0
     return sampling_cfg
 
 
@@ -235,11 +238,14 @@ def eval_one_batch_gen_ppl(
     train_amp_dtype: torch.dtype,
     seed: int,
     pbar_parent: tqdm | None = None,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     """Unconditional gen. PPL: sample with train model, score via gpt2-large.
 
     Draws ``cfg.gen_eval_batches`` generate() batches of size ``cfg.batch_size``,
     then scores all nonempty decoded strings together.
+
+    Returns ``(gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac)``. The last
+    two catch mode-collapse that can fake a very low gen_ppl (e.g. repeated ``/``).
     """
     was_training = train_model.training
     train_model.eval()
@@ -286,6 +292,12 @@ def eval_one_batch_gen_ppl(
     generated = torch.cat(chunks, dim=0)
     assert generated.size(0) == n_total
 
+    # Collapse diagnostics on token ids (before skip_special decode).
+    uniq_counts = [
+        float(row.unique().numel()) for row in generated.detach().cpu()
+    ]
+    gen_uniq_mean = sum(uniq_counts) / max(len(uniq_counts), 1)
+
     src_tok_name = get_preprocess(cfg.preprocess).tokenizer
     src_tok = _get_src_tokenizer(src_tok_name)
     texts = [
@@ -295,6 +307,7 @@ def eval_one_batch_gen_ppl(
     # Match official ELF: score only nonempty decoded strings.
     nonempty = [t for t in texts if isinstance(t, str) and t.strip()]
     skipped = len(texts) - len(nonempty)
+    gen_nonempty_frac = len(nonempty) / max(len(texts), 1)
     if skipped > 0:
         msg = f"eval/gen: skipped {skipped}/{len(texts)} empty samples"
         if pbar_parent is not None:
@@ -307,7 +320,7 @@ def eval_one_batch_gen_ppl(
         gen_ppl = float("nan")
         summary = (
             f"eval/gen ({cfg.gen_eval_model}): all samples empty; "
-            f"loss nan ppl nan"
+            f"loss nan ppl nan uniq_mean={gen_uniq_mean:.1f}"
         )
     else:
         # Score in micro-batches to keep gpt2 peak memory near one train batch.
@@ -337,14 +350,15 @@ def eval_one_batch_gen_ppl(
             gen_ppl = float("nan")
             summary = (
                 f"eval/gen ({cfg.gen_eval_model}): no scorable tokens; "
-                f"loss nan ppl nan"
+                f"loss nan ppl nan uniq_mean={gen_uniq_mean:.1f}"
             )
         else:
             gen_loss = loss_sum / token_sum
             gen_ppl = loss_to_ppl(gen_loss)
             summary = (
                 f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} "
-                f"ppl {gen_ppl:.2f} (n={len(nonempty)})"
+                f"ppl {gen_ppl:.2f} (n={len(nonempty)} "
+                f"uniq_mean={gen_uniq_mean:.1f} nonempty={gen_nonempty_frac:.2f})"
             )
 
     if was_training:
@@ -356,4 +370,4 @@ def eval_one_batch_gen_ppl(
         tqdm.write(f"{_TRAIN_LOG} {summary}")
     else:
         _train_log(summary)
-    return gen_loss, gen_ppl
+    return gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac
