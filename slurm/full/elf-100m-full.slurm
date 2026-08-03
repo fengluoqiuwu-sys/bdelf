@@ -2,8 +2,8 @@
 #SBATCH --job-name=elf-cfg-100m-full
 #SBATCH --partition=cls1
 #SBATCH --nodelist=cls1-srv[2-4]
-# BeeGFS：srv3 上 checkpoint_latest 曾出现 ls 可见但 open 失败的幽灵 inode；续训避开。
-#SBATCH --exclude=cls1-srv2,cls1-srv3
+# BeeGFS：srv2 上他人作业多；latest 幽灵由 train.py openable 回退处理，可上 srv3/4。
+#SBATCH --exclude=cls1-srv2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
