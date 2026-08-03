@@ -1,26 +1,17 @@
 ---
-description: 本机运行 Python / pip 必须使用项目 .venv
+description: 本机 Python / pip 必须用仓库 .venv
 alwaysApply: true
 ---
 
 # Python 虚拟环境
 
-本机执行任何 Python（`train.py` / `generate.py` / 一次性脚本 / `pip`）前，必须使用仓库根目录的 `.venv`，不要用系统 `python`/`python3` 或 PATH 里其他无关环境。
-
-优先直接用解释器路径（非交互 shell 最稳）：
+本机任何 Python（`train.py` / `generate.py` / 脚本 / `pip`）必须用仓库根 `.venv`，禁止系统 `python`/`python3`。
 
 ```bash
 .venv/bin/python train.py ...
-.venv/bin/python generate.py ...
 .venv/bin/pip install -r requirements.txt
+# 或：source .venv/bin/activate && python ...
 ```
 
-等价写法（与 `slurm/prototype.slurm` / `scripts/train/*.sh` 一致）：
-
-```bash
-source .venv/bin/activate
-python train.py ...
-```
-
-- 缺 `.venv` 时先：`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
-- 远端 full 作业由 Slurm 脚本自行 `source .venv/bin/activate`；本机命令同样遵守本规则。
+缺环境时：`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`。  
+远端 Slurm 作业由脚本自行 `source .venv/bin/activate`。

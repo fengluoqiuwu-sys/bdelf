@@ -1,63 +1,31 @@
 ---
-description: checkpoint 目录为 variant/model/config-hash；禁止别名；用 scripts/resolve_checkpoint.py 定位
+description: checkpoint 路径为 {fast|full}/{model}/{hash}；禁止别名；硬件锁定
 alwaysApply: true
 ---
 
 # Checkpoint 路径与配置哈希
 
-## 目录布局（唯一身份，无别名）
+## 布局（唯一身份）
 
 ```
 cache/checkpoints/{fast|full}/{model}/{config-hash}/
 ```
 
-- `{fast|full}`：训练变体（来自 `--config 100m-fast|100m-full`）
-- `{model}`：模型族（`--model`）
-- `{config-hash}`：由训练入参与所解析 YAML **内容**得到的短哈希（16 hex）
-- **禁止**软链 / 人类别名目录 / `--run-name` 覆盖路径
+- 权威相对路径：`{variant}/{model}/{config-hash}`（`FL_TrainConfig.extra.run_relpath`）。
+- **禁止**软链、人类别名目录、`--run-name` 覆盖路径。
+- `config-hash`：训练入参 + 进入指纹的 YAML **内容** → 16 hex；`--set` 会改变哈希。
+- **不进哈希**：`world_size`、GPU 硬件规格。
+- 进入指纹的 YAML：recipe / schedule / eval / generate / model arch / dataset / preprocess。
+- 实现：`train/run_path.py`；定位 CLI 见 skill `train`（`scripts/resolve_checkpoint.py`）。
 
-权威相对路径：`{variant}/{model}/{config-hash}`（即 `FL_TrainConfig.extra.run_relpath`）。
-
-本地另有给人看的 `cache/checkpoints/hash_guide.csv`（model / config / dataset / Preprocess / generate / hash / set），按前六列排序；训练启动时自动 upsert。**不随 sync 推送/拉取**。
-
-## 定位工具
-
-入参规则与 `train.py` 相同，在仓库根执行：
-
-```bash
-.venv/bin/python scripts/resolve_checkpoint.py \
-  --model ar --config 100m-fast \
-  --dataset owt --preprocess default --generate eval
-
-.venv/bin/python scripts/resolve_checkpoint.py ... --hash-only
-.venv/bin/python scripts/resolve_checkpoint.py ... --json
-.venv/bin/python scripts/resolve_checkpoint.py ... --set optimizer.learning_rate=1e-3
-```
-
-- `--world-size` / GPU 硬件规格**不进入** config-hash。
-- `--set` 与 train 一样会改变哈希。
-- 改动任一进入指纹的 YAML（recipe / schedule / eval / generate / model arch / dataset / preprocess）也会改变哈希。
-
-实现：`train/run_path.py`（指纹与路径）、`scripts/resolve_checkpoint.py`（CLI）。
+本地 `cache/checkpoints/hash_guide.csv` 给人看（训练时自动 upsert）；**不随 sync 推送/拉取**。
 
 ## 硬件锁定（不进哈希）
 
-首次在该 hash 目录训练时写入 `hardware.json`：
+首次训练写入 `hardware.json`（型号、张数、单卡 GiB）。续训须型号与张数一致；显存只比**四舍五入后的 GiB**。为确保训练结果一致与可复现，请勿在训练中途换卡或改可见 GPU 数；确需变更时请新开实验。
 
-```json
-{"gpu_name": "NVIDIA GeForce RTX 4090", "gpu_count": 4, "memory_gb_per_gpu": 24}
-```
+## 配置演进
 
-之后任意重拉起 / 续训：当前可见 GPU 的**型号、张数**必须一致；单卡显存只比**四舍五入后的 GiB 整数**（不要求与标称字节精确相同），否则拒绝训练。
-换卡或改可见 GPU 数请开新实验（或删除该目录的 `hardware.json` 与 checkpoint，仅当你明确要重置）。
-
-## AI 自动优化约定
-
-- 默认只**新增**配置项并给出保持旧行为的默认值，使旧 hash 目录仍可续训。
-- 仅当旧实现有**严重影响正确性**的 bug 时：统一修代码，并删除（或移走）受影响的旧 checkpoint；不要靠别名指向新目录。
-- 查找已有 run：对相同 train 入参跑 `scripts/resolve_checkpoint.py`，不要猜目录名。
-
-## generate / 引用
-
-- `generate.py --run` 使用相对路径：`fast/ar/<hash>`（相对 `cache/checkpoints/`），不要使用旧式扁平 run 名。
-- Cola Stage-1：优先 `COLA_VAE_CHECKPOINT` 或显式 `vae_run=fast/cola_vae/<hash>`。
+- 默认只**新增**配置项并给保持旧行为的默认值，旧 hash 目录可续训。
+- 严重正确性 bug：修代码并处理受影响的旧 checkpoint；不要用别名指向新目录。
+- `generate.py --run` 用 `fast|full/<model>/<hash>`，不用旧扁平名。
