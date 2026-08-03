@@ -53,7 +53,7 @@ full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto
 ### 运行位置与规模
 
 - 本机 5080（fast）：`.venv/bin/python train.py --model elf --config 100m-fast --dataset owt --preprocess elf --generate eval`
-- 远端 4×4090（full）：`python train.py --config 100m-full ...`（由 `slurm/full/*.slurm` 内 `source .venv/bin/activate` 后调用）
+- 远端 4×4090（full）：`bash slurm/sbatch-train.sh <name>`（短名默认找 `scripts/train/<name>.sh`；可用 `--name` 改 job-name）
 - `world_size` 按可见 GPU 数自动探测（须 ∈ {1,2,4,8}）；本机**不要**跑 full。
 
 ## 训练配置（config/train/）

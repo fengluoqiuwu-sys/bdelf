@@ -19,7 +19,7 @@ alwaysApply: true
 - 禁止在登录节点用非 Slurm 的 Python（含交互式 `python` / `.venv`）跑作业。
 - ssh 登录节点只允许轻量操作：查队列/状态、读日志、更新 `temp/` 登记等。
 - AI 拉起的训练最多 **1 node、4 GPU**（如 `#SBATCH --nodes=1` + `#SBATCH --gpus-per-node=4`）；禁止跨节点或超过 4 卡。
-- Slurm 脚本放在仓库 `slurm/`，随代码同步后提交；禁止提交 `slurm/preprocess-*` 等非 full 作业，只用 `slurm/full/` 或同等 full 配置。
+- 训练：`scripts/train/*.sh` + 远端 `bash slurm/sbatch-train.sh <name>`（短名；`--name` 改 job-name；模板 `slurm/prototype.slurm`）；禁止提交 `slurm/preprocess-*`。
 - 作业内 Python 环境由脚本自行 `source .venv/bin/activate`。
 
 ## 远端文件系统

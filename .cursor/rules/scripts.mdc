@@ -8,7 +8,8 @@ alwaysApply: true
 ## 放置
 
 - 通用辅助脚本放在仓库根下的 `scripts/`（如 resolve / sync / 下数据集）。
-- **Slurm 专属**辅助脚本放在 `slurm/`（如 `gpu_availability.py`、`tail_remote_logs.py`）；作业脚本仍为 `slurm/full/*.slurm` 等。
+- **训练启动脚本**放在 `scripts/train/`（模板 `prototype.sh` + 各实验 `.sh`）。
+- **Slurm**：唯一训练模板 `slurm/prototype.slurm` + 包装器 `slurm/sbatch-train.sh`；另有 `gpu_availability.py` / `tail_remote_logs.py`。勿再为每个模型复制 `.slurm`。
 - **入口**仍留在仓库根：`train.py`、`generate.py`；库模块不要塞进 `scripts/`。
 
 ## 执行目录（强制）
@@ -41,6 +42,9 @@ ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py
 |------|------|
 | `scripts/resolve_checkpoint.py` | 与 train 同入参解析 hash / 目录 |
 | `scripts/download_dataset.py` | 按名下载数据集 |
+| `scripts/train/*.sh` | 训练启动（本地或经 sbatch-train） |
 | `scripts/sync-ovan-server.sh` | 与 ovan-server 同步（本地脚本，见 `.gitignore`） |
+| `slurm/sbatch-train.sh` | 短名提交 `scripts/train/<name>.sh`；`--name` 改 job-name |
+| `slurm/prototype.slurm` | 唯一训练 SBATCH 模板 |
 | `slurm/gpu_availability.py` | cls1 GPU 空闲表（远端执行） |
 | `slurm/tail_remote_logs.py` | 读 `slurm/logs` 末 N 行（远端执行） |

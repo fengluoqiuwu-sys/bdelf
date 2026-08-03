@@ -161,9 +161,9 @@ git commit -m "<语义化描述>"
 ```text
 - [前置] 工作区已干净（第 4.5 步已提交，git status 无未提交改动）
 - bash scripts/sync-ovan-server.sh push
-- 确认 slurm/full/ 下脚本为 full 配置（禁止 preprocess）
+- 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
 - 读远端 temp/agent/current.json，确保无未结束的 AI job 或有登记
-- ssh sbatch（slurm/full/<name>.slurm）
+- ssh 后 `bash slurm/sbatch-train.sh <name>`（可选 `--name JOB_NAME`）
 - 写 current.json + launched/<job_id>.json
 - 启动「5 分钟后首次唤醒」后台调度（见「唤醒调度」）
 ```

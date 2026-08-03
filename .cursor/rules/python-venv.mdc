@@ -15,7 +15,7 @@ alwaysApply: true
 .venv/bin/pip install -r requirements.txt
 ```
 
-等价写法（与 `slurm/full/*.slurm` 一致）：
+等价写法（与 `slurm/prototype.slurm` / `scripts/train/*.sh` 一致）：
 
 ```bash
 source .venv/bin/activate

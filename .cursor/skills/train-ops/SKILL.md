@@ -33,7 +33,7 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 
 ### 硬限制（再强调）
 
-- 只 `sbatch`：`slurm/full/*.slurm` 或同等 full；**禁止** preprocess 作业。
+- 只通过 `bash slurm/sbatch-train.sh <name>` 提交（默认 `scripts/train/<name>.sh`；模板 `slurm/prototype.slurm`）；可用 `--name` 指定 job-name；**禁止** preprocess 作业。
 - 不改远端项目文件；只写 `~/source/bdelf/temp/`。
 - 先本地改脚本 → `bash scripts/sync-ovan-server.sh push` → 再提交。
 
@@ -52,7 +52,7 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 {
   "job_id": "1234567",
   "job_name": "elf-100m-full",
-  "script": "slurm/full/elf-100m-full.slurm",
+  "script": "scripts/train/elf-100m-full.sh",
   "started_at": "2026-08-01T12:00:00+08:00",
   "state": "RUNNING"
 }
@@ -63,7 +63,7 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 ### 提交前检查清单
 
 ```text
-- [ ] 本地 slurm 脚本已就绪且为 full
+- [ ] 本地 `scripts/train/<name>.sh` 已就绪（full 配置）
 - [ ] bash scripts/sync-ovan-server.sh push 已完成
 - [ ] ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'（确认目标节点 AVAIL 够用）
 - [ ] 读取远端 temp/agent/current.json
@@ -99,14 +99,16 @@ ssh ovan-server 'mkdir -p ~/source/bdelf/temp/agent/launched && cat ~/source/bde
 ssh ovan-server 'scancel <JOB_ID>'
 
 # 提交（在 push 之后）
-ssh ovan-server 'cd ~/source/bdelf && sbatch slurm/full/<name>.slurm'
+ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
+# 例：
+# ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh elf-100m-full --name elf-cfg-100m-full --exclude=cls1-srv2'
 ```
 
 登记写入示例（提交成功拿到 JOB_ID 后）：
 
 ```bash
 ssh ovan-server 'mkdir -p ~/source/bdelf/temp/agent/launched && cat > ~/source/bdelf/temp/agent/current.json <<EOF
-{"job_id":"<JOB_ID>","job_name":"<NAME>","script":"slurm/full/<file>.slurm","started_at":"<ISO>","state":"SUBMITTED"}
+{"job_id":"<JOB_ID>","job_name":"<NAME>","script":"scripts/train/<name>.sh","started_at":"<ISO>","state":"SUBMITTED"}
 EOF
 cp ~/source/bdelf/temp/agent/current.json ~/source/bdelf/temp/agent/launched/<JOB_ID>.json'
 ```
