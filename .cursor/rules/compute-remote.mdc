@@ -25,12 +25,14 @@ alwaysApply: true
 ## 远端文件系统
 
 - 项目树（代码/配置/脚本等）**只读**；禁止用 ssh 直接改 `~/source/bdelf` 下除 `temp/` 外的任何文件。
-- 改动一律在本地完成 → `bash sync-ovan-server.sh push` → 再 `sbatch`。
+- 改动一律在本地完成 → `bash scripts/sync-ovan-server.sh push` → 再 `sbatch`。
 - **唯一可写路径**：`~/source/bdelf/temp/`（agent 任务登记）；`temp/` 在 push/pull 中均被屏蔽。
-- `slurm/logs/` 等仅允许只读查看；读训练 `.out`/`.err` 末 N 行优先用本机
-  `.venv/bin/python slurm/tail_remote_logs.py <JOB_ID>`（见 skill `train-ops`）。
-- 查四节点 GPU 空闲优先用本机
-  `.venv/bin/python slurm/gpu_availability.py`（见 skill `train-ops`）。
+- `slurm/logs/` 等仅允许只读查看；读训练 `.out`/`.err` 末 N 行：先 push，再
+  `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'`
+ （脚本内不 SSH；见 skill `train-ops`）。
+- 查四节点 GPU 空闲：先 push，再
+  `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'`
+  （脚本内不 SSH；见 skill `train-ops`）。
 
 ## AI 任务互斥
 

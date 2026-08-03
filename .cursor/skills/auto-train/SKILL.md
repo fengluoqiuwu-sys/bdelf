@@ -30,10 +30,10 @@ ssh ovan-server 'cat ~/source/bdelf/cache/checkpoints/<variant>/<model>/<hash>/c
 
 ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
 
-# Slurm .out/.err 末 N 行：优先用本机脚本（见 train-ops）
-.venv/bin/python slurm/tail_remote_logs.py <JOB_ID>
-.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120
-.venv/bin/python slurm/tail_remote_logs.py --list
+# Slurm .out/.err 末 N 行：push 后在远端跑脚本（见 train-ops；脚本内无 SSH）
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --list'
 ```
 
 - 适用：确认 run 是否存在、checkpoint 步数列表、日志尾部、config、agent 登记、目录树。
@@ -141,7 +141,7 @@ git switch master && git switch -c <idea>
 
 **4.5 强制提交（推送到远端前必做）**
 
-推送 `sync-ovan-server.sh push` 之前，**必须先提交到 git，不允许有未保留的内容**：
+推送 `scripts/sync-ovan-server.sh push` 之前，**必须先提交到 git，不允许有未保留的内容**：
 
 ```bash
 git status
@@ -149,7 +149,7 @@ git add <相关文件>      # 或 git add -A（用前用 git status 确认无夹
 git commit -m "<语义化描述>"
 ```
 
-- `git push` 推送的是 git **commit**；`sync-ovan-server.sh push` 推送的是**工作区文件**。若工作区有
+- `git push` 推送的是 git **commit**；`scripts/sync-ovan-server.sh push` 推送的是**工作区文件**。若工作区有
   未提交的改动，远端拿到的是无法从 git 恢复的环境——这是不允许的。
 - 本地验证通过后、确认改动可用即提交；提交信息写清改动内容与目的（如 `ar2: change anchor embedding format`）。
 - 提交后 `git status` 必须**干净**（无未跟踪/未提交变体）再进入第 5 步。
@@ -160,7 +160,7 @@ git commit -m "<语义化描述>"
 
 ```text
 - [前置] 工作区已干净（第 4.5 步已提交，git status 无未提交改动）
-- bash sync-ovan-server.sh push
+- bash scripts/sync-ovan-server.sh push
 - 确认 slurm/full/ 下脚本为 full 配置（禁止 preprocess）
 - 读远端 temp/agent/current.json，确保无未结束的 AI job 或有登记
 - ssh sbatch（slurm/full/<name>.slurm）

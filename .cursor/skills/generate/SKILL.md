@@ -24,7 +24,7 @@ description: >-
 | （省略） | 扫 `cache/checkpoints/{fast,full}/*/*/checkpoint_latest.pt` 取 mtime 最新者 |
 
 不确定有哪些 run：`.venv/bin/python generate.py --list-runs`。  
-不知道 hash：用与 train 相同入参跑 `resolve_checkpoint.py`。
+不知道 hash：用与 train 相同入参跑 `scripts/resolve_checkpoint.py`。
 
 ## 基本用法
 

@@ -35,7 +35,7 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 
 - 只 `sbatch`：`slurm/full/*.slurm` 或同等 full；**禁止** preprocess 作业。
 - 不改远端项目文件；只写 `~/source/bdelf/temp/`。
-- 先本地改脚本 → `bash sync-ovan-server.sh push` → 再提交。
+- 先本地改脚本 → `bash scripts/sync-ovan-server.sh push` → 再提交。
 
 ### Agent 任务登记（`temp/`）
 
@@ -64,23 +64,23 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 
 ```text
 - [ ] 本地 slurm 脚本已就绪且为 full
-- [ ] bash sync-ovan-server.sh push 已完成
-- [ ] .venv/bin/python slurm/gpu_availability.py（确认目标节点 AVAIL 够用）
+- [ ] bash scripts/sync-ovan-server.sh push 已完成
+- [ ] ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'（确认目标节点 AVAIL 够用）
 - [ ] 读取远端 temp/agent/current.json
 - [ ] 若有未结束的 AI job：scancel 或确认已结束，并更新登记
 - [ ] sbatch，写入 current.json + launched/<job_id>.json
 ```
 
-### 节点 GPU 空闲（优先用本机脚本）
+### 节点 GPU 空闲（push 后在远端执行脚本）
 
-提交前可先看四个计算节点各有几张卡可调度。远端只跑 `scontrol show node -o`：
+提交前可先看四个计算节点各有几张卡可调度。`slurm/gpu_availability.py` **不发起 SSH**：先 push，再经 `ssh` 在远端跑（内部只调 `scontrol`）：
 
 ```bash
 # 表格：TOTAL / USED / FREE / AVAIL（不可调度节点 AVAIL=0）+ STATE
-.venv/bin/python slurm/gpu_availability.py
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'
 
 # JSON（脚本/自动化用）
-.venv/bin/python slurm/gpu_availability.py --json
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py --json'
 ```
 
 列含义：`FREE = TOTAL - USED`；`AVAIL` 在节点 `DOWN`/`DRAIN`/`NOT_RESPONDING` 等时记为 0。
@@ -118,25 +118,25 @@ cp ~/source/bdelf/temp/agent/current.json ~/source/bdelf/temp/agent/launched/<JO
 - `squeue` 里非本 agent 登记的 job：**不要** `scancel`。
 - 资源紧张时告知用户，由用户决定。
 
-### 只读日志（优先用本机脚本）
+### 只读日志（push 后在远端执行脚本）
 
 日志在远端 `~/source/bdelf/slurm/logs/<job-name>-<job-id>.{out,err}`。
-**优先**用仓库脚本经 SSH 拉末 N 行（登录节点只跑 `tail`，轻量合法）：
+`slurm/tail_remote_logs.py` **不发起 SSH**：先保证代码已 push，再经 `ssh` 在远端仓库根执行（轻量只读）：
 
 ```bash
 # 按 job_id 同时看 .out + .err 末 80 行（默认）
-.venv/bin/python slurm/tail_remote_logs.py <JOB_ID>
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
 
 # 只要 stdout / stderr，或改行数
-.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which out
-.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which out'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120'
 
 # 作业名 + id（多匹配时）；或只给作业名取该前缀最新一份
-.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --job-name <NAME>
-.venv/bin/python slurm/tail_remote_logs.py --job-name <NAME> -n 50
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --job-name <NAME>'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --job-name <NAME> -n 50'
 
-# 列出远端 logs 近期文件（找 job_id / 文件名）
-.venv/bin/python slurm/tail_remote_logs.py --list
+# 列出 logs 近期文件（找 job_id / 文件名）
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --list'
 ```
 
 不要为了看日志去 `pull`；也不要手写长串 `ssh ... tail`，除非脚本不可用。
@@ -145,8 +145,8 @@ cp ~/source/bdelf/temp/agent/current.json ~/source/bdelf/temp/agent/launched/<JO
 
 不要在远端跑 generate/eval 做效果检查。
 
-1. `bash sync-ovan-server.sh pull --mode fast [NAME]` — 同步目录与小文件  
-2. `bash sync-ovan-server.sh pull-file NAME FILE` — 拉具体步数或所需 `.pt`  
+1. `bash scripts/sync-ovan-server.sh pull --mode fast [NAME]` — 同步目录与小文件  
+2. `bash scripts/sync-ovan-server.sh pull-file NAME FILE` — 拉具体步数或所需 `.pt`  
 3. 在本机跑测试；注意本机 GPU 互斥  
 
 需要最新权重时可改用 `pull --mode common [NAME]`（见 sync skill）；**禁止** AI 主动 `pull --mode full`。

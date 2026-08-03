@@ -31,7 +31,7 @@ description: >-
 定位 checkpoint（与 train 相同入参）::
 
 ```bash
-.venv/bin/python resolve_checkpoint.py \
+.venv/bin/python scripts/resolve_checkpoint.py \
   --model ar --config 100m-fast \
   --dataset owt --preprocess default --generate eval
 ```
@@ -80,7 +80,7 @@ description: >-
 - `config.json` — 本次 `{"train": <FL_TrainConfig dict>, "model": <model_meta>}`
 - `train_log.csv` / `eval_log.csv` — 训练/评测曲线；`*_ppl.png` 由 `update_ppl_plots` 绘制
 
-用 `resolve_checkpoint.py` 解析 hash；`generate.py --run` 填 `{variant}/{model}/{hash}`。
+用 `scripts/resolve_checkpoint.py` 解析 hash；`generate.py --run` 填 `{variant}/{model}/{hash}`。
 
 ## 检查进度 / 续训
 

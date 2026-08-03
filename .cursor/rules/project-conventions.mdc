@@ -17,7 +17,11 @@ config/
   generate/      # 每模型生成/采样 YAML（训练 --generate）
 dataset/         # FL_Dataset 基类与具体实现
 tokenizer/       # FL_Tokenizer 基类与具体实现
+scripts/         # 通用辅助脚本（工作目录约定见 rule「辅助脚本」）
+slurm/           # 作业脚本 + Slurm 专属辅助（gpu_availability / tail_remote_logs 等）
 cache/           # 本地缓存（已在 .gitignore 中）
+train.py         # 训练入口（仓库根）
+generate.py      # 生成入口（仓库根）
 hf_config.py     # HuggingFace 全局设置（镜像、禁用 XET）
 ```
 

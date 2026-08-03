@@ -1,0 +1,46 @@
+---
+description: 辅助脚本放在 scripts/；一律以仓库根为工作目录执行
+alwaysApply: true
+---
+
+# 辅助脚本（scripts/）
+
+## 放置
+
+- 通用辅助脚本放在仓库根下的 `scripts/`（如 resolve / sync / 下数据集）。
+- **Slurm 专属**辅助脚本放在 `slurm/`（如 `gpu_availability.py`、`tail_remote_logs.py`）；作业脚本仍为 `slurm/full/*.slurm` 等。
+- **入口**仍留在仓库根：`train.py`、`generate.py`；库模块不要塞进 `scripts/`。
+
+## 执行目录（强制）
+
+- **默认工作目录是仓库根**（含 `train.py` / `config/` / `.venv/` 的那一层）。
+- 正确示例：
+
+```bash
+cd /path/to/bdelf
+.venv/bin/python scripts/resolve_checkpoint.py --model ar --config 100m-fast ...
+bash scripts/sync-ovan-server.sh push
+```
+
+- 不要 `cd scripts && python foo.py`；文档与 skill 里的命令写成 `scripts/<name>.py` 或 `slurm/<name>.py`。
+- `scripts/` 下 Python 通过 `scripts/repo_env.py` 的 `ensure_repo_root()` 固定 `cwd` / `sys.path`；`slurm/*.py` 辅助脚本自行 `chdir` 到仓库根。
+
+## 远端：ssh 后再跑 Python（强制）
+
+- `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**脚本内不得发起 SSH**；在目标机（通常 ovan-server）上直接调用 `scontrol` / 读本地文件。
+- 本机需要远端结果时：先 `bash scripts/sync-ovan-server.sh push`，再：
+
+```bash
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
+```
+
+## 常用脚本
+
+| 路径 | 用途 |
+|------|------|
+| `scripts/resolve_checkpoint.py` | 与 train 同入参解析 hash / 目录 |
+| `scripts/download_dataset.py` | 按名下载数据集 |
+| `scripts/sync-ovan-server.sh` | 与 ovan-server 同步（本地脚本，见 `.gitignore`） |
+| `slurm/gpu_availability.py` | cls1 GPU 空闲表（远端执行） |
+| `slurm/tail_remote_logs.py` | 读 `slurm/logs` 末 N 行（远端执行） |

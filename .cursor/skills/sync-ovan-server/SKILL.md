@@ -1,14 +1,14 @@
 ---
 name: sync-ovan-server
 description: >-
-  Sync bdelf with ovan-server via sync-ovan-server.sh (push code/cache, pull
-  checkpoints). Use when the user asks to push/pull to ovan-server, sync
+  Sync bdelf with ovan-server via scripts/sync-ovan-server.sh (push code/cache,
+  pull checkpoints). Use when the user asks to push/pull to ovan-server, sync
   checkpoints, or fetch a specific checkpoint step file.
 ---
 
 # sync-ovan-server
 
-项目根目录脚本：`sync-ovan-server.sh`。远端：`ovan-server:~/source/bdelf`。
+仓库根执行：`bash scripts/sync-ovan-server.sh`。远端：`ovan-server:~/source/bdelf`。
 
 ## 禁止（AI 必须遵守）
 
@@ -17,12 +17,12 @@ description: >-
 
 ## 命令
 
-在项目根目录执行。
+在仓库根执行（见 rule「辅助脚本」）。
 
 ### push
 
 ```bash
-bash sync-ovan-server.sh push
+bash scripts/sync-ovan-server.sh push
 ```
 
 - 代码镜像推送（`--delete`）；排除 `.venv` / `cache` / `temp/` / `.git` / `.cursor/` / `.claude/` 等
@@ -33,7 +33,7 @@ bash sync-ovan-server.sh push
 ### pull
 
 ```bash
-bash sync-ovan-server.sh pull [--mode fast|common] [NAME]
+bash scripts/sync-ovan-server.sh pull [--mode fast|common] [NAME]
 ```
 
 | mode | 行为 |
@@ -42,20 +42,20 @@ bash sync-ovan-server.sh pull [--mode fast|common] [NAME]
 | `common` | 同 fast，另同步 `checkpoint_latest.pt` |
 | `full` | 全部 `.pt` — **AI 禁止使用** |
 
-- `NAME`：可选，限定 `cache/checkpoints/{fast|full}/{model}/{hash}/`（用 `resolve_checkpoint.py` 解析）
+- `NAME`：可选，限定 `cache/checkpoints/{fast|full}/{model}/{hash}/`（用 `scripts/resolve_checkpoint.py` 解析）
 
 - 默认拉全部 run 目录的范围内文件；有 `NAME` 时只同步该目录
 
 ### pull-file（单文件 / 指定步数）
 
 ```bash
-bash sync-ovan-server.sh pull-file NAME FILE
+bash scripts/sync-ovan-server.sh pull-file NAME FILE
 ```
 
 例：
 
 ```bash
-bash sync-ovan-server.sh pull-file ar2-300m-full-muon checkpoint_step_0100000.pt
+bash scripts/sync-ovan-server.sh pull-file ar2-300m-full-muon checkpoint_step_0100000.pt
 ```
 
 ## 选用规则

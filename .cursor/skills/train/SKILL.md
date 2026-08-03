@@ -33,7 +33,7 @@ full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto
 定位 checkpoint 目录（与 train 相同入参）::
 
 ```bash
-.venv/bin/python resolve_checkpoint.py \
+.venv/bin/python scripts/resolve_checkpoint.py \
   --model ar --config 100m-fast \
   --dataset owt --preprocess default --generate eval
 ```
@@ -82,7 +82,7 @@ full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto
 - `config.json` — 本次 `{"train": <FL_TrainConfig dict>, "model": <model_meta>}`
 - `train_log.csv` / `eval_log.csv` — 训练/评测曲线；`*_ppl.png` 由 `update_ppl_plots` 绘制
 
-用 `resolve_checkpoint.py`（与 train 相同入参）解析 `config-hash` / 目录；`generate.py --run` 填 `{variant}/{model}/{hash}`。
+用 `scripts/resolve_checkpoint.py`（与 train 相同入参）解析 `config-hash` / 目录；`generate.py --run` 填 `{variant}/{model}/{hash}`。
 
 ## 检查进度 / 续训
 

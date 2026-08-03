@@ -1,5 +1,5 @@
 ---
-description: checkpoint 目录为 variant/model/config-hash；禁止别名；用 resolve_checkpoint.py 定位
+description: checkpoint 目录为 variant/model/config-hash；禁止别名；用 scripts/resolve_checkpoint.py 定位
 alwaysApply: true
 ---
 
@@ -22,23 +22,23 @@ cache/checkpoints/{fast|full}/{model}/{config-hash}/
 
 ## 定位工具
 
-入参规则与 `train.py` 相同，用仓库根目录脚本：
+入参规则与 `train.py` 相同，在仓库根执行：
 
 ```bash
-.venv/bin/python resolve_checkpoint.py \
+.venv/bin/python scripts/resolve_checkpoint.py \
   --model ar --config 100m-fast \
   --dataset owt --preprocess default --generate eval
 
-.venv/bin/python resolve_checkpoint.py ... --hash-only
-.venv/bin/python resolve_checkpoint.py ... --json
-.venv/bin/python resolve_checkpoint.py ... --set optimizer.learning_rate=1e-3
+.venv/bin/python scripts/resolve_checkpoint.py ... --hash-only
+.venv/bin/python scripts/resolve_checkpoint.py ... --json
+.venv/bin/python scripts/resolve_checkpoint.py ... --set optimizer.learning_rate=1e-3
 ```
 
 - `--world-size` / GPU 硬件规格**不进入** config-hash。
 - `--set` 与 train 一样会改变哈希。
 - 改动任一进入指纹的 YAML（recipe / schedule / eval / generate / model arch / dataset / preprocess）也会改变哈希。
 
-实现：`train/run_path.py`（指纹与路径）、`resolve_checkpoint.py`（CLI）。
+实现：`train/run_path.py`（指纹与路径）、`scripts/resolve_checkpoint.py`（CLI）。
 
 ## 硬件锁定（不进哈希）
 
@@ -55,7 +55,7 @@ cache/checkpoints/{fast|full}/{model}/{config-hash}/
 
 - 默认只**新增**配置项并给出保持旧行为的默认值，使旧 hash 目录仍可续训。
 - 仅当旧实现有**严重影响正确性**的 bug 时：统一修代码，并删除（或移走）受影响的旧 checkpoint；不要靠别名指向新目录。
-- 查找已有 run：对相同 train 入参跑 `resolve_checkpoint.py`，不要猜目录名。
+- 查找已有 run：对相同 train 入参跑 `scripts/resolve_checkpoint.py`，不要猜目录名。
 
 ## generate / 引用
 
