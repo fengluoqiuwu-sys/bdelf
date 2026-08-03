@@ -86,8 +86,10 @@ def _parse_node_line(line: str) -> dict | None:
 
 
 def fetch_nodes(nodes: tuple[str, ...]) -> tuple[list[dict], str]:
+    # Slurm 25+：多节点须用 hostlist（逗号 / 方括号），不可拆成多个 argv
+    hostlist = ",".join(nodes)
     proc = subprocess.run(
-        ["scontrol", "show", "node", *nodes, "-o"],
+        ["scontrol", "show", "node", hostlist, "-o"],
         text=True,
         capture_output=True,
     )
