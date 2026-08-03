@@ -700,11 +700,18 @@ class _BDELFBackbone(nn.Module):
     total_sum = (ce_per_token * ce_mask).sum() + (l2_per_token * l2_mask).sum()
     loss = total_sum / torch.clamp(valid.sum(), min=1.0)
 
-    self.last_ce_loss = (
-      (ce_per_token * ce_mask).sum() / torch.clamp(ce_mask.sum(), min=1.0)
+    ce_denom = ce_mask.sum()
+    l2_denom = l2_mask.sum()
+    # 本微批无 decode 样本时记 nan，避免 0/1→ce=0→假 ppl=1.0。
+    self.last_ce_loss = torch.where(
+      ce_denom > 0,
+      (ce_per_token * ce_mask).sum() / ce_denom.clamp(min=1.0),
+      torch.full((), float("nan"), device=ce_per_token.device, dtype=ce_per_token.dtype),
     ).detach()
-    self.last_l2_loss = (
-      (l2_per_token * l2_mask).sum() / torch.clamp(l2_mask.sum(), min=1.0)
+    self.last_l2_loss = torch.where(
+      l2_denom > 0,
+      (l2_per_token * l2_mask).sum() / l2_denom.clamp(min=1.0),
+      torch.full((), float("nan"), device=l2_per_token.device, dtype=l2_per_token.dtype),
     ).detach()
     return loss
 
