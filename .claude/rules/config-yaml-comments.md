@@ -24,6 +24,6 @@ description: config/**/*.yaml 行内中文注释与同功能文件结构一致
 ```yaml
 name: full                 # 配置名，非 prototype 时与文件名一致
 variant: full              # 训练变体：fast | full
-target_tokens: 20000000000 # 数据 token 预算，用于推导 max_steps
+target_tokens: 50000000000 # 数据 token 预算，用于推导 max_steps
 compile: true              # 是否启用 torch.compile(Inductor)
 ```

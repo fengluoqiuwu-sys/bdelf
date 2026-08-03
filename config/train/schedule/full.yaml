@@ -1,10 +1,10 @@
 # =============================================================================
 # 训练日程（token 预算驱动 max_steps）
 # =============================================================================
-_doc: 正式训练日程（2e10 token，多卡）  # 文件说明，写入 extra
+_doc: 正式训练日程（5e10 token，多卡）  # 文件说明，写入 extra
 name: full  # 配置名；非 prototype 时与文件名一致
 variant: full  # 训练变体：fast | full
-target_tokens: 20000000000  # 数据 token 预算，用于推导 max_steps
+target_tokens: 50000000000  # 数据 token 预算，用于推导 max_steps
 warmup_ratio: 0.005  # 预热步数占 max_steps 的比例
 min_lr_ratio: 0.1  # 最小学习率为峰值的比例
 eval_step: 500  # 评测间隔（优化器步）
