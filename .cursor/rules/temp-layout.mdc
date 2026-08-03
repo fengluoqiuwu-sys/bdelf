@@ -10,11 +10,13 @@ alwaysApply: true
 | 路径 | 用途 |
 |------|------|
 | `temp/auto-research/<idea>/` | 自动训练/优化记录（见 skill `auto-train`） |
-| `temp/idea/<idea>/` | 读论文后的想法/规格文稿 |
-| `temp/papers/<name>/` | 论文（`paper/`）与相关代码（`sources/`） |
+| `temp/idea/<idea>/` | 人工认可后的想法/规格文稿 |
+| `temp/papers/<name>/` | 论文（`paper/` + `INDEX.md`）与可选 `sources/` |
+| `temp/research-scout/<run>/` | 自由探索找 idea 的 run 记录（见 skill `research-scout`）；交付物 `ideas.md` |
 | `temp/vram-probe/` | `alloc.md`：model×batch→alloc_peak_GiB（见 skill `vram-probe`）；开训按当前卡+global_bs 查表 |
 | 远端 `~/source/bdelf/temp/agent/` | **仅** AI job 登记（见 rule「远端计算约束」） |
 
-- `<idea>` / `<name>`：短横线小写 slug（如 `elf-cfg`）。
-- `auto-research` / `idea` 目录建议有 `README.md`。
+- `<idea>` / `<name>` / `<run>`：短横线小写 slug（如 `elf-cfg`、`2026-08-03-diff-lm`）。
+- `auto-research` / `idea` / `research-scout` 目录建议有 `README.md`。
+- scout 不写入 `temp/idea/`；人筛选后再搬入。
 - 勿把大 checkpoint 放进 `temp/`。

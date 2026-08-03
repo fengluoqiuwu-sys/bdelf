@@ -48,3 +48,5 @@ cache/                     # gitignore
 | `generate` | 本机 `generate.py` |
 | `sync-ovan-server` | push / pull / pull-file |
 | `auto-train` | 用户明确「自动执行」后的闭环优化 |
+| `research-scout` | 自由探索找未充分做过的 idea → `temp/research-scout/` |
+| `paper-ingest` | 下载论文并编 AI 用 INDEX（供 scout subagent；仅 auto/composer） |

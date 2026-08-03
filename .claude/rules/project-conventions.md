@@ -39,5 +39,7 @@ Claude：**只推理、不训练、不用远端**（见 rule「禁止训练」�
 | Skill | 用途 |
 |-------|------|
 | `generate` | 本机 `generate.py` 推理 |
+| `research-scout` | 自由探索找 idea → `temp/research-scout/` |
+| `paper-ingest` | 下载论文编 INDEX（供 scout subagent） |
 
-训练 / 远端 / 同步属于 **Cursor**（`train`、`train-ops`、`sync-ovan-server`、`auto-train`），Claude 不要调用。
+训练 / 远端 / 同步属于 **Cursor**（`train`、`train-ops`、`sync-ovan-server`、`auto-train`、`vram-probe`），Claude 不要调用。
