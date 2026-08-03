@@ -121,8 +121,13 @@ fi
 
 mkdir -p "$ROOT/slurm/logs"
 
+# 不用 sbatch --export：集群上 ALL/NONE 均曾触发
+# 「user env retrieval failed requeued held」。改写 pending 文件，由
+# prototype.slurm 按 SLURM_JOB_NAME 读取（与 vram-probe 同策略）。
+PENDING="$ROOT/slurm/logs/train-script-${JOB_NAME}.pending"
+printf '%s\n' "$TRAIN_SCRIPT" > "$PENDING"
+
 exec sbatch \
   --job-name="$JOB_NAME" \
-  --export=ALL,BDELF_TRAIN_SCRIPT="$TRAIN_SCRIPT" \
   "${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"}" \
   "$ROOT/slurm/prototype.slurm"

@@ -2,12 +2,12 @@
 # =============================================================================
 # 训练作业唯一 Slurm 模板（勿再为每个模型复制本文件）
 # =============================================================================
-# 通过包装器提交，并注入要跑的训练脚本：
+# 通过包装器提交：
 #   bash slurm/sbatch-train.sh <name> [--name JOB_NAME] [额外 sbatch 参数...]
 #
-# 包装器会设置：
-#   --job-name=<脚本 basename>
-#   --export=ALL,BDELF_TRAIN_SCRIPT=<绝对路径>
+# 包装器写入 slurm/logs/train-script-<job-name>.pending（绝对路径），
+# 本脚本按 SLURM_JOB_NAME 读取。不使用 sbatch --export（避免集群
+# user env retrieval hold）。
 # =============================================================================
 #SBATCH --job-name=bdelf-train
 #SBATCH --partition=cls1
@@ -27,12 +27,14 @@ PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
 cd "$PROJECT"
 source .venv/bin/activate
 
-if [[ -z "${BDELF_TRAIN_SCRIPT:-}" ]]; then
-  echo "BDELF_TRAIN_SCRIPT 未设置；请用: bash slurm/sbatch-train.sh <name>" >&2
+PENDING="$PROJECT/slurm/logs/train-script-${SLURM_JOB_NAME}.pending"
+if [[ ! -f "$PENDING" ]]; then
+  echo "缺少 $PENDING；请用: bash slurm/sbatch-train.sh <name>" >&2
   exit 1
 fi
-if [[ ! -f "$BDELF_TRAIN_SCRIPT" ]]; then
-  echo "训练脚本不存在: $BDELF_TRAIN_SCRIPT" >&2
+BDELF_TRAIN_SCRIPT="$(head -n 1 "$PENDING")"
+if [[ -z "$BDELF_TRAIN_SCRIPT" || ! -f "$BDELF_TRAIN_SCRIPT" ]]; then
+  echo "训练脚本无效: ${BDELF_TRAIN_SCRIPT:-<empty>}（来自 $PENDING）" >&2
   exit 1
 fi
 
