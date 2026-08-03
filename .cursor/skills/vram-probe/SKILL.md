@@ -5,7 +5,7 @@ description: >-
   gpt2-large + train model/optimizer/EMA, measure peak memory across micro-batch
   sizes, stop on OOM. Fills model×batch alloc table under temp/vram-probe/;
   train-time queries the table against the target GPU budget and global_batch_size.
-  Mutex via train-ops agent registry; 2 GiB safety margin is an AI selection rule,
+  Mutex via train-ops agent registry (multi-job; AI GPU sum ≤ 4); 2 GiB safety margin is an AI selection rule,
   not coded into the probe.
 ---
 
@@ -30,7 +30,7 @@ description: >-
 
 候选集合：`1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128`。
 
-已知：目标卡 `total_memory_GiB`、本次 `global_batch_size`、`world_size`（full 默认 4）、表中该模型各档 `alloc`：
+已知：目标卡 `total_memory_GiB`、本次 `global_batch_size`、`world_size`（AI full 默认 **2**）、表中该模型各档 `alloc`：
 
 ```text
 budget = total_memory_GiB − 2
@@ -49,7 +49,7 @@ chosen = max { b ∈ 候选 |
 
 - 测**全** `--batches`（默认全候选）；**不**按 recipe 的 `global_batch_size` 过滤
 - 测量时 `grad_accum_steps=1`（单 micro-step 峰值与真实 accum / global_bs 无关）
-- `--world-size` 仅元数据（默认 4）；探针进程始终 1 卡
+- `--world-size` 仅元数据（AI full 默认传 **2**）；探针进程始终 1 卡
 - `torch.compile` **跟随 schedule**（full 为 true）；可用 `--no-compile` 覆盖
 - 其它与训练对齐：bf16 autocast、`(loss/accum).backward()`、Muon/AdamW、EMA（若开）、常驻 gpt2-large、TF32 matmul
 - 填表：`ok` 行写入 `alloc_peak_GiB`；首次 OOM 的档写 `oom`，更大档保持 `—`（未测）
@@ -58,15 +58,15 @@ chosen = max { b ∈ 候选 |
 
 `.venv/bin/python scripts/vram_probe.py …` **能跑但不建议**；以远端目标卡为准。本机 GPU 互斥仍适用。
 
-## 远端提交（强制互斥）
+## 远端提交（计入 AI GPU 合计）
 
 ```text
 - [ ] bash scripts/sync-ovan-server.sh push   # 探针/脚本有更新时
 - [ ] bash scripts/remote_status.sh           # 强制
-- [ ] 无未结束 AI job；有空闲 GPU
+- [ ] agent_gpu_sum + 1 ≤ 4；有空闲 GPU（否则 auto-train 睡 60m）
 - [ ] ssh 后 bash slurm/sbatch-vram-probe.sh …
-- [ ] 写 temp/agent/current.json + launched/<job_id>.json
-- [ ] 结束后更新 launched、清空 current
+- [ ] 写 temp/agent/active/<job_id>.json（gpus:1）+ launched/<job_id>.json
+- [ ] 结束后更新 launched、删除 active/<job_id>.json
 - [ ] 读日志 → 更新 temp/vram-probe/alloc.md 对应行 + 测量记录
 ```
 

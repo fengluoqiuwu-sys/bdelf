@@ -52,3 +52,4 @@ description: >-
 - ELF 生成无条件：传 `--prompt` 会报错。
 - 给 ELF 显式 `--temperature` 会从 argmax 切到 multinomial。
 - 跨实验对比请显式 `--run`，勿依赖「最新 mtime」。
+- **AI**：跑前确认处于本任务分支；结束后 `git switch master`。generate **不**占 `temp/local-workspace.lock/`（见 skill `train-ops` / `auto-train`）。

@@ -14,9 +14,9 @@
 #SBATCH --nodelist=cls1-srv[2-4]
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-gpu=8
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.out
 #SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.err

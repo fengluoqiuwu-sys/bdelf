@@ -8,5 +8,7 @@ alwaysApply: true
 - **硬件**：1× RTX 5080（16GB）；用途：`fast` 冒烟与调试。
 - **Python**：见 rule「Python 虚拟环境」。
 - **GPU 互斥**：同时只跑一个占 GPU 的进程；可停本会话拉起的作业，勿杀用户自启进程。
+- **分支**：AI 本机 generate / 改代码前须确认处于**本任务分支**；操作结束后 `git switch master`（见 skill `auto-train`）。
+- **工作区锁**：AI 对本机**非 temp** 文件的改动（generate 除外）须抢 `temp/local-workspace.lock/`（写 `holder`，1s 后读回校验）；抢不到则睡 30min 再试（见 skill `train-ops`）。
 - **推理/评测**：generate / eval / 调试推理**只在本机**；远端只训不测。
 - 调度与拉 checkpoint 流程见 skill `train-ops` / `sync-ovan-server` / `generate`。

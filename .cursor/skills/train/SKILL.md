@@ -61,7 +61,7 @@ description: >-
 | 本机 fast 冒烟 | `.venv/bin/python train.py ... --config 100m-fast ...` 或 `bash scripts/train/<name>.sh`（若脚本已是 fast） |
 | 远端 full | `bash slurm/sbatch-train.sh <name>`（短名 → `scripts/train/<name>.sh`；`--name` 改 job-name） |
 
-`world_size` 按可见 GPU 探测（∈ {1,2,4,8}）。本机不要跑 full 规模。
+`world_size` 按可见 GPU 探测（∈ {1,2,4,8}）。AI 远端 full 默认 2 卡（`prototype.slurm`）。本机不要跑 full 规模。
 
 ## 产物
 

@@ -31,19 +31,23 @@ description: >-
    - 构建鉴权：提交命令尽量合并为一条 `&&` / 一个脚本；初始化、登记等放同一块。
    - 若某条被拒，停下向用户说明，不要擅自更换等价命令绕过。
 4. **一次性授权即覆盖整个自动训练循环，不设边界**：得到"批准"后，整个循环（ssh 只读探查、
-   push/sbatch、开新分支、删本 agent 登记 run 的 checkpoint、换向 fork、sleep 唤醒、连不上重试等）
+   push/sbatch、开新分支、删本 agent 登记 run 的 checkpoint、换向 fork、sleep 唤醒、
+   资源等待（无卡 60m / 抢锁 30m）、连不上重试等）
    均视为已被授权，自动执行，不再逐条打断用户。
-   - 唯一**绝对底线**（不因授权而放宽，见「边界」）：不删/不动**非本 agent 登记范围**他人的
+   - 唯一**绝对底线**（不因授权而放宽，见「边界」）：不删/不动**非本 holder 登记范围**他人的
      job 与 checkpoint；不执行 `pull --mode full`；不 push 非 full 脚本。这几条即便已"全权"
      也不做，如确有必要先停下来向用户确认。
 
 ## 分支与目录约定
 
-本地 `temp/` 三分法见 rule「本地 temp/ 布局」：`auto-research/`（本 skill 实验记录）、
+本地 `temp/` 三分法见 rule「temp/ 布局」：`auto-research/`（本 skill 实验记录）、
 `idea/`（读论文提出的想法规格）、`papers/`（论文与克隆代码）。远端 `temp/agent/` 仅 job 登记。
 
 - **基线分支：`master`**（仓库当前只有 master，无 main）。"fork" = `git branch`/`git switch` 切分支，不是 GitHub fork。
 - 每个任务从 `master` fork 出**想法根分支** `<idea>`（如 `ar2`），再按需派生子分支。
+- **本机操作前后切分支（强制）**：多 AI 可能改工作树当前分支。每次本机 **generate** 或 **改代码** 前：
+  `git branch --show-current` 须为本任务分支；否则 `git switch <idea>`（或当前变体分支）。
+  **操作结束后**一律 `git switch master`。细则与工作区锁见下节与 skill `train-ops`。
 - **继承链原则（关键）**：派生子分支 / 换向分支时，一律从**当前携带相关代码实现的分支** fork，
   靠 git 祖先链继承已写好的代码，**绝不回基线从零恢复**——避免重写代码浪费时间、引入错误。
   只对真正全新的、与现有实现无关的想法才直接从 `master` fork。
@@ -72,8 +76,18 @@ description: >-
 - **换向/停止训练时的权重留存**（见第 10 步）：需保留一份最新权重时，**不放进 `temp/`**，
   **也不再使用 `cache/temp/`**；checkpoint 在 `cache/checkpoints/{fast|full}/{model}/{hash}/`（见 rule「Checkpoint 路径与配置哈希」），并在
   `temp/auto-research/<idea>/` 笔记里写明 run 名与用途。
-- 远端 `temp/` 与本地 `temp/` **互不同步**：远端 `~/source/bdelf/temp/agent/` 只做 AI job 登记
+- 远端 `temp/` 与本地 `temp/` **互不同步**：远端 `~/source/bdelf/temp/agent/active/` 登记 AI job
   （见 train-ops）；自动训练记录放本地 `temp/auto-research/<idea>/`。
+
+## 本机工作区锁（非 temp 改动）
+
+凡 AI 改动本机**非 `temp/`** 文件（实现、配置、commit、fast 冒烟相关改动等）前，须抢占
+`temp/local-workspace.lock/`（写 `holder` → 睡 1s → 读回校验；命令见 skill `train-ops`）。  
+**generate 不占锁**，但仍须确认本任务分支并在结束后回到 `master`。
+
+- 抢到（读回 `holder` 为自己）→ 切到本任务分支 → 操作 → `git switch master` → 释锁。
+- 抢不到（`mkdir` 失败或读回 `holder`≠自己）→ 睡 **30 分钟**再试（见「资源等待」）。
+- 人工上锁方式见 skill `train-ops`「人工上锁」。
 
 ## 主流程
 
@@ -82,9 +96,10 @@ description: >-
 1. fork 想法根分支（或从当前分支 fork 新变体，继承已有实现）
 2. 在 temp/auto-research/<idea>/README.md 记录口径
 3. 实现思路
-4. 本地验证：fast 冒烟（起训练看到首批 loss 正常、2–3 分钟后停）+ generate/ppl 跑通
+4. 本地验证：抢工作区锁 → 确认本任务分支 → fast 冒烟 + generate/ppl → 回 master → 释锁
 4.6 显存探针（强制，见「VRAM 探针」）：改动影响显存时 → push → vram-probe → 填 alloc.md
-5. push 到 ovan-server（sync 脚本）→ 按表+global_bs 选型 → train-ops 登记互斥 → sbatch full
+5. push → 按表+global_bs 选型 → remote_status：AI 合计 GPU+2≤4 且有 AVAIL
+   → 否则按「资源等待」睡 60m 再看 → sbatch full（2 GPU）→ 写 active/<job_id>.json
    → 起「5 分钟首次唤醒」后台调度（确认拉起）
 6. 唤醒循环：5m → 15m → 30m → 此后每 30m（见「唤醒调度」）
    ├ 7a 决定继续 → 回 6
@@ -92,9 +107,10 @@ description: >-
    ├ 7c 已完成 → 11
    └ 7d 同 bug 卡住（见「卡住即停」）→ 11，勿空烧 token
 8. 停止训练：本分支可修 → 9；需换架构 → 10；修不动 →「卡住即停」→ 11
-9. 本分支修改 → commit →（若影响显存再跑 4.6）→ 删远端该 run checkpoint → push 重跑 → 回 4/5
-10. 架构调整 / 换向 → 从当前分支 fork 新分支继承代码 → 删远端旧 run checkpoint
-    → temp 记放弃原因/调整 → 回 3（实现调整；再训前必过 4.6）
+9. 抢锁 → 本分支修改 → commit → 回 master → 释锁 →（若影响显存再跑 4.6）
+   → 删远端该 run checkpoint → push 重跑 → 回 4/5
+10. 架构调整 / 换向 → 抢锁 → 从当前分支 fork 新分支 → 回 master → 释锁
+    → 删远端旧 run checkpoint → temp 记放弃原因/调整 → 回 3
 11. 完成 / 放弃 → 写 temp/auto-research/<idea>/SUMMARY.md → 结束并总结
 ```
 
@@ -112,11 +128,13 @@ git switch master && git switch -c <idea>
 
 **3. 实现思路**
 
-按项目规范复写模型/配置；复用 registry / config 加载逻辑，不重复造轮子。改动尽量最小。
+按项目规范复写模型/配置；复用 registry / config 加载逻辑，不重复造轮子。改动尽量最小。  
+动手前抢工作区锁并确认本任务分支；改完提交（见 4.5）后 `git switch master` 并释锁。
 
 **4. 本地验证（5080 / fast）—— 只做冒烟，不跑满**
 
 - 本机 Python 用 `.venv/bin/python`（见 rule「Python 虚拟环境」、skill train / generate）。
+- 先抢锁 + 确认本任务分支（generate 段可不占锁，但仍须切分支）；结束回 `master`。
 - `fast` **仅用于验证改动能跑通**，不是正式训练：起训练后观察到**首批训练步 loss 正常打印、
   无报错 / 崩溃 / segfault** 即可，通常 **2–3 分钟**内确认后就**主动停掉该进程**（kill），
   不要让 fast 跑满整个 token 预算（正式训练只在远端 full 跑）。
@@ -125,18 +143,21 @@ git switch master && git switch -c <idea>
 
 **4.5 强制提交（推送到远端前必做）**
 
-推送 `scripts/sync-ovan-server.sh push` 之前，**必须先提交到 git，不允许有未保留的内容**：
+推送 `scripts/sync-ovan-server.sh push` 之前，**必须先提交到 git，不允许有未保留的内容**
+（持有工作区锁、在本任务分支上）：
 
 ```bash
 git status
 git add <相关文件>      # 或 git add -A（用前用 git status 确认无夹带）
 git commit -m "<语义化描述>"
+git switch master
+# 然后释放 temp/local-workspace.lock
 ```
 
 - `git push` 推送的是 git **commit**；`scripts/sync-ovan-server.sh push` 推送的是**工作区文件**。若工作区有
   未提交的改动，远端拿到的是无法从 git 恢复的环境——这是不允许的。
 - 本地验证通过后、确认改动可用即提交；提交信息写清改动内容与目的（如 `ar2: change anchor embedding format`）。
-- 提交后 `git status` 必须**干净**（无未跟踪/未提交变体）再进入第 5 步。
+- 提交后任务分支上 `git status` 必须**干净**；回到 `master` 后再进入第 5 步。
 - 思路/实验记录（`temp/auto-research/<idea>/*.md`）属本地记录、不同步；`temp/` 在 `.gitignore` 中，版本化时用
   `git add -f temp/auto-research/<idea>/...`。是否提交不影响远端 push。
 
@@ -145,29 +166,32 @@ git commit -m "<语义化描述>"
 凡改动会影响显存占用（模型结构、精度、序列长 / chunk、EMA、优化器状态规模等），在提交 full **之前**必须：
 
 1. 工作区已提交且干净（4.5）；`bash scripts/sync-ovan-server.sh push`
-2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 登记互斥 → `bash slurm/sbatch-vram-probe.sh …`
+2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 若合计 GPU+1>4 或无 AVAIL 则睡 60m →
+   写 `active/` 登记 → `bash slurm/sbatch-vram-probe.sh …`
 3. 读日志；把各档 **`alloc_peak_GiB`**（及 `oom`）填入 **`temp/vram-probe/alloc.md`** 对应行
 4. **不要**把探针结论写回 recipe 默认 YAML；可在 `temp/auto-research/<idea>/` 记一笔链接到该表
 5. **禁止**未填/过期表直接 `sbatch-train`
 
 仅改 loss 日志文案等明显不影响显存的改动可跳过本步；有疑虑时宁可跑探针。
 
-**开训选型**（步骤 5）：查 `alloc.md` 该模型各列，结合**当前目标卡** `total−2` 与本次 `global_batch_size` / `world_size`，取最大安全且整除的 micro-batch（公式见 skill `vram-probe`）。默认 YAML 已是该值则不必 `--set`；否则专用 `scripts/train/<name>.sh` 加 `--set batch.batch_size=…`。
+**开训选型**（步骤 5）：查 `alloc.md` 该模型各列，结合**当前目标卡** `total−2` 与本次 `global_batch_size` / `world_size=2`，取最大安全且整除的 micro-batch（公式见 skill `vram-probe`）。默认 YAML 已是该值则不必 `--set`；否则专用 `scripts/train/<name>.sh` 加 `--set batch.batch_size=…`。
 
 **5. 推送与远端训练**
 
 ```text
-- [前置] 工作区已干净（第 4.5 步已提交，git status 无未提交改动）
+- [前置] 工作区已干净（第 4.5 步已提交；已回 master、已释锁）
 - [前置] 若本轮改动影响显存：第 4.6 步已完成，alloc.md 对应行已更新
-- [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（必要时 scripts/train 含 --set）
+- [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（world_size=2；必要时 scripts/train 含 --set）
 - bash scripts/sync-ovan-server.sh push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
-- bash scripts/remote_status.sh   # 强制：GPU / 队列 / agent 登记
-- 确认无未结束 AI job（或已 scancel 自己的）且有足够 AVAIL
-- ssh 后 `bash slurm/sbatch-train.sh <name>`（可选 `--name JOB_NAME`）
-- 写 current.json + launched/<job_id>.json
+- bash scripts/remote_status.sh   # 强制：GPU / 队列 / agent_gpu_sum
+- 若 agent_gpu_sum+2>4 或 AVAIL 不足 → 按「资源等待」睡 60min 再 remote_status
+- ssh 后 `bash slurm/sbatch-train.sh <name>`（默认 2 GPU；可选 `--name JOB_NAME`）
+- 写 active/<job_id>.json（gpus:2, holder:auto-train:<idea>）+ launched/
 - 启动「5 分钟后首次唤醒」后台调度（见「唤醒调度」）
 ```
+
+允许多个 AI 作业并行，只要登记合计 GPU ≤ 4（本作业 2 卡计入）。
 
 **6-7. 唤醒循环与判据**
 
@@ -179,7 +203,8 @@ git commit -m "<语义化描述>"
    若本轮要 `scancel` / 重提 sbatch，同样先跑 `remote_status.sh`。
 2. 需要本地对照元数据时再 `pull --mode fast [NAME]`（禁 full）。
 3. 看训练数据：loss/step、gen_ppl 等；需要权重时 `pull-file` 拉某个 checkpoint。
-4. 在本机跑 generate / eval（**不要在远端测**，见 train-ops）。
+4. 在本机跑 generate / eval：确认本任务分支 → generate → `git switch master`
+   （**不要在远端测**；generate 不占工作区锁，见 train-ops）。
 5. 四选一：
    - 曲线健康、还值得训 → 继续循环（6）。
    - 需要调整 → 8。
@@ -188,13 +213,12 @@ git commit -m "<语义化描述>"
 
 **8-9. 同分支调整**
 
-- 可溯源的小问题（代码 bug、超参），在当前分支直接改。
-- 改完先 **commit**（遵循 4.5 的"推前必须提交、工作区干净"约定），再继续。
+- 可溯源的小问题（代码 bug、超参）：抢锁 → 切本任务分支 → 改 → **commit**（4.5）→ 回 master → 释锁。
 - 若改动影响显存：必须再跑 **4.6**（探针 → 填 `alloc.md` → 查表选型），**禁止**缺测直接重提 full。
 - 处理旧 checkpoint：
   - **保留一份最佳/最近的基准 checkpoint**：勿用 `cache/temp/`；暂留在原
     `cache/checkpoints/<run>/`，并在 `temp/auto-research/<idea>/` 注明对照 run；
-  - 其余旧 run 的 checkpoint 删除（仅限 AI 登记任务范围 —— 这是对"远端只读、仅 temp 可写"
+  - 其余旧 run 的 checkpoint 删除（仅限本 `holder` 登记范围 —— 这是对"远端只读、仅 temp 可写"
     rule 的显式例外；不要动他人 run）。
 - 在 `temp/auto-research/<idea>/` 记本次调整原因与基准位置。
 - 重新 `push` 后回 4/5。
@@ -205,13 +229,13 @@ git commit -m "<语义化描述>"
 
 - **架构变体（同一思路的演进）**：
   - **派生新分支前**：按「开新分支前重读」重新通读该思路记录与当前实现，确认理解后决定改点。
-  - 从**当前分支** fork（`git switch -c <idea>-<variant>`），继承已实现代码，在此之上修改，
-    绝不回 master 从零恢复。
+  - 抢锁后从**当前分支** fork（`git switch -c <idea>-<variant>`），继承已实现代码，在此之上修改，
+    绝不从零在 master 上重写；结束后回 master 并释锁。
   - 记录在**原 `temp/auto-research/<idea>/`**（新增 `<variant>.md`，注明父分支、改动、放弃/调整原因）。
   - 处理旧 run checkpoint：留存一份最新权重于原 `cache/checkpoints/<run>/`（勿用 `cache/temp/`），
     其余删除；在笔记中写明保留的 run。
 - **全新想法（切换方向）**：
-  - 从 `master` fork 新根分支，新建独立 `temp/auto-research/<newidea>/`。
+  - 抢锁后从 `master` fork 新根分支，新建独立 `temp/auto-research/<newidea>/`；回 master 释锁。
   - 旧想法的放弃原因写回原 `temp/auto-research/<idea>/`；如需保留权重，同样暂留原
     `cache/checkpoints/<run>/` 并在笔记标明（勿用 `cache/temp/`）。
 - 两种都回步骤 3（实现/调整），而非步骤 1。
@@ -246,6 +270,17 @@ sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
 - ssh 连不上时的重试仍睡 5 分钟（与上表无关）。
 - 收敛退出：多次不可救报错、换向、判定完成、或「卡住即停」。
 
+## 资源等待（正常流程，不是失败）
+
+下列情况**不算异常**，属于排队/互斥，继续循环即可，不必向用户确认、也不因此进「卡住即停」或结束：
+
+| 条件 | 动作 |
+|------|------|
+| 远端 AVAIL 不足，或 `agent_gpu_sum` + 本作业卡数将 > 4 | 睡 **60 分钟** → 再 `remote_status` → 仍不够则重复 |
+| 本机锁：`mkdir` 失败，或写 `holder` 后 1s 读回 ≠ 自己 | 睡 **30 分钟** → 再抢 → 仍失败则重复 |
+
+与「唤醒调度」独立：这是提交前/改代码前的等待，不是训练中的 progress 唤醒。
+
 ## 卡住即停（防空烧 token）
 
 同一阻塞问题（编译/运行崩溃、loss NaN、数据管线挂死、反复相同 traceback 等）**不要无限修—重跑**。满足任一即结束本轮 auto-train（进 11，写 SUMMARY，向用户说明），**禁止**为「再试一次」继续烧对话 / 训练 token：
@@ -268,4 +303,5 @@ sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
 - 没有明确"请自动执行"→ 只讨论/给方案，不实际开训。
 - 不用 `pull --mode full`（体积风险，见 sync skill 硬性禁令）。
 - 不 push 非 full 的 slurm 脚本；不用 preprocess 作业。
-- 不删非本 agent 登记范围内他人的 job / checkpoint。
+- 不删 / 不 `scancel` 非本 `holder` 登记范围内他人的 job / checkpoint。
+- 不把 AI 训练改成 4 卡去抢满预算（保持每作业 2 GPU，以便多任务并存）。

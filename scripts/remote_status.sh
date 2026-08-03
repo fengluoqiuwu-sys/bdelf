@@ -17,7 +17,7 @@ usage() {
 本机调用，经 ssh 在 ovan-server 上只读查询：
   - slurm/gpu_availability.py（空闲 GPU）
   - squeue -u $USER
-  - temp/agent/current.json
+  - temp/agent/active/*.json（AI 作业登记；兼容旧 current.json）
 
 环境变量：REMOTE_HOST（默认 ovan-server）、REMOTE_ROOT（默认 ~/source/bdelf）
 EOF
@@ -45,6 +45,7 @@ if [[ "${JSON:-0}" == "1" ]]; then
   .venv/bin/python - <<'PY'
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -82,15 +83,55 @@ if sq.returncode == 0:
 elif sq.stderr.strip():
     print(sq.stderr.strip(), file=sys.stderr)
 
-agent_path = root / "temp/agent/current.json"
-if agent_path.is_file():
-    agent = json.loads(agent_path.read_text(encoding="utf-8"))
-else:
-    agent = None
+def _gpus_from_record(rec: dict) -> int:
+    if isinstance(rec.get("gpus"), int) and rec["gpus"] > 0:
+        return rec["gpus"]
+    gres = str(rec.get("gres") or "")
+    m = re.search(r"gpu(?::[^=]+)?(?:=|:)(\d+)", gres, re.I)
+    if m:
+        return int(m.group(1))
+    return 2  # AI 训练默认 2
+
+
+def _load_agent_active(agent_root: Path) -> list[dict]:
+    active_dir = agent_root / "active"
+    jobs: list[dict] = []
+    if active_dir.is_dir():
+        for path in sorted(active_dir.glob("*.json")):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            rec.setdefault("job_id", path.stem)
+            rec["gpus"] = _gpus_from_record(rec)
+            jobs.append(rec)
+    # 兼容旧单文件 current.json
+    legacy = agent_root / "current.json"
+    if legacy.is_file() and not jobs:
+        try:
+            rec = json.loads(legacy.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            rec = None
+        if isinstance(rec, dict) and rec.get("job_id"):
+            rec["gpus"] = _gpus_from_record(rec)
+            jobs.append(rec)
+    return jobs
+
+
+agent_jobs = _load_agent_active(root / "temp/agent")
+agent_gpu_sum = sum(int(j.get("gpus") or 0) for j in agent_jobs)
 
 print(
     json.dumps(
-        {"gpu": gpu, "squeue": rows, "agent_current": agent},
+        {
+            "gpu": gpu,
+            "squeue": rows,
+            "agent_active": agent_jobs,
+            "agent_gpu_sum": agent_gpu_sum,
+            "agent_gpu_budget": 4,
+        },
         ensure_ascii=False,
         indent=2,
     )
@@ -103,12 +144,24 @@ else
   echo "=== squeue ($USER) ==="
   squeue -u "$USER" || true
   echo
-  echo "=== agent current ==="
-  if [[ -f temp/agent/current.json ]]; then
+  echo "=== agent active (AI jobs) ==="
+  if [[ -d temp/agent/active ]] && compgen -G "temp/agent/active/*.json" > /dev/null; then
+    sum=0
+    for f in temp/agent/active/*.json; do
+      echo "--- $(basename "$f") ---"
+      cat "$f"
+      echo
+      g=$(.venv/bin/python -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('gpus') or 2))" "$f")
+      sum=$((sum + g))
+    done
+    echo "agent_gpu_sum=${sum} / budget=4"
+  elif [[ -f temp/agent/current.json ]]; then
+    echo "(legacy current.json)"
     cat temp/agent/current.json
     echo
   else
     echo "none"
+    echo "agent_gpu_sum=0 / budget=4"
   fi
 fi
 REMOTE
