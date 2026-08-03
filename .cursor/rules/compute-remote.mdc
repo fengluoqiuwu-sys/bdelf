@@ -39,7 +39,7 @@ bash scripts/remote_status.sh          # 或加 --json
 
 - 远端 `temp/agent/active/<job_id>.json`：**每个**未结束 AI 作业一份（训练 / vram-probe 等）；据此统计合计 GPU 与「哪些是 AI 任务」。
 - `temp/agent/launched/<job_id>.json`：历史快照。
-- 可同时跑多个 AI 作业，条件：登记合计 GPU + 本作业申请 ≤ 4，且集群有足够空闲卡。
+- 可同时跑多个 AI 作业，条件：登记合计 GPU + 本作业申请 ≤ 4。集群无空闲卡时仍可 `sbatch` 排队，勿空等 AVAIL。
 - 可 `scancel` **自己登记**的作业；勿动他人 / 未登记作业。
 - 禁止在远端 generate / eval / 看效果；拉回本机测。
 - 流程细节：skill `train-ops`、`sync-ovan-server`、`auto-train`。

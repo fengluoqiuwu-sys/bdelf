@@ -32,7 +32,7 @@ description: >-
    - 若某条被拒，停下向用户说明，不要擅自更换等价命令绕过。
 4. **一次性授权即覆盖整个自动训练循环，不设边界**：得到"批准"后，整个循环（ssh 只读探查、
    push/sbatch、开新分支、删本 agent 登记 run 的 checkpoint、换向 fork、sleep 唤醒、
-   资源等待（无卡 60m / 抢锁 30m）、连不上重试等）
+   资源等待（排队后 60m 再看 / AI 额度满 60m / 抢锁 30m）、连不上重试等）
    均视为已被授权，自动执行，不再逐条打断用户。
    - 唯一**绝对底线**（不因授权而放宽，见「边界」）：不删/不动**非本 holder 登记范围**他人的
      job 与 checkpoint；不执行 `pull --mode full`；不 push 非 full 脚本。这几条即便已"全权"
@@ -98,9 +98,9 @@ description: >-
 3. 实现思路
 4. 本地验证：抢工作区锁 → 确认本任务分支 → fast 冒烟 + generate/ppl → 回 master → 释锁
 4.6 显存探针（强制，见「VRAM 探针」）：改动影响显存时 → push → vram-probe → 填 alloc.md
-5. push → 按表+global_bs 选型 → remote_status：AI 合计 GPU+2≤4 且有 AVAIL
-   → 否则按「资源等待」睡 60m 再看 → sbatch full（2 GPU）→ 写 active/<job_id>.json
-   → 起「5 分钟首次唤醒」后台调度（确认拉起）
+5. push → 按表+global_bs 选型 → remote_status：AI 合计 GPU+2≤4 才可提交
+   （额度满则睡 60m 再看；**勿**因 AVAIL=0 空等）→ sbatch full（2 GPU）排队
+   → 写 active/<job_id>.json → 起唤醒调度（排队中按「资源等待」60m 再看；已 RUNNING 用「唤醒调度」）
 6. 唤醒循环：5m → 15m → 30m → 此后每 30m（见「唤醒调度」）
    ├ 7a 决定继续 → 回 6
    ├ 7b 需调整 → 8
@@ -166,8 +166,8 @@ git switch master
 凡改动会影响显存占用（模型结构、精度、序列长 / chunk、EMA、优化器状态规模等），在提交 full **之前**必须：
 
 1. 工作区已提交且干净（4.5）；`bash scripts/sync-ovan-server.sh push`
-2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 若合计 GPU+1>4 或无 AVAIL 则睡 60m →
-   写 `active/` 登记 → `bash slurm/sbatch-vram-probe.sh …`
+2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 若合计 GPU+1>4 则睡 60m 再看；
+   **AVAIL 不足仍先 sbatch 排队**（勿空等空闲卡）→ 写 `active/` 登记 → `bash slurm/sbatch-vram-probe.sh …`
 3. 读日志；把各档 **`alloc_peak_GiB`**（及 `oom`）填入 **`temp/vram-probe/alloc.md`** 对应行
 4. **不要**把探针结论写回 recipe 默认 YAML；可在 `temp/auto-research/<idea>/` 记一笔链接到该表
 5. **禁止**未填/过期表直接 `sbatch-train`
@@ -185,13 +185,15 @@ git switch master
 - bash scripts/sync-ovan-server.sh push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
 - bash scripts/remote_status.sh   # 强制：GPU / 队列 / agent_gpu_sum
-- 若 agent_gpu_sum+2>4 或 AVAIL 不足 → 按「资源等待」睡 60min 再 remote_status
+- 若 agent_gpu_sum+2>4 → 按「资源等待」睡 60min 再 remote_status（等本侧额度腾出）
+- **AVAIL 不足不是阻塞**：照样 sbatch，让 Slurm 排队（空等空闲卡永远排不上）
 - ssh 后 `bash slurm/sbatch-train.sh <name>`（默认 2 GPU；可选 `--name JOB_NAME`）
 - 写 active/<job_id>.json（gpus:2, holder:auto-train:<idea>）+ launched/
-- 启动「5 分钟后首次唤醒」后台调度（见「唤醒调度」）
+- 若提交时已 RUNNING → 启动「5 分钟后首次唤醒」（见「唤醒调度」）
+- 若仍 PENDING → 按「资源等待」睡 60min 再看是否已拉起，拉起后改用「唤醒调度」
 ```
 
-允许多个 AI 作业并行，只要登记合计 GPU ≤ 4（本作业 2 卡计入）。
+允许多个 AI 作业并行，只要登记合计 GPU ≤ 4（本作业 2 卡计入）。集群无空闲卡时靠排队，不靠轮询 AVAIL。
 
 **6-7. 唤醒循环与判据**
 
@@ -276,10 +278,13 @@ sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
 
 | 条件 | 动作 |
 |------|------|
-| 远端 AVAIL 不足，或 `agent_gpu_sum` + 本作业卡数将 > 4 | 睡 **60 分钟** → 再 `remote_status` → 仍不够则重复 |
+| `agent_gpu_sum` + 本作业卡数将 > 4 | **先不提交**；睡 **60 分钟** → 再 `remote_status` → 仍满则重复（等本侧已登记作业结束腾出额度） |
+| 已 sbatch 但仍 PENDING（集群无空闲卡、在排队） | 睡 **60 分钟** → 再 `remote_status` / 看队列 → 仍 PENDING 则重复；已 RUNNING 则改用「唤醒调度」 |
 | 本机锁：`mkdir` 失败，或写 `holder` 后 1s 读回 ≠ 自己 | 睡 **30 分钟** → 再抢 → 仍失败则重复 |
 
-与「唤醒调度」独立：这是提交前/改代码前的等待，不是训练中的 progress 唤醒。
+**禁止**：因 `AVAIL=0` 而空等、不提交——永远等不到「先有空卡再 sbatch」；正确做法是先排队，再 60m 看是否已 RUNNING。
+
+与「唤醒调度」独立：额度满 / 排队 PENDING / 抢锁 属于提交前后的等待；作业已 RUNNING 后的 progress 探查用「唤醒调度」。
 
 ## 卡住即停（防空烧 token）
 

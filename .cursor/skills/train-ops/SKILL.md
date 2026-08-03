@@ -86,7 +86,7 @@ bash scripts/remote_status.sh          # 可读表；机器用加 --json
 ```
 
 一次 ssh，汇总：`gpu_availability` + `squeue` + `temp/agent/active/*.json`（及 `agent_gpu_sum`）。  
-确认：集群有足够 `AVAIL`、**AI 登记合计 GPU + 本作业申请 ≤ 4** 后，再继续。不要手拼多条 ssh 代替本工具。
+确认 **AI 登记合计 GPU + 本作业申请 ≤ 4** 后再 `sbatch`。`AVAIL` 仅作参考——不足时仍应提交让 Slurm 排队，**不要**空等空闲卡。不要手拼多条 ssh 代替本工具。
 
 ## 远端提交 full
 
@@ -96,7 +96,7 @@ bash scripts/remote_status.sh          # 可读表；机器用加 --json
 - [ ] scripts/train/<name>.sh 已就绪（full）
 - [ ] bash scripts/sync-ovan-server.sh push
 - [ ] bash scripts/remote_status.sh   # 强制；看 GPU / 队列 / AI 登记合计
-- [ ] agent_gpu_sum + 本作业 gpus ≤ 4；有足够 AVAIL
+- [ ] agent_gpu_sum + 本作业 gpus ≤ 4（额度满则等；AVAIL 不足仍可排队提交）
 - [ ] bash slurm/sbatch-train.sh <name> […]   # prototype 默认 2 GPU
 - [ ] 写 temp/agent/active/<job_id>.json + launched/<job_id>.json
 ```
@@ -111,7 +111,7 @@ ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 
 禁止 AI 提交 preprocess 作业。模板：`slurm/prototype.slurm`（**默认 2 GPU**）。
 
-无足够空闲卡或 AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`；一次性手动任务则向用户说明后停下。
+AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
 
 ## VRAM 探针（填 alloc 表；开训查表选型）
 
