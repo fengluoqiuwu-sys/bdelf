@@ -1,10 +1,8 @@
-_doc: Eval config template
-name: prototype
-eval_sample_count: null
-eval_sample_seed: 42
-gen_eval_model: gpt2-large
-gen_eval_model_dtype: bf16
-gen_eval_model_device: cuda
-gen_eval_batches: 32
-use_fast_infer: false
-eval_gen_steps: 128
+# =============================================================================
+# 在线评测（held-out PPL + 生成式 PPL）
+# =============================================================================
+_doc: 评测配置模板（不可实例化）  # 文件说明，写入 extra
+name: prototype  # 配置名；非 prototype 时与文件名一致
+eval_sample_count: null  # held-out 子采样条数；null 表示全量
+eval_sample_seed: 42  # held-out 子采样随机种子
+gen_eval_samples: 256  # 每次 gen-PPL 生成并打分的序列数

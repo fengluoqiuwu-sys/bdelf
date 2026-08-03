@@ -1,9 +1,0 @@
-_doc: 8× 48GB GPUs (ultra); 4GB headroom/GPU; num_workers per-rank (8×12=96 total)
-name: full-8x4090
-world_size: 8
-num_workers: 12
-gpu_memory_gb: 48
-memory_headroom_gb: 4.0
-# train usable ≈ gpu - headroom - gpt2-large(~1.5) on rank0 → ~42.5GB
-memory_budget_gb: 42.5
-hardware_profile: 8× 48GB

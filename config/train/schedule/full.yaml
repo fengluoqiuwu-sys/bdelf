@@ -1,15 +1,17 @@
-_doc: Full training schedule (20B token budget, multi-GPU)
-name: full
-variant: full
-target_tokens: 20000000000
-warmup_ratio: 0.005
-min_lr_ratio: 0.1
-eval_step: 500
-save_step: 1000
-snapshot_step: 5000
-log_plot_step: 100
-resume: true
-seed: 42
-use_muon: true
-# torch.compile(Inductor)用于多卡训练;首个 step 有编译开销,稳态吞吐提升。设 false 回退 eager。
-compile: true
+# =============================================================================
+# 训练日程（token 预算驱动 max_steps）
+# =============================================================================
+_doc: 正式训练日程（2e10 token，多卡）  # 文件说明，写入 extra
+name: full  # 配置名；非 prototype 时与文件名一致
+variant: full  # 训练变体：fast | full
+target_tokens: 20000000000  # 数据 token 预算，用于推导 max_steps
+warmup_ratio: 0.005  # 预热步数占 max_steps 的比例
+min_lr_ratio: 0.1  # 最小学习率为峰值的比例
+eval_step: 500  # 评测间隔（优化器步）
+save_step: 1000  # 保存 checkpoint 间隔（优化器步）
+snapshot_step: 5000  # 快照间隔（优化器步）
+log_plot_step: 100  # 曲线日志间隔（优化器步）
+resume: true  # 若存在 checkpoint_latest 则续训
+seed: 42  # 全局随机种子
+use_muon: true  # 隐藏层 Linear 用 Muon，其余 AdamW
+compile: true  # 是否启用 torch.compile(Inductor)

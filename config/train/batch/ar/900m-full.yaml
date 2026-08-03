@@ -1,7 +1,0 @@
-_doc: >
-  ar/900m-full for 24GB×4; independent variant. Train budget ≤18.5GB (card - 4GB head - 1.5GB gpt2). batch_size is power-of-two or multiple of 8 (extrap).
-name: 900m-full
-batch_size: 4
-global_batch_size: 32
-num_params_m: 870.5
-estimated_peak_vram_gb: 16.4

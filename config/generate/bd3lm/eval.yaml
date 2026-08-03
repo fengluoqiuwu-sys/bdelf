@@ -1,0 +1,9 @@
+# =============================================================================
+# 生成 / 采样（generate=正式生成；eval=训练在线 gen-eval / 测试）
+# =============================================================================
+_doc: BD3LM 训练在线 gen-eval / 测试采样（少步）  # 文件说明，写入 extra
+name: eval  # 配置名；非 prototype 时与文件名一致
+num_steps: 32  # 扩散采样步数
+sampler: semi_ar  # 采样器：semi_ar 等
+first_hitting: true  # 是否 first-hitting
+nucleus_p: 1.0  # Nucleus (top-p)；1.0 关闭

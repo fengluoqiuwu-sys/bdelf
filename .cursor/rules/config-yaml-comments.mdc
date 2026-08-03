@@ -1,0 +1,47 @@
+---
+description: config/**/*.yaml 行内中文注释与同功能文件结构一致
+globs: config/**/*.yaml
+alwaysApply: false
+---
+
+# config YAML 注释与结构
+
+适用于 `config/` 下全部 YAML（datasets / tokenizers / preprocess / models / train / generate）。
+
+## 行内注释（强制）
+
+- **每个键值行**必须带行内单行注释：写在该行**右侧**，形式为 `key: value  # 中文说明`。
+- 注释语言遵循项目规范：**中文**（专有名词 / 缩写可保留英文，如 Muon、AdaLN、PPL）。
+- 禁止把说明写在键上方的独立 `#` 行（分区横幅除外，见下）。
+- 禁止用 YAML 多行字符串（`>` / `|`）写说明。
+
+分区可用单独一行的 `# ===...===` 横幅（中文），横幅本身不算字段注释；同功能家族内横幅文字必须一致。
+
+## 同功能文件必须同构
+
+「同功能」= 同一目录角色下的一组文件，例如：
+
+- `config/train/schedule/{prototype,fast,full}.yaml`
+- `config/train/eval/{prototype,default}.yaml`
+- `config/train/model/*/{fast,full}.yaml`（含 `prototype`；同变体跨模型同构）
+- `config/generate/<model>/{prototype,generate,eval}.yaml`（同模型内同构；跨模型字段可不同）
+- `config/models/<family>/{prototype,100m,...}.yaml`
+- `config/datasets/{prototype,...}.yaml` 等
+
+同组文件除**参数取值**外必须完全一致：
+
+1. 键集合与嵌套层级相同（缺省也要显式写出，保持键对齐）
+2. 键顺序相同
+3. 每个键右侧的中文注释文案相同
+4. 分区横幅 / 空行布局相同
+
+新增变体：先复制同组已有文件，只改 `name` 与参数值，不改注释与结构。
+
+## 示例
+
+```yaml
+name: full                 # 配置名，非 prototype 时与文件名一致
+variant: full              # 训练变体：fast | full
+target_tokens: 20000000000 # 数据 token 预算，用于推导 max_steps
+compile: true              # 是否启用 torch.compile(Inductor)
+```

@@ -1,8 +1,0 @@
-_doc: >
-  ar2/100m-ultra for ≤42.5GB. 由 bs16/24 实测线性外推 bs=40≈37.7GB；
-  bs=48≈45.2 超预算。gbs=320 → 8 卡 accum=1。
-name: 100m-ultra
-batch_size: 40
-global_batch_size: 320
-num_params_m: 99.0
-estimated_peak_vram_gb: 37.7

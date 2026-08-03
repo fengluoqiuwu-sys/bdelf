@@ -1,0 +1,10 @@
+# =============================================================================
+# 生成 / 采样（generate=正式生成；eval=训练在线 gen-eval / 测试）
+# =============================================================================
+_doc: BDELF 正式生成采样  # 文件说明，写入 extra
+name: generate  # 配置名；非 prototype 时与文件名一致
+temperature: 1.0  # 采样温度；≤0 为 argmax
+top_k: null  # Top-k；null 表示全词表
+num_ode_steps: 8  # ODE 积分步数
+time_schedule: logit_normal  # 时间调度：logit_normal 等
+use_fast_infer: true  # 是否走 fast infer（简化 AdaLN）

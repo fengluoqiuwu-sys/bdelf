@@ -1,7 +1,0 @@
-_doc: >
-  ar2/900m-ultra for ≤42.5GB. 相对 AR(bs=16) 降为 8。
-name: 900m-ultra
-batch_size: 8
-global_batch_size: 64
-num_params_m: 870.5
-estimated_peak_vram_gb: 32.0
