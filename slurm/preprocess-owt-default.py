@@ -21,7 +21,7 @@ def validate_raw_dataset(dataset: str) -> None:
     if not root.exists():
         raise SystemExit(
             f"missing {root}; download on login node first:\n"
-            f"  python download_dataset.py {dataset}"
+            f"  python scripts/download_dataset.py {dataset}"
         )
 
     parquet = sorted(root.rglob("*.parquet"))

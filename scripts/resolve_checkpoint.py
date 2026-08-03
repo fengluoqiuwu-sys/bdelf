@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """由与 ``train.py`` 相同的入参解析 checkpoint 配置哈希与目录。
 
-用法::
+用法（工作目录为仓库根）::
 
-    .venv/bin/python resolve_checkpoint.py \\
+    .venv/bin/python scripts/resolve_checkpoint.py \\
       --model ar --config 100m-fast \\
       --dataset owt --preprocess default --generate eval
 
-    .venv/bin/python resolve_checkpoint.py ... --hash-only
-    .venv/bin/python resolve_checkpoint.py ... --json
+    .venv/bin/python scripts/resolve_checkpoint.py ... --hash-only
+    .venv/bin/python scripts/resolve_checkpoint.py ... --json
 """
 
 from __future__ import annotations
@@ -16,6 +16,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+
+import repo_env
+
+repo_env.ensure_repo_root()
 
 from dataset import list_datasets
 from models import list_model_configs, list_models, resolve_model_config_path
@@ -43,9 +47,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python resolve_checkpoint.py --model ar --config 100m-fast "
+            "  python scripts/resolve_checkpoint.py --model ar --config 100m-fast "
             "--dataset owt --preprocess default --generate eval\n"
-            "  python resolve_checkpoint.py --model elf --config 100m-full "
+            "  python scripts/resolve_checkpoint.py --model elf --config 100m-full "
             "--dataset owt --preprocess elf --generate eval --hash-only\n"
         ),
     )

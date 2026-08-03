@@ -55,7 +55,7 @@ def resolve_vae_checkpoint(
         raise FileNotFoundError(
             f"No VAE checkpoint under {root}/{{fast,full}}/{vae_model}/<hash>/. "
             "Train cola_vae first or set vae_run / COLA_VAE_CHECKPOINT "
-            "(use resolve_checkpoint.py for the hash path)."
+            "(use scripts/resolve_checkpoint.py for the hash path)."
         )
     return max(candidates, key=lambda p: p.stat().st_mtime)
 

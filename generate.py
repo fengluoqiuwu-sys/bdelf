@@ -90,7 +90,7 @@ def resolve_checkpoint(
             raise FileNotFoundError(
                 f"Checkpoint not found: {path}\n"
                 "Use --run {fast|full}/{model}/{config-hash} "
-                "(see resolve_checkpoint.py)."
+                "(see scripts/resolve_checkpoint.py)."
             )
         return path
     return find_latest_checkpoint(root)
@@ -252,7 +252,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--run",
         help=(
             "Run under cache/checkpoints: {fast|full}/{model}/{config-hash} "
-            "(see resolve_checkpoint.py)"
+            "(see scripts/resolve_checkpoint.py)"
         ),
     )
     parser.add_argument(
