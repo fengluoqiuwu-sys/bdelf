@@ -515,8 +515,7 @@ def train_loop(
     # Eager-load frozen HF encoders before Dynamo can trace into from_pretrained.
     _preload_frozen_encoders(model)
 
-    # Compile before DDP. ELF mixed-branch keeps a single dynamic graph;
-    # BDELF still uses a synced denoise/decode branch kwarg per step.
+    # Compile before DDP. ELF/BDELF mixed-branch keeps a single dynamic graph.
     compile_model = bool(cfg.extra.get("compile", False)) and device.type == "cuda"
     if compile_model:
         if rank == 0:
@@ -663,8 +662,8 @@ def train_loop(
                     group["lr"] = lr * float(group.get("lr_scale", 1.0))
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                # ELF: mixed_branch_training → model mixes per-example internally.
-                # BDELF: synced exclusive branch per step.
+                # ELF/BDELF: mixed_branch_training → model mixes per-example internally.
+                # 其它 dual-branch 模型：整步互斥 denoise/decode。
                 if dual_branch and not mixed_branch:
                     train_branch: str | None = _sample_synced_train_branch(
                         model, device, is_distributed=is_distributed,

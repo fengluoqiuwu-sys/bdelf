@@ -11,7 +11,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_BDELFConfig(PretrainedConfig):
-    """Configuration for Block Diffusion + Embedded Language Flow."""
+    """Configuration for Block Diffusion + Embedded Language Flow (ELF-aligned cond)."""
 
     model_type = "fl_bdelf"
     _YAML_REQUIRED = frozenset(
@@ -24,6 +24,9 @@ class FL_BDELFConfig(PretrainedConfig):
             "n_embd",
             "dropout",
             "attn_backend",
+            "num_time_tokens",
+            "num_model_mode_tokens",
+            "self_cond_prob",
             "denoiser_p_mean",
             "denoiser_p_std",
             "denoiser_noise_scale",
@@ -51,8 +54,15 @@ class FL_BDELFConfig(PretrainedConfig):
         n_layer: int = 12,
         n_head: int = 12,
         n_embd: int = 672,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         attn_backend: str = "flex",
+        num_time_tokens: int = 4,
+        # 0 = 关闭 training-time SC-CFG scale tokens（旧 checkpoint 兼容）。
+        num_self_cond_cfg_tokens: int = 0,
+        num_model_mode_tokens: int = 4,
+        self_cond_prob: float = 0.5,
+        self_cond_cfg_min: float = 0.5,
+        self_cond_cfg_max: float = 5.0,
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         denoiser_noise_scale: float = 2.0,
@@ -83,6 +93,12 @@ class FL_BDELFConfig(PretrainedConfig):
         self.n_embd = n_embd
         self.dropout = dropout
         self.attn_backend = attn_backend
+        self.num_time_tokens = num_time_tokens
+        self.num_self_cond_cfg_tokens = num_self_cond_cfg_tokens
+        self.num_model_mode_tokens = num_model_mode_tokens
+        self.self_cond_prob = self_cond_prob
+        self.self_cond_cfg_min = self_cond_cfg_min
+        self.self_cond_cfg_max = self_cond_cfg_max
         self.denoiser_p_mean = denoiser_p_mean
         self.denoiser_p_std = denoiser_p_std
         self.denoiser_noise_scale = denoiser_noise_scale
@@ -114,6 +130,12 @@ class FL_BDELFConfig(PretrainedConfig):
             "n_embd": self.n_embd,
             "dropout": self.dropout,
             "attn_backend": self.attn_backend,
+            "num_time_tokens": self.num_time_tokens,
+            "num_self_cond_cfg_tokens": self.num_self_cond_cfg_tokens,
+            "num_model_mode_tokens": self.num_model_mode_tokens,
+            "self_cond_prob": self.self_cond_prob,
+            "self_cond_cfg_min": self.self_cond_cfg_min,
+            "self_cond_cfg_max": self.self_cond_cfg_max,
             "denoiser_p_mean": self.denoiser_p_mean,
             "denoiser_p_std": self.denoiser_p_std,
             "denoiser_noise_scale": self.denoiser_noise_scale,
@@ -132,11 +154,14 @@ CONFIG_CLS = FL_BDELFConfig
 
 @dataclass
 class FlowSamplingConfig:
-    """BDELF inference configuration."""
+    """BDELF inference configuration (supports SC-CFG guidance)."""
 
     num_ode_steps: int = 8
     time_schedule: str | None = None
     use_fast_infer: bool = True
+    temperature: float = 1.0
+    top_k: int | None = None
+    self_cond_cfg_scale: float = 3.0
 
     @classmethod
     def from_dict(cls, cfg: dict) -> FlowSamplingConfig:

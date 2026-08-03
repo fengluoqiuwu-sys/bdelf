@@ -1,4 +1,4 @@
-_doc: Block Diffusion + Flow LM ~100M params (12 layers x 672 dim, diffusion block 32)
+_doc: Block Diffusion + Flow LM ~100M（ELF 式 SC-CFG / in-context 条件，12×672，block 32）
 
 name: bdelf-100m
 tokenizer: gpt2
@@ -6,8 +6,14 @@ diffusion_block_size: 32
 n_layer: 12
 n_head: 12
 n_embd: 672
-dropout: 0.1
+dropout: 0.0
 attn_backend: flex
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+self_cond_prob: 0.5
+self_cond_cfg_min: 0.5
+self_cond_cfg_max: 5.0
 denoiser_p_mean: -1.5
 denoiser_p_std: 0.8
 denoiser_noise_scale: 2.0
@@ -15,7 +21,7 @@ decoder_prob: 0.2
 decoder_p_mean: 0.8
 decoder_p_std: 0.8
 decoder_noise_scale: 5.0
-t_eps: 0.1
+t_eps: 0.05
 time_schedule: logit_normal
 fix_bos: true
 
@@ -25,3 +31,4 @@ sampling:
   num_ode_steps: 8
   time_schedule: logit_normal
   use_fast_infer: true
+  self_cond_cfg_scale: 3.0
