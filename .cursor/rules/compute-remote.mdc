@@ -29,6 +29,8 @@ alwaysApply: true
 - **唯一可写路径**：`~/source/bdelf/temp/`（agent 任务登记）；`temp/` 在 push/pull 中均被屏蔽。
 - `slurm/logs/` 等仅允许只读查看；读训练 `.out`/`.err` 末 N 行优先用本机
   `.venv/bin/python slurm/tail_remote_logs.py <JOB_ID>`（见 skill `train-ops`）。
+- 查四节点 GPU 空闲优先用本机
+  `.venv/bin/python slurm/gpu_availability.py`（见 skill `train-ops`）。
 
 ## AI 任务互斥
 

@@ -64,10 +64,26 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 ```text
 - [ ] 本地 slurm 脚本已就绪且为 full
 - [ ] bash sync-ovan-server.sh push 已完成
+- [ ] .venv/bin/python slurm/gpu_availability.py（确认目标节点 AVAIL 够用）
 - [ ] 读取远端 temp/agent/current.json
 - [ ] 若有未结束的 AI job：scancel 或确认已结束，并更新登记
 - [ ] sbatch，写入 current.json + launched/<job_id>.json
 ```
+
+### 节点 GPU 空闲（优先用本机脚本）
+
+提交前可先看四个计算节点各有几张卡可调度。远端只跑 `scontrol show node -o`：
+
+```bash
+# 表格：TOTAL / USED / FREE / AVAIL（不可调度节点 AVAIL=0）+ STATE
+.venv/bin/python slurm/gpu_availability.py
+
+# JSON（脚本/自动化用）
+.venv/bin/python slurm/gpu_availability.py --json
+```
+
+列含义：`FREE = TOTAL - USED`；`AVAIL` 在节点 `DOWN`/`DRAIN`/`NOT_RESPONDING` 等时记为 0。
+默认节点：`cls1-srv1`（A6000）与 `cls1-srv[2-4]`（4090）。不要手写长串 `ssh ... scontrol`，除非脚本不可用。
 
 ### 常用 SSH 命令
 
