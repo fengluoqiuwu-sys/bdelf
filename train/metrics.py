@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 TRAIN_CSV_FIELDS = [
     "step",
+    "tokens",
     "train_loss",
     "train_ppl",
     "loss_branch",
@@ -26,6 +27,7 @@ TRAIN_CSV_FIELDS = [
 ]
 EVAL_CSV_FIELDS = [
     "step",
+    "tokens",
     "eval_loss",
     "eval_ppl",
     "gen_loss",
@@ -34,6 +36,11 @@ EVAL_CSV_FIELDS = [
     "gen_nonempty_frac",
     "lr",
 ]
+
+# owt+elf train 子集抽样 32768 条、经 gpt2-large 打分的参考水平（写死）。
+# 来源：temp/score_owt_train_ref.py（seed=42）；gen_ppl 对齐在线 gen-eval 口径。
+REF_TRAIN_GEN_PPL = 16.9413
+REF_TRAIN_GEN_UNIQ_MEAN = 435.6844
 
 _TRAIN_LOG = "[train]"
 
@@ -115,134 +122,363 @@ def _parse_float(raw: str | None) -> float | None:
     return float(raw)
 
 
+def _row_tokens(
+    row: dict[str, str],
+    *,
+    tokens_per_micro_step: int | None,
+) -> int | None:
+    """累计数据 token：优先读 CSV ``tokens``，否则由 step 回推。"""
+    raw = _parse_float(row.get("tokens"))
+    if raw is not None:
+        return int(raw)
+    if tokens_per_micro_step is None or tokens_per_micro_step < 1:
+        return None
+    step_raw = row.get("step")
+    if step_raw is None or step_raw == "":
+        return None
+    return (int(step_raw) + 1) * tokens_per_micro_step
+
+
+def _backfill_tokens_column(
+    csv_path: Path,
+    fields: list[str],
+    *,
+    tokens_per_micro_step: int,
+) -> None:
+    """为缺少 ``tokens`` 的旧行按 step 回填，便于 CSV 与曲线一致。"""
+    if not csv_path.exists() or tokens_per_micro_step < 1:
+        return
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        return
+    changed = False
+    for row in rows:
+        if row.get("tokens"):
+            continue
+        tok = _row_tokens(row, tokens_per_micro_step=tokens_per_micro_step)
+        if tok is None:
+            continue
+        row["tokens"] = str(tok)
+        changed = True
+    if not changed:
+        return
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+
+
 def _decode_ce_train_series(
     train_rows: list[dict[str, str]],
+    *,
+    tokens_per_micro_step: int | None,
 ) -> tuple[list[int], list[float], list[float]]:
     """Train decode-CE points for plotting (BDELF exclusive / ELF mixed)."""
-    steps: list[int] = []
+    xs: list[int] = []
     ppls: list[float] = []
     lrs: list[float] = []
     for row in train_rows:
         branch = row.get("loss_branch") or ""
         if branch not in ("decode", "mixed"):
             continue
+        # 旧日志：无 decode 样本时 ce 被记成 0 → ppl=1.0，绘图跳过。
+        ce = _parse_float(row.get("decode_ce"))
+        if branch == "mixed" and (ce is None or ce == 0.0):
+            continue
         ppl = _parse_float(row.get("train_ppl"))
         if ppl is None:
-            ce = _parse_float(row.get("decode_ce"))
-            if ce is not None:
+            if ce is not None and ce > 0.0:
                 ppl = loss_to_ppl(ce)
         if ppl is None:
             continue
-        steps.append(int(row["step"]))
+        if branch == "mixed" and ppl == 1.0 and (ce is None or ce == 0.0):
+            continue
+        tok = _row_tokens(row, tokens_per_micro_step=tokens_per_micro_step)
+        if tok is None:
+            continue
+        xs.append(tok)
         ppls.append(ppl)
         lrs.append(float(row["lr"]))
-    return steps, ppls, lrs
+    return xs, ppls, lrs
 
 
 def update_ppl_plots(
     train_csv: Path,
     eval_csv: Path,
     out_dir: Path,
+    *,
+    tokens_per_micro_step: int | None = None,
 ) -> None:
+    if tokens_per_micro_step is not None and tokens_per_micro_step >= 1:
+        ensure_csv_schema(train_csv, TRAIN_CSV_FIELDS)
+        ensure_csv_schema(eval_csv, EVAL_CSV_FIELDS)
+        _backfill_tokens_column(
+            train_csv, TRAIN_CSV_FIELDS,
+            tokens_per_micro_step=tokens_per_micro_step,
+        )
+        _backfill_tokens_column(
+            eval_csv, EVAL_CSV_FIELDS,
+            tokens_per_micro_step=tokens_per_micro_step,
+        )
+
     train_rows = _read_csv_rows(train_csv)
     eval_rows = _read_csv_rows(eval_csv)
     if not train_rows:
         return
 
-    train_steps = [int(r["step"]) for r in train_rows]
-    train_lr = [float(r["lr"]) for r in train_rows]
-
     dual_branch = any(
         r.get("loss_branch") in ("denoise", "decode", "mixed") for r in train_rows
     )
     if dual_branch:
-        train_plot_steps, train_ppl, _ = _decode_ce_train_series(train_rows)
+        train_plot_x, train_ppl, _ = _decode_ce_train_series(
+            train_rows, tokens_per_micro_step=tokens_per_micro_step,
+        )
     else:
-        train_plot_steps = train_steps
-        train_ppl = [_parse_float(r.get("train_ppl")) for r in train_rows]
+        train_plot_x = []
+        train_ppl = []
+        for r in train_rows:
+            tok = _row_tokens(r, tokens_per_micro_step=tokens_per_micro_step)
+            ppl = _parse_float(r.get("train_ppl"))
+            if tok is None or ppl is None:
+                continue
+            train_plot_x.append(tok)
+            train_ppl.append(ppl)
 
-    eval_steps = [int(r["step"]) for r in eval_rows]
-    eval_ppl = [
-        _parse_float(r.get("eval_ppl") or r.get("gpt2_ppl")) for r in eval_rows
-    ]
-    gen_ppl = [_parse_float(r.get("gen_ppl")) for r in eval_rows]
-
-    for cap, filename in ((1000.0, "ppl_under_1000.png"), (100.0, "ppl_under_100.png")):
-        t_steps, t_ppls = zip(
-            *[
-                (s, p)
-                for s, p in zip(train_plot_steps, train_ppl)
-                if p is not None and p <= cap
-            ]
-        ) if any(p is not None and p <= cap for p in train_ppl) else ([], [])
-
-        e_steps, e_ppls = zip(
-            *[(s, p) for s, p in zip(eval_steps, eval_ppl) if p is not None and p <= cap]
-        ) if any(p is not None and p <= cap for p in eval_ppl) else ([], [])
-
-        g_steps, g_ppls = zip(
-            *[(s, p) for s, p in zip(eval_steps, gen_ppl) if p is not None and p <= cap]
-        ) if any(p is not None and p <= cap for p in gen_ppl) else ([], [])
-
-        if not t_steps and not e_steps and not g_steps:
+    eval_x: list[int] = []
+    eval_ppl: list[float | None] = []
+    gen_ppl: list[float | None] = []
+    gen_uniq: list[float | None] = []
+    for r in eval_rows:
+        tok = _row_tokens(r, tokens_per_micro_step=tokens_per_micro_step)
+        if tok is None:
             continue
+        eval_x.append(tok)
+        eval_ppl.append(_parse_float(r.get("eval_ppl") or r.get("gpt2_ppl")))
+        gen_ppl.append(_parse_float(r.get("gen_ppl")))
+        gen_uniq.append(_parse_float(r.get("gen_uniq_mean")))
 
-        fig, ax_ppl = plt.subplots(figsize=(10, 4.5))
+    train_lr_x: list[int] = []
+    train_lr: list[float] = []
+    for r in train_rows:
+        tok = _row_tokens(r, tokens_per_micro_step=tokens_per_micro_step)
+        if tok is None:
+            continue
+        train_lr_x.append(tok)
+        train_lr.append(float(r["lr"]))
 
-        if t_steps:
-            train_label = (
-                "train decode ppl (exp ce)"
-                if dual_branch
-                else "train ppl (exp loss)"
-            )
+    train_label = (
+        "train decode ppl (exp ce)" if dual_branch else "train ppl (exp loss)"
+    )
+    eval_label = (
+        "eval decode ppl (exp ce)" if dual_branch else "eval ppl (exp loss)"
+    )
+
+    def _filter_xy(
+        xs: list[int],
+        ys: list[float | None] | list[float],
+        *,
+        x_min: float | None = None,
+        y_max: float | None = None,
+    ) -> tuple[list[int], list[float]]:
+        out_x: list[int] = []
+        out_y: list[float] = []
+        for x, y in zip(xs, ys):
+            if y is None:
+                continue
+            if x_min is not None and x < x_min:
+                continue
+            if y_max is not None and y > y_max:
+                continue
+            out_x.append(x)
+            out_y.append(float(y))
+        return out_x, out_y
+
+    def _draw_one(
+        *,
+        filename: str,
+        title: str,
+        x_min: float | None = None,
+        x_max: float | None = None,
+        ppl_cap: float | None = None,
+        ppl_ylim: tuple[float, float] | None = None,
+        auto_ppl_ylim_from: tuple[list[float], ...] | None = None,
+    ) -> None:
+        t_xs, t_ppls = _filter_xy(train_plot_x, train_ppl, x_min=x_min, y_max=ppl_cap)
+        e_xs, e_ppls = _filter_xy(eval_x, eval_ppl, x_min=x_min, y_max=ppl_cap)
+        g_xs, g_ppls = _filter_xy(eval_x, gen_ppl, x_min=x_min, y_max=ppl_cap)
+        u_xs, u_vals = _filter_xy(eval_x, gen_uniq, x_min=x_min)
+        lr_xs, lr_vals = _filter_xy(
+            train_lr_x,
+            [lr if lr > 0 else None for lr in train_lr],
+            x_min=x_min,
+        )
+
+        if not t_xs and not e_xs and not g_xs and not u_xs:
+            return
+
+        ylim = ppl_ylim
+        if ylim is None and auto_ppl_ylim_from is not None:
+            peak = 0.0
+            for series in auto_ppl_ylim_from:
+                for v in series:
+                    if v > peak:
+                        peak = v
+            if peak <= 0:
+                return
+            ylim = (0.0, peak * 1.05)
+
+        fig, ax_ppl = plt.subplots(figsize=(11, 5.2))
+
+        if t_xs:
             ax_ppl.plot(
-                t_steps, t_ppls, color="#4C72B0", alpha=0.55, linewidth=1.2,
+                t_xs, t_ppls, color="#4C72B0", alpha=0.55, linewidth=1.2,
                 label=train_label, zorder=1,
             )
-        if e_steps:
-            eval_label = (
-                "eval decode ppl (exp ce)"
-                if dual_branch
-                else "eval ppl (exp loss)"
-            )
+        if e_xs:
             ax_ppl.plot(
-                e_steps, e_ppls, color="#D62728", linewidth=2.8, marker="o",
+                e_xs, e_ppls, color="#D62728", linewidth=2.8, marker="o",
                 markersize=4, label=eval_label, zorder=5,
             )
-        if g_steps:
+        if g_xs:
             ax_ppl.plot(
-                g_steps, g_ppls, color="#2CA02C", linewidth=2.4, marker="s",
+                g_xs, g_ppls, color="#2CA02C", linewidth=2.4, marker="s",
                 markersize=4, label="gen ppl (gpt2-large)", zorder=6,
             )
+        # 训练语料参考：同色虚线（owt+elf 抽样写死）。
+        ax_ppl.axhline(
+            REF_TRAIN_GEN_PPL,
+            color="#2CA02C",
+            linestyle="--",
+            linewidth=1.4,
+            alpha=0.85,
+            label=f"train-data gen ppl ({REF_TRAIN_GEN_PPL:g})",
+            zorder=3,
+        )
 
         ax_lr = ax_ppl.twinx()
-        lr_steps, lr_vals = zip(
-            *[(s, lr) for s, lr in zip(train_steps, train_lr) if lr > 0]
-        ) if train_lr else ([], [])
-        if lr_steps:
+        if lr_xs:
             ax_lr.plot(
-                lr_steps, lr_vals, color="#7F7F7F", linestyle="--",
+                lr_xs, lr_vals, color="#7F7F7F", linestyle="--",
                 linewidth=1.0, alpha=0.9, label="lr", zorder=2,
             )
             ax_lr.set_ylabel("learning rate")
             ax_lr.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
 
-        ax_ppl.set_xlabel("data step" if dual_branch else "step")
+        ax_uniq = ax_ppl.twinx()
+        ax_uniq.spines["right"].set_position(("outward", 55))
+        ax_uniq.set_ylim(0, 500)
+        ax_uniq.set_ylabel("gen_uniq_mean")
+        if u_xs:
+            ax_uniq.plot(
+                u_xs, u_vals, color="#9467BD", linewidth=2.0, marker="^",
+                markersize=3.5, label="gen_uniq_mean", zorder=4,
+            )
+        ax_uniq.axhline(
+            REF_TRAIN_GEN_UNIQ_MEAN,
+            color="#9467BD",
+            linestyle="--",
+            linewidth=1.4,
+            alpha=0.85,
+            label=f"train-data uniq ({REF_TRAIN_GEN_UNIQ_MEAN:g})",
+            zorder=3,
+        )
+
+        if x_min is not None or x_max is not None:
+            left = x_min if x_min is not None else ax_ppl.get_xlim()[0]
+            right = x_max if x_max is not None else ax_ppl.get_xlim()[1]
+            ax_ppl.set_xlim(left, right)
+        if ylim is not None:
+            ax_ppl.set_ylim(*ylim)
+
+        ax_ppl.set_xlabel("tokens")
         ax_ppl.set_ylabel("perplexity")
-        ax_ppl.set_title(f"PPL & LR (ppl ≤ {cap:g})")
+        ax_ppl.set_title(title)
         ax_ppl.grid(True, alpha=0.25)
+        ax_ppl.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
 
         handles, labels = ax_ppl.get_legend_handles_labels()
         h2, l2 = ax_lr.get_legend_handles_labels()
-        ax_ppl.legend(handles + h2, labels + l2, loc="upper right")
+        h3, l3 = ax_uniq.get_legend_handles_labels()
+        # 图例按列填充；显式排序，让 lr 与 gen ppl 对调位置。
+        by_label = {lab: h for h, lab in zip(handles + h2 + h3, labels + l2 + l3)}
+        legend_order = [
+            train_label,
+            eval_label,
+            "lr",
+            f"train-data gen ppl ({REF_TRAIN_GEN_PPL:g})",
+            "gen ppl (gpt2-large)",
+            "gen_uniq_mean",
+            f"train-data uniq ({REF_TRAIN_GEN_UNIQ_MEAN:g})",
+        ]
+        all_h = [by_label[lab] for lab in legend_order if lab in by_label]
+        all_l = [lab for lab in legend_order if lab in by_label]
+        # 图例放在坐标区下方横排，避免挡曲线；系列变多时自动换行。
+        n_items = max(len(all_h), 1)
+        ncol = min(3, n_items)
+        fig.legend(
+            all_h,
+            all_l,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=ncol,
+            frameon=False,
+            fontsize=8,
+            columnspacing=1.2,
+            handlelength=2.0,
+        )
 
-        fig.tight_layout()
-        fig.savefig(out_dir / filename, dpi=120)
+        fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+        fig.savefig(out_dir / filename, dpi=120, bbox_inches="tight")
         plt.close(fig)
+
+    for cap, filename in ((1000.0, "ppl_under_1000.png"), (100.0, "ppl_under_100.png")):
+        _draw_one(
+            filename=filename,
+            title=f"PPL & LR (ppl ≤ {cap:g})",
+            ppl_cap=cap,
+        )
+
+    # 最近 1B token 窗口：PPL 纵轴 = 窗口内 gen+train 最高值 × 1.05。
+    recent_span = 1_000_000_000
+    all_xs = train_plot_x + eval_x + train_lr_x
+    if all_xs:
+        x_right = max(all_xs)
+        x_left = max(0, x_right - recent_span)
+        t_win, t_win_ppl = _filter_xy(train_plot_x, train_ppl, x_min=x_left)
+        g_win, g_win_ppl = _filter_xy(eval_x, gen_ppl, x_min=x_left)
+        _draw_one(
+            filename="ppl_recent_1b.png",
+            title="PPL & LR (recent 1B tokens)",
+            x_min=x_left,
+            x_max=x_right,
+            auto_ppl_ylim_from=(t_win_ppl, g_win_ppl),
+        )
+
+
+def _as_optional_float(raw: Any) -> float | None:
+    """把 tensor / 数值转成 float；nan/None → None。"""
+    if raw is None:
+        return None
+    if hasattr(raw, "detach"):
+        raw = raw.detach()
+    if hasattr(raw, "item"):
+        try:
+            raw = raw.item()
+        except (RuntimeError, ValueError):
+            return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value:  # nan
+        return None
+    return value
 
 
 def build_train_row(
     step: int,
+    tokens: int,
     train_loss: float,
     lr: float,
     tokens_per_sec: float,
@@ -254,7 +490,8 @@ def build_train_row(
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "step": step,
-        "train_loss": round(train_loss, 6),
+        "tokens": tokens,
+        "train_loss": round(train_loss, 6) if train_loss == train_loss else "",
         "train_ppl": "",
         "loss_branch": "",
         "denoise_mse": "",
@@ -264,28 +501,33 @@ def build_train_row(
     }
     if dual_branch:
         row["loss_branch"] = loss_branch
+        mse = _as_optional_float(denoise_mse)
+        ce = _as_optional_float(decode_ce)
         if loss_branch == "mixed":
             # Official-style combined loss; still record both branch metrics.
-            if denoise_mse is not None and denoise_mse == denoise_mse:
-                row["denoise_mse"] = round(denoise_mse, 6)
-            if decode_ce is not None and decode_ce == decode_ce:
-                row["decode_ce"] = round(decode_ce, 6)
-                row["train_ppl"] = round(loss_to_ppl(decode_ce), 4)
+            if mse is not None:
+                row["denoise_mse"] = round(mse, 6)
+            # 无 decode 样本时 ce 为 nan，跳过，不写假 ppl=1.0。
+            if ce is not None:
+                row["decode_ce"] = round(ce, 6)
+                row["train_ppl"] = round(loss_to_ppl(ce), 4)
         elif loss_branch == "denoise":
             # MSE is not a CE; leave train_ppl empty (same as BDELF).
-            row["denoise_mse"] = round(train_loss, 6)
+            row["denoise_mse"] = round(train_loss, 6) if train_loss == train_loss else ""
         elif loss_branch == "decode":
             # PPL only from decode CE (exp(ce)), never from denoise MSE.
-            row["decode_ce"] = round(train_loss, 6)
-            row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
-            row["train_loss"] = row["decode_ce"]
+            if train_loss == train_loss:
+                row["decode_ce"] = round(train_loss, 6)
+                row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
+                row["train_loss"] = row["decode_ce"]
         else:
             raise ValueError(
                 f"dual_branch logging requires loss_branch "
                 f"'denoise', 'decode', or 'mixed', got {loss_branch!r}"
             )
     else:
-        row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
+        if train_loss == train_loss:
+            row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
     return row
 
 
@@ -324,7 +566,11 @@ def format_interval_summary(
     row: dict[str, Any],
 ) -> list[str]:
     pct = 100.0 * (step + 1) / max_steps
-    return [f"[{step + 1}/{max_steps} ({pct:.1f}%)] {_train_metrics_text(row)}"]
+    tokens = row.get("tokens")
+    tok_part = f" tokens={tokens:,}" if isinstance(tokens, int) else ""
+    return [
+        f"[{step + 1}/{max_steps} ({pct:.1f}%){tok_part}] {_train_metrics_text(row)}"
+    ]
 
 
 def _rank0_log(msg: str, pbar: tqdm | None) -> None:

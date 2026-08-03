@@ -597,7 +597,12 @@ def train_loop(
         if rank == 0:
             kept_train = truncate_csv_for_resume(train_csv, step)
             kept_eval = truncate_csv_for_resume(eval_csv, step)
-            update_ppl_plots(train_csv, eval_csv, run_dir)
+            update_ppl_plots(
+                train_csv,
+                eval_csv,
+                run_dir,
+                tokens_per_micro_step=cfg.tokens_per_micro_step,
+            )
             _train_log(
                 f"Resuming from checkpoint: step {step} "
                 f"(train_log {kept_train} rows, eval_log {kept_eval} rows)",
@@ -615,7 +620,7 @@ def train_loop(
     dual_branch = uses_dual_branch_logging(model)
     mixed_branch = bool(getattr(unwrap_model(model), "mixed_branch_training", False))
     if rank == 0 and dual_branch:
-        decoder_prob = float(cfg.extra.get("decoder_prob", 0.2))
+        decoder_prob = float(getattr(unwrap_model(model).backbone, "decoder_prob", 0.2))
         denoise_prob = max(0.0, 1.0 - decoder_prob)
         if mixed_branch:
             _train_log(
@@ -627,7 +632,7 @@ def train_loop(
             _train_log(
                 f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
                 f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
-                "each micro-step is a data step; metrics/plots use decode CE",
+                "metrics/plots use decode CE",
             )
 
     model.train()
@@ -737,14 +742,18 @@ def train_loop(
                 denoise_mse = None
                 decode_ce = None
             elapsed = time.time() - t0
-            # Every micro-step consumes a full data batch (dual-branch 4:1 is loss mix).
+            # 每微批消耗一整份数据 batch（与是否 denoise/decode 混合无关）。
             seq_tokens = batch.size(0) * (
                 batch.size(1) if uses_full_sequence(model) else batch.size(1) - 1
             )
             tokens_per_sec = seq_tokens / max(elapsed, 1e-6)
 
             row = build_train_row(
-                step, train_loss, lr, tokens_per_sec,
+                step,
+                cfg.tokens_seen_after_step(step),
+                train_loss,
+                lr,
+                tokens_per_sec,
                 dual_branch=dual_branch, loss_branch=loss_branch,
                 denoise_mse=denoise_mse, decode_ce=decode_ce,
             )
@@ -822,6 +831,7 @@ def train_loop(
                                 )
                         eval_row = {
                             "step": step,
+                            "tokens": cfg.tokens_seen_after_step(step),
                             "eval_loss": round(eval_loss, 6),
                             "eval_ppl": round(eval_ppl, 4),
                             "gen_loss": (
@@ -849,7 +859,12 @@ def train_loop(
                         _rank0_log(line, pbar)
 
                 if (step + 1) % cfg.log_plot_step == 0:
-                    update_ppl_plots(train_csv, eval_csv, run_dir)
+                    update_ppl_plots(
+                        train_csv,
+                        eval_csv,
+                        run_dir,
+                        tokens_per_micro_step=cfg.tokens_per_micro_step,
+                    )
                     rank0_sync = True
 
                 # save_step / snapshot_step are independent intervals; do not nest
@@ -892,7 +907,12 @@ def train_loop(
                 latest_ckpt, model, optimizer, next_step, cfg, model_meta,
                 ema_state=ema_state,
             )
-            update_ppl_plots(train_csv, eval_csv, run_dir)
+            update_ppl_plots(
+                train_csv,
+                eval_csv,
+                run_dir,
+                tokens_per_micro_step=cfg.tokens_per_micro_step,
+            )
             _train_log(f"Saved; resume from step {next_step} on next run")
         if is_distributed:
             dist.barrier()
@@ -913,7 +933,12 @@ def train_loop(
             final_snapshot, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,
         )
-        update_ppl_plots(train_csv, eval_csv, run_dir)
+        update_ppl_plots(
+            train_csv,
+            eval_csv,
+            run_dir,
+            tokens_per_micro_step=cfg.tokens_per_micro_step,
+        )
         _train_log(
             f"Training finished after {step} steps; "
             f"saved {latest_ckpt.name} and {final_snapshot.name} in {run_dir}"
