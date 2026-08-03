@@ -439,8 +439,8 @@ def update_ppl_plots(
             ppl_cap=cap,
         )
 
-    # 最近 1B token 窗口：PPL 纵轴 = 窗口内 gen+train 最高值 × 1.05。
-    recent_span = 1_000_000_000
+    # 最近 5B token 窗口：PPL 纵轴 = 窗口内 gen+train 最高值 × 1.05。
+    recent_span = 5_000_000_000
     all_xs = train_plot_x + eval_x + train_lr_x
     if all_xs:
         x_right = max(all_xs)
@@ -448,8 +448,8 @@ def update_ppl_plots(
         t_win, t_win_ppl = _filter_xy(train_plot_x, train_ppl, x_min=x_left)
         g_win, g_win_ppl = _filter_xy(eval_x, gen_ppl, x_min=x_left)
         _draw_one(
-            filename="ppl_recent_1b.png",
-            title="PPL & LR (recent 1B tokens)",
+            filename="ppl_recent_5b.png",
+            title="PPL & LR (recent 5B tokens)",
             x_min=x_left,
             x_max=x_right,
             auto_ppl_ylim_from=(t_win_ppl, g_win_ppl),
