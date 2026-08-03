@@ -52,6 +52,6 @@ python train.py \
   --config 100m-full \
   --dataset owt \
   --preprocess default \
-  --run-name cola_vae-100m-full-muon
+  --generate eval
 
 echo "=== job end: $(date -Is) ==="

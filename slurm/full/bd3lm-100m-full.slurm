@@ -57,6 +57,7 @@ python train.py \
   --model bd3lm \
   --config 100m-full \
   --dataset owt \
-  --preprocess default
+  --preprocess default \
+  --generate eval
 
 echo "=== job end: $(date -Is) ==="

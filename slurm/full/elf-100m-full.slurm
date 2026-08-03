@@ -68,6 +68,6 @@ python train.py \
   --config 100m-full \
   --dataset owt \
   --preprocess elf \
-  --run-name elf-cfg-100m-full-muon
+  --generate eval
 
 echo "=== job end: $(date -Is) ==="
