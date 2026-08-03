@@ -1,0 +1,25 @@
+---
+description: auto-train 远端巡检唤醒节奏（sbatch 后渐进间隔）
+alwaysApply: true
+---
+
+# auto-train 唤醒节奏
+
+`auto-train` 循环用后台 `sleep` + 特征串输出做唤醒。间隔按**本轮作业已成功唤醒的次数**递进（每次 sbatch / 续训重提后重新计数）：
+
+| 次序 | 间隔 | sleep |
+|------|------|-------|
+| 第 1 次 | 5 分钟 | `300` |
+| 第 2 次 | 15 分钟 | `900` |
+| 第 3 次 | 30 分钟 | `1800` |
+| 第 4 次起 | 每 30 分钟 | `1800` |
+
+```bash
+# 示例：按当前次序选时长
+sleep 300 && echo "AUTO-TRAIN-WAKEUP-1"   # 第 1 次
+sleep 900 && echo "AUTO-TRAIN-WAKEUP-2"   # 第 2 次
+sleep 1800 && echo "AUTO-TRAIN-WAKEUP"    # 第 3 次及以后
+```
+
+- 完整 auto-train 流程见 skill `auto-train`；本 rule 只约束唤醒间隔。
+- ssh 连不上时的重试仍为睡 5 分钟（与上表无关）。

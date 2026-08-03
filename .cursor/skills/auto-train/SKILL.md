@@ -97,7 +97,7 @@ ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
 4. 本地验证：fast 冒烟（起训练看到首批 loss 正常、2–3 分钟后停）+ generate/ppl 跑通
 5. push 到 ovan-server（sync 脚本）→ train-ops 登记互斥 → sbatch full
    → 起「5 分钟首次唤醒」后台调度（确认拉起）
-6. 唤醒循环：每 15 分钟
+6. 唤醒循环：5m → 15m → 30m → 此后每 30m（见「唤醒调度」）
    ├ 7a 决定继续 → 回 6
    ├ 7b 需调整 → 8
    └ 7c 已完成 → 11
@@ -163,8 +163,9 @@ git commit -m "<语义化描述>"
 
 **6-7. 唤醒循环与判据**
 
-唤醒节奏：**首次 sbatch 后 5 分钟唤醒**（确认作业成功拉起、未立即报错）；此后**每 15 分钟**
-唤醒一次评估。每次唤醒：
+唤醒节奏（与 rule `auto-train-wake` 一致；每次 sbatch / 续训重提后重新计数）：
+**第 1 次 5 分钟**（确认拉起）→ **第 2 次 15 分钟** → **第 3 次 30 分钟** → **此后每 30 分钟**。
+每次唤醒：
 
 1. **优先 ssh 只读探查**（见上节）：`squeue`、列 `checkpoints/<NAME>/`、`tail` 日志、读 `config.json` /
    `current.json`——确认拉起状态与进度，**不必先 pull**。
@@ -217,12 +218,13 @@ Cursor 中 agent 无法自主设闹钟；用「后台 sleep + 输出通知」实
 turn 继续（system 会在 turn 结束后推送该通知）。
 
 ```bash
-# 首次：5 分钟后唤醒；之后每次 15 分钟
-sleep 300 && echo "AUTO-TRAIN-WAKEUP-first";   # 首候
-sleep 900 && echo "AUTO-TRAIN-WAKEUP";          # 循环
+# 递进：5m → 15m → 30m → 此后每 30m（按本轮作业已成功唤醒次数）
+sleep 300 && echo "AUTO-TRAIN-WAKEUP-1"    # 第 1 次
+sleep 900 && echo "AUTO-TRAIN-WAKEUP-2"    # 第 2 次
+sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
 ```
 
-- 实际 sleep 间隔用能支撑下一个判据的最短值；唤醒消息带上**明确的下一步动作**（pull fast /
+- 间隔按上表执行；唤醒消息带上**明确的下一步动作**（pull fast /
   读日志 / 决定继续或调整），避免描述含糊。
 - **依赖对话保持开启**：这个机制只有会话存在时才有效。若会话迟迟未被唤醒或已关闭，
   下次启动时从「ssh 读远端 job 状态 + 目录/日志」恢复现场，而不是从头再来。
