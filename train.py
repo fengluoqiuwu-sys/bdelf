@@ -71,6 +71,7 @@ from train.metrics import (
     append_csv_row,
     build_train_row,
     format_interval_summary,
+    init_csv_header,
     loss_to_ppl,
     truncate_csv_for_resume,
     update_ppl_plots,
@@ -539,6 +540,10 @@ def train_loop(
 
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
+    # 预先写表头：log_plot_step 可能早于首次 eval，避免 plot 时 eval_log 尚不存在。
+    if rank == 0:
+        init_csv_header(train_csv, TRAIN_CSV_FIELDS)
+        init_csv_header(eval_csv, EVAL_CSV_FIELDS)
     # Absolute path: relative cache/ can race under BeeGFS when ranks disagree
     # on cwd visibility right after a cross-node resume.
     latest_ckpt = (run_dir / "checkpoint_latest.pt").resolve()

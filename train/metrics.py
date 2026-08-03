@@ -68,10 +68,25 @@ def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> No
         writer.writerow({k: row.get(k, "") for k in fields})
 
 
-def ensure_csv_schema(csv_path: Path, fields: list[str]) -> None:
-    """Rewrite CSV if the on-disk header is missing newly added columns."""
-    if not csv_path.exists():
+def init_csv_header(csv_path: Path, fields: list[str]) -> None:
+    """若尚无文件则只写表头，保证 plot/schema 迁移有落盘目标。
+
+    train_log 每步都会 append；eval_log 要等到首次 eval。
+    ``log_plot_step`` 常小于 ``eval_step``，若不预先建表头，
+    首次 ``update_ppl_plots`` 会对尚不存在的 eval_log 调 ``ensure_csv_schema`` 崩溃。
+    """
+    if csv_path.exists():
         return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=fields).writeheader()
+
+
+def ensure_csv_schema(csv_path: Path, fields: list[str]) -> None:
+    """Rewrite CSV if the on-disk header is missing newly added columns.
+
+    调用方须保证文件已存在（新 run 用 ``init_csv_header``；旧 run 由 append 创建）。
+    """
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         old_fields = list(reader.fieldnames or [])
@@ -212,6 +227,7 @@ def update_ppl_plots(
     *,
     tokens_per_micro_step: int | None = None,
 ) -> None:
+    # tokens 列迁移只作用于已落盘的 CSV；缺文件说明调用方未 init / 路径错误。
     if tokens_per_micro_step is not None and tokens_per_micro_step >= 1:
         ensure_csv_schema(train_csv, TRAIN_CSV_FIELDS)
         ensure_csv_schema(eval_csv, EVAL_CSV_FIELDS)
