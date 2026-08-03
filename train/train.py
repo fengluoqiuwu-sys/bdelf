@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Literal, Optional, TypeVar
 import yaml
 
 from config_util import load_mapping_config
-from models import resolve_model_config_path
 from preprocess import get_preprocess
 from train.generate_config import get_generate
 from train.run_path import (
@@ -211,12 +210,13 @@ class FL_TrainConfig:
         )
 
     @property
-    def effective_tokens_per_optimizer_step(self) -> int:
-        """Data tokens per optimizer step (same as raw; dual-branch 4:1 is loss mix only)."""
-        raw = self.extra.get("effective_tokens_per_optimizer_step")
-        if raw is not None:
-            return int(raw)
-        return self.tokens_per_optimizer_step
+    def tokens_per_micro_step(self) -> int:
+        """全局数据 token / 微批（各 rank 合计）。"""
+        return self.batch_size * self.world_size * self.seq_tokens
+
+    def tokens_seen_after_step(self, step: int) -> int:
+        """完成 0-based 微批 ``step`` 后累计吃掉的数据 token。"""
+        return (step + 1) * self.tokens_per_micro_step
 
     @property
     def target_tokens(self) -> int | None:
@@ -241,15 +241,6 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
             f"Invalid config name {config_name!r}, expected 100m-{{fast,full}}"
         )
     return model, config_name
-
-
-def _model_decoder_prob(model: str, model_config: str) -> float:
-    if model not in ("bdelf", "elf"):
-        return 1.0
-    path = resolve_model_config_path(model, model_config)
-    with open(path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    return float(cfg.get("decoder_prob", 0.2))
 
 
 def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
@@ -602,7 +593,9 @@ def compose_train_config(
             f"got {eval_cfg.gen_eval_model_device!r}"
         )
 
-    raw_tokens_per_step = (
+    # 数据 token / 优化器步：global_batch × 每序列计入预算的 token 数。
+    # denoise/decode 混合只影响 loss，不改变数据消耗与日程推导。
+    tokens_per_step = (
         batch.batch_size
         * accum
         * resolved_world_size
@@ -612,25 +605,14 @@ def compose_train_config(
             else max(1, chunk_length - 1)
         )
     )
-    # Dual-branch (BDELF/ELF) uses denoise:decode ≈ 4:1 as a loss mix only:
-    # every micro-step still consumes a full data batch, so the token budget and
-    # schedule intervals match AR/BD3LM (raw data tokens / optimizer steps).
-    decoder_prob = _model_decoder_prob(model, model_config)
-    if model in ("bdelf", "elf"):
-        if decoder_prob <= 0.0 or decoder_prob > 1.0:
-            raise ValueError(
-                f"{run_label}: decoder_prob must be in (0, 1], got {decoder_prob}"
-            )
     resolved = _resolve_schedule(
         schedule,
         run_name=run_label,
-        tokens_per_step=raw_tokens_per_step,
+        tokens_per_step=tokens_per_step,
     )
-    # ``_resolve_schedule`` returns optimizer-step counts (one update after
-    # ``grad_accum_steps`` micro-batches). ``train_loop`` increments ``step``
-    # every micro-batch, so convert budget/intervals to micro-steps here.
+    # ``_resolve_schedule`` 返回优化器步；``train_loop`` 按微批递增 step，此处换算。
     max_optimizer_steps = resolved.max_steps
-    target_tokens = max_optimizer_steps * raw_tokens_per_step
+    target_tokens = max_optimizer_steps * tokens_per_step
 
     log_plot_step = resolved.log_plot_step
     eval_step = resolved.eval_step
@@ -668,12 +650,9 @@ def compose_train_config(
         batch.extra,
         {
             "chunk_length": chunk_length,
-            "tokens_per_optimizer_step": raw_tokens_per_step,
-            "effective_tokens_per_optimizer_step": raw_tokens_per_step,
-            "decoder_prob": decoder_prob,
+            "tokens_per_optimizer_step": tokens_per_step,
             "target_tokens": target_tokens,
             "max_optimizer_steps": max_optimizer_steps,
-            "schedule_branch_scale": 1,
             "config_hash": config_hash,
             "run_relpath": run_rel,
             "config_refs": {
