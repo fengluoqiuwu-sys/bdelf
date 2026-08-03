@@ -1,5 +1,5 @@
 ---
-description: 远端（Slurm / partition=cls1）计算与自动运行硬约束
+description: 远端 Slurm（ovan-server / cls1）计算硬约束
 alwaysApply: true
 ---
 
@@ -7,40 +7,35 @@ alwaysApply: true
 
 ## 集群
 
-- 通过 `ssh ovan-server` 操作远端 **Slurm** 集群。
-- 只能使用 `partition=cls1`。
-- 节点（每节点 8 卡）：
-  - `cls1-srv1`：8× A6000（48GB）
-  - `cls1-srv[2-4]`：8× RTX 4090（24GB）
+- 主机：`ssh ovan-server`；**仅** `partition=cls1`。
+- `cls1-srv1`：8× A6000（48GB）；`cls1-srv[2-4]`：8× RTX 4090（24GB）。
+- AI 训练：最多 **1 node、4 GPU**；禁止跨节点。
 
-## 如何跑任务
+## 远端状态（强制前置）
 
-- 训练、评测、预处理及任何 CPU/GPU 占用不可忽略的工作，**必须经 Slurm `sbatch` 提交**。
-- 禁止在登录节点用非 Slurm 的 Python（含交互式 `python` / `.venv`）跑作业。
-- ssh 登录节点只允许轻量操作：查队列/状态、读日志、更新 `temp/` 登记等。
-- AI 拉起的训练最多 **1 node、4 GPU**（如 `#SBATCH --nodes=1` + `#SBATCH --gpus-per-node=4`）；禁止跨节点或超过 4 卡。
-- 训练：`scripts/train/*.sh` + 远端 `bash slurm/sbatch-train.sh <name>`（短名；`--name` 改 job-name；模板 `slurm/prototype.slurm`）；禁止提交 `slurm/preprocess-*`。
-- 作业内 Python 环境由脚本自行 `source .venv/bin/activate`。
+在本机对远端做**作业相关操作**之前（`sbatch` / `slurm/sbatch-train.sh` / `scancel`、改 `temp/agent` 登记等），**必须先**调用：
 
-## 远端文件系统
+```bash
+bash scripts/remote_status.sh          # 或加 --json
+```
 
-- 项目树（代码/配置/脚本等）**只读**；禁止用 ssh 直接改 `~/source/bdelf` 下除 `temp/` 外的任何文件。
-- 改动一律在本地完成 → `bash scripts/sync-ovan-server.sh push` → 再 `sbatch`。
-- **唯一可写路径**：`~/source/bdelf/temp/`（agent 任务登记）；`temp/` 在 push/pull 中均被屏蔽。
-- `slurm/logs/` 等仅允许只读查看；读训练 `.out`/`.err` 末 N 行：先 push，再
-  `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'`
- （脚本内不 SSH；见 skill `train-ops`）。
-- 查四节点 GPU 空闲：先 push，再
-  `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'`
-  （脚本内不 SSH；见 skill `train-ops`）。
+未跑完、未根据输出确认 GPU/队列/登记可继续之前，不得提交或取消作业。只读拉日志可用 `tail_remote_logs`（见 skill `train-ops`），不替代本工具。
 
-## AI 任务互斥
+## 提交与登录节点
 
-- 只约束本 agent 在 `temp/` 中登记过的任务；他人手动任务不擅自取消。
-- 同时只跑一个 AI 登记任务：提交前检查登记；可 `scancel` 自己上一个任务，或确认结束后再提交。
-- 拉起/取消后必须更新 `temp/` 登记。
+- 占 CPU/GPU 的工作必须经 Slurm；登录节点禁止非 Slurm 的重 Python 作业。
+- 登录节点只做轻量事：队列/状态、只读日志、写 `temp/` 登记。
+- 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`）。
+- **禁止** AI 提交 `slurm/preprocess-*`。
 
-## 禁止在远端做的事
+## 文件系统
 
-- generate / eval / 看训练效果 / 调试推理：不要在远端跑，拉回本机测（见 rule「本机计算约束」）。
-- 提交与登记见 skill `train-ops`；同步见 skill `sync-ovan-server`。
+- 项目树只读；改代码只在本地 → `bash scripts/sync-ovan-server.sh push` → 再提交。
+- 远端 AI **唯一可写**：`~/source/bdelf/temp/`（agent 登记；push/pull 均不同步）。
+- `slurm/gpu_availability.py` / `tail_remote_logs.py` 内不得 SSH；本机汇总状态用 `scripts/remote_status.sh`。
+
+## 互斥与禁区
+
+- 同时只跑一个本 agent 已登记任务；可 `scancel` 自己的；勿动他人作业。
+- 禁止在远端 generate / eval / 看效果；拉回本机测。
+- 流程细节：skill `train-ops`、`sync-ovan-server`。

@@ -1,89 +1,49 @@
 ---
-description: bdelf 项目结构与编码规范
+description: bdelf 目录结构、配置模式与编码原则
 alwaysApply: true
 ---
 
 # bdelf 项目规范
 
-## 项目结构
+## 目录（摘要）
 
 ```
-config/
-  datasets/      # 数据集 YAML 配置
-  tokenizers/    # Tokenizer YAML 配置
-  preprocess/    # 预处理 YAML 配置
-  models/        # 模型架构 YAML 配置
-  train/         # 训练配方 / schedule / eval
-  generate/      # 每模型生成/采样 YAML（训练 --generate）
-dataset/         # FL_Dataset 基类与具体实现
-tokenizer/       # FL_Tokenizer 基类与具体实现
-scripts/         # 通用辅助脚本；scripts/train/ 为训练启动 sh
-slurm/           # prototype.slurm + sbatch-train.sh；gpu/tail 辅助；preprocess 作业
-cache/           # 本地缓存（已在 .gitignore 中）
-train.py         # 训练入口（仓库根）
-generate.py      # 生成入口（仓库根）
-hf_config.py     # HuggingFace 全局设置（镜像、禁用 XET）
+config/{datasets,tokenizers,preprocess,models,train,generate}/
+dataset/  tokenizer/  models/
+scripts/  scripts/train/   # 辅助与训练启动 sh
+slurm/                     # prototype + sbatch-train；gpu/tail；preprocess
+train.py  generate.py  hf_config.py
+cache/                     # gitignore
 ```
 
-## 命名约定
+脚本与 Slurm 细则见 rule「脚本约定」；checkpoint 路径见 rule「Checkpoint 路径与配置哈希」。
 
-- 基类 / 配置类使用 `FL_` 前缀：`FL_Dataset`、`FL_DatasetConfig`、`FL_Tokenizer`、`FL_TokenizerConfig`
-- 配置文件名与 `name` 字段一致：`config/datasets/wikitext.yaml` → `name: wikitext`
-- 具体实现类可私有命名：`_WikiText_Dataset`
+## 命名与配置
 
-## 配置模式
+- 基类/配置类：`FL_` 前缀（`FL_Dataset`、`FL_Tokenizer`…）。
+- 配置文件名与 `name` 字段一致；`prototype.yaml` 仅模板、不实例化。
+- Dataset：YAML + 实现类 + `register_dataset` → `get_dataset(name)`。
+- Tokenizer：YAML → `get_tokenizer(name)`（无需注册）。
+- Generate：`config/generate/<model>/{generate,eval}.yaml` → `get_generate(model, name)`；训练用 `eval`，`generate.py` 默认 `generate`。
+- 非属性键（如 `_doc`）进 `extra`；缺 `_YAML_REQUIRED` 字段则报错退出。
+- `config/**/*.yaml` 行内中文注释与同构：见 rule「config YAML 注释与结构」。
 
-**Dataset** 使用注册表模式：
+## HuggingFace / 依赖
 
-1. 在 `config/datasets/` 下新增 `<name>.yaml`（可复制 `prototype.yaml`）
-2. 实现继承 `FL_Dataset` 的具体类
-3. 在 `dataset/__init__.py` 中调用 `register_dataset(name, cls)`
-4. 外部通过 `get_dataset(name)` 获取实例
+- 先 `import hf_config`，再导入 `huggingface_hub` / `transformers` / `datasets`。
+- 本机依赖：仓库 `.venv`（见 rule「Python 虚拟环境」）；`requirements.txt` 含 cu130 torch 源。
 
-**Tokenizer** 无需注册，统一使用 `FL_Tokenizer`：
+## 注释与编码
 
-1. 在 `config/tokenizers/` 下新增 `<name>.yaml`（可复制 `prototype.yaml`）
-2. 外部通过 `get_tokenizer(name)` 获取实例
+- 注释主体用**中文**（专有名词可英文）；改到的英文注释顺手改中文。
+- 最小改动；复用 registry/config 加载；不主动加未要求的测试/文档。
 
-**Generate** 按模型分目录，每模型两套采样配置：
+## Agent skills（按需读）
 
-1. 在 `config/generate/<model>/` 下维护 `generate.yaml`（正式生成）与 `eval.yaml`（训练/测试）
-2. 外部通过 `get_generate(model, name)` 获取；训练 `--generate eval`，`generate.py` 默认 `--generate generate`
-3. 字段因模型而异（AR 有 temperature/top_k；bdelf 有 use_fast_infer 等），同模型内 `prototype`/`generate`/`eval` 同构
-
-`prototype.yaml` 仅作模板，不参与实例化。
-
-**YAML 配置规则**：
-
-- 非属性信息以 YAML 键值对书写（如 `_doc`），加载时存入配置的 ``extra`` 字段
-- 缺少 `_YAML_REQUIRED` 中定义的必需属性时加载报错退出
-- `config/**/*.yaml` 须对每个键值使用**行内中文注释**（写在右侧）；同功能文件（如 `prototype` 与 `full`）除参数取值外，键顺序 / 注释文案 / 布局须完全一致（见 rule「config YAML 注释与结构」）
-
-## HuggingFace 使用
-
-访问 HuggingFace 前必须先 `import hf_config`，再导入 `huggingface_hub` / `transformers` / `datasets`，以确保镜像与 XET 设置生效。
-
-## 依赖安装
-
-使用仓库根目录 `.venv`（见 rule「Python 虚拟环境」）。PyTorch 从 CUDA 13.0 wheel 源安装：
-
-```bash
-python3 -m venv .venv   # 若尚无
-.venv/bin/pip install -r requirements.txt
-```
-
-`requirements.txt` 中通过 `--extra-index-url https://download.pytorch.org/whl/cu130` 指定 torch/torchvision 源。
-
-## 注释语言（强制）
-
-- **整个项目**的注释一律使用**中文**（代码、配置、脚本、Slurm、skill/rule 文档中的说明性注释均适用）。
-- 允许保留必要的英文专有名词 / 缩写 / 符号（如 Muon、AdaLN、PPL、`torch.compile`、API 名、公式符号），但说明语句主体必须是中文。
-- 新写或改动文件时：顺手把触及到的英文注释改成中文；不必为「只改注释」单独全库翻写。
-- `config/**/*.yaml` 另有行内注释与同构要求，见 rule「config YAML 注释与结构」。
-
-## 编码原则
-
-- 最小改动：只改与任务相关的代码
-- 复用现有抽象，不重复实现 registry / config 加载逻辑
-- 注释用中文，且只解释非显而易见的业务或技术细节
-- 不主动添加未被要求的测试或文档
+| Skill | 用途 |
+|-------|------|
+| `train` | `train.py` CLI、配置拼装、checkpoint 定位 |
+| `train-ops` | 本机冒烟、远端 sbatch/登记；作业前必跑 `remote_status.sh` |
+| `generate` | 本机 `generate.py` |
+| `sync-ovan-server` | push / pull / pull-file |
+| `auto-train` | 用户明确「自动执行」后的闭环优化 |

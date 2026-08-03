@@ -1,50 +1,31 @@
 ---
-description: 辅助脚本放在 scripts/；一律以仓库根为工作目录执行
+description: 脚本放置与执行目录；Slurm 辅助脚本内禁止 SSH
 alwaysApply: true
 ---
 
-# 辅助脚本（scripts/）
+# 脚本约定
 
 ## 放置
 
-- 通用辅助脚本放在仓库根下的 `scripts/`（如 resolve / sync / 下数据集）。
-- **训练启动脚本**放在 `scripts/train/`（模板 `prototype.sh` + 各实验 `.sh`）。
-- **Slurm**：唯一训练模板 `slurm/prototype.slurm` + 包装器 `slurm/sbatch-train.sh`；另有 `gpu_availability.py` / `tail_remote_logs.py`。勿再为每个模型复制 `.slurm`。
-- **入口**仍留在仓库根：`train.py`、`generate.py`；库模块不要塞进 `scripts/`。
-
-## 执行目录（强制）
-
-- **默认工作目录是仓库根**（含 `train.py` / `config/` / `.venv/` 的那一层）。
-- 正确示例：
-
-```bash
-cd /path/to/bdelf
-.venv/bin/python scripts/resolve_checkpoint.py --model ar --config 100m-fast ...
-bash scripts/sync-ovan-server.sh push
-```
-
-- 不要 `cd scripts && python foo.py`；文档与 skill 里的命令写成 `scripts/<name>.py` 或 `slurm/<name>.py`。
-- `scripts/` 下 Python 通过 `scripts/repo_env.py` 的 `ensure_repo_root()` 固定 `cwd` / `sys.path`；`slurm/*.py` 辅助脚本自行 `chdir` 到仓库根。
-
-## 远端：ssh 后再跑 Python（强制）
-
-- `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**脚本内不得发起 SSH**；在目标机（通常 ovan-server）上直接调用 `scontrol` / 读本地文件。
-- 本机需要远端结果时：先 `bash scripts/sync-ovan-server.sh push`，再：
-
-```bash
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
-```
-
-## 常用脚本
-
-| 路径 | 用途 |
+| 位置 | 内容 |
 |------|------|
-| `scripts/resolve_checkpoint.py` | 与 train 同入参解析 hash / 目录 |
-| `scripts/download_dataset.py` | 按名下载数据集 |
-| `scripts/train/*.sh` | 训练启动（本地或经 sbatch-train） |
-| `scripts/sync-ovan-server.sh` | 与 ovan-server 同步（本地脚本，见 `.gitignore`） |
-| `slurm/sbatch-train.sh` | 短名提交 `scripts/train/<name>.sh`；`--name` 改 job-name |
-| `slurm/prototype.slurm` | 唯一训练 SBATCH 模板 |
-| `slurm/gpu_availability.py` | cls1 GPU 空闲表（远端执行） |
-| `slurm/tail_remote_logs.py` | 读 `slurm/logs` 末 N 行（远端执行） |
+| 仓库根 | 入口：`train.py`、`generate.py`（库代码勿塞进 `scripts/`） |
+| `scripts/` | 通用辅助（resolve、download、sync、`remote_status.sh` 等） |
+| `scripts/train/` | 训练启动 `.sh`（模板 `prototype.sh`） |
+| `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`gpu_availability.py` / `tail_remote_logs.py`；preprocess 作业 |
+
+勿再为每个模型复制一份 `.slurm`。
+
+## 执行目录
+
+- **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
+- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`。
+- 禁止 `cd scripts && python foo.py`。
+- `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
+
+## SSH 边界
+
+- `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**不得在进程内发起 SSH**；在目标机直接跑。
+- 本机查远端作业前置状态：`bash scripts/remote_status.sh`（内部 ssh；**远端任务前必跑**，见 rule「远端计算约束」）。
+- 本机读远端日志：push（如需）→ `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`。
+- 具体命令与登记流程见 skill `train-ops` / `sync-ovan-server`。
