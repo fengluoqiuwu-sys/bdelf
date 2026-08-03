@@ -59,7 +59,7 @@ temp/research-scout/<run-slug>/
 
 ### 开 paper-ingest subagent（强制）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto` 或 `composer-2.5-fast`**（同族 composer 亦可）。  
+用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**（禁止 composer 或其它显式模型）。  
 `run_in_background: false`（除非并行多篇且你能合并结果）。
 
 Prompt 须包含：
