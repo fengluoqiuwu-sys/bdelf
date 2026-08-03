@@ -1,6 +1,6 @@
 """AR2: semantic-anchor block-causal LM (intra-block token-by-token AR).
 
-Spec: temp/ar2.md (revised: intra-block mask-predict replaced by causal AR).
+Spec: temp/idea/ar2/README.md (revised: intra-block mask-predict replaced by causal AR).
 
 Sequence layout (training, single clean stream):
   per block: [s_0..s_{ns-1}, t_0..t_{B-1}], total K*(B+ns) positions.

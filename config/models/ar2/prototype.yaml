@@ -1,10 +1,10 @@
 _doc: >
   AR2 模型配置模板（不参与实例化）。语义锚点 + 块内因果 AR（精确 NLL，可与 AR 基线
-  直接比 PPL），规格见 temp/ar2.md。所有超参数集中于 yaml，模型代码不写死。
+  直接比 PPL），规格见 temp/idea/ar2/README.md。所有超参数集中于 yaml，模型代码不写死。
 
 name: ar2-prototype
 tokenizer: gpt2
-# 结构超参数（temp/ar2.md §6.1）
+# 结构超参数（temp/idea/ar2/README.md §6.1）
 block_size: 16          # B：块长
 num_anchors: 1          # n_s：每块锚点 <s> 个数
 t_window: 4             # W：t 列可见窗口（块数）

@@ -1,6 +1,6 @@
 """AR2 (anchor + intra-block causal AR) configuration.
 
-Spec: temp/ar2.md. Hyperparameters live in config/models/ar2/*.yaml; nothing
+Spec: temp/idea/ar2/README.md. Hyperparameters live in config/models/ar2/*.yaml; nothing
 architecture-related is hard-coded in the model.
 """
 
