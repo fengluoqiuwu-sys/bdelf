@@ -14,7 +14,7 @@ description: 本机运行 Python / pip 必须使用项目 .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-等价写法（与 `slurm/full/*.slurm` 一致）：
+等价写法：
 
 ```bash
 source .venv/bin/activate
@@ -22,4 +22,3 @@ python train.py ...
 ```
 
 - 缺 `.venv` 时先：`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
-- 远端 full 作业由 Slurm 脚本自行 `source .venv/bin/activate`；本机命令同样遵守本规则。

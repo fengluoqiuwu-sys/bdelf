@@ -17,6 +17,5 @@ description: 本机（RTX 5080）计算与自动运行硬约束
 
 ## 测试与评测
 
-- generate / eval / 调试推理：**只在本机跑**（不要在远端跑）。
-- 流程：先 `pull --mode fast [NAME]`，再 `pull-file` 拉所需 checkpoint，在本机测试。
-- 同步细节见 skill `sync-ovan-server`；本机调度见 skill `train-ops`。
+- generate / eval / 调试推理：只在本机跑。
+- 本机调度与训练命令见 skill `train`；生成见 skill `generate`。

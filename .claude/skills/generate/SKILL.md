@@ -9,9 +9,9 @@ description: >-
 
 # generate
 
-推理/生成入口：本机用 `.venv/bin/python generate.py`（见 rule「Python 虚拟环境」；
-**不在远端跑**，注意本机 GPU 互斥）。配合 skill `train-ops`（效果评测流程）与
-`sync-ovan-server`（先 `pull --mode fast [NAME]` 再 `pull-file` 拉所需 checkpoint）。
+推理/生成入口：本机用 `.venv/bin/python generate.py`（见 rule「Python 虚拟环境」与「本机计算约束」；
+注意本机 GPU 互斥）。Claude **禁止**操作远端（见 rule「禁止使用远端」）；checkpoint 须已在本机
+`cache/checkpoints/` 下。
 
 ## 选 checkpoint
 

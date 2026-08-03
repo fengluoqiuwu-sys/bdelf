@@ -23,15 +23,16 @@ description: >-
 查看远端目录结构或单个文件时，**优先用 ssh 直接读，不要为了看一眼就 pull**：
 
 ```bash
-# 列目录
+# 列目录 / 读小文本
 ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/'
 ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/<NAME>/'
-ssh ovan-server 'ls -la ~/source/bdelf/slurm/logs/'
-
-# 读单个文本/配置/日志（小文件）
 ssh ovan-server 'cat ~/source/bdelf/cache/checkpoints/<NAME>/config.json'
-ssh ovan-server 'tail -n 80 ~/source/bdelf/slurm/logs/<job>-<id>.out'
 ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
+
+# Slurm .out/.err 末 N 行：优先用本机脚本（见 train-ops）
+.venv/bin/python slurm/tail_remote_logs.py <JOB_ID>
+.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120
+.venv/bin/python slurm/tail_remote_logs.py --list
 ```
 
 - 适用：确认 run 是否存在、checkpoint 步数列表、日志尾部、config、agent 登记、目录树。

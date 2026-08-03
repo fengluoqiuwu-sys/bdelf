@@ -1,19 +1,17 @@
 ---
 name: train
 description: >-
-  Run bdelf pretraining via train.py: local fast/debug training on RTX 5080 and
-  remote full training on ovan-server. Understand the train config layout
-  (model/batch/eval/hardware/optimizer/schedule), construct train.py CLI args,
-  and read/verify checkpoints and train/eval logs. Use when the user wants to
-  launch or inspect training, pick a train config, or check train/eval progress.
+  Run bdelf pretraining via train.py on local RTX 5080 (fast/debug). Understand
+  the train config layout (model/batch/eval/hardware/optimizer/schedule),
+  construct train.py CLI args, and read/verify checkpoints and train/eval logs.
+  Use when the user wants to launch or inspect local training, pick a train
+  config, or check train/eval progress.
 ---
 
 # train
 
-训练入口：本机用 `.venv/bin/python train.py`（见 rule「Python 虚拟环境」）。配合
-rule「本机计算约束」/「远端计算约束」、skill `train-ops`（调度/互斥/远端 Slurm 登记）与
-`sync-ovan-server`（push/pull）使用。本 skill 聚焦**命令与配置**本身；要不要跑
-full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto-train`。
+训练入口：本机用 `.venv/bin/python train.py`（见 rule「Python 虚拟环境」与
+「本机计算约束」）。Claude **不得**操作远端（见 rule「禁止使用远端」）。
 
 ## 命令格式
 
@@ -32,7 +30,6 @@ full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto
 ### 运行位置与规模
 
 - 本机 5080（fast）：`.venv/bin/python train.py --model elf --config 100m-fast --dataset owt --preprocess elf`
-- 远端 4×4090（full）：`python train.py --config 100m-full ...`（由 `slurm/full/*.slurm` 内 `source .venv/bin/activate` 后调用）
 - 本机**不要**跑 full/ultra；full 自动探测 GPU 数（须 ∈ {1,2,4,8}），本机只有 1 卡默认配 world_size=4 会启动失败。
 
 ## 训练配置（config/train/）
@@ -67,5 +64,5 @@ full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto
 ## 检查进度 / 续训
 
 - `resume` 默认 true：`checkpoint_latest.pt` 存在则自动续训（CSV 按 step 截断，恢复 RNG）。
-- 看曲线/评测：`pull --mode fast [NAME]` 拉回 `train_log.csv`/`eval_log.csv` 后分析，或在远端只读 `tail` 日志（见 train-ops），不要在远端跑 generate/eval。
+- 看曲线/评测：直接读本机 `cache/checkpoints/<run>/` 下的 `train_log.csv` / `eval_log.csv`。
 - 已到 `max_steps`（由 `target_tokens` 折算）会直接结束；训练结束总是落最终 checkpoint。

@@ -101,11 +101,28 @@ cp ~/source/bdelf/temp/agent/current.json ~/source/bdelf/temp/agent/launched/<JO
 - `squeue` 里非本 agent 登记的 job：**不要** `scancel`。
 - 资源紧张时告知用户，由用户决定。
 
-### 只读日志
+### 只读日志（优先用本机脚本）
+
+日志在远端 `~/source/bdelf/slurm/logs/<job-name>-<job-id>.{out,err}`。
+**优先**用仓库脚本经 SSH 拉末 N 行（登录节点只跑 `tail`，轻量合法）：
 
 ```bash
-ssh ovan-server 'tail -n 80 ~/source/bdelf/slurm/logs/<job>-<id>.out'
+# 按 job_id 同时看 .out + .err 末 80 行（默认）
+.venv/bin/python slurm/tail_remote_logs.py <JOB_ID>
+
+# 只要 stdout / stderr，或改行数
+.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which out
+.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120
+
+# 作业名 + id（多匹配时）；或只给作业名取该前缀最新一份
+.venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --job-name <NAME>
+.venv/bin/python slurm/tail_remote_logs.py --job-name <NAME> -n 50
+
+# 列出远端 logs 近期文件（找 job_id / 文件名）
+.venv/bin/python slurm/tail_remote_logs.py --list
 ```
+
+不要为了看日志去 `pull`；也不要手写长串 `ssh ... tail`，除非脚本不可用。
 
 ## 测试效果（拉回本机）
 
