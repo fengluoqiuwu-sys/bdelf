@@ -324,6 +324,39 @@ def _wait_for_file(
         time.sleep(interval_s)
 
 
+def _try_open_ckpt(path: Path, *, timeout_s: float = 2.0) -> Path | None:
+    """Return ``path`` if briefly openable; BeeGFS ghosts can pass ``is_file``."""
+    try:
+        return _wait_for_file(path, timeout_s=timeout_s, interval_s=0.2)
+    except FileNotFoundError:
+        return None
+
+
+def _pick_resume_ckpt(run_dir: Path) -> Path | None:
+    """Prefer latest, then explicit resume_*, then newest step_* that can open."""
+    candidates: list[Path] = [run_dir / "checkpoint_latest.pt"]
+    candidates.extend(sorted(run_dir.glob("checkpoint_resume_*.pt"), reverse=True))
+    step_ckpts = sorted(
+        run_dir.glob("checkpoint_step_*.pt"),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    candidates.extend(step_ckpts)
+    seen: set[Path] = set()
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        opened = _try_open_ckpt(resolved)
+        if opened is not None:
+            return opened
+    return None
+
+
 def _stage_ckpt_to_local(
     src: Path, *, rank: int, is_distributed: bool,
 ) -> Path:
@@ -469,12 +502,23 @@ def train_loop(
     if rank == 0 and ema_state is not None:
         _train_log(f"EMA enabled: decay={ema_decay:g}")
 
-    # Only rank 0's filesystem view decides resume; peers wait for the file.
-    resume_from_ckpt = cfg.resume and latest_ckpt.is_file() if rank == 0 else False
+    # Rank0 picks an *openable* ckpt (BeeGFS ghosts: is_file ok, open fails).
+    resume_src: Path | None = None
+    if rank == 0 and cfg.resume:
+        resume_src = _pick_resume_ckpt(run_dir)
+        if resume_src is not None and resume_src != latest_ckpt:
+            _train_log(
+                f"checkpoint_latest not openable here; resuming from {resume_src.name}",
+            )
+    resume_from_ckpt = resume_src is not None
     if is_distributed:
         flag = torch.tensor([int(resume_from_ckpt)], device=device, dtype=torch.int32)
         dist.broadcast(flag, src=0)
         resume_from_ckpt = bool(flag.item())
+        name_list = [resume_src.name if resume_src is not None else ""]
+        dist.broadcast_object_list(name_list, src=0)
+        if resume_from_ckpt:
+            resume_src = (run_dir / name_list[0]).resolve()
 
     if resume_from_ckpt:
         # Every rank must load weights/optimizer state: DDP only broadcasts
@@ -482,8 +526,9 @@ def train_loop(
         # leave the other ranks on their random init.
         # Stage off BeeGFS first: concurrent multi-rank open of a ~1GB file
         # has hit FileNotFoundError even after is_file()/short waits.
+        assert resume_src is not None
         resume_path = _stage_ckpt_to_local(
-            latest_ckpt, rank=rank, is_distributed=is_distributed,
+            resume_src, rank=rank, is_distributed=is_distributed,
         )
         step, loaded_ema = load_checkpoint(
             resume_path, model, optimizer, device,
