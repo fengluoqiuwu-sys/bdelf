@@ -70,6 +70,8 @@ def append_csv_row(csv_path: Path, fields: list[str], row: dict[str, Any]) -> No
 
 def ensure_csv_schema(csv_path: Path, fields: list[str]) -> None:
     """Rewrite CSV if the on-disk header is missing newly added columns."""
+    if not csv_path.exists():
+        return
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         old_fields = list(reader.fieldnames or [])
