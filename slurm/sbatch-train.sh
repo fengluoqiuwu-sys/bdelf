@@ -119,6 +119,14 @@ if [[ -z "$JOB_NAME" ]]; then
   JOB_NAME="$(basename "$TRAIN_SCRIPT" .sh)"
 fi
 
+# 计算节点上 /home/csh 常不可见；与 prototype.slurm 统一为 BeeGFS 绝对路径。
+PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
+TRAIN_SCRIPT="$PROJECT/scripts/train/$(basename "$TRAIN_SCRIPT")"
+if [[ ! -f "$TRAIN_SCRIPT" ]]; then
+  echo "BeeGFS 上找不到训练脚本: $TRAIN_SCRIPT" >&2
+  exit 1
+fi
+
 mkdir -p "$ROOT/slurm/logs"
 
 # 不用 sbatch --export：集群上 ALL/NONE 均曾触发
