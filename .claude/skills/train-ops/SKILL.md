@@ -8,7 +8,8 @@ description: >-
 
 # train-ops
 
-配合 rule「本机与远端计算约束」与 skill `sync-ovan-server`。
+配合 rule「本机计算约束」/「远端计算约束」、rule「Python 虚拟环境」与 skill `sync-ovan-server`。
+本机 Python 一律用 `.venv/bin/python`（或先 `source .venv/bin/activate`）。
 
 ## 本机（5080 / fast + 调试）
 
@@ -23,7 +24,8 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
    - 用户自行启动的进程 → 不杀；改为等待或询问用户
 3. 一次只跑一个占 GPU 的进程（训练 / generate / 显存探测等串行）。
 4. 使用 `fast` / `fast-16gb` 等本机配置；不要在本机跑远端 full 规模多卡作业。
-5. `fast` 是**冒烟验证**，不是正式训练：起进程后看到**首批 loss 正常打印、无崩溃**即可，
+5. 本机命令用 `.venv/bin/python`（见 train / generate skill），不要用系统 python。
+6. `fast` 是**冒烟验证**，不是正式训练：起进程后看到**首批 loss 正常打印、无崩溃**即可，
    **2–3 分钟内主动停掉**（kill），不要跑满 fast 的 token 预算（正式训练只在远端 full 跑）。
 
 ## 远端（4×4090 / 仅 full + Slurm）

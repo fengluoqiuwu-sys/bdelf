@@ -9,9 +9,9 @@ description: >-
 
 # generate
 
-推理/生成入口：`python generate.py`（**不在远端跑**，本机测试，注意本机 GPU 互斥）。
-配合 skill `train-ops`（效果评测流程）与 `sync-ovan-server`（先 `pull --mode fast [NAME]`
-再 `pull-file` 字段所需 checkpoint 到本地）。
+推理/生成入口：本机用 `.venv/bin/python generate.py`（见 rule「Python 虚拟环境」；
+**不在远端跑**，注意本机 GPU 互斥）。配合 skill `train-ops`（效果评测流程）与
+`sync-ovan-server`（先 `pull --mode fast [NAME]` 再 `pull-file` 拉所需 checkpoint）。
 
 ## 选 checkpoint
 
@@ -23,18 +23,18 @@ description: >-
 | `--checkpoint <path>` | 显式指定任意 `.pt`（含历史快照） |
 | （省略） | 扫 `cache/checkpoints/*/checkpoint_latest.pt` 取 mtime 最新者 |
 
-不确定有哪些 run：`python generate.py --list-runs`。
+不确定有哪些 run：`.venv/bin/python generate.py --list-runs`。
 
 ## 基本用法
 
 ```bash
-python generate.py                                    # 最新 checkpoint，1024 token 无条件生成
-python generate.py --run elf-100m-full                # 指定 run 的最新权重
-python generate.py --checkpoint cache/checkpoints/<run>/checkpoint_step_0100000.pt  # 指定步数
-python generate.py --num-samples 3                    # 多个独立样本
-python generate.py --prompt "Once upon a time"        # 续写（自动前置 BOS）
-python generate.py --prompt-file prompt.txt --run ar-100m-full-muon
-python generate.py --device cuda:0                    # 默认 cuda（无卡则 cpu）
+.venv/bin/python generate.py                                    # 最新 checkpoint，1024 token 无条件生成
+.venv/bin/python generate.py --run elf-100m-full                # 指定 run 的最新权重
+.venv/bin/python generate.py --checkpoint cache/checkpoints/<run>/checkpoint_step_0100000.pt  # 指定步数
+.venv/bin/python generate.py --num-samples 3                    # 多个独立样本
+.venv/bin/python generate.py --prompt "Once upon a time"        # 续写（自动前置 BOS）
+.venv/bin/python generate.py --prompt-file prompt.txt --run ar-100m-full-muon
+.venv/bin/python generate.py --device cuda:0                    # 默认 cuda（无卡则 cpu）
 ```
 
 ## 主要参数

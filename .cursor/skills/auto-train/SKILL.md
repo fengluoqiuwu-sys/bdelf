@@ -14,9 +14,9 @@ description: >-
 
 自动训练 + 自动优化的完整闭环 skill。仅在用户**明确说"请自动执行"并授权**后启动。
 
-配合 rule「本机与远端计算约束」、skill `train-ops`（本地调试/远端 Slurm 登记/评测）与
+配合 rule「本机计算约束」/「远端计算约束」、skill `train-ops`（本地调试/远端 Slurm 登记/评测）与
 `sync-ovan-server`（push / pull / pull-file）使用。本 skill 只编排流程与决策，不重复实现
-命令细节；需要具体命令时去读那两个 skill 与 rule。
+命令细节；需要具体命令时去读那两个 skill 与对应 rule。
 
 ## 远端只读探查（优先于 pull）
 
@@ -126,6 +126,7 @@ git switch master && git switch -c <idea>
 
 **4. 本地验证（5080 / fast）—— 只做冒烟，不跑满**
 
+- 本机 Python 用 `.venv/bin/python`（见 rule「Python 虚拟环境」、skill train / generate）。
 - `fast` **仅用于验证改动能跑通**，不是正式训练：起训练后观察到**首批训练步 loss 正常打印、
   无报错 / 崩溃 / segfault** 即可，通常 **2–3 分钟**内确认后就**主动停掉该进程**（kill），
   不要让 fast 跑满整个 token 预算（正式训练只在远端 full 跑）。

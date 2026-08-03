@@ -10,15 +10,15 @@ description: >-
 
 # train
 
-训练入口：`python train.py`。配合 rule「本机与远端计算约束」、skill `train-ops`
-（调度/互斥/远端 Slurm 登记）与 `sync-ovan-server`（push/pull）使用。本 skill
-聚焦**命令与配置**本身；要不要跑 full、提交到远端、拉 checkpoint 等流程决策见
-`train-ops` 与 `auto-train`。
+训练入口：本机用 `.venv/bin/python train.py`（见 rule「Python 虚拟环境」）。配合
+rule「本机计算约束」/「远端计算约束」、skill `train-ops`（调度/互斥/远端 Slurm 登记）与
+`sync-ovan-server`（push/pull）使用。本 skill 聚焦**命令与配置**本身；要不要跑
+full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto-train`。
 
 ## 命令格式
 
 ```bash
-python train.py \
+.venv/bin/python train.py \
   --model     <model>      # 必须：ar | ar1_5 | ar2 | bd3lm | bdelf | elf
   --config    <name>       # 必须：config/train/batch/<model>/<name>.yaml，如 100m-fast / 900m-full
   --dataset   <dataset>    # 必须：config/datasets/，如 owt / wikitext / arxiv
@@ -31,8 +31,8 @@ python train.py \
 
 ### 运行位置与规模
 
-- 本机 5080（fast）：`python train.py --model elf --config 100m-fast --dataset owt --preprocess elf`
-- 远端 4×4090（full）：`python train.py --config 100m-full ...`（由 `slurm/full/*.slurm` 内调用）
+- 本机 5080（fast）：`.venv/bin/python train.py --model elf --config 100m-fast --dataset owt --preprocess elf`
+- 远端 4×4090（full）：`python train.py --config 100m-full ...`（由 `slurm/full/*.slurm` 内 `source .venv/bin/activate` 后调用）
 - 本机**不要**跑 full/ultra；full 自动探测 GPU 数（须 ∈ {1,2,4,8}），本机只有 1 卡默认配 world_size=4 会启动失败。
 
 ## 训练配置（config/train/）

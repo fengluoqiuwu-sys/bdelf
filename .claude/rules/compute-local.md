@@ -1,0 +1,22 @@
+---
+description: 本机（RTX 5080）计算与自动运行硬约束
+---
+
+# 本机计算约束
+
+## 环境
+
+- **硬件**：1× RTX 5080（16GB）。
+- **用途**：`fast` 训练与任意快速调试。
+- **Python**：一律用仓库 `.venv`（见 rule「Python 虚拟环境」）。
+
+## GPU 互斥
+
+- 不要让两个占用 GPU 的进程同时跑；需要时串行。
+- 允许结束 **本会话拉起** 的旧 GPU 进程；不要随意杀掉用户自己启动的进程。
+
+## 测试与评测
+
+- generate / eval / 调试推理：**只在本机跑**（不要在远端跑）。
+- 流程：先 `pull --mode fast [NAME]`，再 `pull-file` 拉所需 checkpoint，在本机测试。
+- 同步细节见 skill `sync-ovan-server`；本机调度见 skill `train-ops`。

@@ -49,10 +49,11 @@ hf_config.py     # HuggingFace 全局设置（镜像、禁用 XET）
 
 ## 依赖安装
 
-PyTorch 从 CUDA 13.0 wheel 源安装：
+使用仓库根目录 `.venv`（见 rule「Python 虚拟环境」）。PyTorch 从 CUDA 13.0 wheel 源安装：
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv   # 若尚无
+.venv/bin/pip install -r requirements.txt
 ```
 
 `requirements.txt` 中通过 `--extra-index-url https://download.pytorch.org/whl/cu130` 指定 torch/torchvision 源。
