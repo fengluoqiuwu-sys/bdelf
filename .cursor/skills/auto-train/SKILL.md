@@ -14,31 +14,13 @@ description: >-
 
 自动训练 + 自动优化的完整闭环 skill。仅在用户**明确说"请自动执行"并授权**后启动。
 
-配合 rule「本机计算约束」/「远端计算约束」、skill `train-ops`（本地调试/远端 Slurm 登记/评测）与
-`sync-ovan-server`（push / pull / pull-file）使用。本 skill 只编排流程与决策，不重复实现
-命令细节；需要具体命令时去读那两个 skill 与对应 rule。
+配合 rule「本机/远端计算」「temp/ 布局」、skill `train-ops` / `sync-ovan-server` / `train` / `generate`。  
+本 skill 只编排闭环与决策；具体命令去读对应 skill。
 
 ## 远端只读探查（优先于 pull）
 
-查看远端目录结构或单个文件时，**优先用 ssh 直接读，不要为了看一眼就 pull**：
-
-```bash
-# 列目录 / 读小文本
-ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/'
-ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/{fast,full}/*/*/'
-ssh ovan-server 'cat ~/source/bdelf/cache/checkpoints/<variant>/<model>/<hash>/config.json'
-
-ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
-
-# Slurm .out/.err 末 N 行：push 后在远端跑脚本（见 train-ops；脚本内无 SSH）
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120'
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --list'
-```
-
-- 适用：确认 run 是否存在、checkpoint 步数列表、日志尾部、config、agent 登记、目录树。
-- **不要**用 ssh 读大二进制（`.pt`）；需要权重时用 `pull-file` / `pull --mode common`。
-- 仅在本地要跑 generate/eval、或需要把元数据落盘对照时，再 `pull --mode fast` / `pull-file`。
+看目录、config、登记、日志末尾时：**优先 ssh 只读**（命令见 skill `train-ops`），不要为看一眼就 pull。  
+勿 ssh 读大 `.pt`；需要权重用 `pull-file` / `pull --mode common`。
 
 ## 触发与授权
 
@@ -106,12 +88,13 @@ ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py
 6. 唤醒循环：5m → 15m → 30m → 此后每 30m（见「唤醒调度」）
    ├ 7a 决定继续 → 回 6
    ├ 7b 需调整 → 8
-   └ 7c 已完成 → 11
-8. 停止训练：本分支可修 → 9；需换架构 → 10
+   ├ 7c 已完成 → 11
+   └ 7d 同 bug 卡住（见「卡住即停」）→ 11，勿空烧 token
+8. 停止训练：本分支可修 → 9；需换架构 → 10；修不动 →「卡住即停」→ 11
 9. 本分支修改 → commit → 删远端该 run checkpoint → push 重跑 → 回 4/5（temp 记录原因）
 10. 架构调整 / 换向 → 从当前分支 fork 新分支继承代码 → 删远端旧 run checkpoint
     → temp 记放弃原因/调整 → 回 3（实现调整）
-11. 完成 → 写 temp/auto-research/<idea>/SUMMARY.md → 结束并总结
+11. 完成 / 放弃 → 写 temp/auto-research/<idea>/SUMMARY.md → 结束并总结
 ```
 
 ### 步骤详述
@@ -162,7 +145,8 @@ git commit -m "<语义化描述>"
 - [前置] 工作区已干净（第 4.5 步已提交，git status 无未提交改动）
 - bash scripts/sync-ovan-server.sh push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
-- 读远端 temp/agent/current.json，确保无未结束的 AI job 或有登记
+- bash scripts/remote_status.sh   # 强制：GPU / 队列 / agent 登记
+- 确认无未结束 AI job（或已 scancel 自己的）且有足够 AVAIL
 - ssh 后 `bash slurm/sbatch-train.sh <name>`（可选 `--name JOB_NAME`）
 - 写 current.json + launched/<job_id>.json
 - 启动「5 分钟后首次唤醒」后台调度（见「唤醒调度」）
@@ -170,19 +154,20 @@ git commit -m "<语义化描述>"
 
 **6-7. 唤醒循环与判据**
 
-唤醒节奏（与 rule `auto-train-wake` 一致；每次 sbatch / 续训重提后重新计数）：
-**第 1 次 5 分钟**（确认拉起）→ **第 2 次 15 分钟** → **第 3 次 30 分钟** → **此后每 30 分钟**。
+唤醒节奏见下节「唤醒调度」（每次 sbatch / 续训重提后重新计数）。
 每次唤醒：
 
-1. **优先 ssh 只读探查**（见上节）：`squeue`、列 `checkpoints/<NAME>/`、`tail` 日志、读 `config.json` /
-   `current.json`——确认拉起状态与进度，**不必先 pull**。
+1. **优先只读探查**：`bash scripts/remote_status.sh`（队列/登记/GPU），再按需 `tail_remote_logs`、
+   列 `checkpoints/<NAME>/`、读 `config.json`——确认拉起状态与进度，**不必先 pull**。
+   若本轮要 `scancel` / 重提 sbatch，同样先跑 `remote_status.sh`。
 2. 需要本地对照元数据时再 `pull --mode fast [NAME]`（禁 full）。
 3. 看训练数据：loss/step、gen_ppl 等；需要权重时 `pull-file` 拉某个 checkpoint。
 4. 在本机跑 generate / eval（**不要在远端测**，见 train-ops）。
-5. 三选一：
+5. 四选一：
    - 曲线健康、还值得训 → 继续循环（6）。
    - 需要调整 → 8。
    - 已收敛/无需再调 → 11。
+   - **卡死在同一 bug**（见「卡住即停」）→ 11，勿再修。
 
 **8-9. 同分支调整**
 
@@ -217,35 +202,48 @@ git commit -m "<语义化描述>"
 
 **11. 完成与总结**
 
-- 判定标准：当前方向已收敛、或继续调优收益趋近于零、或资源/时间到限。
-- 写 `temp/auto-research/<idea>/SUMMARY.md`：最终架构、最佳配置、数据、优缺点、后续建议。
+- 判定标准：当前方向已收敛、继续调优收益趋近于零、资源/时间到限、或触发「卡住即停」（久修不果的 bug）。
+- 写 `temp/auto-research/<idea>/SUMMARY.md`：最终架构、最佳配置、数据、优缺点、后续建议；若因 bug 放弃，写清症状、已试修复与放弃原因。
 - 结束循环，向用户给出**完整总结**（用了哪些分支、跑了哪些实验、结论、checkpoint 位置）。
 
 ## 唤醒调度（重要）
 
-Cursor 中 agent 无法自主设闹钟；用「后台 sleep + 输出通知」实现：
-每个 turn 末尾启动一个后台调度，`sleep` 对应时长后发一条带特征串的输出通知，据此在下个
-turn 继续（system 会在 turn 结束后推送该通知）。
+Cursor agent 无自主闹钟；用后台 `sleep` + 特征串输出，在 turn 结束后由系统通知唤醒。  
+间隔按**本轮作业已成功唤醒次数**递进（每次 sbatch / 续训重提后重新计数）：
+
+| 次序 | 间隔 | sleep |
+|------|------|-------|
+| 第 1 次 | 5 分钟 | `300` |
+| 第 2 次 | 15 分钟 | `900` |
+| 第 3 次起 | 每 30 分钟 | `1800` |
 
 ```bash
-# 递进：5m → 15m → 30m → 此后每 30m（按本轮作业已成功唤醒次数）
 sleep 300 && echo "AUTO-TRAIN-WAKEUP-1"    # 第 1 次
 sleep 900 && echo "AUTO-TRAIN-WAKEUP-2"    # 第 2 次
 sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
 ```
 
-- 间隔按上表执行；唤醒消息带上**明确的下一步动作**（pull fast /
-  读日志 / 决定继续或调整），避免描述含糊。
-- **依赖对话保持开启**：这个机制只有会话存在时才有效。若会话迟迟未被唤醒或已关闭，
-  下次启动时从「ssh 读远端 job 状态 + 目录/日志」恢复现场，而不是从头再来。
-- 唤醒循环有收敛退出：训练报错多次重试无效、方向被判失败换向、或判定完成 → 结束。
+- 唤醒消息须带**明确下一步**（读日志 / pull fast / 决定继续或调整）。
+- **依赖对话保持开启**；会话中断后，下次从 ssh 读 job/日志恢复，勿从头重来。
+- ssh 连不上时的重试仍睡 5 分钟（与上表无关）。
+- 收敛退出：多次不可救报错、换向、判定完成、或「卡住即停」。
+
+## 卡住即停（防空烧 token）
+
+同一阻塞问题（编译/运行崩溃、loss NaN、数据管线挂死、反复相同 traceback 等）**不要无限修—重跑**。满足任一即结束本轮 auto-train（进 11，写 SUMMARY，向用户说明），**禁止**为「再试一次」继续烧对话 / 训练 token：
+
+- **同因修复 ≥3 次**仍不过本地冒烟，或远端仍以同类错误失败；
+- **连续 ≥2 次换向/大改**仍卡在同一根因（说明方向或问题理解不对，继续叠改无意义）；
+- 已清楚根因但修复依赖外部条件（缺数据、集群策略、非本仓库权限等），短期无法推进。
+
+未达阈值前：每次失败在 `temp/auto-research/<idea>/` 记清报错摘要与已试手段，避免重复无效路径。到阈值后**立刻停**，不要再开一轮 sbatch「碰运气」。
 
 ## 异常 / 失败处理
 
 - **ssh 连不上**：睡 5 分钟重试（可能是网络波动）。
 - **连续 3 次连不上**：退出任务，向用户总结已经做到哪一步、远端状态如何、如何恢复。
-- **远端 job 报错 / 崩溃**：看日志定位；可救则同分支修（9），不可救则换向（10）。
-- **本地训练/推理卡死**：结束本次占用进程重试；不随意杀用户自己启动的进程。
+- **远端 job 报错 / 崩溃**：看日志定位；可救则同分支修（9），不可救则换向（10）；反复同类错误按「卡住即停」。
+- **本地训练/推理卡死**：结束本次占用进程重试；不随意杀用户自己启动的进程；同因多次卡死同样适用「卡住即停」。
 
 ## 边界（不要自动做）
 
