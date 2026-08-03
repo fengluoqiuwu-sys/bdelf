@@ -6,44 +6,34 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Type, TypeVar
+from typing import Any, Dict, List, Literal, Optional, TypeVar
 
 import yaml
 
-from config_util import load_yaml_config
+from config_util import load_mapping_config
 from models import resolve_model_config_path
 from preprocess import get_preprocess
+from train.generate_config import get_generate
+from train.run_path import (
+    CHECKPOINT_ROOT,
+    build_train_fingerprint,
+    config_hash_from_fingerprint,
+    run_dir_for,
+    run_relpath,
+)
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "train"
-BATCH_DIR = CONFIG_DIR / "batch"
-CHECKPOINT_ROOT = "cache/checkpoints"
+MODEL_DIR = CONFIG_DIR / "model"
 
-TrainVariant = Literal["fast", "full", "ultra"]
+TrainVariant = Literal["fast", "full"]
 TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
 _TRAIN_MODELS = ("ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "cola_vae", "cola")
-_MODEL_CONFIG_RE = re.compile(r"^(100m|300m|900m)-(fast|full|ultra)$")
-_HARDWARE_BY_VARIANT = {
-    "fast": "fast-16gb",
-    "full": "full-4x4090",
-    "ultra": "full-8x4090",
-}
-
-
-@dataclass
-class FL_HardwareConfig:
-    _YAML_REQUIRED = frozenset(
-        {"name", "world_size", "num_workers", "gpu_memory_gb", "memory_headroom_gb"}
-    )
-
-    name: str = "prototype"
-    world_size: int = 1
-    num_workers: int = 2
-    gpu_memory_gb: float = 16.0
-    memory_headroom_gb: float = 1.0
-    extra: Dict[str, Any] = field(default_factory=dict)
+_MODEL_CONFIG_RE = re.compile(r"^(100m)-(fast|full)$")
+# DataLoader workers per rank; world_size comes from visible GPU count at launch.
+DEFAULT_NUM_WORKERS = 8
 
 
 @dataclass
@@ -81,7 +71,8 @@ class FL_ScheduleConfig:
 
     YAML ``{eval,save,snapshot,log_plot}_step`` are in optimizer-step units.
     ``compose_train_config`` multiplies them (and ``max_steps`` / warmup) by
-    ``grad_accum_steps`` so ``train_loop`` can count every micro-batch.
+    the derived accum (``global_batch_size / (batch_size * world_size)``) so
+    ``train_loop`` can count every micro-batch.
 
     The only accepted knobs are ``target_tokens`` + ``warmup_ratio`` +
     ``{eval,save,snapshot,log_plot}_step``. Legacy ``max_steps`` / ``*_every`` /
@@ -125,9 +116,6 @@ class FL_EvalConfig:
         {
             "name",
             "eval_sample_seed",
-            "gen_eval_model",
-            "gen_eval_model_dtype",
-            "gen_eval_model_device",
         }
     )
 
@@ -139,37 +127,30 @@ class FL_EvalConfig:
     gen_eval_model: str = "gpt2-large"
     gen_eval_model_dtype: TrainDtype = "bf16"
     gen_eval_model_device: str = "cuda"
-    # Number of generate() batches per gen-PPL eval
-    gen_eval_batches: int = 32
-    # BDELF generate during eval: false → legacy (full AdaLN), matches training
-    use_fast_infer: bool = False
-    # BD3LM online-eval sampling steps (full 5000 is too slow)
-    eval_gen_steps: int = 128
+    # Total sequences to generate+score per gen-PPL eval
+    gen_eval_samples: int = 32
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FL_BatchConfig:
-    """Per-run micro-batch. Exactly one of ``grad_accum_steps`` / ``global_batch_size``.
+    """Per-run micro-batch. ``global_batch_size`` is required.
 
-    ``fast`` configs set ``grad_accum_steps``. ``full``/``ultra`` set
-    ``global_batch_size``; compose derives accum as
+    Compose derives micro-batch accum as
     ``global_batch_size / (batch_size * world_size)``.
     """
 
-    _YAML_REQUIRED = frozenset({"name", "batch_size", "num_params_m"})
+    _YAML_REQUIRED = frozenset({"name", "batch_size", "global_batch_size"})
 
     name: str = "prototype"
     batch_size: int = 4
-    grad_accum_steps: Optional[int] = None
-    global_batch_size: Optional[int] = None
-    num_params_m: float = 100.0
+    global_batch_size: int = 4
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FL_TrainConfig:
-    """Composed training config resolved by convention from sub-configs."""
+    """Composed training config resolved from per-model recipe + global schedule/eval."""
 
     name: str
     model: str
@@ -177,9 +158,11 @@ class FL_TrainConfig:
     variant: TrainVariant
     dataset: str
     preprocess: str
+    generate: str
     checkpoint_root: str
     batch_size: int
-    grad_accum_steps: int
+    grad_accum_steps: int  # derived: global_batch_size / (batch_size * world_size)
+    global_batch_size: int
     world_size: int
     dtype: TrainDtype
     max_steps: int
@@ -202,9 +185,8 @@ class FL_TrainConfig:
     gen_eval_model: str
     gen_eval_model_dtype: TrainDtype
     gen_eval_model_device: str
-    gen_eval_batches: int
-    eval_use_fast_infer: bool
-    eval_gen_steps: int
+    gen_eval_samples: int
+    generate_sampling: Dict[str, Any]  # from config/generate/<model>/<name>.yaml
     use_muon: bool = True
     muon_learning_rate: float = 0.003
     muon_weight_decay: float = 0.01
@@ -242,17 +224,6 @@ class FL_TrainConfig:
         return int(raw) if raw is not None else None
 
 
-_SUBCONFIG: Dict[str, tuple[Type[Any], frozenset[str]]] = {
-    "hardware": (FL_HardwareConfig, FL_HardwareConfig._YAML_REQUIRED),
-    "optimizer": (FL_OptimizerConfig, FL_OptimizerConfig._YAML_REQUIRED),
-    "schedule": (FL_ScheduleConfig, FL_ScheduleConfig._YAML_REQUIRED),
-    "eval": (FL_EvalConfig, FL_EvalConfig._YAML_REQUIRED),
-    "batch": (FL_BatchConfig, FL_BatchConfig._YAML_REQUIRED),
-}
-
-_MODEL_SCOPED_KINDS = frozenset({"batch", "optimizer"})
-
-
 def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, str]:
     if config_name is None:
         if "/" not in model:
@@ -267,7 +238,7 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
         )
     if not _MODEL_CONFIG_RE.fullmatch(config_name):
         raise ValueError(
-            f"Invalid config name {config_name!r}, expected {{100m,300m,900m}}-{{fast,full,ultra}}"
+            f"Invalid config name {config_name!r}, expected 100m-{{fast,full}}"
         )
     return model, config_name
 
@@ -288,25 +259,184 @@ def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
     return match.group(1), match.group(2)  # type: ignore[return-value]
 
 
-def _subconfig_path(kind: str, name: str, *, model: str | None = None) -> Path:
-    if kind in _MODEL_SCOPED_KINDS:
-        if model is None:
-            raise ValueError(f"{kind} sub-config requires model")
-        return CONFIG_DIR / kind / model / f"{name}.yaml"
-    return CONFIG_DIR / kind / f"{name}.yaml"
+_OVERRIDE_SECTIONS = frozenset(
+    {"optimizer", "batch", "schedule", "eval", "generate"}
+)
 
 
-def _load_subconfig(kind: str, name: str, *, model: str | None = None) -> Any:
-    if name == "prototype":
-        raise ValueError(f"Prototype {kind} config cannot be instantiated.")
-    cls, required = _SUBCONFIG[kind]
-    path = _subconfig_path(kind, name, model=model)
+def parse_train_overrides(items: list[str] | None) -> dict[str, dict[str, Any]]:
+    """Parse CLI ``section.key=value`` overrides into nested dicts.
+
+    Values are parsed with ``yaml.safe_load`` (so ``1e-3``, ``true``, ``null`` work).
+    Allowed sections: optimizer, batch, schedule, eval.
+    """
+    if not items:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for raw in items:
+        if "=" not in raw:
+            raise ValueError(
+                f"Invalid --set {raw!r}; expected section.key=value "
+                f"(e.g. optimizer.learning_rate=1e-3)"
+            )
+        key, value_raw = raw.split("=", 1)
+        key = key.strip()
+        if "." not in key:
+            raise ValueError(
+                f"Invalid --set key {key!r}; expected section.key "
+                f"(sections: {', '.join(sorted(_OVERRIDE_SECTIONS))})"
+            )
+        section, field_name = key.split(".", 1)
+        section = section.strip()
+        field_name = field_name.strip()
+        if section not in _OVERRIDE_SECTIONS:
+            raise ValueError(
+                f"Unknown --set section {section!r}; "
+                f"expected one of: {', '.join(sorted(_OVERRIDE_SECTIONS))}"
+            )
+        if not field_name or "." in field_name:
+            raise ValueError(
+                f"Invalid --set field {key!r}; use a single section.key "
+                f"(got nested path)"
+            )
+        try:
+            value = yaml.safe_load(value_raw)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid --set value for {key!r}: {value_raw!r}") from exc
+        # PyYAML keeps bare forms like ``1e-3`` as strings; coerce numerics.
+        if isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+        out.setdefault(section, {})[field_name] = value
+    return out
+
+
+def _apply_mapping_overrides(
+    target: dict[str, Any],
+    overrides: dict[str, Any] | None,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not overrides:
+        return target
+    merged = dict(target)
+    for key, value in overrides.items():
+        merged[key] = value
+    return merged
+
+
+def model_train_config_path(model: str, variant: TrainVariant) -> Path:
+    return MODEL_DIR / model / f"{variant}.yaml"
+
+
+def _load_model_recipe(model: str, variant: TrainVariant) -> dict[str, Any]:
+    if model == "prototype":
+        raise ValueError("Prototype train config cannot be instantiated.")
+    path = model_train_config_path(model, variant)
     if not path.is_file():
-        available = ", ".join(list_subconfigs(kind, model=model)) or "<none>"
+        available = ", ".join(list_train_models()) or "<none>"
         raise FileNotFoundError(
-            f"Config {path} does not exist. Available: {available}"
+            f"Train recipe {path} does not exist. Available models: {available}"
         )
-    return load_yaml_config(cls, path, required=required)
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: YAML root must be a mapping")
+    return raw
+
+
+def _load_optimizer_from_recipe(
+    recipe: dict[str, Any],
+    *,
+    path: Path,
+    model_config: str,
+    overrides: dict[str, Any] | None = None,
+) -> FL_OptimizerConfig:
+    section = recipe.get("optimizer")
+    if not isinstance(section, dict):
+        raise ValueError(f"{path}: missing mapping field 'optimizer'")
+    raw = _apply_mapping_overrides(
+        dict(section), overrides, label=f"{path}#optimizer",
+    )
+    raw.setdefault("name", model_config)
+    return load_mapping_config(
+        FL_OptimizerConfig,
+        raw,
+        required=FL_OptimizerConfig._YAML_REQUIRED,
+        label=f"{path}#optimizer",
+    )
+
+
+def _load_batch_from_recipe(
+    recipe: dict[str, Any],
+    *,
+    path: Path,
+    config_name: str,
+    overrides: dict[str, Any] | None = None,
+) -> FL_BatchConfig:
+    section = recipe.get("batch")
+    if not isinstance(section, dict):
+        raise ValueError(f"{path}: missing mapping field 'batch'")
+    raw = _apply_mapping_overrides(
+        dict(section), overrides, label=f"{path}#batch",
+    )
+    if "grad_accum_steps" in raw:
+        raise ValueError(
+            f"{path}#batch: grad_accum_steps is removed; set global_batch_size "
+            f"(accum = global_batch_size / (batch_size * world_size))"
+        )
+    raw.setdefault("name", config_name)
+    return load_mapping_config(
+        FL_BatchConfig,
+        raw,
+        required=FL_BatchConfig._YAML_REQUIRED,
+        label=f"{path}#batch",
+    )
+
+
+def _load_schedule(
+    variant: TrainVariant,
+    overrides: dict[str, Any] | None = None,
+) -> FL_ScheduleConfig:
+    path = CONFIG_DIR / "schedule" / f"{variant}.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"Schedule config {path} does not exist.")
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: YAML root must be a mapping")
+    raw = _apply_mapping_overrides(raw, overrides, label=str(path))
+    return load_mapping_config(
+        FL_ScheduleConfig,
+        raw,
+        required=FL_ScheduleConfig._YAML_REQUIRED,
+        label=str(path),
+    )
+
+
+def _load_eval(overrides: dict[str, Any] | None = None) -> FL_EvalConfig:
+    path = CONFIG_DIR / "eval" / "default.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"Eval config {path} does not exist.")
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: YAML root must be a mapping")
+    raw = _apply_mapping_overrides(raw, overrides, label=str(path))
+    for removed in ("use_fast_infer", "eval_gen_steps"):
+        if removed in raw:
+            raise ValueError(
+                f"{path}: {removed} moved to config/generate/<model>/; "
+                f"pass --generate <name> and/or --set generate.*"
+            )
+    return load_mapping_config(
+        FL_EvalConfig, raw, required=FL_EvalConfig._YAML_REQUIRED, label=str(path),
+    )
 
 
 def _merge_extra(*parts: Dict[str, Any]) -> Dict[str, Any]:
@@ -367,39 +497,25 @@ def _resolve_grad_accum(
     *,
     world_size: int,
     run_name: str,
-) -> tuple[int, Optional[int]]:
-    """Return ``(grad_accum_steps, global_batch_size|None)`` from batch yaml."""
-    has_accum = batch.grad_accum_steps is not None
-    has_global = batch.global_batch_size is not None
-    if has_accum == has_global:
-        raise ValueError(
-            f"{run_name}: batch yaml must set exactly one of "
-            f"grad_accum_steps or global_batch_size"
-        )
+) -> tuple[int, int]:
+    """Return ``(grad_accum_steps, global_batch_size)`` from ``global_batch_size``."""
     if batch.batch_size < 1 or world_size < 1:
         raise ValueError(f"{run_name}: batch_size/world_size must be >= 1")
-
-    if has_global:
-        global_batch = int(batch.global_batch_size)  # type: ignore[arg-type]
-        if global_batch < 1:
-            raise ValueError(
-                f"{run_name}: global_batch_size must be >= 1, got {global_batch}"
-            )
-        denom = batch.batch_size * world_size
-        if global_batch % denom != 0:
-            raise ValueError(
-                f"{run_name}: global_batch_size={global_batch} must be divisible "
-                f"by batch_size*world_size={batch.batch_size}*{world_size}={denom}"
-            )
-        accum = global_batch // denom
-        if accum < 1:
-            raise ValueError(f"{run_name}: derived grad_accum_steps must be >= 1")
-        return accum, global_batch
-
-    accum = int(batch.grad_accum_steps)  # type: ignore[arg-type]
+    global_batch = int(batch.global_batch_size)
+    if global_batch < 1:
+        raise ValueError(
+            f"{run_name}: global_batch_size must be >= 1, got {global_batch}"
+        )
+    denom = batch.batch_size * world_size
+    if global_batch % denom != 0:
+        raise ValueError(
+            f"{run_name}: global_batch_size={global_batch} must be divisible "
+            f"by batch_size*world_size={batch.batch_size}*{world_size}={denom}"
+        )
+    accum = global_batch // denom
     if accum < 1:
-        raise ValueError(f"{run_name}: grad_accum_steps must be >= 1, got {accum}")
-    return accum, None
+        raise ValueError(f"{run_name}: derived grad_accum_steps must be >= 1")
+    return accum, global_batch
 
 
 def compose_train_config(
@@ -408,67 +524,81 @@ def compose_train_config(
     *,
     dataset: str,
     preprocess: str,
+    generate: str,
     world_size: int | None = None,
+    overrides: dict[str, dict[str, Any]] | None = None,
 ) -> FL_TrainConfig:
-    """Merge sub-configs by naming convention.
+    """Merge per-model recipe with global schedule/eval + generate.
 
-    ``config_name`` must be ``{100m,300m,900m}-{fast,full,ultra}``. Sub-config refs:
-      - hardware ← variant
-      - optimizer ← ``optimizer/<model>/<model size>.yaml``
-      - schedule ← variant (``full``/``ultra`` derive ``max_steps`` from ``target_tokens``)
-      - eval ← ``default``
-      - batch ← ``batch/<model>/<config_name>.yaml``
+    ``config_name`` must be ``100m-{fast,full}`` and loads
+    ``config/train/model/<model>/{fast|full}.yaml``. Shared refs:
+      - schedule ← ``schedule/<variant>.yaml``
+      - eval ← ``eval/default.yaml``
+      - generate ← ``config/generate/<model>/<generate>.yaml``
 
-    ``dataset`` / ``preprocess`` are supplied at launch (not from yaml).
-    ``world_size`` overrides hardware when set (full/ultra auto-detect at launch).
+    ``overrides`` may contain ``optimizer`` / ``batch`` / ``schedule`` /
+    ``eval`` / ``generate`` dicts applied before dataclass validation
+    (CLI ``--set section.key=value``).
+
+    ``dataset`` / ``preprocess`` / ``generate`` are supplied at launch
+    (not from the train recipe yaml).
+    ``world_size`` is the visible GPU count at launch (1/2/4/8); defaults to 1.
     """
     model, config_name = _parse_train_ref(model, config_name)
     model_config, variant = _parse_model_config_variant(config_name)
+    ov = overrides or {}
 
-    hardware_name = _HARDWARE_BY_VARIANT[variant]
+    recipe_path = model_train_config_path(model, variant)
+    recipe = _load_model_recipe(model, variant)
+    optimizer = _load_optimizer_from_recipe(
+        recipe,
+        path=recipe_path,
+        model_config=model_config,
+        overrides=ov.get("optimizer"),
+    )
+    batch = _load_batch_from_recipe(
+        recipe,
+        path=recipe_path,
+        config_name=config_name,
+        overrides=ov.get("batch"),
+    )
+    schedule = _load_schedule(variant, overrides=ov.get("schedule"))
+    eval_cfg = _load_eval(overrides=ov.get("eval"))
+    generate_cfg = get_generate(model, generate, overrides=ov.get("generate"))
 
-    hardware = _load_subconfig("hardware", hardware_name)
-    optimizer = _load_subconfig("optimizer", model_config, model=model)
-    schedule = _load_subconfig("schedule", variant)
-    run_name = f"{model}-{config_name}"
+    run_label = f"{model}-{config_name}"
     if schedule.use_muon:
-        run_name = f"{run_name}-muon"
-    eval_cfg = _load_subconfig("eval", "default")
-    batch = _load_subconfig("batch", config_name, model=model)
+        run_label = f"{run_label}-muon"
     chunk_length = get_preprocess(preprocess).chunk_length
 
-    resolved_world_size = hardware.world_size if world_size is None else world_size
+    resolved_world_size = 1 if world_size is None else world_size
     accum, global_batch = _resolve_grad_accum(
-        batch, world_size=resolved_world_size, run_name=run_name,
+        batch, world_size=resolved_world_size, run_name=run_label,
     )
 
     if schedule.variant != variant:
         raise ValueError(
-            f"{run_name}: schedule.variant={schedule.variant!r} != {variant!r}"
+            f"{run_label}: schedule.variant={schedule.variant!r} != {variant!r}"
         )
 
-    _validate_dtype(optimizer.dtype, path=run_name, label="dtype")
+    _validate_dtype(optimizer.dtype, path=run_label, label="dtype")
     _validate_dtype(
-        eval_cfg.gen_eval_model_dtype, path=run_name, label="gen_eval_model_dtype",
+        eval_cfg.gen_eval_model_dtype, path=run_label, label="gen_eval_model_dtype",
     )
 
     if eval_cfg.eval_sample_count is not None and eval_cfg.eval_sample_count < 1:
         raise ValueError(
-            f"{run_name}: eval_sample_count must be >= 1 when set, "
+            f"{run_label}: eval_sample_count must be >= 1 when set, "
             f"got {eval_cfg.eval_sample_count}"
         )
-    if eval_cfg.eval_gen_steps < 1:
+    if eval_cfg.gen_eval_samples < 1:
         raise ValueError(
-            f"{run_name}: eval_gen_steps must be >= 1, got {eval_cfg.eval_gen_steps}"
-        )
-    if eval_cfg.gen_eval_batches < 1:
-        raise ValueError(
-            f"{run_name}: gen_eval_batches must be >= 1, "
-            f"got {eval_cfg.gen_eval_batches}"
+            f"{run_label}: gen_eval_samples must be >= 1, "
+            f"got {eval_cfg.gen_eval_samples}"
         )
     if eval_cfg.gen_eval_model_device not in ("cuda", "cpu"):
         raise ValueError(
-            f"{run_name}: gen_eval_model_device must be 'cuda' or 'cpu', "
+            f"{run_label}: gen_eval_model_device must be 'cuda' or 'cpu', "
             f"got {eval_cfg.gen_eval_model_device!r}"
         )
 
@@ -489,11 +619,11 @@ def compose_train_config(
     if model in ("bdelf", "elf"):
         if decoder_prob <= 0.0 or decoder_prob > 1.0:
             raise ValueError(
-                f"{run_name}: decoder_prob must be in (0, 1], got {decoder_prob}"
+                f"{run_label}: decoder_prob must be in (0, 1], got {decoder_prob}"
             )
     resolved = _resolve_schedule(
         schedule,
-        run_name=run_name,
+        run_name=run_label,
         tokens_per_step=raw_tokens_per_step,
     )
     # ``_resolve_schedule`` returns optimizer-step counts (one update after
@@ -514,8 +644,24 @@ def compose_train_config(
     save_step = max(1, save_step * accum)
     snapshot_step = max(1, snapshot_step * accum)
 
+    fingerprint = build_train_fingerprint(
+        model=model,
+        model_config=model_config,
+        variant=variant,
+        dataset=dataset,
+        preprocess=preprocess,
+        generate=generate,
+        optimizer=optimizer,
+        batch=batch,
+        schedule=schedule,
+        eval_cfg=eval_cfg,
+        generate_cfg=generate_cfg,
+        overrides=ov,
+    )
+    config_hash = config_hash_from_fingerprint(fingerprint)
+    run_rel = run_relpath(variant=variant, model=model, config_hash=config_hash)
+
     extra = _merge_extra(
-        hardware.extra,
         optimizer.extra,
         schedule.extra,
         eval_cfg.extra,
@@ -528,31 +674,35 @@ def compose_train_config(
             "target_tokens": target_tokens,
             "max_optimizer_steps": max_optimizer_steps,
             "schedule_branch_scale": 1,
+            "config_hash": config_hash,
+            "run_relpath": run_rel,
             "config_refs": {
-                "hardware": hardware_name,
-                "optimizer": f"{model}/{model_config}",
+                "recipe": f"model/{model}/{variant}.yaml",
                 "schedule": variant,
                 "eval": "default",
-                "batch": f"{model}/{config_name}",
+                "generate": generate,
+                "batch_profile": variant,
                 "dataset": dataset,
                 "preprocess": preprocess,
+                "overrides": ov,
             },
             "use_muon": schedule.use_muon,
+            "compile": bool(schedule.extra.get("compile", False)),
         },
     )
-    if global_batch is not None:
-        extra["global_batch_size"] = global_batch
 
     return FL_TrainConfig(
-        name=run_name,
+        name=config_hash,
         model=model,
         model_config=model_config,
         variant=variant,
         dataset=dataset,
         preprocess=preprocess,
+        generate=generate,
         checkpoint_root=CHECKPOINT_ROOT,
         batch_size=batch.batch_size,
         grad_accum_steps=accum,
+        global_batch_size=global_batch,
         world_size=resolved_world_size,
         dtype=optimizer.dtype,
         max_steps=max_steps,
@@ -567,7 +717,7 @@ def compose_train_config(
         eval_step=eval_step,
         save_step=save_step,
         snapshot_step=snapshot_step,
-        num_workers=hardware.num_workers,
+        num_workers=DEFAULT_NUM_WORKERS,
         resume=schedule.resume,
         seed=schedule.seed,
         eval_sample_count=eval_cfg.eval_sample_count,
@@ -575,9 +725,8 @@ def compose_train_config(
         gen_eval_model=eval_cfg.gen_eval_model,
         gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
         gen_eval_model_device=eval_cfg.gen_eval_model_device,
-        gen_eval_batches=eval_cfg.gen_eval_batches,
-        eval_use_fast_infer=eval_cfg.use_fast_infer,
-        eval_gen_steps=eval_cfg.eval_gen_steps,
+        gen_eval_samples=eval_cfg.gen_eval_samples,
+        generate_sampling=generate_cfg.to_sampling_cfg(),
         use_muon=schedule.use_muon,
         muon_learning_rate=optimizer.muon_learning_rate,
         muon_weight_decay=optimizer.muon_weight_decay,
@@ -587,49 +736,36 @@ def compose_train_config(
     )
 
 
-def list_subconfigs(kind: str, *, model: str | None = None) -> List[str]:
-    subdir = CONFIG_DIR / kind
-    if not subdir.is_dir():
-        return []
-
-    if kind in _MODEL_SCOPED_KINDS:
-        if model is not None:
-            model_dir = subdir / model
-            if not model_dir.is_dir():
-                return []
-            return sorted(
-                path.stem
-                for path in model_dir.glob("*.yaml")
-                if path.stem != "prototype"
-            )
-        names: List[str] = []
-        for model_dir in sorted(subdir.iterdir()):
-            if not model_dir.is_dir():
-                continue
-            for path in sorted(model_dir.glob("*.yaml")):
-                if path.stem != "prototype":
-                    names.append(f"{model_dir.name}/{path.stem}")
-        return names
-
-    return sorted(
-        path.stem
-        for path in subdir.glob("*.yaml")
-        if path.stem != "prototype"
-    )
-
-
 def list_train_models() -> List[str]:
-    if not BATCH_DIR.is_dir():
+    if not MODEL_DIR.is_dir():
         return []
-    return sorted(
-        path.name
-        for path in BATCH_DIR.iterdir()
-        if path.is_dir() and path.name != "prototype"
-    )
+    names: List[str] = []
+    for path in sorted(MODEL_DIR.iterdir()):
+        if not path.is_dir() or path.name == "prototype":
+            continue
+        if (path / "fast.yaml").is_file() or (path / "full.yaml").is_file():
+            names.append(path.name)
+    return names
 
 
 def list_train_configs(model: str | None = None) -> List[str]:
-    return list_subconfigs("batch", model=model)
+    """Return available ``100m-{fast,full}`` profiles for ``model`` (or all)."""
+    models = [model] if model is not None else list_train_models()
+    names: List[str] = []
+    for m in models:
+        if m == "prototype":
+            continue
+        model_dir = MODEL_DIR / m
+        if not model_dir.is_dir():
+            continue
+        for variant in ("fast", "full"):
+            if (model_dir / f"{variant}.yaml").is_file():
+                name = f"100m-{variant}"
+                if model is not None:
+                    names.append(name)
+                else:
+                    names.append(f"{m}/{name}")
+    return names
 
 
 def get_train_config(
@@ -638,28 +774,32 @@ def get_train_config(
     *,
     dataset: str,
     preprocess: str,
+    generate: str,
     world_size: int | None = None,
+    overrides: dict[str, dict[str, Any]] | None = None,
 ) -> FL_TrainConfig:
     return compose_train_config(
         model,
         config_name,
         dataset=dataset,
         preprocess=preprocess,
+        generate=generate,
         world_size=world_size,
+        overrides=overrides,
     )
 
 
 def resolve_train_config_path(config_arg: str) -> Path:
-    """Return the batch yaml used as the train-config anchor."""
+    """Return the per-model train recipe yaml for the selected variant."""
     as_path = Path(config_arg)
     if as_path.suffix in (".yaml", ".yml") and as_path.is_file():
         return as_path
     model, config_name = _parse_train_ref(config_arg, None)
-    path = BATCH_DIR / model / f"{config_name}.yaml"
+    _model_config, variant = _parse_model_config_variant(config_name)
+    path = model_train_config_path(model, variant)
     if not path.is_file():
-        available = ", ".join(list_train_configs()) or "<none>"
+        available = ", ".join(list_train_models()) or "<none>"
         raise FileNotFoundError(
-            f"Train config {path} does not exist. Available: {available}"
+            f"Train recipe {path} does not exist. Available models: {available}"
         )
     return path
-

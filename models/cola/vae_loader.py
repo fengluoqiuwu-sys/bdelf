@@ -23,9 +23,9 @@ def resolve_vae_checkpoint(
 ) -> Path:
     """Resolve VAE ``checkpoint_latest.pt``.
 
-    Order: ``COLA_VAE_CHECKPOINT`` env → ``vae_run`` → newest matching
-    ``{vae_model}-{vae_size}-{variant}*/checkpoint_latest.pt`` → newest
-    ``{vae_model}-{vae_size}*/checkpoint_latest.pt``.
+    Order: ``COLA_VAE_CHECKPOINT`` env → ``vae_run``（相对 root 的
+    ``{fast|full}/cola_vae/<hash>``）→ 在新布局下按 mtime 选最新
+    ``{variant?}/cola_vae/*/checkpoint_latest.pt``。
     """
     env = os.environ.get("COLA_VAE_CHECKPOINT")
     if env:
@@ -41,23 +41,23 @@ def resolve_vae_checkpoint(
             raise FileNotFoundError(f"VAE checkpoint not found: {path}")
         return path
 
-    patterns: list[str] = []
-    if variant:
-        patterns.append(f"{vae_model}-{vae_size}-{variant}*/checkpoint_latest.pt")
-    patterns.append(f"{vae_model}-{vae_size}*/checkpoint_latest.pt")
-
+    variants = [variant] if variant in ("fast", "full") else ["fast", "full"]
     candidates: list[Path] = []
-    for pattern in patterns:
-        candidates = sorted(root.glob(pattern), key=lambda p: p.stat().st_mtime)
-        if candidates:
-            break
+    for var in variants:
+        model_root = root / var / vae_model
+        if not model_root.is_dir():
+            continue
+        for hash_dir in model_root.iterdir():
+            ckpt = hash_dir / "checkpoint_latest.pt"
+            if ckpt.is_file():
+                candidates.append(ckpt)
     if not candidates:
         raise FileNotFoundError(
-            f"No VAE checkpoint under {root} matching "
-            f"{vae_model}-{vae_size}-[{variant or '*'}]*. "
-            "Train cola_vae first or set vae_run / COLA_VAE_CHECKPOINT."
+            f"No VAE checkpoint under {root}/{{fast,full}}/{vae_model}/<hash>/. "
+            "Train cola_vae first or set vae_run / COLA_VAE_CHECKPOINT "
+            "(use resolve_checkpoint.py for the hash path)."
         )
-    return candidates[-1]
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def load_vae_backbone(

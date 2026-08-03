@@ -200,19 +200,8 @@ def prepare_gpt2_eval_texts(
 
 
 def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
-    sampling_cfg: dict[str, Any] = {"use_fast_infer": cfg.eval_use_fast_infer}
-    if cfg.model == "bd3lm":
-        sampling_cfg["num_steps"] = cfg.eval_gen_steps
-    elif cfg.model == "elf":
-        # Align online gen-eval with the paper's main sampler (not a cheap ODE
-        # proxy). gen_ppl is only meaningful with this + correct single-fwd SC-CFG.
-        sampling_cfg["num_sampling_steps"] = min(32, max(1, int(cfg.eval_gen_steps)))
-        sampling_cfg["sampling_method"] = "sde"
-        sampling_cfg["sde_gamma"] = 1.5
-        sampling_cfg["temperature"] = 0.0  # paper decode: argmax
-        sampling_cfg["time_schedule"] = "logit_normal"
-        sampling_cfg["self_cond_cfg_scale"] = 3.0
-    return sampling_cfg
+    """在线 gen-eval 采样参数来自 ``--generate`` 指定的 generate 配置。"""
+    return dict(cfg.generate_sampling)
 
 
 def load_gen_eval_baseline(cfg: FL_TrainConfig) -> nn.Module:
@@ -241,8 +230,8 @@ def eval_one_batch_gen_ppl(
 ) -> tuple[float, float, float, float]:
     """Unconditional gen. PPL: sample with train model, score via gpt2-large.
 
-    Draws ``cfg.gen_eval_batches`` generate() batches of size ``cfg.batch_size``,
-    then scores all nonempty decoded strings together.
+    Generates ``cfg.gen_eval_samples`` sequences (micro-batched by
+    ``cfg.batch_size``), then scores all nonempty decoded strings together.
 
     Returns ``(gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac)``. The last
     two catch mode-collapse that can fake a very low gen_ppl (e.g. repeated ``/``).
@@ -259,14 +248,14 @@ def eval_one_batch_gen_ppl(
     use_train_amp = train_device.type == "cuda"
     use_gpt2_amp = gpt2_device.type == "cuda"
     gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
-    n_batches = int(cfg.gen_eval_batches)
-    n_total = n_batches * cfg.batch_size
+    n_total = int(cfg.gen_eval_samples)
+    micro_bs = max(1, int(cfg.batch_size))
 
     if pbar_parent is not None:
         pbar_parent.clear()
         tqdm.write(
-            f"{_TRAIN_LOG} eval/gen: sampling {n_batches} x "
-            f"{cfg.batch_size} x {seqlen} (seed={seed}) ...",
+            f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen} "
+            f"(micro_bs={micro_bs}, seed={seed}) ...",
         )
 
     # Isolate sampling RNG from the training loop.
@@ -281,14 +270,17 @@ def eval_one_batch_gen_ppl(
         with torch.amp.autocast(
             "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
         ):
-            for _ in range(n_batches):
+            remaining = n_total
+            while remaining > 0:
+                this_bs = min(micro_bs, remaining)
                 generated, _nfe = gen_model.generate(
-                    num_samples=cfg.batch_size,
+                    num_samples=this_bs,
                     seqlen=seqlen,
                     for_eval=True,
                     sampling_cfg=sampling_cfg,
                 )
                 chunks.append(generated.detach())
+                remaining -= this_bs
     generated = torch.cat(chunks, dim=0)
     assert generated.size(0) == n_total
 

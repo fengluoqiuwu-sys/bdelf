@@ -39,15 +39,21 @@ def _checkpoint_root() -> Path:
 
 
 def list_checkpoint_runs(root: Path | None = None) -> list[Path]:
-    """Return run directories that contain ``checkpoint_latest.pt``."""
+    """列出含 ``checkpoint_latest.pt`` 的 run 目录（``{variant}/{model}/{hash}``）。"""
     root = root or _checkpoint_root()
     if not root.is_dir():
         return []
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir() and (path / "checkpoint_latest.pt").is_file()
-    )
+    runs: list[Path] = []
+    for variant_dir in sorted(root.iterdir()):
+        if not variant_dir.is_dir() or variant_dir.name not in ("fast", "full"):
+            continue
+        for model_dir in sorted(variant_dir.iterdir()):
+            if not model_dir.is_dir():
+                continue
+            for hash_dir in sorted(model_dir.iterdir()):
+                if hash_dir.is_dir() and (hash_dir / "checkpoint_latest.pt").is_file():
+                    runs.append(hash_dir)
+    return runs
 
 
 def find_latest_checkpoint(root: Path | None = None) -> Path:
@@ -78,9 +84,14 @@ def resolve_checkpoint(
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         return path
     if run:
+        # 相对 checkpoint_root：fast/ar/<hash> 或旧扁平名（仅当目录仍存在）
         path = root / run / "checkpoint_latest.pt"
         if not path.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
+            raise FileNotFoundError(
+                f"Checkpoint not found: {path}\n"
+                "Use --run {fast|full}/{model}/{config-hash} "
+                "(see resolve_checkpoint.py)."
+            )
         return path
     return find_latest_checkpoint(root)
 
@@ -196,23 +207,22 @@ def generate_tokens(
     seed: int,
     device: torch.device,
     dtype: torch.dtype,
-    temperature: float | None,
-    top_k: int | None,
+    sampling_cfg: dict | None = None,
+    temperature: float | None = None,
+    top_k: int | None = None,
     prefix_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
     set_seed(seed)
-    # Only override model YAML sampling when the user explicitly passes values.
-    # Important for ELF: yaml default temperature=0 (argmax); a hard-coded
-    # CLI default of 1.0 would silently switch to multinomial sampling.
-    sampling_cfg: dict[str, float | int | None] = {}
+    # 以 generate 配置为底，CLI 显式传入的 temperature/top_k 再覆盖。
+    merged: dict = dict(sampling_cfg or {})
     if temperature is not None:
-        sampling_cfg["temperature"] = temperature
+        merged["temperature"] = temperature
     if top_k is not None:
-        sampling_cfg["top_k"] = top_k
+        merged["top_k"] = top_k
     gen_kwargs: dict = dict(
         num_samples=num_samples,
         seqlen=num_tokens,
-        sampling_cfg=sampling_cfg or None,
+        sampling_cfg=merged or None,
     )
     if prefix_tokens is not None:
         if not model_supports_prefix(model):
@@ -240,7 +250,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--run",
-        help="Run name under cache/checkpoints (uses its checkpoint_latest.pt)",
+        help=(
+            "Run under cache/checkpoints: {fast|full}/{model}/{config-hash} "
+            "(see resolve_checkpoint.py)"
+        ),
     )
     parser.add_argument(
         "--num-tokens",
@@ -266,11 +279,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Read prompt text from a UTF-8 file",
     )
     parser.add_argument(
+        "--generate",
+        default="generate",
+        help=(
+            "Generate config under config/generate/<model>/ "
+            "(default: generate; train online eval uses eval)"
+        ),
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=None,
         help=(
-            "Sampling temperature; omit to use the model YAML default "
+            "Override sampling temperature; omit to use --generate config "
             "(ELF: 0=argmax; AR/BDELF: typically 1.0)"
         ),
     )
@@ -278,7 +299,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=None,
-        help="Top-k filter; omit for model default / full-vocab multinomial",
+        help="Override top-k; omit to use --generate config / full-vocab",
     )
     parser.add_argument(
         "--seed",
@@ -309,7 +330,8 @@ def main() -> None:
         for run_dir in runs:
             ckpt = run_dir / "checkpoint_latest.pt"
             mtime = ckpt.stat().st_mtime
-            _log(f"{run_dir.name}\tstep=? mtime={mtime:.0f}\t{ckpt}")
+            rel = run_dir.relative_to(_checkpoint_root())
+            _log(f"{rel}\tmtime={mtime:.0f}\t{ckpt}")
         return
 
     ckpt_path = resolve_checkpoint(checkpoint=args.checkpoint, run=args.run)
@@ -344,12 +366,20 @@ def main() -> None:
                 f"shorter than --num-tokens={args.num_tokens}"
             )
 
+    from train.generate_config import get_generate
+
+    gen_cfg = get_generate(model_meta["name"], args.generate)
+    sampling_cfg = gen_cfg.to_sampling_cfg()
+
     _log(
         f"Model={model_meta['name']}, step={step}, "
         f"device={device}, dtype={dtype}, num_tokens={args.num_tokens}, "
-        f"prefix_len={prefix_len}, "
-        f"temperature={args.temperature if args.temperature is not None else 'yaml'}, "
-        f"top_k={args.top_k if args.top_k is not None else 'yaml'}, seed={args.seed}",
+        f"prefix_len={prefix_len}, generate={args.generate}, "
+        f"temperature="
+        f"{args.temperature if args.temperature is not None else sampling_cfg.get('temperature', 'yaml')}, "
+        f"top_k="
+        f"{args.top_k if args.top_k is not None else sampling_cfg.get('top_k', 'yaml')}, "
+        f"seed={args.seed}",
     )
 
     tokens, nfe = generate_tokens(
@@ -359,6 +389,7 @@ def main() -> None:
         seed=args.seed,
         device=device,
         dtype=dtype,
+        sampling_cfg=sampling_cfg,
         temperature=args.temperature,
         top_k=args.top_k,
         prefix_tokens=prefix_tokens,

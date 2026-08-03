@@ -38,7 +38,14 @@ from models import (
 )
 from dataset import list_datasets
 from preprocess import get_preprocessed, list_preprocess
-from train import FL_TrainConfig, get_train_config, list_train_configs, list_train_models
+from train import (
+    FL_TrainConfig,
+    get_train_config,
+    list_generate,
+    list_train_configs,
+    list_train_models,
+    parse_train_overrides,
+)
 from train.batching import (
     TokenChunkDataset,
     build_eval_subset,
@@ -236,23 +243,17 @@ def setup_distributed(cfg: FL_TrainConfig) -> tuple[int, int, torch.device, bool
     return rank, world_size, torch.device(f"cuda:{local_rank}"), True
 
 
-ALLOWED_FULL_ULTRA_WORLD_SIZES = frozenset({1, 2, 4, 8})
+ALLOWED_WORLD_SIZES = frozenset({1, 2, 4, 8})
 
 
-def _resolve_launch_world_size(train_config: str) -> int | None:
-    """Auto-detect GPU count for full/ultra; ``None`` means keep hardware default."""
-    variant = train_config.rsplit("-", 1)[-1]
-    if variant not in ("full", "ultra"):
-        return None
+def _resolve_launch_world_size() -> int:
+    """Auto-detect visible GPU count; must be in {1, 2, 4, 8} (CPU-only → 1)."""
     if not torch.cuda.is_available():
-        raise SystemExit(
-            f"{variant} training requires CUDA; no GPU detected "
-            f"(torch.cuda.is_available() is False)."
-        )
+        return 1
     n = torch.cuda.device_count()
-    if n not in ALLOWED_FULL_ULTRA_WORLD_SIZES:
+    if n not in ALLOWED_WORLD_SIZES:
         raise SystemExit(
-            f"full/ultra 需要 1/2/4/8 张可见 GPU，当前 device_count={n}"
+            f"训练需要 1/2/4/8 张可见 GPU，当前 device_count={n}"
         )
     return n
 
@@ -261,10 +262,11 @@ def _spawn_worker(
     local_rank: int,
     model_name: str,
     train_config: str,
-    run_name: str | None,
     world_size: int,
     dataset: str,
     preprocess: str,
+    generate: str,
+    overrides: dict | None,
 ) -> None:
     os.environ["RANK"] = str(local_rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
@@ -277,10 +279,10 @@ def _spawn_worker(
         train_config,
         dataset=dataset,
         preprocess=preprocess,
+        generate=generate,
         world_size=world_size,
+        overrides=overrides,
     )
-    if run_name:
-        cfg.name = run_name
     size = train_config.rsplit("-", 1)[0]
     run_training(model_name, size, cfg)
 
@@ -450,16 +452,65 @@ def train_loop(
     is_distributed: bool,
 ) -> None:
     amp_dtype = get_amp_dtype(cfg.dtype)
-    run_dir = Path(cfg.checkpoint_root) / cfg.name
+    from train.hardware import (
+        HardwareMismatchError,
+        detect_train_hardware,
+        ensure_hardware_lock,
+    )
+    from train.run_path import checkpoint_run_dir_from_cfg
+
+    run_dir = checkpoint_run_dir_from_cfg(cfg)
+
+    # 硬件锁定（不进 hash）：探测可见 GPU，首次写入 hardware.json，续跑必须一致。
+    hw_err = ""
+    current_hw = None
+    try:
+        current_hw = detect_train_hardware()
+    except HardwareMismatchError as exc:
+        hw_err = str(exc)
+
+    if is_distributed:
+        gathered: list[str] | None = [""] * world_size if rank == 0 else None
+        dist.gather_object(hw_err, gathered, dst=0)
+        if rank == 0 and gathered is not None:
+            for msg in gathered:
+                if msg:
+                    hw_err = msg
+                    break
+        err_box = [hw_err]
+        dist.broadcast_object_list(err_box, src=0)
+        hw_err = err_box[0]
+    if hw_err:
+        raise SystemExit(hw_err)
+
     if rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
-        with open(run_dir / "config.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {"train": asdict(cfg), "model": model_meta},
-                f,
-                indent=2,
-                ensure_ascii=False,
+        try:
+            assert current_hw is not None
+            hw = ensure_hardware_lock(run_dir, current_hw)
+            _train_log(
+                f"Hardware lock: {hw.gpu_count}× {hw.gpu_name} "
+                f"({hw.memory_gb_per_gpu} GiB each)"
             )
+            with open(run_dir / "config.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {"train": asdict(cfg), "model": model_meta},
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            from train.hash_guide import upsert_hash_guide_row
+
+            upsert_hash_guide_row(asdict(cfg))
+        except HardwareMismatchError as exc:
+            hw_err = str(exc)
+
+    if is_distributed:
+        err_box = [hw_err]
+        dist.broadcast_object_list(err_box, src=0)
+        hw_err = err_box[0]
+    if hw_err:
+        raise SystemExit(hw_err)
 
     # Eager-load frozen HF encoders before Dynamo can trace into from_pretrained.
     _preload_frozen_encoders(model)
@@ -889,21 +940,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  python train.py --model ar --config 100m-fast "
-            "--dataset owt --preprocess default\n"
+            "--dataset owt --preprocess default --generate eval\n"
             "  python train.py --model ar2 --config 100m-full "
-            "--dataset owt --preprocess default\n"
+            "--dataset owt --preprocess default --generate eval\n"
             "  python train.py --model ar1_5 --config 100m-full "
-            "--dataset owt --preprocess default\n"
-            "  python train.py --model bdelf --config 900m-full "
-            "--dataset owt --preprocess default\n"
+            "--dataset owt --preprocess default --generate eval\n"
+            "  python train.py --model bdelf --config 100m-full "
+            "--dataset owt --preprocess default --generate eval\n"
             "  python train.py --model elf --config 100m-fast "
-            "--dataset owt --preprocess elf\n"
+            "--dataset owt --preprocess elf --generate eval\n"
             "  python train.py --model elf --config 100m-full "
-            "--dataset owt --preprocess elf\n\n"
+            "--dataset owt --preprocess elf --generate eval\n\n"
             f"Available models: {', '.join(models)}\n"
             f"Available datasets: {', '.join(datasets)}\n"
             f"Available preprocess configs: {', '.join(preprocess_names)}\n"
-            "Train configs: {{100m,300m,900m}}-{{fast,full,ultra}}"
+            "Train configs: 100m-{fast,full}\n"
+            "Generate configs: config/generate/<model>/<name>.yaml\n"
+            "Overrides: --set section.key=value "
+            "(sections: optimizer, batch, schedule, eval, generate)"
         ),
     )
     parser.add_argument(
@@ -916,7 +970,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         dest="train_config",
         metavar="CONFIG",
-        help="Train config name, e.g. 100m-fast / 900m-full / 900m-ultra",
+        help="Train config name, e.g. 100m-fast / 100m-full",
     )
     parser.add_argument(
         "--dataset",
@@ -929,9 +983,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Preprocess config name (config/preprocess/); options: {', '.join(preprocess_names)}",
     )
     parser.add_argument(
-        "--run-name",
-        default=None,
-        help="Checkpoint directory name; defaults to train config name field",
+        "--generate",
+        required=True,
+        help=(
+            "Generate config name under config/generate/<model>/ "
+            "(train online gen-eval: eval; standalone generate.py: generate)"
+        ),
+    )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        dest="overrides",
+        metavar="SECTION.KEY=VALUE",
+        help=(
+            "Override a train hyperparameter after loading YAML "
+            "(repeatable). Examples: optimizer.learning_rate=1e-3, "
+            "batch.batch_size=16, schedule.target_tokens=1e9, "
+            "eval.gen_eval_samples=64, generate.temperature=0.8"
+        ),
     )
     return parser
 
@@ -947,7 +1017,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
     train_models = list_train_models()
     if args.model not in train_models:
         raise SystemExit(
-            f"Model {args.model!r} has no train batch config. Available: {', '.join(train_models)}"
+            f"Model {args.model!r} has no train recipe. Available: {', '.join(train_models)}"
         )
 
     configs = list_train_configs(args.model)
@@ -955,7 +1025,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         raise SystemExit(
             f"Unknown train config {args.train_config!r}. {args.model} available: "
             f"{', '.join(configs)}\n"
-            f"Naming format: {{100m,300m,900m}}-{{fast,full,ultra}}"
+            f"Naming format: 100m-{{fast,full}}"
         )
 
     size = args.train_config.rsplit("-", 1)[0]
@@ -983,20 +1053,33 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
             f"Config directory: config/preprocess/"
         )
 
+    generate_names = list_generate(args.model)
+    if args.generate not in generate_names:
+        raise SystemExit(
+            f"Unknown generate config {args.generate!r}. {args.model} available: "
+            f"{', '.join(generate_names) or '<none>'}\n"
+            f"Config directory: config/generate/{args.model}/"
+        )
+
     try:
-        launch_world_size = _resolve_launch_world_size(args.train_config)
+        overrides = parse_train_overrides(args.overrides)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid --set override: {exc}") from exc
+
+    try:
+        launch_world_size = _resolve_launch_world_size()
         cfg = get_train_config(
             args.model,
             args.train_config,
             dataset=args.dataset,
             preprocess=args.preprocess,
+            generate=args.generate,
             world_size=launch_world_size,
+            overrides=overrides,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"Failed to load train config: {exc}") from exc
 
-    if args.run_name:
-        cfg.name = args.run_name
     return args.model, size, cfg
 
 
@@ -1011,13 +1094,26 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
 
     if rank == 0:
         _train_log(f"Model: {model_name}/{model_size}")
-        _train_log(f"Train config: {cfg.name} ({cfg.variant})")
+        _train_log(
+            f"Train run: {cfg.extra.get('run_relpath', cfg.name)} "
+            f"(hash={cfg.name}, variant={cfg.variant})"
+        )
+        overrides = (cfg.extra.get("config_refs") or {}).get("overrides") or {}
+        if overrides:
+            flat = []
+            for section, mapping in sorted(overrides.items()):
+                for key, value in sorted(mapping.items()):
+                    flat.append(f"{section}.{key}={value!r}")
+            _train_log(f"Overrides: {', '.join(flat)}")
         if cfg.use_muon:
             _train_log(
                 f"Optimizer: Muon+AdamW hybrid "
                 f"(muon_lr={cfg.muon_learning_rate}, adam_lr={cfg.learning_rate})"
             )
-        _train_log(f"Data: dataset={cfg.dataset}, preprocess={cfg.preprocess}")
+        _train_log(
+            f"Data: dataset={cfg.dataset}, preprocess={cfg.preprocess}, "
+            f"generate={cfg.generate}"
+        )
         _train_log(f"Device: {device}, world_size={world_size}")
         if cfg.target_tokens is not None:
             opt_steps = int(cfg.extra.get("max_optimizer_steps", 0)) or (
@@ -1088,7 +1184,9 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         model_cfg["train_variant"] = cfg.variant
         # Resume packs VAE+DiT; skip Stage-1 disk resolve so missing VAE dirs
         # do not block loading an existing cola run checkpoint.
-        latest_cola = Path(cfg.checkpoint_root) / cfg.name / "checkpoint_latest.pt"
+        from train.run_path import checkpoint_run_dir_from_cfg
+
+        latest_cola = checkpoint_run_dir_from_cfg(cfg) / "checkpoint_latest.pt"
         if cfg.resume and latest_cola.is_file():
             model_cfg["load_vae_weights"] = False
 
@@ -1112,7 +1210,7 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 f"(seed={cfg.eval_sample_seed})",
             )
         _train_log(
-            f"gen. ppl: {cfg.gen_eval_batches} batches / eval via "
+            f"gen. ppl: {cfg.gen_eval_samples} samples / eval via "
             f"{cfg.gen_eval_model} "
             f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device})",
         )
@@ -1179,10 +1277,11 @@ def main() -> None:
             args=(
                 model_name,
                 args.train_config,
-                args.run_name,
                 cfg.world_size,
                 args.dataset,
                 args.preprocess,
+                args.generate,
+                (cfg.extra.get("config_refs") or {}).get("overrides") or None,
             ),
             nprocs=cfg.world_size,
             join=True,
