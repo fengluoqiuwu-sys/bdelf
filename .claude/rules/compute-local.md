@@ -1,21 +1,11 @@
 ---
-description: 本机（RTX 5080）计算与自动运行硬约束
+description: 本机 RTX 5080 计算硬约束（Claude：仅推理）
 ---
 
 # 本机计算约束
 
-## 环境
-
 - **硬件**：1× RTX 5080（16GB）。
-- **用途**：`fast` 训练与任意快速调试。
-- **Python**：一律用仓库 `.venv`（见 rule「Python 虚拟环境」）。
-
-## GPU 互斥
-
-- 不要让两个占用 GPU 的进程同时跑；需要时串行。
-- 允许结束 **本会话拉起** 的旧 GPU 进程；不要随意杀掉用户自己启动的进程。
-
-## 测试与评测
-
-- generate / eval / 调试推理：只在本机跑。
-- 本机调度与训练命令见 skill `train`；生成见 skill `generate`。
+- **Python**：见 rule「Python 虚拟环境」。
+- **GPU 互斥**：同时只跑一个占 GPU 的进程；可停本会话拉起的作业，勿杀用户自启进程。
+- **Claude 范围**：只做本机 generate / 只读检查；**禁止训练**（见 rule「禁止训练」）；**禁止远端**（见 rule「禁止使用远端」）。
+- 推理命令见 skill `generate`。
