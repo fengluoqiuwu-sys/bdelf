@@ -14,7 +14,7 @@ description: >-
 
 自动训练 + 自动优化的完整闭环 skill。仅在用户**明确说"请自动执行"并授权**后启动。
 
-配合 rule「本机/远端计算」「temp/ 布局」、skill `train-ops` / `sync-ovan-server` / `train` / `generate`。  
+配合 rule「本机/远端计算」「temp/ 布局」、skill `train-ops` / `sync-ovan-server` / `train` / `generate` / `vram-probe`。  
 本 skill 只编排闭环与决策；具体命令去读对应 skill。
 
 ## 远端只读探查（优先于 pull）
@@ -83,7 +83,8 @@ description: >-
 2. 在 temp/auto-research/<idea>/README.md 记录口径
 3. 实现思路
 4. 本地验证：fast 冒烟（起训练看到首批 loss 正常、2–3 分钟后停）+ generate/ppl 跑通
-5. push 到 ovan-server（sync 脚本）→ train-ops 登记互斥 → sbatch full
+4.6 显存探针（强制，见「VRAM 探针」）：改动影响显存时 → push → vram-probe → 填 alloc.md
+5. push 到 ovan-server（sync 脚本）→ 按表+global_bs 选型 → train-ops 登记互斥 → sbatch full
    → 起「5 分钟首次唤醒」后台调度（确认拉起）
 6. 唤醒循环：5m → 15m → 30m → 此后每 30m（见「唤醒调度」）
    ├ 7a 决定继续 → 回 6
@@ -91,9 +92,9 @@ description: >-
    ├ 7c 已完成 → 11
    └ 7d 同 bug 卡住（见「卡住即停」）→ 11，勿空烧 token
 8. 停止训练：本分支可修 → 9；需换架构 → 10；修不动 →「卡住即停」→ 11
-9. 本分支修改 → commit → 删远端该 run checkpoint → push 重跑 → 回 4/5（temp 记录原因）
+9. 本分支修改 → commit →（若影响显存再跑 4.6）→ 删远端该 run checkpoint → push 重跑 → 回 4/5
 10. 架构调整 / 换向 → 从当前分支 fork 新分支继承代码 → 删远端旧 run checkpoint
-    → temp 记放弃原因/调整 → 回 3（实现调整）
+    → temp 记放弃原因/调整 → 回 3（实现调整；再训前必过 4.6）
 11. 完成 / 放弃 → 写 temp/auto-research/<idea>/SUMMARY.md → 结束并总结
 ```
 
@@ -139,10 +140,26 @@ git commit -m "<语义化描述>"
 - 思路/实验记录（`temp/auto-research/<idea>/*.md`）属本地记录、不同步；`temp/` 在 `.gitignore` 中，版本化时用
   `git add -f temp/auto-research/<idea>/...`。是否提交不影响远端 push。
 
+**4.6 VRAM 探针（显存相关改动后强制）**
+
+凡改动会影响显存占用（模型结构、精度、序列长 / chunk、EMA、优化器状态规模等），在提交 full **之前**必须：
+
+1. 工作区已提交且干净（4.5）；`bash scripts/sync-ovan-server.sh push`
+2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 登记互斥 → `bash slurm/sbatch-vram-probe.sh …`
+3. 读日志；把各档 **`alloc_peak_GiB`**（及 `oom`）填入 **`temp/vram-probe/alloc.md`** 对应行
+4. **不要**把探针结论写回 recipe 默认 YAML；可在 `temp/auto-research/<idea>/` 记一笔链接到该表
+5. **禁止**未填/过期表直接 `sbatch-train`
+
+仅改 loss 日志文案等明显不影响显存的改动可跳过本步；有疑虑时宁可跑探针。
+
+**开训选型**（步骤 5）：查 `alloc.md` 该模型各列，结合**当前目标卡** `total−2` 与本次 `global_batch_size` / `world_size`，取最大安全且整除的 micro-batch（公式见 skill `vram-probe`）。默认 YAML 已是该值则不必 `--set`；否则专用 `scripts/train/<name>.sh` 加 `--set batch.batch_size=…`。
+
 **5. 推送与远端训练**
 
 ```text
 - [前置] 工作区已干净（第 4.5 步已提交，git status 无未提交改动）
+- [前置] 若本轮改动影响显存：第 4.6 步已完成，alloc.md 对应行已更新
+- [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（必要时 scripts/train 含 --set）
 - bash scripts/sync-ovan-server.sh push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
 - bash scripts/remote_status.sh   # 强制：GPU / 队列 / agent 登记
@@ -173,6 +190,7 @@ git commit -m "<语义化描述>"
 
 - 可溯源的小问题（代码 bug、超参），在当前分支直接改。
 - 改完先 **commit**（遵循 4.5 的"推前必须提交、工作区干净"约定），再继续。
+- 若改动影响显存：必须再跑 **4.6**（探针 → 填 `alloc.md` → 查表选型），**禁止**缺测直接重提 full。
 - 处理旧 checkpoint：
   - **保留一份最佳/最近的基准 checkpoint**：勿用 `cache/temp/`；暂留在原
     `cache/checkpoints/<run>/`，并在 `temp/auto-research/<idea>/` 注明对照 run；

@@ -11,7 +11,7 @@ alwaysApply: true
 config/{datasets,tokenizers,preprocess,models,train,generate}/
 dataset/  tokenizer/  models/
 scripts/  scripts/train/   # 辅助与训练启动 sh
-slurm/                     # prototype + sbatch-train；gpu/tail；preprocess
+slurm/                     # prototype + sbatch-train；vram-probe；gpu/tail；preprocess
 train.py  generate.py  hf_config.py
 cache/                     # gitignore
 ```
@@ -44,6 +44,7 @@ cache/                     # gitignore
 |-------|------|
 | `train` | `train.py` CLI、配置拼装、checkpoint 定位 |
 | `train-ops` | 本机冒烟、远端 sbatch/登记；作业前必跑 `remote_status.sh` |
+| `vram-probe` | 单卡显存探针 → `temp/vram-probe/alloc.md`（model×batch）；开训查表选型 |
 | `generate` | 本机 `generate.py` |
 | `sync-ovan-server` | push / pull / pull-file |
 | `auto-train` | 用户明确「自动执行」后的闭环优化 |

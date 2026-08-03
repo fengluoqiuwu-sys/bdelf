@@ -11,7 +11,7 @@ description: >-
 # train-ops
 
 操作流程 skill。硬约束见 rule「本机计算约束」「远端计算约束」「脚本约定」「Python 虚拟环境」。  
-训练参数/配置见 skill `train`；同步见 `sync-ovan-server`；生成见 `generate`。
+训练参数/配置见 skill `train`；同步见 `sync-ovan-server`；生成见 `generate`；显存定档见 `vram-probe`。
 
 ## 本机 fast 冒烟
 
@@ -22,7 +22,7 @@ description: >-
 
 ## 远端状态工具（强制）
 
-任何远端**作业操作**（`sbatch` / `sbatch-train` / `scancel`、改 agent 登记）之前，在本机**先**执行：
+任何远端**作业操作**（`sbatch` / `sbatch-train` / `sbatch-vram-probe` / `scancel`、改 agent 登记）之前，在本机**先**执行：
 
 ```bash
 bash scripts/remote_status.sh          # 可读表；机器用加 --json
@@ -52,6 +52,15 @@ ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 ```
 
 禁止 AI 提交 preprocess 作业。模板：`slurm/prototype.slurm`。
+
+## VRAM 探针（填 alloc 表；开训查表选型）
+
+测 rank0 峰值（训练模型 + 优化器 + EMA + `gpt2-large`），把各档 GiB 填入本地 `temp/vram-probe/alloc.md`（model×batch）。  
+**开训时查表**：`alloc ≤ 当前卡 total−2`，且满足本次 `global_batch_size` 整除（细则见 skill **`vram-probe`**）。
+
+- 同属 AI **占 GPU** 作业：须 `remote_status`、agent 登记互斥（与 full 训练同一把锁）。
+- 提交：`bash slurm/sbatch-vram-probe.sh [--nodelist=…] -- <vram_probe.py 参数…>`（1 卡模板；节点不写死）。
+- 本机可跑探针但不建议；勿与正在跑的本地训练抢卡。
 
 ### Agent 登记（远端 `temp/agent/`，不同步）
 

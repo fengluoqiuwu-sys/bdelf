@@ -12,6 +12,7 @@ alwaysApply: true
 | `temp/auto-research/<idea>/` | 自动训练/优化记录（见 skill `auto-train`） |
 | `temp/idea/<idea>/` | 读论文后的想法/规格文稿 |
 | `temp/papers/<name>/` | 论文（`paper/`）与相关代码（`sources/`） |
+| `temp/vram-probe/` | `alloc.md`：model×batch→alloc_peak_GiB（见 skill `vram-probe`）；开训按当前卡+global_bs 查表 |
 | 远端 `~/source/bdelf/temp/agent/` | **仅** AI job 登记（见 rule「远端计算约束」） |
 
 - `<idea>` / `<name>`：短横线小写 slug（如 `elf-cfg`）。

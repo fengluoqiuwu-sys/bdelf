@@ -10,16 +10,16 @@ alwaysApply: true
 | 位置 | 内容 |
 |------|------|
 | 仓库根 | 入口：`train.py`、`generate.py`（库代码勿塞进 `scripts/`） |
-| `scripts/` | 通用辅助（resolve、download、sync、`remote_status.sh` 等） |
+| `scripts/` | 通用辅助（resolve、download、sync、`remote_status.sh`、`vram_probe.py` 等） |
 | `scripts/train/` | 训练启动 `.sh`（模板 `prototype.sh`） |
-| `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`gpu_availability.py` / `tail_remote_logs.py`；preprocess 作业 |
+| `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`vram-probe.slurm` + `sbatch-vram-probe.sh`；`gpu_availability.py` / `tail_remote_logs.py`；preprocess 作业 |
 
 勿再为每个模型复制一份 `.slurm`。
 
 ## 执行目录
 
 - **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
-- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`。
+- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-vram-probe.sh …`。
 - 禁止 `cd scripts && python foo.py`。
 - `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
 
