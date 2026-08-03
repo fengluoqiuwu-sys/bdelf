@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
-"""本机经 SSH 查询 ovan-server 上 cls1 四个计算节点各有几张 GPU 可用。
+"""查询 cls1 四个计算节点各有几张 GPU 可用。
 
-远端只跑 ``scontrol show node -o``（轻量只读，不占 GPU）。
+本机直接跑 ``scontrol show node -o``（轻量只读，不占 GPU）。
 按节点汇总：配置卡数 / 已分配 / 空闲 / 状态 / GPU 型号。
 
-示例::
+脚本不发起 SSH。本机查远端时，先 push，再：
+
+    ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'
+
+示例（在目标机仓库根执行）::
 
     .venv/bin/python slurm/gpu_availability.py
     .venv/bin/python slurm/gpu_availability.py --json
-    .venv/bin/python slurm/gpu_availability.py --host ovan-server
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
-DEFAULT_HOST = "ovan-server"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+os.chdir(_REPO_ROOT)
+
 DEFAULT_NODES = ("cls1-srv1", "cls1-srv2", "cls1-srv3", "cls1-srv4")
 
 _RE_NODE = re.compile(r"NodeName=(\S+)")
@@ -28,16 +35,6 @@ _RE_STATE = re.compile(r"\bState=(\S+)")
 _RE_CFG_GPU = re.compile(r"\bCfgTRES=[^\s]*gres/gpu=(\d+)")
 _RE_ALLOC_GPU = re.compile(r"\bAllocTRES=(?:[^\s]*gres/gpu=(\d+))?")
 _RE_REASON = re.compile(r"\bReason=(.+?)(?:\s+[A-Z][a-zA-Z]*=|\s*$)")
-
-
-def _ssh_capture(host: str, remote_script: str) -> tuple[int, str, str]:
-    proc = subprocess.run(
-        ["ssh", host, "bash", "-s"],
-        input=remote_script,
-        text=True,
-        capture_output=True,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
 
 
 def _parse_gres_type(gres: str) -> str:
@@ -88,25 +85,22 @@ def _parse_node_line(line: str) -> dict | None:
     }
 
 
-def fetch_nodes(host: str, nodes: tuple[str, ...]) -> tuple[list[dict], str]:
-    node_list = " ".join(nodes)
-    script = f"""\
-set -euo pipefail
-for n in {node_list}; do
-  scontrol show node "$n" -o
-done
-"""
-    rc, out, err = _ssh_capture(host, script)
-    if rc != 0:
-        msg = err.strip() or out.strip() or f"ssh/scontrol failed (exit {rc})"
+def fetch_nodes(nodes: tuple[str, ...]) -> tuple[list[dict], str]:
+    proc = subprocess.run(
+        ["scontrol", "show", "node", *nodes, "-o"],
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or f"scontrol failed (exit {proc.returncode})").strip()
         raise RuntimeError(msg)
 
     rows: list[dict] = []
-    for line in out.splitlines():
+    for line in proc.stdout.splitlines():
         row = _parse_node_line(line)
         if row:
             rows.append(row)
-    return rows, err.strip()
+    return rows, proc.stderr.strip()
 
 
 def _print_table(rows: list[dict]) -> None:
@@ -148,9 +142,8 @@ def _print_table(rows: list[dict]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Query how many GPUs are free on cls1-srv[1-4] via SSH + scontrol.",
+        description="查询 cls1-srv[1-4] 空闲 GPU（本机 scontrol；不发起 SSH）。",
     )
-    p.add_argument("--host", default=DEFAULT_HOST, help=f"SSH 主机（默认 {DEFAULT_HOST}）")
     p.add_argument(
         "--json",
         action="store_true",
@@ -168,9 +161,12 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--nodes 不能为空")
 
     try:
-        rows, warn = fetch_nodes(args.host, nodes)
+        rows, warn = fetch_nodes(nodes)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
+        return 1
+    except FileNotFoundError:
+        print("scontrol 不在 PATH（请在 Slurm 登录/计算节点上执行本脚本）", file=sys.stderr)
         return 1
 
     missing = [n for n in nodes if not any(r["node"] == n for r in rows)]
@@ -179,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
     if warn:
         print(warn, file=sys.stderr)
 
-    # 按请求顺序排列
     by_name = {r["node"]: r for r in rows}
     ordered = [by_name[n] for n in nodes if n in by_name]
 

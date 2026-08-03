@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""本机经 SSH 读取远端 Slurm 训练 .out / .err 末 N 行（轻量只读，不占用 GPU）。
+"""读取本机（通常为远端仓库）Slurm 训练 .out / .err 末 N 行。
 
 日志命名与 ``#SBATCH --output/--error`` 一致：``<job-name>-<job-id>.{out,err}``，
-默认目录：``~/source/bdelf/slurm/logs``（与 sync-ovan-server 远端树一致）。
+默认目录：仓库根下 ``slurm/logs``。
 
-远端只执行 ``ls`` / ``tail`` 等轻量命令，不在登录节点启 Python。
+脚本不发起 SSH。本机查远端日志时，先 push，再：
 
-示例::
+    ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py 1234567'
+
+示例（在目标机仓库根执行）::
 
     .venv/bin/python slurm/tail_remote_logs.py 1234567
     .venv/bin/python slurm/tail_remote_logs.py 1234567 -n 120
@@ -18,154 +20,118 @@
 from __future__ import annotations
 
 import argparse
-import shlex
-import subprocess
+import os
 import sys
-import textwrap
+from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+os.chdir(_REPO_ROOT)
 
-DEFAULT_HOST = "ovan-server"
-DEFAULT_LOG_DIR = "~/source/bdelf/slurm/logs"
+DEFAULT_LOG_DIR = _REPO_ROOT / "slurm" / "logs"
 DEFAULT_N = 80
 
 
-def _ssh(host: str, remote_script: str) -> int:
-    return subprocess.run(["ssh", host, "bash", "-s"], input=remote_script, text=True).returncode
+def cmd_list(log_dir: Path, limit: int) -> int:
+    if not log_dir.is_dir():
+        print(f"missing log dir: {log_dir}", file=sys.stderr)
+        return 1
 
-
-def _quote_log_dir(path: str) -> str:
-    if path.startswith("~/"):
-        return "~/" + shlex.quote(path[2:])
-    if path == "~":
-        return "~"
-    return shlex.quote(path)
-
-
-def cmd_list(host: str, log_dir: str, limit: int) -> int:
-    d = _quote_log_dir(log_dir)
-    script = textwrap.dedent(
-        f"""\
-        set -euo pipefail
-        d={d}
-        if [[ ! -d "$d" ]]; then
-          echo "missing log dir: $d" >&2
-          exit 1
-        fi
-        shopt -s nullglob
-        files=("$d"/*.out "$d"/*.err)
-        if (( ${{#files[@]}} > 0 )); then
-          ls -lt -- "${{files[@]}}" | head -n {int(limit)}
-        else
-          echo "note: no .out/.err yet under $d; listing all files:" >&2
-          ls -lt -- "$d" | head -n {int(limit)}
-        fi
-        """
+    files = sorted(
+        list(log_dir.glob("*.out")) + list(log_dir.glob("*.err")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
     )
-    return _ssh(host, script)
+    if not files:
+        print(f"note: no .out/.err yet under {log_dir}; listing all files:", file=sys.stderr)
+        files = sorted(log_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for path in files[:limit]:
+        st = path.stat()
+        print(f"{st.st_mtime:10.0f}  {st.st_size:12d}  {path}")
+    return 0
+
+
+def _existing(paths: list[Path]) -> list[Path]:
+    return [p for p in paths if p.is_file()]
+
+
+def _pick_latest_by_name(log_dir: Path, job_name: str) -> Path:
+    cands = sorted(
+        log_dir.glob(f"{job_name}-*.out"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not cands:
+        raise FileNotFoundError(f"no .out for job-name={job_name} under {log_dir}")
+    return cands[0]
 
 
 def cmd_tail(
-    host: str,
-    log_dir: str,
+    log_dir: Path,
     n: int,
     which: str,
     job_id: str | None,
     job_name: str | None,
 ) -> int:
-    d = _quote_log_dir(log_dir)
-    jid_q = shlex.quote(job_id) if job_id else "''"
-    name_q = shlex.quote(job_name) if job_name else "''"
-    want_out = 1 if which in ("out", "both") else 0
-    want_err = 1 if which in ("err", "both") else 0
+    if not log_dir.is_dir():
+        print(f"missing log dir: {log_dir}", file=sys.stderr)
+        return 1
 
-    script = textwrap.dedent(
-        f"""\
-        set -euo pipefail
-        d={d}
-        jid={jid_q}
-        name={name_q}
-        n={int(n)}
-        want_out={want_out}
-        want_err={want_err}
+    outs: list[Path] = []
+    errs: list[Path] = []
+    if job_id and job_name:
+        outs = [log_dir / f"{job_name}-{job_id}.out"]
+        errs = [log_dir / f"{job_name}-{job_id}.err"]
+    elif job_id:
+        outs = sorted(log_dir.glob(f"*-{job_id}.out"))
+        errs = sorted(log_dir.glob(f"*-{job_id}.err"))
+    else:
+        assert job_name is not None
+        try:
+            latest = _pick_latest_by_name(log_dir, job_name)
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        outs = [latest]
+        errs = [latest.with_suffix(".err")]
 
-        if [[ ! -d "$d" ]]; then
-          echo "missing log dir: $d" >&2
-          exit 1
-        fi
-        shopt -s nullglob
+    real_outs = _existing(outs)
+    real_errs = _existing(errs)
 
-        outs=()
-        errs=()
-        if [[ -n "$jid" && -n "$name" ]]; then
-          outs=("$d/${{name}}-${{jid}}.out")
-          errs=("$d/${{name}}-${{jid}}.err")
-        elif [[ -n "$jid" ]]; then
-          outs=("$d"/*-"$jid".out)
-          errs=("$d"/*-"$jid".err)
-        else
-          cands=("$d"/"$name"-*.out)
-          if (( ${{#cands[@]}} == 0 )); then
-            echo "no .out for job-name=$name under $d" >&2
-            exit 1
-          fi
-          latest=""
-          newest=0
-          for f in "${{cands[@]}}"; do
-            mt=$(stat -c %Y -- "$f" 2>/dev/null || stat -f %m -- "$f")
-            if (( mt >= newest )); then
-              newest=$mt
-              latest=$f
-            fi
-          done
-          outs=("$latest")
-          errs=("${{latest%.out}}.err")
-        fi
+    if len(real_outs) > 1 or len(real_errs) > 1:
+        print(f"multiple matches for job_id={job_id}; pass --job-name", file=sys.stderr)
+        for p in real_outs + real_errs:
+            print(p, file=sys.stderr)
+        return 2
 
-        # 过滤不存在的路径；job_id 多匹配时要求 --job-name
-        real_outs=()
-        for f in "${{outs[@]}}"; do
-          [[ -e "$f" ]] && real_outs+=("$f")
-        done
-        real_errs=()
-        for f in "${{errs[@]}}"; do
-          [[ -e "$f" ]] && real_errs+=("$f")
-        done
+    found = False
+    targets: list[Path] = []
+    if which in ("out", "both"):
+        targets.extend(real_outs)
+    if which in ("err", "both"):
+        targets.extend(real_errs)
 
-        if (( ${{#real_outs[@]}} > 1 || ${{#real_errs[@]}} > 1 )); then
-          echo "multiple matches for job_id=$jid; pass --job-name" >&2
-          printf '%s\\n' "${{real_outs[@]}}" "${{real_errs[@]}}" >&2
-          exit 2
-        fi
+    for path in targets:
+        found = True
+        print(f"===== {path} (last {n} lines) =====")
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"read failed: {exc}", file=sys.stderr)
+            return 1
+        lines = text.splitlines()
+        print("\n".join(lines[-n:]))
+        print()
 
-        found=0
-        if (( want_out )); then
-          for f in "${{real_outs[@]}}"; do
-            found=1
-            printf '===== %s (last %s lines) =====\\n' "$f" "$n"
-            tail -n "$n" -- "$f"
-            printf '\\n'
-          done
-        fi
-        if (( want_err )); then
-          for f in "${{real_errs[@]}}"; do
-            found=1
-            printf '===== %s (last %s lines) =====\\n' "$f" "$n"
-            tail -n "$n" -- "$f"
-            printf '\\n'
-          done
-        fi
-        if (( found == 0 )); then
-          echo "no matching log files under $d" >&2
-          exit 1
-        fi
-        """
-    )
-    return _ssh(host, script)
+    if not found:
+        print(f"no matching log files under {log_dir}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Tail last N lines of remote Slurm .out/.err via SSH.",
+        description="读取本机 Slurm .out/.err 末 N 行（不发起 SSH；远端请先 push 再 ssh 执行）。",
     )
     p.add_argument(
         "job_id",
@@ -188,13 +154,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--job-name",
-        help="作业名（#SBATCH --job-name / %%x）；与 job_id 合用可精确定位，"
+        help="作业名（#SBATCH --job-name）；与 job_id 合用可精确定位，"
         "单独使用则取该名前缀最新的 .out/.err",
     )
     p.add_argument(
         "--list",
         action="store_true",
-        help="列出远端 logs 目录最近文件后退出",
+        help="列出 logs 目录最近文件后退出",
     )
     p.add_argument(
         "--list-limit",
@@ -202,11 +168,11 @@ def main(argv: list[str] | None = None) -> int:
         default=30,
         help="--list 时最多显示行数（默认 30）",
     )
-    p.add_argument("--host", default=DEFAULT_HOST, help=f"SSH 主机（默认 {DEFAULT_HOST}）")
     p.add_argument(
         "--log-dir",
+        type=Path,
         default=DEFAULT_LOG_DIR,
-        help=f"远端日志目录（默认 {DEFAULT_LOG_DIR}）",
+        help=f"日志目录（默认 {DEFAULT_LOG_DIR}）",
     )
     args = p.parse_args(argv)
 
@@ -215,15 +181,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.job_id is not None and not args.job_id.isdigit():
         p.error("job_id must be numeric")
 
+    log_dir = args.log_dir.expanduser()
+    if not log_dir.is_absolute():
+        log_dir = (_REPO_ROOT / log_dir).resolve()
+
     if args.list:
-        return cmd_list(args.host, args.log_dir, args.list_limit)
+        return cmd_list(log_dir, args.list_limit)
 
     if args.job_id is None and not args.job_name:
         p.error("需要 job_id，或 --job-name，或 --list")
 
     return cmd_tail(
-        host=args.host,
-        log_dir=args.log_dir,
+        log_dir=log_dir,
         n=args.lines,
         which=args.which,
         job_id=args.job_id,
