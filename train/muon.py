@@ -182,6 +182,56 @@ class FL_CombinedOptimizer:
         self.adamw.load_state_dict(state_dict["adamw"])
 
 
+def _vae_lr_ratio(model: nn.Module) -> float:
+    config = getattr(model, "config", None)
+    ratio = getattr(config, "vae_lr_ratio", None)
+    if ratio is None:
+        return 1.0
+    return float(ratio)
+
+
+def _split_vae_params(
+    params: list[nn.Parameter],
+    model: nn.Module,
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Split params into (non_vae, vae) by matching ``.vae.`` in named_parameters."""
+    vae_ids = {
+        id(p)
+        for name, p in model.named_parameters()
+        if p.requires_grad and ".vae." in name
+    }
+    if not vae_ids:
+        return params, []
+    non_vae = [p for p in params if id(p) not in vae_ids]
+    vae = [p for p in params if id(p) in vae_ids]
+    return non_vae, vae
+
+
+def _adamw_groups(
+    decay_params: list[nn.Parameter],
+    nodecay_params: list[nn.Parameter],
+    *,
+    model: nn.Module,
+    cfg: FL_TrainConfig,
+) -> list[dict[str, Any]]:
+    ratio = _vae_lr_ratio(model)
+    groups: list[dict[str, Any]] = []
+    if ratio == 1.0:
+        if decay_params:
+            groups.append({"params": decay_params, "weight_decay": cfg.weight_decay})
+        if nodecay_params:
+            groups.append({"params": nodecay_params, "weight_decay": 0.0})
+        return groups
+
+    for params, wd in ((decay_params, cfg.weight_decay), (nodecay_params, 0.0)):
+        non_vae, vae = _split_vae_params(params, model)
+        if non_vae:
+            groups.append({"params": non_vae, "weight_decay": wd, "lr_scale": 1.0})
+        if vae:
+            groups.append({"params": vae, "weight_decay": wd, "lr_scale": ratio})
+    return groups
+
+
 def build_optimizer(
     model: nn.Module,
     cfg: FL_TrainConfig,
@@ -189,16 +239,20 @@ def build_optimizer(
     if not cfg.use_muon:
         decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
         nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+        groups = _adamw_groups(decay_params, nodecay_params, model=model, cfg=cfg)
         return torch.optim.AdamW(
-            [
-                {"params": decay_params, "weight_decay": cfg.weight_decay},
-                {"params": nodecay_params, "weight_decay": 0.0},
-            ],
+            groups,
             lr=cfg.learning_rate,
             betas=(cfg.beta1, cfg.beta2),
         )
 
     muon_params, decay_params, nodecay_params = split_muon_adamw_params(model)
+    ratio = _vae_lr_ratio(model)
+    if ratio != 1.0:
+        # Scaled VAE LR is applied via AdamW groups; keep Muon on non-VAE only.
+        muon_params, muon_vae = _split_vae_params(muon_params, model)
+        decay_params = list(decay_params) + [p for p in muon_vae if p.dim() >= 2]
+        nodecay_params = list(nodecay_params) + [p for p in muon_vae if p.dim() < 2]
     if not muon_params:
         raise ValueError(f"{cfg.name}: use_muon enabled but no Muon-eligible weights found")
 
@@ -210,10 +264,7 @@ def build_optimizer(
         ns_steps=cfg.muon_ns_steps,
     )
     adamw = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ],
+        _adamw_groups(decay_params, nodecay_params, model=model, cfg=cfg),
         lr=cfg.learning_rate,
         betas=(cfg.beta1, cfg.beta2),
     )
@@ -227,10 +278,11 @@ def schedule_optimizer_lrs(
     muon_lr: float,
 ) -> None:
     for group in optimizer.param_groups:
+        scale = float(group.get("lr_scale", 1.0))
         if group.get("optim_kind") == "muon":
-            group["lr"] = muon_lr
+            group["lr"] = muon_lr * scale
         else:
-            group["lr"] = adam_lr
+            group["lr"] = adam_lr * scale
 
 
 def scaled_lr(step: int, cfg: FL_TrainConfig, base_lr: float) -> float:

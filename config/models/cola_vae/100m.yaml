@@ -1,0 +1,20 @@
+_doc: >
+  Cola Text VAE ~30M (4+4 causal layers x 384 dim). Size tag is the experiment
+  tier matching DiT 100m; not the VAE parameter count.
+
+name: cola_vae-100m
+tokenizer: gpt2
+max_seq_len: 1024
+n_layer_enc: 4
+n_layer_dec: 4
+n_head: 6
+n_embd: 384
+latent_dim: 16
+dropout: 0.1
+beta_kl: 0.1
+lambda_mask: 1.0
+mask_ratio: 0.15
+use_flash: true
+
+sampling:
+  temperature: 1.0

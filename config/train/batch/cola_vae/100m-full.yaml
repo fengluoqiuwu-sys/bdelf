@@ -1,0 +1,7 @@
+_doc: >
+  cola_vae/100m-full for 24GB×4. Global batch sized for stable Stage-1 VAE.
+name: 100m-full
+batch_size: 16
+global_batch_size: 256
+num_params_m: 30.0
+estimated_peak_vram_gb: 14.0

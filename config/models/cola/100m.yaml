@@ -1,0 +1,34 @@
+_doc: >
+  Cola DiT ~100M (12x768) + loaded cola_vae (~30M). Latent d=16, block=16.
+  Auto-loads cache/checkpoints/cola_vae-100m-{variant}*/checkpoint_latest.pt
+
+name: cola-100m
+tokenizer: gpt2
+max_seq_len: 1024
+n_layer: 12
+n_head: 12
+n_embd: 768
+latent_dim: 16
+diffusion_block_size: 16
+dropout: 0.0
+denoiser_p_mean: 0.0
+denoiser_p_std: 1.0
+time_schedule: logit_normal
+schedule_loc: 1.0
+t_eps: 0.05
+vae_model: cola_vae
+vae_size: 100m
+vae_lr_ratio: 1.0
+lambda_vae: 1.0
+lambda_fm: 1.0
+lambda_ref: 0.1
+beta_kl: 0.1
+lambda_mask: 1.0
+mask_ratio: 0.15
+freeze_vae: false
+
+sampling:
+  num_ode_steps: 16
+  cfg_scale: 7.0
+  temperature: 1.0
+  time_schedule: logit_normal

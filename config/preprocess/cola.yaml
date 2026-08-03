@@ -1,0 +1,10 @@
+_doc: >
+  Cola preprocess alias (identical to default: GPT-2 + 1024). Prefer
+  --preprocess default to reuse the existing owt_default cache.
+
+name: cola
+tokenizer: gpt2
+chunk_length: 1024
+overflow_mode: discard
+seed: 42
+text_column: text

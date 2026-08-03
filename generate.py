@@ -129,7 +129,12 @@ def load_model_from_checkpoint(
 ) -> tuple[torch.nn.Module, dict, int, dict | None]:
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_meta = load_model_meta(ckpt_path, ck)
-    model = build_model(model_meta["name"], model_meta["config"])
+    model_cfg = dict(model_meta["config"] or {})
+    # Cola Stage-2 checkpoints already contain VAE weights; skip re-loading
+    # cola_vae run artifacts (which may be absent on generate-only machines).
+    if model_meta["name"] == "cola":
+        model_cfg["load_vae_weights"] = False
+    model = build_model(model_meta["name"], model_cfg)
     model.load_state_dict(ck["model"])
     model.eval()
 

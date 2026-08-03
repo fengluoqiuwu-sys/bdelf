@@ -609,7 +609,7 @@ def train_loop(
                 )
             else:
                 for group in optimizer.param_groups:
-                    group["lr"] = lr
+                    group["lr"] = lr * float(group.get("lr_scale", 1.0))
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 # ELF: mixed_branch_training → model mixes per-example internally.
@@ -1081,6 +1081,16 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
 
     with open(model_cfg_path, encoding="utf-8") as f:
         model_cfg = yaml.safe_load(f) or {}
+
+    if model_name == "cola":
+        # Help Stage-2 auto-resolve matching cola_vae-{size}-{variant}* checkpoints.
+        model_cfg = dict(model_cfg)
+        model_cfg["train_variant"] = cfg.variant
+        # Resume packs VAE+DiT; skip Stage-1 disk resolve so missing VAE dirs
+        # do not block loading an existing cola run checkpoint.
+        latest_cola = Path(cfg.checkpoint_root) / cfg.name / "checkpoint_latest.pt"
+        if cfg.resume and latest_cola.is_file():
+            model_cfg["load_vae_weights"] = False
 
     model = build_model(model_name, model_cfg).to(device)
     model_meta = {
