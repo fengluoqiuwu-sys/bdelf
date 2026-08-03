@@ -457,19 +457,26 @@ def update_ppl_plots(
             ppl_cap=cap,
         )
 
-    # 最近 5B token 窗口：PPL 纵轴 = 窗口内 gen+train 最高值 × 1.05。
+    # 最近 5B token 窗口：忽略 ppl>1000（与 under_1000 同口径），
+    # 纵轴 = 窗口内保留点的 gen+train 最高值 × 1.05。
     recent_span = 5_000_000_000
+    recent_ppl_cap = 1000.0
     all_xs = train_plot_x + eval_x + train_lr_x
     if all_xs:
         x_right = max(all_xs)
         x_left = max(0, x_right - recent_span)
-        t_win, t_win_ppl = _filter_xy(train_plot_x, train_ppl, x_min=x_left)
-        g_win, g_win_ppl = _filter_xy(eval_x, gen_ppl, x_min=x_left)
+        t_win, t_win_ppl = _filter_xy(
+            train_plot_x, train_ppl, x_min=x_left, y_max=recent_ppl_cap,
+        )
+        g_win, g_win_ppl = _filter_xy(
+            eval_x, gen_ppl, x_min=x_left, y_max=recent_ppl_cap,
+        )
         _draw_one(
             filename="ppl_recent_5b.png",
-            title="PPL & LR (recent 5B tokens)",
+            title=f"PPL & LR (recent 5B tokens, ppl ≤ {recent_ppl_cap:g})",
             x_min=x_left,
             x_max=x_right,
+            ppl_cap=recent_ppl_cap,
             auto_ppl_ylim_from=(t_win_ppl, g_win_ppl),
         )
 
