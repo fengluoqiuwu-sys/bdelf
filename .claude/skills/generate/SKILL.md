@@ -19,11 +19,12 @@ description: >-
 
 | 参数 | 含义 |
 |------|------|
-| `--run <name>` | `cache/checkpoints/<name>/checkpoint_latest.pt` |
+| `--run <rel>` | `cache/checkpoints/{fast\|full}/{model}/{hash}/checkpoint_latest.pt` |
 | `--checkpoint <path>` | 显式指定任意 `.pt`（含历史快照） |
-| （省略） | 扫 `cache/checkpoints/*/checkpoint_latest.pt` 取 mtime 最新者 |
+| （省略） | 扫 `cache/checkpoints/{fast,full}/*/*/checkpoint_latest.pt` 取 mtime 最新者 |
 
-不确定有哪些 run：`.venv/bin/python generate.py --list-runs`。
+不确定有哪些 run：`.venv/bin/python generate.py --list-runs`。  
+不知道 hash：用与 train 相同入参跑 `resolve_checkpoint.py`。
 
 ## 基本用法
 
@@ -31,6 +32,8 @@ description: >-
 .venv/bin/python generate.py                                    # 最新 checkpoint，1024 token 无条件生成
 .venv/bin/python generate.py --run elf-100m-full                # 指定 run 的最新权重
 .venv/bin/python generate.py --checkpoint cache/checkpoints/<run>/checkpoint_step_0100000.pt  # 指定步数
+.venv/bin/python generate.py --generate generate                # 正式生成配置（默认）
+.venv/bin/python generate.py --generate eval                    # 与训练在线评测同一套采样
 .venv/bin/python generate.py --num-samples 3                    # 多个独立样本
 .venv/bin/python generate.py --prompt "Once upon a time"        # 续写（自动前置 BOS）
 .venv/bin/python generate.py --prompt-file prompt.txt --run ar-100m-full-muon
@@ -41,11 +44,12 @@ description: >-
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
+| `--generate` | `generate` | `config/generate/<model>/{generate,eval}.yaml` |
 | `--num-tokens` | 1024 | 总序列长（含 prompt 前缀） |
 | `--num-samples` | 1 | 独立样本数 |
 | `--prompt` / `--prompt-file` | 无 | 续写前缀；二者互斥，`--prompt-file` 读 UTF-8 文件 |
-| `--temperature` | yaml | 采样温度；省略用模型 YAML 默认（ELF=0 argmax；AR/BDELF≈1.0） |
-| `--top-k` | yaml | Top-k；省略用模型默认/全词表 |
+| `--temperature` | 配置文件 | 覆盖 generate 配置中的温度 |
+| `--top-k` | 配置文件 | 覆盖 generate 配置中的 top-k |
 | `--seed` | 42 | 采样种子 |
 | `--device` | cuda | torch 设备 |
 | `--list-runs` | - | 列出含 `checkpoint_latest.pt` 的 run 并退出 |

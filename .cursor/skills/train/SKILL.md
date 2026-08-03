@@ -3,7 +3,7 @@ name: train
 description: >-
   Run bdelf pretraining via train.py: local fast/debug training on RTX 5080 and
   remote full training on ovan-server. Understand the train config layout
-  (model/batch/eval/hardware/optimizer/schedule), construct train.py CLI args,
+  (per-model recipe + schedule/eval), construct train.py CLI args,
   and read/verify checkpoints and train/eval logs. Use when the user wants to
   launch or inspect training, pick a train config, or check train/eval progress.
 ---
@@ -20,49 +20,69 @@ full、提交到远端、拉 checkpoint 等流程决策见 `train-ops` 与 `auto
 ```bash
 .venv/bin/python train.py \
   --model     <model>      # 必须：ar | ar1_5 | ar2 | bd3lm | bdelf | elf
-  --config    <name>       # 必须：config/train/batch/<model>/<name>.yaml，如 100m-fast / 900m-full
+  --config    <name>       # 必须：100m-fast / 100m-full（选 batch 剖面）
   --dataset   <dataset>    # 必须：config/datasets/，如 owt / wikitext / arxiv
   --preprocess <pre>       # 必须：config/preprocess/，如 default / elf
-  --run-name  <dir>        # 可选：checkpoint 目录名，默认为 train config 的 name
+  --generate  <gen>        # 必须：config/generate/<model>/；训练用 eval，正式生成用 generate
+  --set SECTION.KEY=VALUE  # 可选：覆盖 YAML 超参（可重复）
 ```
 
 可用值都可直接查：`--help` 的 epilog 会列出 Available models / datasets / preprocess。
 校验失败会 `SystemExit` 并提示可用项。
 
+定位 checkpoint 目录（与 train 相同入参）::
+
+```bash
+.venv/bin/python resolve_checkpoint.py \
+  --model ar --config 100m-fast \
+  --dataset owt --preprocess default --generate eval
+```
+
+`--set` 在加载 recipe / schedule / eval / generate 之后、推导 accum / token 预算之前生效。section 为：
+`optimizer` / `batch` / `schedule` / `eval` / `generate`。例：
+
+```bash
+--set optimizer.learning_rate=1e-3 \
+--set batch.batch_size=16 \
+--set schedule.target_tokens=1000000000 \
+--set eval.gen_eval_samples=64 \
+--set generate.temperature=0.8
+```
+
+覆盖写入 checkpoint 的 `config_refs.overrides`，便于复现。
 ### 运行位置与规模
 
-- 本机 5080（fast）：`.venv/bin/python train.py --model elf --config 100m-fast --dataset owt --preprocess elf`
+- 本机 5080（fast）：`.venv/bin/python train.py --model elf --config 100m-fast --dataset owt --preprocess elf --generate eval`
 - 远端 4×4090（full）：`python train.py --config 100m-full ...`（由 `slurm/full/*.slurm` 内 `source .venv/bin/activate` 后调用）
-- 本机**不要**跑 full/ultra；full 自动探测 GPU 数（须 ∈ {1,2,4,8}），本机只有 1 卡默认配 world_size=4 会启动失败。
+- `world_size` 按可见 GPU 数自动探测（须 ∈ {1,2,4,8}）；本机**不要**跑 full。
 
 ## 训练配置（config/train/）
 
-`get_train_config` 把多个子 YAML 组合成一份 `FL_TrainConfig`，`--config` 的名字取自
-`batch/<model>/`，其余子目录全局共享。
+`get_train_config` 把 **per-model recipe**、全局 schedule/eval 与 **generate** 组合成 `FL_TrainConfig`。
 
-| 子目录 | 说明 | 关键字段（示例） |
-|--------|------|------------------|
-| `batch/<model>/<name>.yaml` | 每 GPU 微批；微批或全局批二选一 | `batch_size`, `grad_accum_steps` **或** `global_batch_size` |
-| `schedule/{fast,full,ultra}.yaml` | 训练计划 | `target_tokens`, `warmup_ratio`, `{eval,save,snapshot,log_plot}_step`, `resume`, `use_muon` |
-| `optimizer/<model>/<name>.yaml` | 优化器 | `learning_rate`, `muon_learning_rate`, `weight_decay`, `grad_clip` |
-| `eval/default.yaml` | 评测 | `eval_sample_count`, `gen_eval_model`, `gen_eval_batches` |
-| `hardware/{fast-16gb,full-4x4090,full-8x4090}.yaml` | 硬件 | `world_size`, `num_workers`, `gpu_memory_gb` |
+| 路径 | 说明 | 关键字段 |
+|------|------|----------|
+| `config/train/model/<model>/{fast,full}.yaml` | 模型配方：optimizer + batch | `learning_rate`, `batch_size`, `global_batch_size` |
+| `schedule/{fast,full}.yaml` | 全局训练计划 | `target_tokens`, `warmup_ratio`, `{eval,save,snapshot,log_plot}_step`, `resume`, `use_muon` |
+| `eval/default.yaml` | 全局在线评测 | `eval_sample_count`, `gen_eval_samples` |
+| `config/generate/<model>/{generate,eval}.yaml` | 每模型采样（字段因模型而异） | 如 `temperature` / `top_k` / `num_steps` / `use_fast_infer` … |
 
-- 名字一律用 `/` 形式列出/选用：如头里 `batch/elf/{100m,300m,900m}-{fast,full,ultra}`。
-- `_YAML_REQUIRED` 缺失会报错退出；非属性信息写 YAML 键（如 `_doc`）进 `extra`。
-- schedule 的 `{eval,save,snapshot,log_plot}_step` 以**优化器步**为单位，内部乘以
-  `grad_accum_steps` 换算成微步。改计划时长优先调 `target_tokens`。
+- `--config 100m-fast|100m-full` 对应加载 `model/<model>/fast.yaml` 或 `full.yaml`。
+- `--generate eval`：训练在线 gen-eval；`generate.py --generate generate`：正式生成。
+- 梯度累积由 `global_batch_size / (batch_size * world_size)` 推导；须整除。
+- schedule 的 `{eval,save,snapshot,log_plot}_step` 以**优化器步**为单位，内部按推导的
+  accum 换算成微步。改计划时长优先调 `target_tokens`。
 
 ## checkpoint 与日志
 
-落在 `cache/checkpoints/<run>/`（`CHECKPOINT_ROOT = "cache/checkpoints"`）：
+落在 `cache/checkpoints/{fast|full}/{model}/{config-hash}/`（无别名；见 rule「Checkpoint 路径与配置哈希」）：
 
 - `checkpoint_latest.pt` — 最新可续训权重（含 model/optimizer/EMA/step）
 - `checkpoint_step_XXXXXXX.pt` — 历史快照
 - `config.json` — 本次 `{"train": <FL_TrainConfig dict>, "model": <model_meta>}`
 - `train_log.csv` / `eval_log.csv` — 训练/评测曲线；`*_ppl.png` 由 `update_ppl_plots` 绘制
 
-`--run-name` 指定 `<run>` 目录名；不指定则取 train config 的 `name` 字段（可能与其他模型同名冲突，跨模型跑建议显式 `--run-name`）。
+用 `resolve_checkpoint.py`（与 train 相同入参）解析 `config-hash` / 目录；`generate.py --run` 填 `{variant}/{model}/{hash}`。
 
 ## 检查进度 / 续训
 

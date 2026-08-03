@@ -25,8 +25,9 @@ description: >-
 ```bash
 # 列目录 / 读小文本
 ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/'
-ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/<NAME>/'
-ssh ovan-server 'cat ~/source/bdelf/cache/checkpoints/<NAME>/config.json'
+ssh ovan-server 'ls -la ~/source/bdelf/cache/checkpoints/{fast,full}/*/*/'
+ssh ovan-server 'cat ~/source/bdelf/cache/checkpoints/<variant>/<model>/<hash>/config.json'
+
 ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
 
 # Slurm .out/.err 末 N 行：优先用本机脚本（见 train-ops）
@@ -87,7 +88,7 @@ ssh ovan-server 'cat ~/source/bdelf/temp/agent/current.json'
   - 每个调整/子实验一个 `.md`：写明改动内容、原因、父节点、结果数据。
   - `SUMMARY.md`（只在完成后写）：整个思路的结论与最终建议。
 - **换向/停止训练时的权重留存**（见第 10 步）：需保留一份最新权重时，**不放进 `temp/`**，
-  **也不再使用 `cache/temp/`**；落盘路径待另行约定前，先留在原 `cache/checkpoints/<run>/` 并在
+  **也不再使用 `cache/temp/`**；checkpoint 在 `cache/checkpoints/{fast|full}/{model}/{hash}/`（见 rule「Checkpoint 路径与配置哈希」），并在
   `temp/auto-research/<idea>/` 笔记里写明 run 名与用途。
 - 远端 `temp/` 与本地 `temp/` **互不同步**：远端 `~/source/bdelf/temp/agent/` 只做 AI job 登记
   （见 train-ops）；自动训练记录放本地 `temp/auto-research/<idea>/`。
@@ -160,7 +161,7 @@ git commit -m "<语义化描述>"
 ```text
 - [前置] 工作区已干净（第 4.5 步已提交，git status 无未提交改动）
 - bash sync-ovan-server.sh push
-- 确认 slurm/full/ 下脚本为 full 配置（禁止 ultra/preprocess）
+- 确认 slurm/full/ 下脚本为 full 配置（禁止 preprocess）
 - 读远端 temp/agent/current.json，确保无未结束的 AI job 或有登记
 - ssh sbatch（slurm/full/<name>.slurm）
 - 写 current.json + launched/<job_id>.json
@@ -250,5 +251,5 @@ sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
 
 - 没有明确"请自动执行"→ 只讨论/给方案，不实际开训。
 - 不用 `pull --mode full`（体积风险，见 sync skill 硬性禁令）。
-- 不 push 非 full 的 slurm 脚本；不用 ultra/preprocess 作业。
+- 不 push 非 full 的 slurm 脚本；不用 preprocess 作业。
 - 不删非本 agent 登记范围内他人的 job / checkpoint。

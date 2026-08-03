@@ -25,9 +25,10 @@ description: >-
 bash sync-ovan-server.sh push
 ```
 
-- 代码镜像推送（`--delete`）；排除 `.venv` / `cache` / `temp/` / `.git` 等
+- 代码镜像推送（`--delete`）；排除 `.venv` / `cache` / `temp/` / `.git` / `.cursor/` / `.claude/` 等
 - `cache/` 增量推送；排除 `preprocessed_datasets/`、`checkpoints/`、`compile*` 等
 - **`temp/` 在 push 与 pull 中均屏蔽**（远端 agent 任务登记，互不同步）
+- `cache/checkpoints/hash_guide.csv` 仅本地哈希指引：整目录本就不 push；pull 时也排除该文件
 
 ### pull
 
@@ -41,7 +42,8 @@ bash sync-ovan-server.sh pull [--mode fast|common] [NAME]
 | `common` | 同 fast，另同步 `checkpoint_latest.pt` |
 | `full` | 全部 `.pt` — **AI 禁止使用** |
 
-- `NAME`：可选，限定 `cache/checkpoints/<NAME>/`（如 `ar2-300m-full-muon`）
+- `NAME`：可选，限定 `cache/checkpoints/{fast|full}/{model}/{hash}/`（用 `resolve_checkpoint.py` 解析）
+
 - 默认拉全部 run 目录的范围内文件；有 `NAME` 时只同步该目录
 
 ### pull-file（单文件 / 指定步数）
@@ -66,6 +68,7 @@ bash sync-ovan-server.sh pull-file ar2-300m-full-muon checkpoint_step_0100000.pt
 
 ## 注意事项
 
-- Checkpoint 布局：`cache/checkpoints/<run>/checkpoint_latest.pt`、`checkpoint_step_XXXXXXX.pt`、`config.json`
+- Checkpoint 布局：`cache/checkpoints/{fast|full}/{model}/{config-hash}/`（无别名；见 rule「Checkpoint 路径与配置哈希」）
+
 - `NAME` 必须与远端目录名一致；不存在会 rsync 报 `No such file or directory`
 - 不确定目录名时，先 `pull --mode fast`（或 ssh 列远端 `cache/checkpoints/`）再针对性拉取
