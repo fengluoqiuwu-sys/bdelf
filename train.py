@@ -625,20 +625,33 @@ def train_loop(
     dual_branch = uses_dual_branch_logging(model)
     mixed_branch = bool(getattr(unwrap_model(model), "mixed_branch_training", False))
     if rank == 0 and dual_branch:
-        decoder_prob = float(getattr(unwrap_model(model).backbone, "decoder_prob", 0.2))
-        denoise_prob = max(0.0, 1.0 - decoder_prob)
-        if mixed_branch:
+        if cfg.model == "late_ce":
+            bb = unwrap_model(model).backbone
             _train_log(
-                f"{cfg.model.upper()} dual-branch: per-example mix "
-                f"denoise:decode ≈ {denoise_prob:g}:{decoder_prob:g} "
-                "(official ELF train_step); metrics/plots use decode CE",
+                f"LATE_CE: MSE + timed CE "
+                f"(mode={getattr(bb, 'late_ce_mode', '?')}, "
+                f"delta={getattr(bb, 'late_ce_delta', '?')}, "
+                f"region={getattr(bb, 'late_ce_region', '?')}, "
+                f"t={getattr(bb, 'time_schedule', '?')}); "
+                "metrics: mse / late_ce",
             )
         else:
-            _train_log(
-                f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
-                f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
-                "metrics/plots use decode CE",
+            decoder_prob = float(
+                getattr(unwrap_model(model).backbone, "decoder_prob", 0.2)
             )
+            denoise_prob = max(0.0, 1.0 - decoder_prob)
+            if mixed_branch:
+                _train_log(
+                    f"{cfg.model.upper()} dual-branch: per-example mix "
+                    f"denoise:decode ≈ {denoise_prob:g}:{decoder_prob:g} "
+                    "(official ELF train_step); metrics/plots use decode CE",
+                )
+            else:
+                _train_log(
+                    f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
+                    f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
+                    "metrics/plots use decode CE",
+                )
 
     model.train()
     t0 = time.time()
@@ -738,14 +751,17 @@ def train_loop(
                 loss_branch = "mixed"
                 denoise_mse = raw_for_log.last_l2_loss
                 decode_ce = raw_for_log.last_ce_loss
+                late_ce = getattr(raw_for_log, "last_late_ce_loss", float("nan"))
             elif dual_branch:
                 loss_branch = train_branch if train_branch else ""
                 denoise_mse = None
                 decode_ce = None
+                late_ce = None
             else:
                 loss_branch = ""
                 denoise_mse = None
                 decode_ce = None
+                late_ce = None
             elapsed = time.time() - t0
             # 每微批消耗一整份数据 batch（与是否 denoise/decode 混合无关）。
             seq_tokens = batch.size(0) * (
@@ -761,6 +777,7 @@ def train_loop(
                 tokens_per_sec,
                 dual_branch=dual_branch, loss_branch=loss_branch,
                 denoise_mse=denoise_mse, decode_ce=decode_ce,
+                late_ce=late_ce,
             )
 
             rank0_sync = False
@@ -776,6 +793,8 @@ def train_loop(
                         postfix["ppl"] = f"{loss_to_ppl(decode_ce):.1f}"
                     if denoise_mse == denoise_mse:
                         postfix["mse"] = f"{denoise_mse:.3f}"
+                    if late_ce is not None and late_ce == late_ce:
+                        postfix["late_ce"] = f"{late_ce:.3f}"
                 elif dual_branch and loss_branch == "decode":
                     postfix = {
                         "ce": f"{train_loss:.3f}",
@@ -986,7 +1005,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Train configs: 100m-{fast,full}\n"
             "Generate configs: config/generate/<model>/<name>.yaml\n"
             "Overrides: --set section.key=value "
-            "(sections: optimizer, batch, schedule, eval, generate)"
+            "(sections: optimizer, batch, schedule, eval, generate, model)"
         ),
     )
     parser.add_argument(
@@ -1206,6 +1225,11 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
 
     with open(model_cfg_path, encoding="utf-8") as f:
         model_cfg = yaml.safe_load(f) or {}
+    model_overrides = (
+        (cfg.extra.get("config_refs") or {}).get("overrides") or {}
+    ).get("model")
+    if model_overrides:
+        model_cfg = {**model_cfg, **dict(model_overrides)}
 
     if model_name == "cola":
         # Help Stage-2 auto-resolve matching cola_vae-{size}-{variant}* checkpoints.

@@ -96,6 +96,9 @@ def build_train_fingerprint(
     model_arch = _load_yaml_mapping(
         resolve_model_config_path(model, model_config),
     )
+    # ``--set model.*`` 并入架构指纹（与 train.py 加载时一致）
+    if overrides and overrides.get("model"):
+        model_arch = {**model_arch, **dict(overrides["model"])}
     preprocess_yaml = _load_yaml_mapping(
         repo / "config" / "preprocess" / f"{preprocess}.yaml",
     )

@@ -1,0 +1,38 @@
+_doc: LateCE ~105M（均匀 t + 晚段轨迹 CE；无 decode 分支）
+
+name: late_ce-100m
+tokenizer: t5-small
+max_seq_len: 1024
+encoder_model_name: t5-small
+text_encoder_dim: 512
+bottleneck_dim: 128
+n_layer: 12
+n_head: 12
+n_embd: 768
+dropout: 0.0
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+self_cond_prob: 0.5
+self_cond_cfg_min: 0.5
+self_cond_cfg_max: 5.0
+latent_mean: 0.0
+latent_std: 0.2
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: uniform          # 训练 t~U(0,1)；hard 下 CE 占比≈δ
+late_ce_mode: hard              # 门控：hard 窗 / soft 连续权重
+late_ce_delta: 0.2              # 窗宽；均匀 t 时 CE 样例占比≈δ
+late_ce_alpha: 10.0             # soft：p_CE=σ(α·(t-(1-δ)))（early 对称）
+late_ce_weight: 1.0             # LateCE 相对 denoise MSE 的权重
+late_ce_region: late            # late=近干净段；early=高噪负对照
+
+sampling:
+  sampling_method: sde
+  num_sampling_steps: 32
+  sde_gamma: 1.5
+  time_schedule: logit_normal
+  temperature: 0.0
+  self_cond_cfg_scale: 3.0
