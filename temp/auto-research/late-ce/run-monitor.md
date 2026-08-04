@@ -18,3 +18,8 @@
 - run: full/late_ce/c81ffbd037f6cd5d
 - state: SUBMITTED
 - holder: auto-train:late-ce
+
+## wakeup-1 job 14340 FAILED
+- 原因：`AutoConfig.from_pretrained(t5-small)` 未传 `cache_dir`；离线找不到 `cache/huggingface/hub`
+- 修复：`tokenizer.py` / `train/eval.py` 传入 `cache/tokenizers/...`
+- 已清 active/14340；准备重提
