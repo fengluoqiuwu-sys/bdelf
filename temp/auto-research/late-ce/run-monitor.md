@@ -23,3 +23,8 @@
 - 原因：`AutoConfig.from_pretrained(t5-small)` 未传 `cache_dir`；离线找不到 `cache/huggingface/hub`
 - 修复：`tokenizer.py` / `train/eval.py` 传入 `cache/tokenizers/...`
 - 已清 active/14340；准备重提
+
+## sbatch 14350（重提）
+- time: 2026-08-04T19:24:08+08:00
+- fix: tokenizer/eval cache_dir offline
+- run: full/late_ce/c81ffbd037f6cd5d
