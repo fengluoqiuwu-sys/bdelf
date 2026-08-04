@@ -263,6 +263,11 @@ def _build_fl_tokenizer(config: FL_TokenizerConfig) -> "FL_Tokenizer":
         if num_added and not os.environ.get("BDELF_QUIET_TOKENIZER"):
             print(f"[tokenizer] Added {num_added} special token(s)")
 
-    model_config = AutoConfig.from_pretrained(config.base_tokenizer)
+    # 与上面 tokenizer 同一 cache_dir，避免 Slurm TRANSFORMERS_OFFLINE 时
+    # 回落到空的 cache/huggingface/hub。
+    model_config = AutoConfig.from_pretrained(
+        config.base_tokenizer,
+        cache_dir=cache_dir,
+    )
     tokenizer._embed_size = _infer_embed_size(model_config)
     return tokenizer
