@@ -11,3 +11,10 @@
 ## 2026-08-04 启动
 - 本机冒烟 OK：`mse`/`late_ce` 正常打印；无 decode `ce`
 - 下一步：push → remote_status → sbatch → 登记 → 唤醒
+
+## sbatch 14340
+- time: 2026-08-04T19:00:47+08:00
+- name: late-ce-100m-full
+- run: full/late_ce/c81ffbd037f6cd5d
+- state: SUBMITTED
+- holder: auto-train:late-ce
