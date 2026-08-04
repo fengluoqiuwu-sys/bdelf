@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# elf-cfg 续训专用：锁定 fingerprint → full/elf/19de90b094488c46
-# 勿随意加 --set；勿在未核对 temp/auto-research/elf-cfg/README.md「续训指纹冻结」
-# 的情况下改 config/train/model/elf/full.yaml 的 batch/optimizer。
+# ELF-B 100m full + SC-CFG（训练期 gen-eval 用 32 samples，控制评测开销）。
+# 经 slurm/sbatch-train.sh 提交；默认 2 GPU（prototype.slurm）。
+# fingerprint：resolve_checkpoint.py … --set eval.gen_eval_samples=32
+#   → full/elf/57ef50375e85d826（无 checkpoint_latest 时从 step 0 开训）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
