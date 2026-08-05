@@ -101,7 +101,7 @@ description: >-
 5. push → 按表+global_bs 选型 → remote_status：AI 合计 GPU+2≤4 才可提交
    （额度满则睡 60m 再看；**勿**因 AVAIL=0 空等）→ sbatch full（2 GPU）排队
    → 写 active/<job_id>.json → 起唤醒调度（排队中按「资源等待」60m 再看；已 RUNNING 用「唤醒调度」）
-6. 唤醒循环：5m → 15m → 30m → 此后每 30m（见「唤醒调度」）
+6. 唤醒循环：5m → 15m → 30m → 此后每 60m（见「唤醒调度」）
    ├ 7a 决定继续 → 回 6
    ├ 7b 需调整 → 8
    ├ 7c 已完成 → 11
@@ -259,12 +259,14 @@ Cursor agent 无自主闹钟；用后台 `sleep` + 特征串输出，在 turn �
 |------|------|-------|
 | 第 1 次 | 5 分钟 | `300` |
 | 第 2 次 | 15 分钟 | `900` |
-| 第 3 次起 | 每 30 分钟 | `1800` |
+| 第 3 次 | 30 分钟 | `1800` |
+| 第 4 次起 | 每 60 分钟 | `3600` |
 
 ```bash
 sleep 300 && echo "AUTO-TRAIN-WAKEUP-1"    # 第 1 次
 sleep 900 && echo "AUTO-TRAIN-WAKEUP-2"    # 第 2 次
-sleep 1800 && echo "AUTO-TRAIN-WAKEUP"     # 第 3 次及以后
+sleep 1800 && echo "AUTO-TRAIN-WAKEUP-3"   # 第 3 次
+sleep 3600 && echo "AUTO-TRAIN-WAKEUP"     # 第 4 次及以后
 ```
 
 - 唤醒消息须带**明确下一步**（读日志 / pull fast / 决定继续或调整）。
