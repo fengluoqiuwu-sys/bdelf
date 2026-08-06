@@ -5,11 +5,17 @@
 #   bash slurm/sbatch-preprocess.sh --dataset owt --preprocess default
 #   bash slurm/sbatch-preprocess.sh --dataset owt --preprocess elf --exclude=cls1-srv2
 #
+# 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err}
 # ``--`` 之前也可夹杂其它 sbatch 选项；dataset/preprocess 均须显式给出。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=../scripts/job_log_dir.sh
+source "$ROOT/scripts/job_log_dir.sh"
+
+SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
+PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
 
 usage() {
   cat <<'EOF' >&2
@@ -84,12 +90,16 @@ done
 [[ -n "$PREPROCESS" ]] || { echo "缺少 --preprocess" >&2; usage; }
 [[ -n "$JOB_NAME" ]] || JOB_NAME="${DATASET}-${PREPROCESS}-preprocess"
 
-mkdir -p "$ROOT/slurm/logs"
-
-ARGS_FILE="$ROOT/slurm/logs/preprocess-args.pending"
+job_log_alloc "$SERVER_NAME" "$PROJECT"
+PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
+ARGS_FILE="$PENDING_DIR/preprocess-args.pending"
 printf '%s\n' --dataset "$DATASET" --preprocess "$PREPROCESS" > "$ARGS_FILE"
 
-exec sbatch \
+SBATCH_OUT="$(sbatch \
   --job-name="$JOB_NAME" \
+  --output="${JOB_LOG_DIR}/%x-%j.out" \
+  --error="${JOB_LOG_DIR}/%x-%j.err" \
   "${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"}" \
-  "$ROOT/slurm/preprocess.slurm"
+  "$ROOT/slurm/preprocess.slurm")"
+printf '%s\n' "$SBATCH_OUT"
+echo "log_dir=$JOB_LOG_DIR"

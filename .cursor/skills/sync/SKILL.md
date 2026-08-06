@@ -30,6 +30,7 @@ bash scripts/sync.sh ovan-server push --code-only # 只推代码
 ```
 
 - 代码镜像（`--delete`）；排除 `.venv` / `cache` 链接 / `temp/` / `.git` / `.cursor/` / `.claude/` 等。
+- `logs/`：gitignore；**push 不传、且 `--delete` 不删远端**；由 **pull** 增量拉取。
 - 默认再推 cache **内容**目录：`models/` `tokenizers/`。
   - `--checksum`：先比对校验和，相同则不传。
   - **不**用 `-L`（保留 HF `snapshots→blobs` 软链）。
@@ -48,6 +49,8 @@ bash scripts/sync.sh ovan-server pull [--mode fast|common] [NAME]
 | `fast`（默认） | 排除 `*.pt`，只拉元数据 |
 | `common` | 另含 `checkpoint_latest.pt` |
 | `full` | 全部 `.pt` — AI 默认禁止 |
+
+另：每次 `pull` 都会增量同步远端 `logs/` → 本地（作业 `.out` / `.err` / `gpu.log`；体量小）。
 
 `NAME`：`{fast|full}/{model}/{hash}`（用 `scripts/resolve_checkpoint.py` 解析）。省略则同步全部 run 的过滤结果。
 

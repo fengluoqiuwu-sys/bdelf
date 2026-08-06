@@ -1,11 +1,11 @@
 ---
 name: train-ops
 description: >-
-  Local fast smoke training on RTX 5080 and remote full training on ovan-server
-  via Slurm: mandatory slurm/remote_status.sh before remote job ops,
-  sbatch-train (default 2 GPU), multi-job agent registry under temp/agent/active
-  (slurm: job_id; local: scheduler local; common remote: GPU agent only, no cpus),
-  remote logs over ssh. Use when starting/stopping jobs, sbatch/scancel,
+  Local fast smoke training on RTX 5080 and remote full training: Slurm via
+  sbatch-train (ovan-server; mandatory remote_status.sh) or common via
+  scripts/launch-train.sh (--server + --gpus). Job logs unified under
+  logs/<server>/<timestamp>/ (.out/.err/gpu.log). Agent registry in
+  temp/agent/active. Use when starting/stopping jobs, sbatch/scancel,
   checking queues, or evaluating after pull. Hard limits in compute-local /
   compute-remote-slurm / compute-remote-common; CLI in skill train.
 ---
@@ -69,9 +69,15 @@ bash slurm/remote_status.sh          # 可读表；机器用加 --json
 
 对 `servers.csv` 中 `调度类型=common` 的远端机（见 rule「远端 common 计算约束」）：
 
-- 允许重 CPU，**不**登记 CPU。
-- 占 GPU 须用户授权；启动须 `--gpus <物理卡号,…>`（例 `bash scripts/train/<name>.sh --gpus 0,1`）。
-- 登记该机 `temp/agent/`：必填 `pid`、`gpus`、`gpu_ids`（与 `--gpus` 一致）、`holder`；**无** `cpus`；`gpu_ids` 不得与其它 active 重叠。
+- 允许重 CPU，**不**登记 CPU、不经 `launch-train`。
+- 占 GPU 须用户授权；**禁止**直接跑 `scripts/train/*.sh`，须：
+
+```bash
+bash scripts/ssh.sh <名字> -- \
+  bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]
+```
+
+- `launch-train` 自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<名字>/<时间戳>/` 下三个日志文件。
 - 作业前扫 active 的 `gpu_ids` + 可选 `nvidia-smi`；无 `remote_status.sh`。
 
 ## 远端提交 full（Slurm / ovan-server）
@@ -93,9 +99,11 @@ bash slurm/remote_status.sh          # 可读表；机器用加 --json
 ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 # 例：bash slurm/sbatch-train.sh elf-100m-full --name elf-cfg-100m-full --exclude=cls1-srv2
 # 人工若要 4 卡：追加 --gpus-per-node=4 --mem=128G（AI 自动训练保持默认 2）
+# stdout 含 Submitted batch job <id> 与 log_dir=logs/ovan-server/<时间戳>
 ```
 
-禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 2 GPU**）。
+禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 2 GPU**）。  
+日志目录：`logs/ovan-server/<时间戳>/`（`.out` / `.err` / `gpu-<job_id>.log`）。
 
 AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
 
@@ -183,16 +191,17 @@ cp temp/agent/active/pid${PID}.json temp/agent/launched/pid${PID}.json
 
 #### common 远端（仅占 GPU；登记卡号；不登记 CPU）
 
-`servers.csv` 中 `调度类型=common`：纯 CPU 不写 agent；占 GPU 须 `--gpus` 选物理卡，并在该机登记。硬约束见「远端 common 计算约束」。
+`servers.csv` 中 `调度类型=common`：纯 CPU 不写 agent；占 GPU 用 `scripts/launch-train.sh`（自动登记）。硬约束见「远端 common 计算约束」。
 
 ```json
 {
   "job_id": "pid12345",
   "pid": 12345,
   "job_name": "elf-100m-full",
-  "cmdline": "bash scripts/train/elf-cfg-100m-full.sh --gpus 0,1",
+  "cmdline": "bash scripts/launch-train.sh elf-cfg-100m-full --server train-server-1 --gpus 0,1",
   "gpus": 2,
   "gpu_ids": [0, 1],
+  "log_dir": "logs/train-server-1/20260806T100000",
   "started_at": "2026-08-06T10:00:00+08:00",
   "state": "RUNNING",
   "holder": "auto-train:<idea>",
@@ -203,18 +212,39 @@ cp temp/agent/active/pid${PID}.json temp/agent/launched/pid${PID}.json
 - **必填**：`pid`、`gpus`、`gpu_ids`、`holder`、`started_at`、`state`、`scheduler: "common"`（不要 `cpus`）。
 - `gpu_ids` 与其它 active **不得重叠**。
 
+## 作业日志布局（Slurm / common 统一）
+
+```text
+logs/<server-name>/<时间戳>/
+  <job-name>-<job_id>.out
+  <job-name>-<job_id>.err
+  gpu-<job_id>.log          # 训练包装器后台 nvidia-smi；探针/预处理可无
+  meta.json                 # 可选：server / job_id / script / …
+```
+
+- `<server-name>`：`servers.csv`「名字」（Slurm 默认 `ovan-server`）。
+- `<job_id>`：Slurm 数字 job id，或 common 的进程 PID（文件名用裸 PID；agent 键为 `pid<PID>`）。
+- `logs/` gitignore；**pull 增量拉取**；push 不上传且 `--delete` 不删远端。
+- 旧路径 `slurm/logs/` 仍被 `tail_remote_logs.py` 兼容扫描。
+
 ## 远端只读：日志
 
 `slurm/tail_remote_logs.py` 在远端执行（**无内嵌 SSH**）。脚本有更新时先 push。
 
 ```bash
+# Slurm
 ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
 ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120'
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --list'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --server ovan-server --list'
+# common
+bash scripts/ssh.sh train-server-1 -- \
+  .venv/bin/python slurm/tail_remote_logs.py pid12345 --server train-server-1
+bash scripts/ssh.sh train-server-1 -- \
+  .venv/bin/python slurm/tail_remote_logs.py pid12345 --which gpu
 ```
 
 看日志不要靠 pull；勿手写长串 `ssh ... tail`，除非脚本不可用。  
-查 GPU/队列/登记用 `remote_status.sh`，不要再手拼 `gpu_availability` + `squeue` + `cat current.json`。
+查 GPU/队列/登记用 `remote_status.sh`（仅 ovan），不要再手拼 `gpu_availability` + `squeue` + `cat current.json`。
 
 ## 效果评测（拉回本机）
 

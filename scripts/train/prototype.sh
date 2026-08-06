@@ -2,17 +2,17 @@
 # =============================================================================
 # 训练启动脚本模板（复制为 scripts/train/<name>.sh 后修改）
 # =============================================================================
-# - 工作目录须为仓库根（本地直接跑，或经 slurm/sbatch-train.sh 拉起）
+# - 工作目录须为仓库根（本地直接跑，或经包装器拉起）
 # - 只写「怎么训」：train.py 参数与可选的模型专属环境变量
-# - 不要写 #SBATCH；资源与集群环境由 slurm/train.slurm + sbatch-train.sh 负责
+# - 不要写 #SBATCH；资源与集群环境由 slurm/prototype.slurm + sbatch-train.sh 负责
 #
 # 本地（fast 冒烟）::
 #   bash scripts/train/<name>.sh
 # 远端 full（Slurm）::
 #   bash slurm/sbatch-train.sh <name>
 #   bash slurm/sbatch-train.sh <name> --name my-job --exclude=cls1-srv2
-# common 远端（须显式选卡）::
-#   bash scripts/train/<name>.sh --gpus 0,1
+# common 远端（须经 launch-train；勿直接跑本脚本）::
+#   bash scripts/launch-train.sh <name> --server <服务名> --gpus 0,1
 # =============================================================================
 set -euo pipefail
 

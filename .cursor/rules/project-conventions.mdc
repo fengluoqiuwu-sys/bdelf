@@ -10,13 +10,14 @@ alwaysApply: true
 ```
 config/{datasets,tokenizers,preprocess,models,train,generate}/
 dataset/  tokenizer/  models/
-scripts/  scripts/train/   # 辅助与训练启动 sh
+scripts/  scripts/train/   # 辅助与训练启动 sh；common 用 launch-train.sh
 slurm/                     # prototype + sbatch-train/vram-probe/preprocess；gpu/tail/remote_status
+logs/<服务名>/<时间戳>/     # 作业 .out/.err/gpu.log（gitignore；pull 同步，push 不删远端）
 train.py  generate.py  hf_config.py
 cache/                     # gitignore
 ```
 
-脚本与 Slurm 细则见 rule「脚本约定」；checkpoint 路径见 rule「Checkpoint 路径与配置哈希」。
+脚本与包装器细则见 rule「脚本约定」；checkpoint 路径见 rule「Checkpoint 路径与配置哈希」。
 
 ## 命名与配置
 

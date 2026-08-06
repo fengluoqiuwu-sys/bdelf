@@ -10,12 +10,17 @@
 # ``--`` 之后：传给 scripts/vram_probe.py 的参数。
 # 未写 ``--`` 时，第一个探针旗标起视为探针 CLI。
 #
-# 探针参数写入临时文件再经环境变量传路径（避免 --batches 中的逗号破坏
-# sbatch --export=KEY=val,KEY2=… 解析）。
+# 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err}
+# 探针参数写入 logs/ovan-server/pending/vram-probe-args.pending。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=../scripts/job_log_dir.sh
+source "$ROOT/scripts/job_log_dir.sh"
+
+SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
+PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
 
 usage() {
   cat <<'EOF' >&2
@@ -113,21 +118,29 @@ else
   fi
 fi
 
-mkdir -p "$ROOT/slurm/logs"
+job_log_alloc "$SERVER_NAME" "$PROJECT"
+PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
 
 if [[ $SUITE -eq 1 ]]; then
-  # suite 用独立模板，不传 --export（避免 login env retrieval hold）
-  exec sbatch \
+  SBATCH_OUT="$(sbatch \
     --job-name="$JOB_NAME" \
+    --output="${JOB_LOG_DIR}/%x-%j.out" \
+    --error="${JOB_LOG_DIR}/%x-%j.err" \
     "${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"}" \
-    "$ROOT/slurm/vram-probe-suite.slurm"
+    "$ROOT/slurm/vram-probe-suite.slurm")"
+  printf '%s\n' "$SBATCH_OUT"
+  echo "log_dir=$JOB_LOG_DIR"
+  exit 0
 fi
 
-# 单模型：参数文件用固定 pending 名；作业启动后改名消费
-ARGS_FILE="$ROOT/slurm/logs/vram-probe-args.pending"
+ARGS_FILE="$PENDING_DIR/vram-probe-args.pending"
 printf '%s\n' "${PROBE_ARGS[@]}" > "$ARGS_FILE"
 
-exec sbatch \
+SBATCH_OUT="$(sbatch \
   --job-name="$JOB_NAME" \
+  --output="${JOB_LOG_DIR}/%x-%j.out" \
+  --error="${JOB_LOG_DIR}/%x-%j.err" \
   "${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"}" \
-  "$ROOT/slurm/vram-probe.slurm"
+  "$ROOT/slurm/vram-probe.slurm")"
+printf '%s\n' "$SBATCH_OUT"
+echo "log_dir=$JOB_LOG_DIR"

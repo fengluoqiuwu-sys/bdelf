@@ -19,6 +19,8 @@ alwaysApply: true
 | `temp/agent/`（common 远端） | 占 GPU 作业登记（`gpu_ids` + `gpus`；不登记 CPU；见「远端 common 计算约束」） |
 | 远端 `temp/agent/`（slurm / ovan-server） | Slurm AI job 登记（`active/` + `launched/`；见 rule「远端 Slurm 计算约束」） |
 
+另：`logs/<服务名>/<时间戳>/`（仓库根、gitignore）存放作业 `.out` / `.err` / `gpu-*.log`（Slurm 与 common 统一）。**pull 会拉取**；push 不上传且不因 `--delete` 清远端（见 skill `sync` / `train-ops`）。
+
 - `<idea>` / `<name>` / `<run>`：短横线小写 slug（如 `elf-cfg`、`2026-08-03-diff-lm`）。
 - `auto-research` / `idea` / `research-scout` 目录建议有 `README.md`。
 - scout 不写入 `temp/idea/`；人筛选后再搬入。

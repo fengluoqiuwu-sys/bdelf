@@ -2,7 +2,7 @@
 # =============================================================================
 # 单卡单模型 VRAM 探针（勿写死 nodelist）
 # 提交：bash slurm/sbatch-vram-probe.sh --nodelist=… -- --model …
-# 参数文件：slurm/logs/vram-probe-args.pending（由包装器写入；本脚本消费后删除）
+# 参数文件：logs/ovan-server/pending/vram-probe-args.pending（包装器写入；本脚本消费后删除）
 # 不使用 sbatch --export（集群上曾触发 user env retrieval hold）
 # =============================================================================
 #SBATCH --job-name=vram-probe
@@ -13,19 +13,25 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=64G
 #SBATCH --time=0-01:00:00
-#SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.out
-#SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.err
+#SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/logs/ovan-server/_sbatch-default/%x-%j.out
+#SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/logs/ovan-server/_sbatch-default/%x-%j.err
 
 set -euo pipefail
 
 PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
+SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 cd "$PROJECT"
 source .venv/bin/activate
 
-ARGS_FILE="$PROJECT/slurm/logs/vram-probe-args.pending"
+ARGS_FILE="$PROJECT/logs/${SERVER_NAME}/pending/vram-probe-args.pending"
 if [[ ! -f "$ARGS_FILE" ]]; then
-  echo "缺少 $ARGS_FILE；请用: bash slurm/sbatch-vram-probe.sh -- <vram_probe.py 参数>" >&2
-  exit 1
+  ARGS_LEGACY="$PROJECT/slurm/logs/vram-probe-args.pending"
+  if [[ -f "$ARGS_LEGACY" ]]; then
+    ARGS_FILE="$ARGS_LEGACY"
+  else
+    echo "缺少 $ARGS_FILE；请用: bash slurm/sbatch-vram-probe.sh -- <vram_probe.py 参数>" >&2
+    exit 1
+  fi
 fi
 mapfile -t PROBE_ARGV < "$ARGS_FILE"
 rm -f "$ARGS_FILE"

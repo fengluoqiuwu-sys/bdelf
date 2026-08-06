@@ -48,7 +48,8 @@ description: >-
      这几条即便已"全权"也不做，如确有必要先停下来向用户确认。
 
 调度类型按该服务在 `servers.csv` 的「调度类型」列走：`slurm` → `remote_status` + `sbatch-train`（见
-train-ops / 远端 Slurm 规则）；`common` → 显式 `--gpus` + 该机 `temp/agent` 登记（见远端 common 规则）。
+train-ops / 远端 Slurm 规则）；`common` → `scripts/launch-train.sh --server <服务名> --gpus …`（自动写
+`temp/agent` 与 `logs/<服务名>/<时间戳>/`；见远端 common 规则）。
 下文示例里的 `<服务名>` 均指本轮已确认的名字。
 
 ## 代码与记录约定（一律在 master）
@@ -113,8 +114,8 @@ WHO="auto-train:<idea>"
 3.6 显存探针（强制，见「VRAM 探针」）：改动影响显存时 → push → vram-probe → 填 alloc.md
 4. push 到 <服务名> → 按表+global_bs 选型 → 按调度类型提交 full
    （slurm：remote_status，AI 合计 GPU+2≤4；额度满睡 60m；勿因 AVAIL=0 空等 → sbatch 排队）
-   （common：选卡 --gpus + 该机 agent 登记，遵守 csv 额度）
-   → 写 active/ → 起唤醒调度
+   （common：选卡 → launch-train --server --gpus，遵守 csv 额度；自动登记）
+   → 写 active/（slurm 手写；common 由 launch-train 写）→ 起唤醒调度
 5. 唤醒循环：5m → 15m → 30m → 此后每 60m（见「唤醒调度」）
    ├ 继续 → 回 5
    ├ 需调整 → 6
@@ -198,8 +199,10 @@ git commit -m "<语义化描述>"
 - slurm：bash slurm/remote_status.sh → 若 agent_gpu_sum+2>4 则睡 60min 再看
          → AVAIL 不足仍 sbatch 排队 → ssh 后 bash slurm/sbatch-train.sh <name>
          → 写 active/<job_id>.json（gpus:2, holder:auto-train:<idea>, scheduler:slurm）
-- common：扫该机 active → 选不冲突 --gpus（张数≤csv 单任务上限）→ 启训并登记
-         （gpus / gpu_ids / holder / scheduler:common；见远端 common 规则）
+- common：扫该机 active → 选不冲突 --gpus（张数≤csv 单任务上限）
+         → bash scripts/ssh.sh <服务名> -- bash scripts/launch-train.sh <name> \
+              --server <服务名> --gpus … --holder auto-train:<idea>
+         （自动写 agent + logs/<服务名>/<时间戳>/；见远端 common 规则）
 - 若已 RUNNING → 启动「5 分钟后首次唤醒」（见「唤醒调度」）
 - slurm 仍 PENDING → 按「资源等待」睡 60min 再看，拉起后改用「唤醒调度」
 ```

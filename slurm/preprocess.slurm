@@ -2,7 +2,7 @@
 # =============================================================================
 # 通用预处理作业（勿在文件名里写死 dataset/preprocess）
 # 提交：bash slurm/sbatch-preprocess.sh --dataset owt --preprocess default
-# 参数文件：slurm/logs/preprocess-args.pending（由包装器写入；本脚本消费后删除）
+# 参数文件：logs/ovan-server/pending/preprocess-args.pending（包装器写入；本脚本消费后删除）
 # =============================================================================
 #SBATCH --job-name=preprocess
 #SBATCH --partition=cls1
@@ -11,19 +11,25 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.out
-#SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/slurm/logs/%x-%j.err
+#SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/logs/ovan-server/_sbatch-default/%x-%j.out
+#SBATCH --error=/data/cls1-beegfs/home/csh/source/bdelf/logs/ovan-server/_sbatch-default/%x-%j.err
 
 set -euo pipefail
 
 PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
+SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 cd "$PROJECT"
 source .venv/bin/activate
 
-ARGS_FILE="$PROJECT/slurm/logs/preprocess-args.pending"
+ARGS_FILE="$PROJECT/logs/${SERVER_NAME}/pending/preprocess-args.pending"
 if [[ ! -f "$ARGS_FILE" ]]; then
-  echo "缺少 $ARGS_FILE；请用: bash slurm/sbatch-preprocess.sh --dataset … --preprocess …" >&2
-  exit 1
+  ARGS_LEGACY="$PROJECT/slurm/logs/preprocess-args.pending"
+  if [[ -f "$ARGS_LEGACY" ]]; then
+    ARGS_FILE="$ARGS_LEGACY"
+  else
+    echo "缺少 $ARGS_FILE；请用: bash slurm/sbatch-preprocess.sh --dataset … --preprocess …" >&2
+    exit 1
+  fi
 fi
 mapfile -t PRE_ARGV < "$ARGS_FILE"
 rm -f "$ARGS_FILE"

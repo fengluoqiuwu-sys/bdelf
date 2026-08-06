@@ -36,7 +36,8 @@ bash slurm/remote_status.sh          # 或加 --json
 ## 文件系统
 
 - 项目树只读；改代码只在本地 → `bash scripts/sync.sh ovan-server push` → 再提交。
-- 远端 AI **唯一可写**：`~/source/bdelf/temp/`（agent 登记；push/pull 均不同步）。
+- 远端 AI **可写**：`temp/`（agent 登记；不同步）与 `logs/`（作业日志；**pull 拉取**，push 不删远端）。
+- 作业日志统一：`logs/ovan-server/<时间戳>/`，含 `<job-name>-<job-id>.out` / `.err` / `gpu-<job-id>.log`（由 `sbatch-train.sh` + `prototype.slurm` 写入）。
 - `slurm/gpu_availability.py` / `tail_remote_logs.py` 内不得 SSH；本机汇总状态用 `slurm/remote_status.sh`。
 
 ## AI 作业登记与互斥

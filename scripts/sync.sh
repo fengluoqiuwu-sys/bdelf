@@ -33,6 +33,9 @@ RSYNC_CODE_FILTERS=(
   --filter='- .venv/'
   --exclude='cache'
   --exclude='temp/'
+  # logs/：gitignore；代码 push 不传、且 --delete 不删远端（由 pull 单独拉取）
+  --filter='P logs/'
+  --exclude='logs/'
   --exclude='venv/'
   --exclude='env/'
   --exclude='ENV/'
@@ -77,10 +80,12 @@ usage() {
       --with-datasets  额外推 datasets/
       --checksum       cache 内容整文件校验后再传（本地 cache 在 /mnt/d 时很慢，慎用）
       --code-only      只推代码，跳过 cache 内容
-      temp/ 不同步；cache/checkpoints/hash_guide.csv 仅本地（pull 亦排除）
+      temp/ 不同步；logs/ gitignore，push 不覆盖/不删除远端，由 pull 拉取
+      cache/checkpoints/hash_guide.csv 仅本地（pull 亦排除）
 
   pull [--mode MODE] [NAME]
       从远端增量同步 cache/checkpoints/[NAME]/（排除 hash_guide.csv）
+      并增量拉取 logs/（作业 .out/.err/gpu.log 等；体量小）
       --mode fast（默认）| common | full
 
   pull-file NAME FILE
@@ -165,6 +170,18 @@ pull_filters_for_mode() {
   esac
 }
 
+pull_logs() {
+  local remote_src="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/logs/"
+  local local_dst="${LOCAL_DIR}/logs/"
+  echo "==> 从 ${REMOTE_SSH_TARGET}（服务=${SERVER_NAME}）增量同步 logs/..."
+  if ! remote_ssh "test -d ${REMOTE_DIR}/logs"; then
+    echo "    （远端尚无 logs/，跳过）"
+    return 0
+  fi
+  mkdir -p "${local_dst}"
+  rsync_to "${RSYNC_OPTS[@]}" "${remote_src}" "${local_dst}"
+}
+
 pull_checkpoints() {
   local mode="fast"
   local name=""
@@ -223,6 +240,7 @@ pull_checkpoints() {
     rsync_to "${RSYNC_OPTS[@]}" "${RSYNC_HASH_GUIDE_EXCLUDE[@]}" \
       "${remote_src}" "${local_dst}"
   fi
+  pull_logs
 }
 
 pull_file() {
