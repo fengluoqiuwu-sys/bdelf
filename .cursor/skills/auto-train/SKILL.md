@@ -3,11 +3,12 @@ name: auto-train
 description: >-
   Automate the full loop of training and tuning a model end to end: record under
   temp/auto-research/<idea>/, edit only on master (with workspace lock), run fast
-  local smoke-tests, push to ovan-server, submit full training via Slurm, then wake
-  on a schedule to pull-fresh results, evaluate, decide whether to keep training,
-  adjust forward-compatibly or pivot, and finally summarize. Trigger only when the
-  user explicitly says "自动执行" / "auto" AND explicitly authorizes execution. Not
-  for one-off manual runs; those belong to train-ops / sync.
+  local smoke-tests, push to a user-confirmed servers.csv host, submit full training
+  (Slurm or common per that host), then wake on a schedule to pull-fresh results,
+  evaluate, decide whether to keep training, adjust forward-compatibly or pivot,
+  and finally summarize. Trigger only when the user explicitly says "自动执行" /
+  "auto" AND confirms the training server name AND authorizes execution. Not for
+  one-off manual runs; those belong to train-ops / sync.
 ---
 
 # auto-train
@@ -25,19 +26,30 @@ description: >-
 ## 触发与授权
 
 1. 用户描述任务（可能还提到某个架构/思路），并说"请自动执行"。
-2. **必须**在下一条回复里先问"是否执行"，得到明确确认后才动。
-3. 确认执行时，把后续**所有可能运行的一次性指令**（打 tag、起后台调度、首次 push、
-   sbatch 等）合并成**一个待批准块**一次给出，让用户一次性授权，防止其离开后逐条授权卡住。
+2. **必须**在下一条回复里先确认两件事，都得到明确答复后才动：
+   - **训练服务名**：`scripts/servers.csv` 的「名字」列（如 `ovan-server` / `upload-server`）；
+     未指定则列出可用名字请用户选。**禁止**默认任一主机。
+   - **是否执行**：得到明确确认后才进入下一步。
+3. 将确认的服务名记入 `temp/auto-research/<idea>/README.md`（字段建议：`server: <名字>`、
+   `scheduler: slurm|common`）；本轮全程 sync / ssh / 提交 / 登记**只使用该名字**。
+   中途换机须重新向用户确认并改写 README。
+4. 确认执行时，把后续**所有可能运行的一次性指令**（打 tag、起后台调度、首次 push、
+   sbatch / common 启训等）合并成**一个待批准块**一次给出，让用户一次性授权，防止其离开后逐条授权卡住。
    - 构建鉴权：提交命令尽量合并为一条 `&&` / 一个脚本；初始化、登记等放同一块。
    - 若某条被拒，停下向用户说明，不要擅自更换等价命令绕过。
-4. **一次性授权即覆盖整个自动训练循环，不设边界**：得到"批准"后，整个循环（ssh 只读探查、
-   push/sbatch、删本 agent 登记 run 的 checkpoint、换向记笔记、sleep 唤醒、
+5. **一次性授权即覆盖整个自动训练循环，不设边界**：得到"批准"后，整个循环（ssh 只读探查、
+   push/提交、删本 agent 登记 run 的 checkpoint、换向记笔记、sleep 唤醒、
    资源等待（排队后 60m 再看 / AI 额度满 60m / 抢锁 30m）、连不上重试等）
    均视为已被授权，自动执行，不再逐条打断用户。
    - **绝对底线**（不因授权而放宽，见「边界」）：不删/不动**非本 holder 登记范围**他人的
      job 与 checkpoint；不执行 `pull --mode full`；不 push 非 full 脚本；
+     **未确认服务名不得开训**；
      **非向前兼容 / 可能影响其他模型训练或推理的改动须向用户二次确认**（见下「改动兼容性」）。
      这几条即便已"全权"也不做，如确有必要先停下来向用户确认。
+
+调度类型按该服务在 `servers.csv` 的「调度类型」列走：`slurm` → `remote_status` + `sbatch-train`（见
+train-ops / 远端 Slurm 规则）；`common` → 显式 `--gpus` + 该机 `temp/agent` 登记（见远端 common 规则）。
+下文示例里的 `<服务名>` 均指本轮已确认的名字。
 
 ## 代码与记录约定（一律在 master）
 
@@ -94,14 +106,15 @@ WHO="auto-train:<idea>"
 ## 主流程
 
 ```
-0. 授权确认（见上）
-1. 在 temp/auto-research/<idea>/README.md 记录口径（不 fork git 分支）
+0. 授权确认 + 确认训练服务名 <服务名>（见上；写入 README）
+1. 在 temp/auto-research/<idea>/README.md 记录口径与 server/scheduler（不 fork git 分支）
 2. 实现思路（抢锁 → master 上改 → 兼容性自检 → commit → 释锁）
 3. 本地验证：抢锁 → master 上 fast 冒烟；generate 不占锁 → 释锁
 3.6 显存探针（强制，见「VRAM 探针」）：改动影响显存时 → push → vram-probe → 填 alloc.md
-4. push → 按表+global_bs 选型 → remote_status：AI 合计 GPU+2≤4 才可提交
-   （额度满则睡 60m 再看；**勿**因 AVAIL=0 空等）→ sbatch full（2 GPU）排队
-   → 写 active/<job_id>.json → 起唤醒调度
+4. push 到 <服务名> → 按表+global_bs 选型 → 按调度类型提交 full
+   （slurm：remote_status，AI 合计 GPU+2≤4；额度满睡 60m；勿因 AVAIL=0 空等 → sbatch 排队）
+   （common：选卡 --gpus + 该机 agent 登记，遵守 csv 额度）
+   → 写 active/ → 起唤醒调度
 5. 唤醒循环：5m → 15m → 30m → 此后每 60m（见「唤醒调度」）
    ├ 继续 → 回 5
    ├ 需调整 → 6
@@ -138,7 +151,7 @@ WHO="auto-train:<idea>"
 
 **3.5 强制提交（推送到远端前必做）**
 
-推送 `scripts/sync.sh ovan-server push` 之前，**必须先提交到 git，不允许有未保留的内容**
+推送 `scripts/sync.sh <服务名> push` 之前，**必须先提交到 git，不允许有未保留的内容**
 （持有工作区锁、在 **`master`** 上）：
 
 ```bash
@@ -150,7 +163,7 @@ git commit -m "<语义化描述>"
 # 保持在 master
 ```
 
-- `git push` 推送的是 git **commit**；`scripts/sync.sh ovan-server push` 推送的是**工作区文件**。若工作区有
+- `git push` 推送的是 git **commit**；`scripts/sync.sh <服务名> push` 推送的是**工作区文件**。若工作区有
   未提交的改动，远端拿到的是无法从 git 恢复的环境——这是不允许的。
 - 本地验证通过后、确认改动可用即提交；提交信息写清改动内容与目的。
 - 提交后 `git status` 必须**干净**，再进入第 4 步。
@@ -161,35 +174,37 @@ git commit -m "<语义化描述>"
 
 凡改动会影响显存占用（模型结构、精度、序列长 / chunk、EMA、优化器状态规模等），在提交 full **之前**必须：
 
-1. 工作区已提交且干净（3.5）；`bash scripts/sync.sh ovan-server push`
-2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 若合计 GPU+1>4 则睡 60m 再看；
-   **AVAIL 不足仍先 sbatch 排队**（勿空等空闲卡）→ 写 `active/` 登记 → `bash slurm/sbatch-vram-probe.sh …`
+1. 工作区已提交且干净（3.5）；`bash scripts/sync.sh <服务名> push`
+2. 按 skill **`vram-probe`** + **`train-ops`**（slurm 主机：`remote_status` → 若合计 GPU+1>4 则睡 60m 再看；
+   **AVAIL 不足仍先 sbatch 排队**；写 `active/` → `bash slurm/sbatch-vram-probe.sh …`。
+   common 主机：按该机额度选空闲 `--gpus` 后跑探针，勿超 csv 上限）
 3. 读日志；把各档 **`alloc_peak_GiB`**（及 `oom`）填入 **`temp/vram-probe/alloc.md`** 对应行
 4. **不要**把探针结论写回 recipe 默认 YAML；可在 `temp/auto-research/<idea>/` 记一笔链接到该表
-5. **禁止**未填/过期表直接 `sbatch-train`
+5. **禁止**未填/过期表直接开训
 
 仅改 loss 日志文案等明显不影响显存的改动可跳过本步；有疑虑时宁可跑探针。
 
-**开训选型**（步骤 4）：查 `alloc.md` 该模型各列，结合**当前目标卡** `total−2` 与本次 `global_batch_size` / `world_size=2`，取最大安全且整除的 micro-batch（公式见 skill `vram-probe`）。默认 YAML 已是该值则不必 `--set`；否则专用 `scripts/train/<name>.sh` 加 `--set batch.batch_size=…`。
+**开训选型**（步骤 4）：查 `alloc.md` 该模型各列，结合**当前目标卡** `total−2` 与本次 `global_batch_size` / `world_size`，取最大安全且整除的 micro-batch（公式见 skill `vram-probe`）。默认 YAML 已是该值则不必 `--set`；否则专用 `scripts/train/<name>.sh` 加 `--set batch.batch_size=…`。
 
 **4. 推送与远端训练**
 
 ```text
+- [前置] 已确认 <服务名> 与 scheduler，并写入 README
 - [前置] 工作区已干净（第 3.5 步已提交；已在 master、已释锁）
 - [前置] 若本轮改动影响显存：第 3.6 步已完成，alloc.md 对应行已更新
-- [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（world_size=2；必要时 scripts/train 含 --set）
-- bash scripts/sync.sh ovan-server push
+- [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（必要时 scripts/train 含 --set）
+- bash scripts/sync.sh <服务名> push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
-- bash slurm/remote_status.sh   # 强制：GPU / 队列 / agent_gpu_sum
-- 若 agent_gpu_sum+2>4 → 按「资源等待」睡 60min 再 remote_status（等本侧额度腾出）
-- **AVAIL 不足不是阻塞**：照样 sbatch，让 Slurm 排队（空等空闲卡永远排不上）
-- ssh 后 `bash slurm/sbatch-train.sh <name>`（默认 2 GPU；可选 `--name JOB_NAME`）
-- 写 active/<job_id>.json（gpus:2, holder:auto-train:<idea>）+ launched/
-- 若提交时已 RUNNING → 启动「5 分钟后首次唤醒」（见「唤醒调度」）
-- 若仍 PENDING → 按「资源等待」睡 60min 再看是否已拉起，拉起后改用「唤醒调度」
+- slurm：bash slurm/remote_status.sh → 若 agent_gpu_sum+2>4 则睡 60min 再看
+         → AVAIL 不足仍 sbatch 排队 → ssh 后 bash slurm/sbatch-train.sh <name>
+         → 写 active/<job_id>.json（gpus:2, holder:auto-train:<idea>, scheduler:slurm）
+- common：扫该机 active → 选不冲突 --gpus（张数≤csv 单任务上限）→ 启训并登记
+         （gpus / gpu_ids / holder / scheduler:common；见远端 common 规则）
+- 若已 RUNNING → 启动「5 分钟后首次唤醒」（见「唤醒调度」）
+- slurm 仍 PENDING → 按「资源等待」睡 60min 再看，拉起后改用「唤醒调度」
 ```
 
-允许多个 AI 作业并行，只要登记合计 GPU ≤ 4（本作业 2 卡计入）。集群无空闲卡时靠排队，不靠轮询 AVAIL。
+slurm：允许多个 AI 作业并行，只要登记合计 GPU ≤ 该机 csv「最大使用显卡数量」（ovan 默认本作业 2 卡计入）。集群无空闲卡时靠排队，不靠轮询 AVAIL。
 
 **5. 唤醒循环与判据**
 
@@ -303,9 +318,10 @@ Cursor agent 无自主闹钟；用 ``scripts/agent_wakeup.py`` 后台 sleep，�
 ## 边界（不要自动做）
 
 - 没有明确"请自动执行"→ 只讨论/给方案，不实际开训。
+- **未确认训练服务名**→ 不得 push / 提交 / 登记开训（不得默认 `ovan-server`）。
 - 不用 `pull --mode full`（体积风险，见 sync skill 硬性禁令）。
 - 不 push 非 full 的 slurm 脚本；不用 preprocess 作业。
 - 不删 / 不 `scancel` 非本 `holder` 登记范围内他人的 job / checkpoint。
-- 不把 AI 训练改成 4 卡去抢满预算（保持每作业 2 GPU，以便多任务并存）。
+- slurm：不把 AI 训练改成 4 卡去抢满预算（保持每作业 2 GPU，以便多任务并存）。
 - **不为 idea fork git 分支**；代码改动只在 `master`，思路隔离用 `temp/auto-research/`。
 - **不自动落地非向前兼容 / 可能影响其他模型训练或推理的改动**；须向用户二次确认。

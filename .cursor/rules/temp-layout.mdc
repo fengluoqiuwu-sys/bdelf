@@ -9,7 +9,7 @@ alwaysApply: true
 
 | 路径 | 用途 |
 |------|------|
-| `temp/auto-research/<idea>/` | 自动训练/优化记录（见 skill `auto-train`） |
+| `temp/auto-research/<idea>/` | 自动训练/优化记录（见 skill `auto-train`；README 须含已确认的训练服务名） |
 | `temp/idea/<idea>/` | 人工认可后的想法/规格文稿 |
 | `temp/papers/<name>/` | 论文（`paper/` + `INDEX.md`）与可选 `sources/` |
 | `temp/research-scout/<run>/` | 自由探索找 idea 的 run 记录（见 skill `research-scout`）；交付物 `ideas.md` |

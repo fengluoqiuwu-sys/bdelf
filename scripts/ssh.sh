@@ -83,11 +83,20 @@ EOF
   exit 0
 fi
 
-# 远端 cd：工作目录可能含 ~，交给远端 shell 展开
+# 远端 cd：工作目录可能含 ~（单引号会阻止 ~ 展开，故 ~/… 改写成 $HOME/…）
 remote_cd_prefix() {
-  # 单引号包裹路径中的单引号：' -> '\'' 
-  local d="${REMOTE_DIR//\'/\'\\\'\'}"
-  printf "cd '%s'" "${d}"
+  local d="${REMOTE_DIR}"
+  if [[ "${d}" == "~" ]]; then
+    printf 'cd "$HOME"'
+  elif [[ "${d}" == "~/"* ]]; then
+    local rest="${d:2}"
+    rest="${rest//\'/\'\\\'\'}"
+    printf "cd \"\$HOME/%s\"" "${rest}"
+  else
+    # 单引号包裹路径中的单引号：' -> '\''
+    local quoted="${d//\'/\'\\\'\'}"
+    printf "cd '%s'" "${quoted}"
+  fi
 }
 
 if [[ ${#REMOTE_CMD[@]} -eq 0 ]]; then
