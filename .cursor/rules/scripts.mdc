@@ -10,22 +10,22 @@ alwaysApply: true
 | 位置 | 内容 |
 |------|------|
 | 仓库根 | 入口：`train.py`、`generate.py`（库代码勿塞进 `scripts/`） |
-| `scripts/` | 通用辅助（resolve、download、sync、`remote_status.sh`、`vram_probe.py` 等） |
+| `scripts/` | 通用辅助（resolve、download、sync、`preprocess.py`、`vram_probe.py` 等） |
 | `scripts/train/` | 训练启动 `.sh`（模板 `prototype.sh`） |
-| `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`vram-probe.slurm` + `sbatch-vram-probe.sh`；`gpu_availability.py` / `tail_remote_logs.py`；preprocess 作业 |
+| `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`vram-probe.slurm` + `sbatch-vram-probe.sh`；`preprocess.slurm` + `sbatch-preprocess.sh`；`remote_status.sh`（ovan-server 专属）/ `gpu_availability.py` / `tail_remote_logs.py` |
 
 勿再为每个模型复制一份 `.slurm`。
 
 ## 执行目录
 
 - **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
-- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-vram-probe.sh …`。
+- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-vram-probe.sh …`、`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`、`bash scripts/sync.sh <服务名> push|pull|…`（服务名见 `scripts/servers.csv`）。
 - 禁止 `cd scripts && python foo.py`。
 - `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
 
 ## SSH 边界
 
 - `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**不得在进程内发起 SSH**；在目标机直接跑。
-- 本机查远端作业前置状态：`bash scripts/remote_status.sh`（内部 ssh；**远端任务前必跑**，见 rule「远端计算约束」；输出含 `agent_gpu_sum`）。
+- 本机查 ovan-server 作业前置状态：`bash slurm/remote_status.sh`（本机 ssh 汇总；**远端任务前必跑**，见 rule「远端计算约束」；输出含 `agent_gpu_sum`）。
 - 本机读远端日志：push（如需）→ `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`。
-- 具体命令与登记流程见 skill `train-ops` / `sync-ovan-server`。
+- 具体命令与登记流程见 skill `train-ops` / `sync`。

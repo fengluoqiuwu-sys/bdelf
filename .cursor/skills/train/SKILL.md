@@ -5,13 +5,13 @@ description: >-
   checkpoint hash resolution via scripts/resolve_checkpoint.py. Use when
   launching or inspecting training args, picking configs, or locating a run
   directory. For Slurm submit/register/logs use train-ops; for push/pull use
-  sync-ovan-server.
+  sync.
 ---
 
 # train
 
 聚焦**训练命令与配置**。硬约束见 rule「本机/远端计算」「Checkpoint 路径」「Python 虚拟环境」。  
-提交作业、登记、读日志 → skill `train-ops`；同步 → `sync-ovan-server`。
+提交作业、登记、读日志 → skill `train-ops`；同步 → `sync`。
 
 ## CLI
 
@@ -71,4 +71,4 @@ description: >-
 - `config.json`、`hardware.json`、`train_log.csv`、`eval_log.csv`、曲线图
 - full 训练时 upsert 本地 `hash_guide.csv`（fast 不写入；不同步）
 
-`resume` 默认 true：有 `checkpoint_latest.pt` 则续训。进度查看与评测拉数见 `train-ops` / `sync-ovan-server`；**不要在远端跑 generate/eval**。
+`resume` 默认 true：有 `checkpoint_latest.pt` 则续训。进度查看与评测拉数见 `train-ops` / `sync`；**不要在远端跑 generate/eval**。

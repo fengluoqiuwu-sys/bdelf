@@ -7,14 +7,14 @@ description: >-
   results, evaluate, decide whether to keep training, adjust on the same branch or
   pivot to a new direction, and finally summarize. Trigger only when the user
   explicitly says "自动执行" / "auto" AND explicitly authorizes execution. Not for
-  one-off manual runs; those belong to train-ops / sync-ovan-server.
+  one-off manual runs; those belong to train-ops / sync.
 ---
 
 # auto-train
 
 自动训练 + 自动优化的完整闭环 skill。仅在用户**明确说"请自动执行"并授权**后启动。
 
-配合 rule「本机/远端计算」「temp/ 布局」、skill `train-ops` / `sync-ovan-server` / `train` / `generate` / `vram-probe`。  
+配合 rule「本机/远端计算」「temp/ 布局」、skill `train-ops` / `sync` / `train` / `generate` / `vram-probe`。  
 本 skill 只编排闭环与决策；具体命令去读对应 skill。
 
 ## 远端只读探查（优先于 pull）
@@ -76,8 +76,8 @@ description: >-
 - **换向/停止训练时的权重留存**（见第 10 步）：需保留一份最新权重时，**不放进 `temp/`**，
   **也不再使用 `cache/temp/`**；checkpoint 在 `cache/checkpoints/{fast|full}/{model}/{hash}/`（见 rule「Checkpoint 路径与配置哈希」），并在
   `temp/auto-research/<idea>/` 笔记里写明 run 名与用途。
-- 远端 `temp/` 与本地 `temp/` **互不同步**：远端 `~/source/bdelf/temp/agent/active/` 登记 AI job
-  （见 train-ops）；自动训练记录放本地 `temp/auto-research/<idea>/`。
+- 远端 `temp/` 与本地 `temp/` **互不同步**：远端 `~/source/bdelf/temp/agent/active/` 登记 Slurm AI job；本机 / common 机同目录用 **PID/CPU/GPU** 登记（见 train-ops）。
+  自动训练记录放本地 `temp/auto-research/<idea>/`。
 
 ## 本机工作区锁（非 temp 改动）
 
@@ -138,12 +138,12 @@ git switch master && git switch -c <idea>
 - `fast` **仅用于验证改动能跑通**，不是正式训练：起训练后观察到**首批训练步 loss 正常打印、
   无报错 / 崩溃 / segfault** 即可，通常 **2–3 分钟**内确认后就**主动停掉该进程**（kill），
   不要让 fast 跑满整个 token 预算（正式训练只在远端 full 跑）。
-- 本机 GPU 互斥，一次一个进程（见 train-ops）。
+- 本机 GPU 互斥，一次一个进程；冒烟起训后写 `temp/agent/active/pid<PID>.json`（`scheduler:common`），停掉后删 active（见 train-ops）。
 - 验证通过后**清理本机中间产物**（快照/调试文件/临时 run 的 checkpoint 不提交），只保留有意义的改动。
 
 **4.5 强制提交（推送到远端前必做）**
 
-推送 `scripts/sync-ovan-server.sh push` 之前，**必须先提交到 git，不允许有未保留的内容**
+推送 `scripts/sync.sh ovan-server push` 之前，**必须先提交到 git，不允许有未保留的内容**
 （持有工作区锁、在本任务分支上）：
 
 ```bash
@@ -154,7 +154,7 @@ git switch master
 # 然后释放 temp/local-workspace.lock
 ```
 
-- `git push` 推送的是 git **commit**；`scripts/sync-ovan-server.sh push` 推送的是**工作区文件**。若工作区有
+- `git push` 推送的是 git **commit**；`scripts/sync.sh ovan-server push` 推送的是**工作区文件**。若工作区有
   未提交的改动，远端拿到的是无法从 git 恢复的环境——这是不允许的。
 - 本地验证通过后、确认改动可用即提交；提交信息写清改动内容与目的（如 `ar2: change anchor embedding format`）。
 - 提交后任务分支上 `git status` 必须**干净**；回到 `master` 后再进入第 5 步。
@@ -165,7 +165,7 @@ git switch master
 
 凡改动会影响显存占用（模型结构、精度、序列长 / chunk、EMA、优化器状态规模等），在提交 full **之前**必须：
 
-1. 工作区已提交且干净（4.5）；`bash scripts/sync-ovan-server.sh push`
+1. 工作区已提交且干净（4.5）；`bash scripts/sync.sh ovan-server push`
 2. 按 skill **`vram-probe`** + **`train-ops`**：`remote_status` → 若合计 GPU+1>4 则睡 60m 再看；
    **AVAIL 不足仍先 sbatch 排队**（勿空等空闲卡）→ 写 `active/` 登记 → `bash slurm/sbatch-vram-probe.sh …`
 3. 读日志；把各档 **`alloc_peak_GiB`**（及 `oom`）填入 **`temp/vram-probe/alloc.md`** 对应行
@@ -182,9 +182,9 @@ git switch master
 - [前置] 工作区已干净（第 4.5 步已提交；已回 master、已释锁）
 - [前置] 若本轮改动影响显存：第 4.6 步已完成，alloc.md 对应行已更新
 - [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（world_size=2；必要时 scripts/train 含 --set）
-- bash scripts/sync-ovan-server.sh push
+- bash scripts/sync.sh ovan-server push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
-- bash scripts/remote_status.sh   # 强制：GPU / 队列 / agent_gpu_sum
+- bash slurm/remote_status.sh   # 强制：GPU / 队列 / agent_gpu_sum
 - 若 agent_gpu_sum+2>4 → 按「资源等待」睡 60min 再 remote_status（等本侧额度腾出）
 - **AVAIL 不足不是阻塞**：照样 sbatch，让 Slurm 排队（空等空闲卡永远排不上）
 - ssh 后 `bash slurm/sbatch-train.sh <name>`（默认 2 GPU；可选 `--name JOB_NAME`）
@@ -200,7 +200,7 @@ git switch master
 唤醒节奏见下节「唤醒调度」（每次 sbatch / 续训重提后重新计数）。
 每次唤醒：
 
-1. **优先只读探查**：`bash scripts/remote_status.sh`（队列/登记/GPU），再按需 `tail_remote_logs`、
+1. **优先只读探查**：`bash slurm/remote_status.sh`（队列/登记/GPU），再按需 `tail_remote_logs`、
    列 `checkpoints/<NAME>/`、读 `config.json`——确认拉起状态与进度，**不必先 pull**。
    若本轮要 `scancel` / 重提 sbatch，同样先跑 `remote_status.sh`。
 2. 需要本地对照元数据时再 `pull --mode fast [NAME]`（禁 full）。

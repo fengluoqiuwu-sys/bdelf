@@ -9,7 +9,7 @@ description: >-
 
 **硬约束**：只本机推理；不跑 `train.py`；不用 ssh / sync / Slurm（见 `.claude/rules/no-train.md`、`no-remote.md`）。
 
-权重必须已在本机 `cache/checkpoints/`。若缺失：停止并请用户用 Cursor 的 `sync-ovan-server` 拉取后再继续。
+权重必须已在本机 `cache/checkpoints/`。若缺失：停止并请用户用 Cursor 的 `sync` 拉取后再继续。
 
 ## 何时用
 

@@ -67,6 +67,5 @@ temp/
 # ---- Data ----
 cache
 
-# ---- Local sync script ----
-sync-ovan-server.sh
-scripts/sync-ovan-server.sh
+# ---- 服务清单（含连接信息，不入库）----
+scripts/servers.csv

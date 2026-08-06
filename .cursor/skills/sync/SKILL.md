@@ -1,15 +1,17 @@
 ---
-name: sync-ovan-server
+name: sync
 description: >-
-  Sync bdelf with ovan-server using scripts/sync-ovan-server.sh: push code/cache,
-  pull checkpoint metadata or latest weights, pull-file for a single step. Use
-  when the user asks to push/pull or fetch a checkpoint. AI must not use pull
+  Sync bdelf with a remote named in scripts/servers.csv via scripts/sync.sh:
+  push code/cache, pull checkpoint metadata or latest weights, pull-file for a
+  single step. First arg is the server row name (e.g. ovan-server). Use when
+  the user asks to push/pull or fetch a checkpoint. AI must not use pull
   --mode full unless the user insists twice.
 ---
 
-# sync-ovan-server
+# sync
 
-仓库根：`bash scripts/sync-ovan-server.sh`。远端：`ovan-server:~/source/bdelf`。  
+仓库根：`bash scripts/sync.sh <服务名> …`。  
+`<服务名>` 必须是 `scripts/servers.csv` 的「名字」列（该文件 gitignore；含主机/端口/密码/工作目录等）。  
 执行目录见 rule「脚本约定」。Checkpoint 路径见 rule「Checkpoint 路径与配置哈希」。
 
 ## 禁止
@@ -22,21 +24,22 @@ description: >-
 ### push
 
 ```bash
-bash scripts/sync-ovan-server.sh push            # 代码 + datasets/models/HF/tokenizers
-bash scripts/sync-ovan-server.sh push --code-only # 只推代码
+bash scripts/sync.sh ovan-server push            # 代码 + models/tokenizers
+bash scripts/sync.sh ovan-server push --code-only # 只推代码
 ```
 
 - 代码镜像（`--delete`）；排除 `.venv` / `cache` 链接 / `temp/` / `.git` / `.cursor/` / `.claude/` 等。
-- 默认再推 cache **内容**目录：`datasets/` `models/` `huggingface/` `tokenizers/`。
+- 默认再推 cache **内容**目录：`models/` `tokenizers/`。
   - `--checksum`：先比对校验和，相同则不传。
-  - **不**用 `-L`（保留 HF `snapshots→blobs` 软链；旧 `-L` 会展开成实体文件、流量暴涨）。
-  - 排除 `.cache/` `.locks/` `*.lock` 等下载缓存；不推 `preprocessed_datasets/` / `checkpoints/` / `compile*`。
+  - **不**用 `-L`（保留 HF `snapshots→blobs` 软链）。
+  - 排除 `.cache/` `.locks/` `*.lock` 等；不推 `preprocessed_datasets/` / `checkpoints/` / `compile*`。
+  - `--with-datasets` 才额外推 `datasets/`。
 - `temp/` 与 `hash_guide.csv`：不同步（后者 pull 时也排除）。
 
 ### pull
 
 ```bash
-bash scripts/sync-ovan-server.sh pull [--mode fast|common] [NAME]
+bash scripts/sync.sh ovan-server pull [--mode fast|common] [NAME]
 ```
 
 | mode | 行为 |
@@ -50,7 +53,7 @@ bash scripts/sync-ovan-server.sh pull [--mode fast|common] [NAME]
 ### pull-file
 
 ```bash
-bash scripts/sync-ovan-server.sh pull-file NAME FILE
+bash scripts/sync.sh ovan-server pull-file NAME FILE
 # 例：… pull-file full/ar2/<hash> checkpoint_step_0100000.pt
 ```
 

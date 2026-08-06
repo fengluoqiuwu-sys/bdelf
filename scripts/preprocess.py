@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Build OWT + default preprocess cache (single process, Slurm-safe).
+"""构建预处理缓存（单进程，Slurm / 本机均可）。
 
-Must be a real file on disk: preprocess uses multiprocessing spawn, which
-cannot re-exec ``python - <<'PY'`` / ``<stdin>``.
+必须是磁盘上的 ``.py``：预处理内部用 multiprocessing spawn，无法从
+``python - <<'PY'`` / ``<stdin>`` 再 exec。
+
+用法（仓库根）::
+
+    .venv/bin/python scripts/preprocess.py --dataset owt --preprocess default
+    .venv/bin/python scripts/preprocess.py --dataset owt --preprocess elf
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import yaml
 
-PROJECT = Path(__file__).resolve().parents[1]
+import repo_env
+
+PROJECT = repo_env.ensure_repo_root()
 
 
 def validate_raw_dataset(dataset: str) -> None:
@@ -21,7 +27,7 @@ def validate_raw_dataset(dataset: str) -> None:
     if not root.exists():
         raise SystemExit(
             f"missing {root}; download on login node first:\n"
-            f"  python scripts/download_dataset.py {dataset}"
+            f"  .venv/bin/python scripts/download_dataset.py {dataset}"
         )
 
     parquet = sorted(root.rglob("*.parquet"))
@@ -36,7 +42,6 @@ def validate_raw_dataset(dataset: str) -> None:
 
 
 def build_cache(dataset: str, preprocess: str) -> None:
-    sys.path.insert(0, str(PROJECT))
     from preprocess import get_preprocessed
 
     print(f"[preprocess] building cache: dataset={dataset!r} preprocess={preprocess!r}")
@@ -77,9 +82,19 @@ def validate_manifest(dataset: str, preprocess: str) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build preprocess cache for Slurm jobs.")
-    parser.add_argument("--dataset", default="owt")
-    parser.add_argument("--preprocess", default="default")
+    parser = argparse.ArgumentParser(
+        description="Build preprocess cache (dataset + preprocess 均须显式指定)."
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="数据集名（config/datasets/<name>.yaml）",
+    )
+    parser.add_argument(
+        "--preprocess",
+        required=True,
+        help="预处理配置名（config/preprocess/<name>.yaml）",
+    )
     args = parser.parse_args()
 
     print("=== validate raw dataset ===")

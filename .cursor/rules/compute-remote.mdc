@@ -17,7 +17,7 @@ alwaysApply: true
 在本机对远端做**作业相关操作**之前（`sbatch` / `slurm/sbatch-train.sh` / `scancel`、改 `temp/agent` 登记等），**必须先**调用：
 
 ```bash
-bash scripts/remote_status.sh          # 或加 --json
+bash slurm/remote_status.sh          # 或加 --json
 ```
 
 未跑完、未根据输出确认 GPU/队列/登记可继续之前，不得提交或取消作业。只读拉日志可用 `tail_remote_logs`（见 skill `train-ops`），不替代本工具。
@@ -27,19 +27,18 @@ bash scripts/remote_status.sh          # 或加 --json
 - 占 CPU/GPU 的工作必须经 Slurm；登录节点禁止非 Slurm 的重 Python 作业。
 - 登录节点只做轻量事：队列/状态、只读日志、写 `temp/` 登记。
 - 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 2 GPU）。
-- **禁止** AI 提交 `slurm/preprocess-*`。
+- **禁止** AI 提交 `slurm/sbatch-preprocess.sh` / 预处理作业。
 
 ## 文件系统
 
-- 项目树只读；改代码只在本地 → `bash scripts/sync-ovan-server.sh push` → 再提交。
+- 项目树只读；改代码只在本地 → `bash scripts/sync.sh ovan-server push` → 再提交。
 - 远端 AI **唯一可写**：`~/source/bdelf/temp/`（agent 登记；push/pull 均不同步）。
-- `slurm/gpu_availability.py` / `tail_remote_logs.py` 内不得 SSH；本机汇总状态用 `scripts/remote_status.sh`。
+- `slurm/gpu_availability.py` / `tail_remote_logs.py` 内不得 SSH；本机汇总状态用 `slurm/remote_status.sh`。
 
 ## AI 作业登记与互斥
 
-- 远端 `temp/agent/active/<job_id>.json`：**每个**未结束 AI 作业一份（训练 / vram-probe 等）；据此统计合计 GPU 与「哪些是 AI 任务」。
-- `temp/agent/launched/<job_id>.json`：历史快照。
-- 可同时跑多个 AI 作业，条件：登记合计 GPU + 本作业申请 ≤ 4。集群无空闲卡时仍可 `sbatch` 排队，勿空等 AVAIL。
-- 可 `scancel` **自己登记**的作业；勿动他人 / 未登记作业。
+- 主机清单：`scripts/servers.csv`（gitignore；`调度类型` 为 `slurm` 或 `common`）。额度列：最大使用显卡数量 / 单个 ai 任务最大使用显卡数量；硬件列：显卡 / 单卡GB（多种用 `|` 对齐，如 ovan 的 A6000|RTX4090 → 48|24）。
+- **slurm**（如 ovan-server）：远端 `temp/agent/active/<job_id>.json`：**每个**未结束 AI 作业一份（训练 / vram-probe 等）；据此统计合计 GPU 与「哪些是 AI 任务」。`launched/` 为历史。可同时跑多个，条件：登记合计 GPU + 本作业申请 ≤ 该机上限（ovan 为 4）。集群无空闲卡时仍可 `sbatch` 排队，勿空等 AVAIL。可 `scancel` **自己登记**的作业；勿动他人 / 未登记作业。
+- **common**（单机直接跑）：无 Slurm job_id，须在**该机** `temp/agent/` 用 **PID / CPU / GPU** 等本地登记追踪（字段与流程见 rule「本机计算约束」、skill `train-ops`）；合计与单任务卡数遵守该机在 `servers.csv` 中的上限。
 - 禁止在远端 generate / eval / 看效果；拉回本机测。
-- 流程细节：skill `train-ops`、`sync-ovan-server`、`auto-train`。
+- 流程细节：skill `train-ops`、`sync`、`auto-train`。

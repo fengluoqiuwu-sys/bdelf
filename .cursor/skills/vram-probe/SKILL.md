@@ -61,8 +61,8 @@ chosen = max { b ∈ 候选 |
 ## 远端提交（计入 AI GPU 合计）
 
 ```text
-- [ ] bash scripts/sync-ovan-server.sh push   # 探针/脚本有更新时
-- [ ] bash scripts/remote_status.sh           # 强制
+- [ ] bash scripts/sync.sh ovan-server push   # 探针/脚本有更新时
+- [ ] bash slurm/remote_status.sh           # 强制
 - [ ] agent_gpu_sum + 1 ≤ 4（额度满则 auto-train 睡 60m；AVAIL 不足仍先排队）
 - [ ] ssh 后 bash slurm/sbatch-vram-probe.sh …
 - [ ] 写 temp/agent/active/<job_id>.json（gpus:1）+ launched/<job_id>.json

@@ -6,9 +6,20 @@ alwaysApply: true
 # 本机计算约束
 
 - **硬件**：1× RTX 5080（16GB）；用途：`fast` 冒烟与调试。
+- **调度**：本机属 `scripts/servers.csv` 语义下的 **common**（非 Slurm）；占 CPU/GPU 的作业须**本地登记**（见下）。
 - **Python**：见 rule「Python 虚拟环境」。
 - **GPU 互斥**：同时只跑一个占 GPU 的进程；可停本会话拉起的作业，勿杀用户自启进程。
 - **分支**：AI 本机 generate / 改代码前须确认处于**本任务分支**；操作结束后 `git switch master`（见 skill `auto-train`）。
 - **工作区锁**：AI 对本机**非 temp** 文件的改动（generate 除外）须抢 `temp/local-workspace.lock/`（写 `holder`，1s 后读回校验）；抢不到则睡 30min 再试（见 skill `train-ops`）。
 - **推理/评测**：generate / eval / 调试推理**只在本机**；远端只训不测。
-- 调度与拉 checkpoint 流程见 skill `train-ops` / `sync-ovan-server` / `generate`。
+- 调度与拉 checkpoint 流程见 skill `train-ops` / `sync` / `generate`。
+
+## common 作业本地登记（强制）
+
+非 Slurm（`servers.csv` 调度类型 `common`，含本机）上启动的占资源作业，**必须**在该机 `temp/agent/` 登记，便于追踪与互斥（Slurm 机仍用 job_id，见「远端计算约束」）。
+
+- 路径：`temp/agent/active/<id>.json`（未结束）+ `launched/<id>.json`（历史）；`<id>` 建议 `pid<PID>`。
+- **必填**：`pid`、`cpus`（占用/申请的 CPU 数）、`gpus`、`holder`、`started_at`、`state`、`scheduler: "common"`；建议含 `job_name` / `cmdline` / `script`。
+- 启动前：扫 `active/`，对已死 PID 清掉 active（可留 launched）；再确认 GPU/CPU 额度未超。
+- 结束后：更新 launched、**删除**对应 active；勿动他人 `holder` 的登记。
+- 细则与 JSON 示例：skill `train-ops`。

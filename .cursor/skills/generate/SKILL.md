@@ -9,7 +9,7 @@ description: >-
 # generate
 
 本机推理入口（rule「本机计算约束」：不在远端跑；注意 GPU 互斥）。  
-权重不足时先 skill `sync-ovan-server` 拉取，再生成。
+权重不足时先 skill `sync` 拉取，再生成。
 
 ## 选 checkpoint
 

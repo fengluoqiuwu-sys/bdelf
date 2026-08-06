@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本机工具：一次 ssh 汇总远端 GPU / 队列 / agent 登记。
+# 本机工具（ovan-server / Slurm 专属）：一次 ssh 汇总远端 GPU / 队列 / agent 登记。
 # 远端作业操作（sbatch / scancel 等）之前必须先跑本脚本（见 rule「远端计算约束」）。
 set -euo pipefail
 
@@ -12,7 +12,7 @@ JSON=0
 
 usage() {
   cat <<'EOF'
-用法: bash scripts/remote_status.sh [--json]
+用法: bash slurm/remote_status.sh [--json]
 
 本机调用，经 ssh 在 ovan-server 上只读查询：
   - slurm/gpu_availability.py（空闲 GPU）
