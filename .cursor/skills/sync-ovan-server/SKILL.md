@@ -22,11 +22,15 @@ description: >-
 ### push
 
 ```bash
-bash scripts/sync-ovan-server.sh push
+bash scripts/sync-ovan-server.sh push            # 代码 + datasets/models/HF/tokenizers
+bash scripts/sync-ovan-server.sh push --code-only # 只推代码
 ```
 
 - 代码镜像（`--delete`）；排除 `.venv` / `cache` 链接 / `temp/` / `.git` / `.cursor/` / `.claude/` 等。
-- `cache/` 增量推送；排除 `preprocessed_datasets/`、`checkpoints/`、`compile*`。
+- 默认再推 cache **内容**目录：`datasets/` `models/` `huggingface/` `tokenizers/`。
+  - `--checksum`：先比对校验和，相同则不传。
+  - **不**用 `-L`（保留 HF `snapshots→blobs` 软链；旧 `-L` 会展开成实体文件、流量暴涨）。
+  - 排除 `.cache/` `.locks/` `*.lock` 等下载缓存；不推 `preprocessed_datasets/` / `checkpoints/` / `compile*`。
 - `temp/` 与 `hash_guide.csv`：不同步（后者 pull 时也排除）。
 
 ### pull

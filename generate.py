@@ -350,8 +350,11 @@ def main() -> None:
     prefix_tokens = None
     prefix_len = 0
     if prompt_text is not None:
-        if model_meta["name"] == "elf":
-            raise ValueError("ELF generation is unconditional; --prompt is not supported")
+        if model_meta["name"] in ("elf", "late_ce"):
+            raise ValueError(
+                f"{model_meta['name']} generation is unconditional; "
+                "--prompt is not supported"
+            )
         prefix_tokens = encode_prefix_tokens(
             prompt_text,
             tokenizer=tokenizer,

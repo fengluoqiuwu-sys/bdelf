@@ -29,7 +29,9 @@ TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
-_TRAIN_MODELS = ("ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "cola_vae", "cola")
+_TRAIN_MODELS = (
+    "ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "cola_vae", "cola",
+)
 _MODEL_CONFIG_RE = re.compile(r"^(100m)-(fast|full)$")
 # DataLoader workers per rank; world_size comes from visible GPU count at launch.
 DEFAULT_NUM_WORKERS = 8
@@ -196,7 +198,9 @@ class FL_TrainConfig:
     @property
     def seq_tokens(self) -> int:
         chunk = int(self.extra.get("chunk_length", 1024))
-        if self.model in ("ar1_5", "ar2", "bd3lm", "bdelf", "elf", "cola_vae", "cola"):
+        if self.model in (
+            "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "cola_vae", "cola",
+        ):
             return chunk
         return max(1, chunk - 1)
 
@@ -251,7 +255,7 @@ def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
 
 
 _OVERRIDE_SECTIONS = frozenset(
-    {"optimizer", "batch", "schedule", "eval", "generate"}
+    {"optimizer", "batch", "schedule", "eval", "generate", "model"}
 )
 
 
@@ -259,7 +263,8 @@ def parse_train_overrides(items: list[str] | None) -> dict[str, dict[str, Any]]:
     """Parse CLI ``section.key=value`` overrides into nested dicts.
 
     Values are parsed with ``yaml.safe_load`` (so ``1e-3``, ``true``, ``null`` work).
-    Allowed sections: optimizer, batch, schedule, eval.
+    Allowed sections: optimizer, batch, schedule, eval, generate, model.
+    ``model.*`` 覆盖 ``config/models/<model>/<size>.yaml`` 键（进指纹）。
     """
     if not items:
         return {}
@@ -528,8 +533,8 @@ def compose_train_config(
       - generate ← ``config/generate/<model>/<generate>.yaml``
 
     ``overrides`` may contain ``optimizer`` / ``batch`` / ``schedule`` /
-    ``eval`` / ``generate`` dicts applied before dataclass validation
-    (CLI ``--set section.key=value``).
+    ``eval`` / ``generate`` / ``model`` dicts applied before dataclass
+    validation（CLI ``--set section.key=value``；``model.*`` 覆盖架构 YAML）。
 
     ``dataset`` / ``preprocess`` / ``generate`` are supplied at launch
     (not from the train recipe yaml).
@@ -601,7 +606,9 @@ def compose_train_config(
         * resolved_world_size
         * (
             chunk_length
-            if model in ("ar1_5", "ar2", "bd3lm", "bdelf", "elf", "cola_vae", "cola")
+            if model in (
+                "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "cola_vae", "cola",
+            )
             else max(1, chunk_length - 1)
         )
     )

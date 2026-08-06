@@ -133,7 +133,11 @@ def _get_gpt2_tokenizer() -> Any:
     if _GPT2_TOKENIZER is None:
         from transformers import AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained("gpt2")
+        # 与 config/tokenizers/gpt2 对齐；Slurm 离线时勿回落 huggingface/hub。
+        tok = AutoTokenizer.from_pretrained(
+            "gpt2",
+            cache_dir="cache/tokenizers/gpt2",
+        )
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
         _GPT2_TOKENIZER = tok
