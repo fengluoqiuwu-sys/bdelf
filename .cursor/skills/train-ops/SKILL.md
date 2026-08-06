@@ -4,85 +4,59 @@ description: >-
   Local fast smoke training on RTX 5080 and remote full training on ovan-server
   via Slurm: mandatory slurm/remote_status.sh before remote job ops,
   sbatch-train (default 2 GPU), multi-job agent registry under temp/agent/active
-  (slurm: job_id; common/local: pid+cpus+gpus), remote logs over ssh. Use when
-  starting/stopping jobs, sbatch/scancel, checking queues, or evaluating after
-  pull. Hard limits in compute-local / compute-remote; CLI in skill train.
+  (slurm: job_id; local: scheduler local; common remote: GPU agent only, no cpus),
+  remote logs over ssh. Use when starting/stopping jobs, sbatch/scancel,
+  checking queues, or evaluating after pull. Hard limits in compute-local /
+  compute-remote-slurm / compute-remote-common; CLI in skill train.
 ---
 
 # train-ops
 
-操作流程 skill。硬约束见 rule「本机计算约束」「远端计算约束」「脚本约定」「Python 虚拟环境」。  
+操作流程 skill。硬约束见 rule「本机计算约束」「远端 Slurm 计算约束」「远端 common 计算约束」「脚本约定」「Python 虚拟环境」。  
 训练参数/配置见 skill `train`；同步见 `sync`；生成见 `generate`；显存定档见 `vram-probe`；
 自动闭环见 `auto-train`。
 
 ## 本机 fast 冒烟
 
-本机为 **common**（非 Slurm）：占资源作业须写本地 `temp/agent/`（见下「common 本地登记」）。
+本机为**本地调试机**（非 `servers.csv` 服务、非 common）：占资源作业须写本地 `temp/agent/`（见下「本机登记」；`scheduler: "local"`）。
 
 1. 扫 `temp/agent/active/`：死 PID 清 active；再 `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv` 确认 GPU 空闲。
 2. 本会话旧 GPU 进程可停；用户自启进程勿杀。同时只跑一个占 GPU 任务。
-3. 启动后立即登记 `active/pid<PID>.json` + `launched/`（含 `pid` / `cpus` / `gpus`）。
+3. 启动后立即登记 `active/pid<PID>.json` + `launched/`（含 `pid` / `cpus` / `gpus`，`scheduler: "local"`）。
 4. 用 `100m-fast` + `.venv/bin/python train.py ...`（或对应 `scripts/train/`）。
 5. 看到**首批 loss 正常**即可；**2–3 分钟内主动停**，勿跑满 fast token 预算。正式训练只在远端 full。结束后删对应 active、更新 launched。
 
 ## 本机分支与工作区锁（AI）
 
-多 AI / 人工并行时，本机工作树易被切走。
+多 AI / 人工并行时，本机工作树易被切走或改乱。
 
-### 分支（generate 与改代码都要）
+### 分支（一律 master）
 
-1. 操作前：`git branch --show-current` 必须等于本任务分支（如 `<idea>`）；不对则 `git switch <idea>`。
-2. 操作完成后：`git switch master`（把工作树交还默认分支；commit 留在任务分支上）。
+1. 改代码 / generate 前：`git branch --show-current` 必须为 **`master`**；否则 `git switch master`。
+2. **禁止**为自动训练或实验另开实现分支；思路隔离用 `temp/auto-research/<idea>/`（见 skill `auto-train`）。
+3. 改动默认向前兼容、不影响其他模型；破坏性改动须用户二次确认（见 `auto-train`「改动兼容性」）。
 
 ### 工作区锁（仅非 temp 改动；generate **不**占锁）
 
 锁路径：`temp/local-workspace.lock/`（**目录存在即占锁**；见 rule「temp/ 布局」）。  
-`meta.json` 的 `holder` 必须写明是谁（如 `auto-train:<idea>` / `human`）。
+用仓库根工具（勿手写 mkdir）：
 
 ```bash
-# 抢锁：mkdir → 写 holder → 睡 1s → 读回校验
 WHO="auto-train:<idea>"   # 或 human
-mkdir temp/local-workspace.lock || { echo "锁被占用"; exit 1; }
-cat > temp/local-workspace.lock/meta.json <<EOF
-{"holder":"$WHO","purpose":"<简述>","acquired_at":"$(date -Is)"}
-EOF
-sleep 1
-# 读回：holder 必须仍是自己，否则视为未抢到
-got=$(.venv/bin/python -c "import json; print(json.load(open('temp/local-workspace.lock/meta.json'))['holder'])")
-if [[ "$got" != "$WHO" ]]; then
-  echo "校验失败: holder=$got（期望 $WHO）"
-  # 若目录是自己 mkdir 的且 holder 已是他人，不要 rm；直接放弃
-  exit 1
-fi
-
-# 释放（仅 holder 为自己时）
-rm -rf temp/local-workspace.lock
+.venv/bin/python scripts/workspace_lock.py acquire --holder "$WHO" --purpose "<简述>"
+# …改代码 / commit…
+.venv/bin/python scripts/workspace_lock.py release --holder "$WHO"
+.venv/bin/python scripts/workspace_lock.py status   # 可选
 ```
 
-- AI：`mkdir` 失败，或写后 1s 读回 `holder` ≠ 自己 → 睡 **30 分钟** 再试（auto-train「资源等待」）。
+- AI：`acquire` 失败（exit 1）→ 睡 **30 分钟** 再试（auto-train「资源等待」）。
 - 适用：编辑仓库非 `temp/` 文件、commit、改配置/代码、fast 冒烟改动等。
-- **不适用**：只读、只动 `temp/`、`generate.py` 推理（仍要切分支/恢复 master）。
+- **不适用**：只读、只动 `temp/`、`generate.py` 推理（仍须在 `master`）。
+- 勿删他人仍在用的锁；若确认 AI 已死且 `status` 显示僵死，可手动 `rm -rf temp/local-workspace.lock`（慎用）。
 
-### 人工上锁（自己改代码时）
+## 远端状态工具（Slurm / ovan-server 强制）
 
-```bash
-WHO=human
-mkdir temp/local-workspace.lock || { echo "锁被占用"; exit 1; }
-cat > temp/local-workspace.lock/meta.json <<EOF
-{"holder":"$WHO","purpose":"manual edit","acquired_at":"$(date -Is)"}
-EOF
-sleep 1
-got=$(.venv/bin/python -c "import json; print(json.load(open('temp/local-workspace.lock/meta.json'))['holder'])")
-[[ "$got" == "$WHO" ]] || { echo "校验失败: holder=$got"; exit 1; }
-# …自己改完…
-rm -rf temp/local-workspace.lock
-```
-
-勿删他人仍在用的锁；若确认 AI 已死可手动 `rm -rf`。
-
-## 远端状态工具（强制）
-
-任何远端**作业操作**（`sbatch` / `sbatch-train` / `sbatch-vram-probe` / `scancel`、改 agent 登记）之前，在本机**先**执行：
+对 **ovan-server** 做作业相关操作（`sbatch` / `sbatch-train` / `sbatch-vram-probe` / `scancel`、改 agent 登记）之前，在本机**先**执行（见 rule「远端 Slurm 计算约束」）：
 
 ```bash
 bash slurm/remote_status.sh          # 可读表；机器用加 --json
@@ -91,7 +65,16 @@ bash slurm/remote_status.sh          # 可读表；机器用加 --json
 一次 ssh，汇总：`gpu_availability` + `squeue` + `temp/agent/active/*.json`（及 `agent_gpu_sum`）。  
 确认 **AI 登记合计 GPU + 本作业申请 ≤ 4** 后再 `sbatch`。`AVAIL` 仅作参考——不足时仍应提交让 Slurm 排队，**不要**空等空闲卡。不要手拼多条 ssh 代替本工具。
 
-## 远端提交 full
+## common 远端
+
+对 `servers.csv` 中 `调度类型=common` 的远端机（见 rule「远端 common 计算约束」）：
+
+- 允许重 CPU，**不**登记 CPU。
+- 占 GPU 须用户授权；启动须 `--gpus <物理卡号,…>`（例 `bash scripts/train/<name>.sh --gpus 0,1`）。
+- 登记该机 `temp/agent/`：必填 `pid`、`gpus`、`gpu_ids`（与 `--gpus` 一致）、`holder`；**无** `cpus`；`gpu_ids` 不得与其它 active 重叠。
+- 作业前扫 active 的 `gpu_ids` + 可选 `nvidia-smi`；无 `remote_status.sh`。
+
+## 远端提交 full（Slurm / ovan-server）
 
 ### 检查清单
 
@@ -164,9 +147,9 @@ EOF
 cp ~/source/bdelf/temp/agent/active/<JOB_ID>.json ~/source/bdelf/temp/agent/launched/<JOB_ID>.json'
 ```
 
-#### common（本地 / 单机：PID + CPU + GPU）
+#### local（本机调试：PID + CPU + GPU）
 
-非 Slurm 机（含本机 RTX 5080）上占 CPU/GPU 的作业**必须**本地登记；`<id>` 用 `pid<PID>`。
+本机 RTX 5080 **仅调试**，不入 `servers.csv`；占资源作业须本地登记；`<id>` 用 `pid<PID>`；`scheduler: "local"`（见「本机计算约束」）。
 
 ```json
 {
@@ -180,24 +163,45 @@ cp ~/source/bdelf/temp/agent/active/<JOB_ID>.json ~/source/bdelf/temp/agent/laun
   "started_at": "2026-08-06T09:00:00+08:00",
   "state": "RUNNING",
   "holder": "auto-train:<idea>",
-  "scheduler": "common"
+  "scheduler": "local"
 }
 ```
 
-- **必填**：`pid`、`cpus`（占用/申请的逻辑 CPU 数）、`gpus`、`holder`、`started_at`、`state`、`scheduler: "common"`。
-- 启动前：读 `active/`；`kill -0 <pid>` 失败则视为僵死登记，删 active（launched 可标 `FAILED`/`COMPLETED`）；再确认 GPU 互斥与额度。
+- **必填**：`pid`、`cpus`、`gpus`、`holder`、`started_at`、`state`、`scheduler: "local"`。
+- 启动前：读 `active/`；`kill -0 <pid>` 失败则视为僵死登记，删 active。
 - 进程退出后：更新 launched 的 `state`，**删除** `active/pid<PID>.json`。
-- 勿杀 / 勿删他人 `holder` 的进程与登记。
 
 ```bash
 mkdir -p temp/agent/active temp/agent/launched
 PID=<PID>
 cat > temp/agent/active/pid${PID}.json <<EOF
-{"job_id":"pid${PID}","pid":${PID},"job_name":"<NAME>","script":"scripts/train/<name>.sh","cmdline":"<CMD>","cpus":<N>,"gpus":1,"started_at":"$(date -Is)","state":"RUNNING","holder":"<WHO>","scheduler":"common"}
+{"job_id":"pid${PID}","pid":${PID},"job_name":"<NAME>","script":"scripts/train/<name>.sh","cmdline":"<CMD>","cpus":<N>,"gpus":1,"started_at":"$(date -Is)","state":"RUNNING","holder":"<WHO>","scheduler":"local"}
 EOF
 cp temp/agent/active/pid${PID}.json temp/agent/launched/pid${PID}.json
 # 结束：改 launched state 后 rm temp/agent/active/pid${PID}.json
 ```
+
+#### common 远端（仅占 GPU；登记卡号；不登记 CPU）
+
+`servers.csv` 中 `调度类型=common`：纯 CPU 不写 agent；占 GPU 须 `--gpus` 选物理卡，并在该机登记。硬约束见「远端 common 计算约束」。
+
+```json
+{
+  "job_id": "pid12345",
+  "pid": 12345,
+  "job_name": "elf-100m-full",
+  "cmdline": "bash scripts/train/elf-cfg-100m-full.sh --gpus 0,1",
+  "gpus": 2,
+  "gpu_ids": [0, 1],
+  "started_at": "2026-08-06T10:00:00+08:00",
+  "state": "RUNNING",
+  "holder": "auto-train:<idea>",
+  "scheduler": "common"
+}
+```
+
+- **必填**：`pid`、`gpus`、`gpu_ids`、`holder`、`started_at`、`state`、`scheduler: "common"`（不要 `cpus`）。
+- `gpu_ids` 与其它 active **不得重叠**。
 
 ## 远端只读：日志
 
@@ -216,6 +220,6 @@ ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py
 
 1. `bash scripts/sync.sh ovan-server pull --mode fast [NAME]`
 2. `bash scripts/sync.sh ovan-server pull-file NAME FILE`（或 `pull --mode common` 取 latest）
-3. 本机 `generate` / 分析；遵守 GPU 互斥、分支切回约定（见上；generate 不占工作区锁）。
+3. 本机 `generate` / 分析；遵守 GPU 互斥、在 **`master`** 上跑（generate 不占工作区锁）。
 
 **禁止** AI 主动 `pull --mode full`。`NAME` 为 `{fast|full}/{model}/{hash}`（见 skill `train` / rule checkpoint）。

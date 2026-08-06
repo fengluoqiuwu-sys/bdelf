@@ -1,0 +1,73 @@
+---
+description: 远端 common（单机直跑、非 Slurm）计算硬约束
+alwaysApply: true
+---
+
+# 远端 common 计算约束
+
+适用范围：`scripts/servers.csv` 中 `调度类型=common` 的**远端**主机（SSH 目标；单机直接跑，无 Slurm）。  
+本机仅本地调试，见 rule「本机计算约束」（**不**算 common）。Slurm / ovan-server 见「远端 Slurm 计算约束」。
+
+## 主机与额度
+
+- 以 `scripts/servers.csv`（gitignore）为准：名字、IP/端口/密码、工作目录、显卡、单卡GB、最大使用显卡数量、单个 ai 任务最大使用显卡数量。
+- 空字段默认：IP→按名字 SSH；端口→22；密码→本机密钥。
+- 同步：`bash scripts/sync.sh <名字> …`；登录/执行：`bash scripts/ssh.sh <名字> [命令…]`。
+- 占 GPU 时：张数与**具体卡号**均须合规；合计张数 / 单任务张数不得超过 csv 上限；`gpu_ids` 不得与已登记作业重叠。
+
+## 状态（占 GPU 前强制）
+
+无 `slurm/remote_status.sh`。在启动/结束**占 GPU** 作业或改该机 `temp/agent` 之前：
+
+1. 扫该机 `temp/agent/active/*.json`：死 `pid` 清 active；收集已占用的 `gpu_ids`，并汇总 `gpus`。
+2. 可选：`bash scripts/ssh.sh <名字> -- nvidia-smi -L` / `nvidia-smi …` 看物理卡与占用。
+3. 确认：本作业 `gpu_ids` 与 active 无交集；张数未超 csv 上限；不与他人 `holder` 冲突。
+
+纯 CPU 任务**不**走上述登记/额度检查。
+
+## 提交与运行
+
+- **不经 Slurm**：在目标机工作目录直接跑。common 机能看到**全部** GPU，训练**必须**显式选卡：
+
+```bash
+bash scripts/train/<name>.sh --gpus 0,1
+# 或：.venv/bin/python train.py … --gpus 2,3
+```
+
+  `--gpus` 为物理卡号（逗号分隔），启动前写入 `CUDA_VISIBLE_DEVICES`；张数须为 1/2/4/8。
+- **允许** AI 做重 **CPU** 任务（如 `scripts/preprocess.py`）；**不**登记 CPU。
+- **禁止** AI **擅自**占 **GPU**；须用户明确授权，并指定 `--gpus`，且写 `temp/agent`（含 `gpu_ids`）。
+- **generate / eval**：禁止在远端；拉回**本机**再测。
+- 可停本 `holder` 登记且仍存活的进程；勿杀用户自启 / 他人 holder。
+
+## 文件系统
+
+- 项目树只读；改代码只在本地 → `bash scripts/sync.sh <名字> push` → 再跑。
+- 远端 AI **唯一可写**：该机 `temp/`（含 agent 登记；与本地 `temp/` 互不同步）。
+- generate / eval：`scripts/sync.sh <名字> pull …` 后本机测。
+
+## AI 作业登记（仅占 GPU；登记用了哪几张卡）
+
+路径：该机 `temp/agent/active/<id>.json` + `launched/<id>.json`；`<id>` 建议 `pid<PID>`。  
+**仅**占 GPU 需要登记；纯 CPU **不写** agent。**不**登记 `cpus`。
+
+```json
+{
+  "job_id": "pid12345",
+  "pid": 12345,
+  "job_name": "elf-100m-full",
+  "script": "scripts/train/elf-cfg-100m-full.sh",
+  "cmdline": "bash scripts/train/elf-cfg-100m-full.sh --gpus 0,1",
+  "gpus": 2,
+  "gpu_ids": [0, 1],
+  "started_at": "2026-08-06T10:00:00+08:00",
+  "state": "RUNNING",
+  "holder": "auto-train:<idea>",
+  "scheduler": "common"
+}
+```
+
+- **必填**：`pid`、`gpus`（张数）、`gpu_ids`（物理卡号列表，与 `--gpus` 一致）、`holder`、`started_at`、`state`、`scheduler: "common"`。
+- `gpu_ids` 与其他 active 作业**不得重叠**。
+- 启动后写 active + launched；结束后更新 launched、删对应 active。
+- 细则：skill `train-ops` / `train`；同步：skill `sync`。

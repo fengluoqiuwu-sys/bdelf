@@ -10,7 +10,7 @@ alwaysApply: true
 | 位置 | 内容 |
 |------|------|
 | 仓库根 | 入口：`train.py`、`generate.py`（库代码勿塞进 `scripts/`） |
-| `scripts/` | 通用辅助（resolve、download、sync、`preprocess.py`、`vram_probe.py` 等） |
+| `scripts/` | 通用辅助（resolve、download、sync、`ssh.sh`、`workspace_lock.py`、`agent_wakeup.py`、`preprocess.py`、`vram_probe.py` 等） |
 | `scripts/train/` | 训练启动 `.sh`（模板 `prototype.sh`） |
 | `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`vram-probe.slurm` + `sbatch-vram-probe.sh`；`preprocess.slurm` + `sbatch-preprocess.sh`；`remote_status.sh`（ovan-server 专属）/ `gpu_availability.py` / `tail_remote_logs.py` |
 
@@ -19,13 +19,14 @@ alwaysApply: true
 ## 执行目录
 
 - **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
-- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-vram-probe.sh …`、`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`、`bash scripts/sync.sh <服务名> push|pull|…`（服务名见 `scripts/servers.csv`）。
+- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-vram-probe.sh …`、`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`、`bash scripts/sync.sh <服务名> push|pull|…`、`bash scripts/ssh.sh <服务名> [命令…]`、`.venv/bin/python scripts/workspace_lock.py …`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`）。
 - 禁止 `cd scripts && python foo.py`。
 - `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
 
 ## SSH 边界
 
 - `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**不得在进程内发起 SSH**；在目标机直接跑。
-- 本机查 ovan-server 作业前置状态：`bash slurm/remote_status.sh`（本机 ssh 汇总；**远端任务前必跑**，见 rule「远端计算约束」；输出含 `agent_gpu_sum`）。
-- 本机读远端日志：push（如需）→ `ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`。
+- 本机查 ovan-server 作业前置状态：`bash slurm/remote_status.sh`（本机 ssh 汇总；**Slurm 远端任务前必跑**，见 rule「远端 Slurm 计算约束」；输出含 `agent_gpu_sum`）。
+- common 远端：`bash scripts/ssh.sh <名字>`；占 GPU 须 `--gpus` 选卡并 `temp/agent` 登记 `gpu_ids`（不登记 CPU）；无 `remote_status.sh`（见 rule「远端 common 计算约束」）。
+- 本机读 ovan 日志：push（如需）→ `bash scripts/ssh.sh ovan-server -- .venv/bin/python slurm/tail_remote_logs.py …`（或等价 ssh）。
 - 具体命令与登记流程见 skill `train-ops` / `sync`。

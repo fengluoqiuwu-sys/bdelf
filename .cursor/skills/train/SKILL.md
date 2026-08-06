@@ -10,7 +10,7 @@ description: >-
 
 # train
 
-聚焦**训练命令与配置**。硬约束见 rule「本机/远端计算」「Checkpoint 路径」「Python 虚拟环境」。  
+聚焦**训练命令与配置**。硬约束见 rule「本机计算约束」「远端 Slurm 计算约束」「远端 common 计算约束」「Checkpoint 路径」「Python 虚拟环境」。  
 提交作业、登记、读日志 → skill `train-ops`；同步 → `sync`。
 
 ## CLI
@@ -22,6 +22,7 @@ description: >-
   --dataset   <dataset>     # config/datasets/
   --preprocess <pre>        # config/preprocess/
   --generate  eval          # 训练在线评测用 eval；正式生成见 generate skill
+  --gpus      0,1           # 可选；物理卡号 → CUDA_VISIBLE_DEVICES（common 远端必填）
   --set SECTION.KEY=VALUE   # 可重复；写入 config_refs.overrides
 ```
 
@@ -59,9 +60,10 @@ description: >-
 | 场景 | 命令 |
 |------|------|
 | 本机 fast 冒烟 | `.venv/bin/python train.py ... --config 100m-fast ...` 或 `bash scripts/train/<name>.sh`（若脚本已是 fast） |
-| 远端 full | `bash slurm/sbatch-train.sh <name>`（短名 → `scripts/train/<name>.sh`；`--name` 改 job-name） |
+| 远端 Slurm full | `bash slurm/sbatch-train.sh <name>`（短名 → `scripts/train/<name>.sh`；`--name` 改 job-name） |
+| 远端 common full | `bash scripts/train/<name>.sh --gpus 0,1`（**必选**物理卡；脚本会把 `"$@"` 传给 `train.py`） |
 
-`world_size` 按可见 GPU 探测（∈ {1,2,4,8}）。AI 远端 full 默认 2 卡（`prototype.slurm`）。本机不要跑 full 规模。
+`world_size` 按**可见** GPU 探测（∈ {1,2,4,8}）。AI 在 Slurm 上 full 默认 2 卡（`prototype.slurm`）；common 须人工 `--gpus` 选卡。本机不要跑 full 规模。
 
 ## 产物
 

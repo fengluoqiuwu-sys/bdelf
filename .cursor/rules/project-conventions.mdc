@@ -37,16 +37,17 @@ cache/                     # gitignore
 
 - 注释主体用**中文**（专有名词可英文）；改到的英文注释顺手改中文。
 - 最小改动；复用 registry/config 加载；不主动加未要求的测试/文档。
+- AI 改代码默认在 **`master`** + 工作区锁；须向前兼容、不影响其他模型；破坏性改动二次确认（见 `auto-train` / 「本机计算约束」）。
 
 ## Agent skills（按需读）
 
 | Skill | 用途 |
 |-------|------|
 | `train` | `train.py` CLI、配置拼装、checkpoint 定位 |
-| `train-ops` | 本机冒烟、远端 sbatch/登记；作业前必跑 `slurm/remote_status.sh` |
+| `train-ops` | 本机冒烟与登记、Slurm 远端 sbatch/登记、common 远端 GPU 登记（不登记 CPU）；ovan 作业前必跑 `slurm/remote_status.sh` |
 | `vram-probe` | 单卡显存探针 → `temp/vram-probe/alloc.md`（model×batch）；开训查表选型 |
 | `generate` | 本机 `generate.py` |
-| `sync` | `scripts/sync.sh <服务名> push/pull/pull-file`（名字见 `servers.csv`） |
+| `sync` | `scripts/sync.sh` / `scripts/ssh.sh`（`<服务名>` 见 `servers.csv`） |
 | `auto-train` | 用户明确「自动执行」后的闭环优化 |
 | `research-scout` | 自由探索找未充分做过的 idea → `temp/research-scout/` |
 | `paper-ingest` | 下载论文并编 AI 用 INDEX（供 scout subagent；仅 auto） |

@@ -8,9 +8,11 @@
 #
 # 本地（fast 冒烟）::
 #   bash scripts/train/<name>.sh
-# 远端 full::
+# 远端 full（Slurm）::
 #   bash slurm/sbatch-train.sh <name>
 #   bash slurm/sbatch-train.sh <name> --name my-job --exclude=cls1-srv2
+# common 远端（须显式选卡）::
+#   bash scripts/train/<name>.sh --gpus 0,1
 # =============================================================================
 set -euo pipefail
 
@@ -36,4 +38,5 @@ exec "$PY" train.py \
   --config 100m-full \
   --dataset owt \
   --preprocess default \
-  --generate eval
+  --generate eval \
+  "$@"

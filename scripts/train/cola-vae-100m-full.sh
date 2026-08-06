@@ -19,4 +19,5 @@ exec "$PY" train.py \
   --config 100m-full \
   --dataset owt \
   --preprocess default \
-  --generate eval
+  --generate eval \
+  "$@"

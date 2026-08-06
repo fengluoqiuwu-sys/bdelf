@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 本机工具（ovan-server / Slurm 专属）：一次 ssh 汇总远端 GPU / 队列 / agent 登记。
-# 远端作业操作（sbatch / scancel 等）之前必须先跑本脚本（见 rule「远端计算约束」）。
+# 远端作业操作（sbatch / scancel 等）之前必须先跑本脚本（见 rule「远端 Slurm 计算约束」）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

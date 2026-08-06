@@ -1054,7 +1054,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "eval.gen_eval_samples=64, generate.temperature=0.8"
         ),
     )
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        metavar="IDS",
+        help=(
+            "Visible CUDA device indices (comma-separated physical IDs), "
+            "e.g. 0,1 or 2,3. Sets CUDA_VISIBLE_DEVICES before launch. "
+            "Required on common remotes where all GPUs are visible; "
+            "optional elsewhere (Slurm usually already masks devices)."
+        ),
+    )
     return parser
+
+
+def apply_cuda_visible_devices(gpus: str | None) -> list[int] | None:
+    """解析 ``--gpus``，写入 ``CUDA_VISIBLE_DEVICES``；返回物理卡号列表。
+
+    须在首次 ``torch.cuda.device_count()`` / 分配设备之前调用。
+    """
+    if gpus is None:
+        return None
+    raw = gpus.strip()
+    if not raw:
+        raise SystemExit("--gpus 不能为空（例: --gpus 0,1）")
+    ids: list[int] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            raise SystemExit(f"--gpus 格式无效: {gpus!r}（例: 0,1）")
+        try:
+            idx = int(p)
+        except ValueError as exc:
+            raise SystemExit(f"--gpus 含非整数 {p!r}: {gpus!r}") from exc
+        if idx < 0:
+            raise SystemExit(f"--gpus 卡号须 >= 0，收到 {idx}")
+        ids.append(idx)
+    if len(ids) != len(set(ids)):
+        raise SystemExit(f"--gpus 有重复卡号: {gpus!r}")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ids)
+    return ids
 
 
 def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
@@ -1299,6 +1338,13 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    # 须在 validate_args → device_count 之前屏蔽可见卡（common 机看得到全部 GPU）
+    gpu_ids = apply_cuda_visible_devices(args.gpus)
+    if gpu_ids is not None:
+        _train_log(
+            f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} "
+            f"(physical gpu_ids={gpu_ids})"
+        )
     model_name, model_size, cfg = validate_args(args)
 
     if cfg.world_size > 1 and "RANK" not in os.environ:

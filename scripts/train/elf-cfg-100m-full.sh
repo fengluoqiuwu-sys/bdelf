@@ -33,4 +33,5 @@ exec "$PY" train.py \
   --set eval.gen_eval_samples=32 \
   --set schedule.warmup_ratio=0.1 \
   --set schedule.min_lr_ratio=1.0 \
-  --set schedule.target_tokens=45200000000
+  --set schedule.target_tokens=45200000000 \
+  "$@"
