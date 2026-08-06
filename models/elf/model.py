@@ -278,19 +278,21 @@ class _ELFBackbone(nn.Module):
         in-context prefix tokens.
         """
         bsz = x.shape[0]
-        # Match official ELF: keep embedding projections in fp32 under AMP.
+        # 对齐官方 ELF：投影段关 AMP、跟随权重精度（训练权重 fp32 → 等价于
+        # 原 .float()；generate.py 以 bf16 加载时不再与权重 dtype 冲突）。
+        param_dtype = self.text_proj.proj1.weight.dtype
         with torch.amp.autocast("cuda", enabled=False):
-            x_f = x.float()
+            x_f = x.to(dtype=param_dtype)
             if x_f.shape[-1] == 2 * self.text_encoder_dim:
                 x_f = self.self_cond_proj(x_f)
             x_h = self.text_proj(x_f)
             sc_cfg_scale_emb = (
-                self_cond_cfg_scale.float()
+                self_cond_cfg_scale.to(dtype=param_dtype)
                 if self_cond_cfg_scale is not None
                 else None
             )
             prefix = self.build_context(
-                t.float(),
+                t.to(dtype=param_dtype),
                 self_cond_cfg_scale=sc_cfg_scale_emb,
             ).to(dtype=x_h.dtype)
 
@@ -339,13 +341,13 @@ class _ELFBackbone(nn.Module):
             # tensor that may be all zeros), always run the unembed head so
             # mixed-branch DDP never sees unused parameters.
             if decoder_step_active is not None:
-                xf = x_h.float()
+                xf = x_h.to(dtype=self.proj_kernel.dtype)
                 hidden = F.gelu(
                     xf @ self.proj_kernel + self.proj_bias,
                     approximate="tanh",
                 )
                 decoder_logits = hidden @ self.unembed_kernel + self.unembed_bias
-            x_pred = self.final_layer(x_h.float())
+            x_pred = self.final_layer(x_h.to(dtype=param_dtype))
         return x_pred, decoder_logits
 
     # ------------------------------------------------------------------
