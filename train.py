@@ -627,13 +627,16 @@ def train_loop(
     if rank == 0 and dual_branch:
         if cfg.model == "late_ce":
             bb = unwrap_model(model).backbone
+            decoder_prob = float(getattr(bb, "decoder_prob", 0.2))
             _train_log(
-                f"LATE_CE: MSE + timed CE "
-                f"(mode={getattr(bb, 'late_ce_mode', '?')}, "
+                f"LATE_CE 变体 B: per-example denoise:decode ≈ "
+                f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+                f"+ 晚窗轨迹 CE (mode={getattr(bb, 'late_ce_mode', '?')}, "
                 f"delta={getattr(bb, 'late_ce_delta', '?')}, "
+                f"weight={getattr(bb, 'late_ce_weight', '?')}, "
                 f"region={getattr(bb, 'late_ce_region', '?')}, "
                 f"t={getattr(bb, 'time_schedule', '?')}); "
-                "metrics: mse / late_ce",
+                "metrics: mse / ce / late_ce",
             )
         else:
             decoder_prob = float(

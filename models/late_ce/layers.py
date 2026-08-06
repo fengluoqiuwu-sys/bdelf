@@ -155,7 +155,9 @@ class TimestepEmbedder(nn.Module):
         return emb
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        t_emb = self.mlp_0(self.timestep_embedding(t, self.frequency_embedding_size))
+        emb = self.timestep_embedding(t, self.frequency_embedding_size)
+        # 正弦表恒为 fp32；跟随权重精度（训练 fp32 / bf16 加载推理）。
+        t_emb = self.mlp_0(emb.to(dtype=self.mlp_0.weight.dtype))
         return self.mlp_2(F.silu(t_emb))
 
 

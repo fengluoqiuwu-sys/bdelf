@@ -6,7 +6,8 @@
 
 ## 本轮目标
 
-远端 full 训练 LateCE-δ=0.2（均匀 \(t\)、无 decode 分支），对照 ELF 基线看 Gen.PPL–entropy。
+远端 full 训练 LateCE-δ=0.2 **变体 B**（decode 0.2 + 晚窗 CE weight 0.1），对照 ELF 基线看 Gen.PPL–entropy。
+（变体 A 两个 run 因实现问题作废留档，见 run-monitor.md 2026-08-06。）
 
 ## 开训配置
 

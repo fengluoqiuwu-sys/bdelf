@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LateCE 100m full（均匀 t + 晚段 CE；无 decode 分支）。
+# LateCE 100m full（变体 B：ELF decode 分支 + 均匀 t 晚段 CE，weight=0.1）。
 # 训练日程与 elf-cfg-100m-full 对齐（论文 Tab.7）：
 #   - warmup_ratio=0.1
 #   - min_lr_ratio=1.0 → warmup 后 constant LR=0.002

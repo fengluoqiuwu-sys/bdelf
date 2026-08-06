@@ -1,7 +1,9 @@
-"""LateCE：连续 Flow Matching + 时间门控轨迹 CE。
+"""LateCE 变体 B：ELF 双分支 + 晚段轨迹 CE。
 
-训练：t~U(0,1)（可改）、全程 MSE/x-pred，仅在时间窗内叠加 token CE。
-无 ELF 式 t=1 decode 分支。推理仍末步 unembed。见 ``temp/idea/late-ce/``。
+训练：per-example 混合 ELF 式 t=1 decode CE（``decoder_prob``）与 denoise
+MSE/x-pred（t~U(0,1) 可改）；denoise 行在晚段时间窗内额外叠加
+``late_ce_weight`` 加权的轨迹 token CE。推理末步 unembed（decode mode）。
+见 ``temp/idea/late-ce/``。
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from models.tokens import FL_TokenLayout
 
 
 class _LateCEBackbone(nn.Module):
-    """DiT backbone：训练 MSE + 时间门控 LateCE；推理末步 unembed。"""
+    """DiT backbone：ELF 双分支（denoise MSE + decode CE）+ 晚窗轨迹 CE。"""
 
     full_sequence_training = True
     dual_branch_logging = True
@@ -69,6 +71,10 @@ class _LateCEBackbone(nn.Module):
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         denoiser_noise_scale: float = 2.0,
+        decoder_prob: float = 0.2,
+        decoder_p_mean: float = 0.8,
+        decoder_p_std: float = 0.8,
+        decoder_noise_scale: float = 5.0,
         t_eps: float = 0.05,
         time_schedule: str = "uniform",
         late_ce_mode: str = "hard",
@@ -101,8 +107,10 @@ class _LateCEBackbone(nn.Module):
         self.denoiser_p_mean = denoiser_p_mean
         self.denoiser_p_std = denoiser_p_std
         self.denoiser_noise_scale = denoiser_noise_scale
-        # train.py 双分支日志读此字段；无 decode 分支故恒为 0
-        self.decoder_prob = 0.0
+        self.decoder_prob = decoder_prob
+        self.decoder_p_mean = decoder_p_mean
+        self.decoder_p_std = decoder_p_std
+        self.decoder_noise_scale = decoder_noise_scale
         self.t_eps = t_eps
         self.time_schedule = time_schedule
         self.late_ce_mode = str(late_ce_mode).lower()
@@ -282,19 +290,21 @@ class _LateCEBackbone(nn.Module):
         in-context prefix tokens.
         """
         bsz = x.shape[0]
-        # Match official ELF: keep embedding projections in fp32 under AMP.
+        # 对齐官方 ELF：投影段关 AMP、跟随权重精度（训练权重 fp32 → 等价于
+        # 原 .float()；generate.py 以 bf16 加载时不再与权重 dtype 冲突）。
+        param_dtype = self.text_proj.proj1.weight.dtype
         with torch.amp.autocast("cuda", enabled=False):
-            x_f = x.float()
+            x_f = x.to(dtype=param_dtype)
             if x_f.shape[-1] == 2 * self.text_encoder_dim:
                 x_f = self.self_cond_proj(x_f)
             x_h = self.text_proj(x_f)
             sc_cfg_scale_emb = (
-                self_cond_cfg_scale.float()
+                self_cond_cfg_scale.to(dtype=param_dtype)
                 if self_cond_cfg_scale is not None
                 else None
             )
             prefix = self.build_context(
-                t.float(),
+                t.to(dtype=param_dtype),
                 self_cond_cfg_scale=sc_cfg_scale_emb,
             ).to(dtype=x_h.dtype)
 
@@ -343,13 +353,13 @@ class _LateCEBackbone(nn.Module):
             # tensor that may be all zeros), always run the unembed head so
             # mixed-branch DDP never sees unused parameters.
             if decoder_step_active is not None:
-                xf = x_h.float()
+                xf = x_h.to(dtype=self.proj_kernel.dtype)
                 hidden = F.gelu(
                     xf @ self.proj_kernel + self.proj_bias,
                     approximate="tanh",
                 )
                 decoder_logits = hidden @ self.unembed_kernel + self.unembed_bias
-            x_pred = self.final_layer(x_h.float())
+            x_pred = self.final_layer(x_h.to(dtype=param_dtype))
         return x_pred, decoder_logits
 
     # ------------------------------------------------------------------
@@ -408,60 +418,26 @@ class _LateCEBackbone(nn.Module):
             return (t >= threshold).to(dtype=t.dtype)
         return torch.sigmoid(self.late_ce_alpha * (t - threshold))
 
-    def _train_loss(
+    def _denoise_loss(
         self,
         x0: torch.Tensor,
-        tokens: torch.Tensor,
         *,
         loss_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """全程 x-pred MSE；时间窗内叠加轨迹 CE（无 decode 分支）。"""
+        """纯 denoise MSE（forced eval / 调试用；对齐 ELF）。"""
         bsz = x0.shape[0]
         device = x0.device
-        dtype = x0.dtype
-
-        t = self._sample_train_t(bsz, device).to(dtype=dtype)
+        t = self._sample_train_t(bsz, device).to(dtype=x0.dtype)
         noise = torch.randn_like(x0) * self.denoiser_noise_scale
         t_exp = t.reshape(-1, 1, 1)
         z = t_exp * x0 + (1.0 - t_exp) * noise
         v_target = (x0 - z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
 
-        self_cond_cfg: torch.Tensor | None = None
-        if self.num_self_cond_cfg_tokens > 0:
-            self_cond_cfg = self._sample_cfg_scale(bsz, device)
+        if self.self_cond_prob > 0:
             use_sc = (
-                (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
+                (torch.rand((bsz,), device=device, dtype=x0.dtype) < self.self_cond_prob)
                 .reshape(-1, 1, 1)
-                .to(dtype=dtype)
-            )
-            with torch.no_grad():
-                z_sc0 = torch.cat([z, torch.zeros_like(z)], dim=-1)
-                x_init, _ = self.net_forward(
-                    z_sc0, t, decoder_step_active=False, deterministic=True,
-                    self_cond_cfg_scale=self_cond_cfg,
-                )
-            v_uncond = self._x_to_v(x_init, z, t)
-            x_uncond = x_init.detach()
-            with torch.no_grad():
-                z_sc1 = torch.cat([z, x_uncond], dim=-1)
-                x_cond, _ = self.net_forward(
-                    z_sc1, t, decoder_step_active=False, deterministic=True,
-                    self_cond_cfg_scale=self_cond_cfg,
-                )
-            v_cond = self._x_to_v(x_cond, z, t)
-            sc_w = self_cond_cfg.reshape(-1, 1, 1)
-            sc_guidance = (1.0 - 1.0 / sc_w) * (v_cond - v_uncond)
-            sc_guidance = torch.where(
-                use_sc.bool(), sc_guidance, torch.zeros_like(sc_guidance),
-            )
-            v_target = (v_target + sc_guidance).detach()
-            sc_half = x_uncond * use_sc
-            model_in = torch.cat([z, sc_half], dim=-1)
-        elif self.self_cond_prob > 0:
-            use_sc = (
-                (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
-                .reshape(-1, 1, 1)
-                .to(dtype=dtype)
+                .to(dtype=x0.dtype)
             )
             with torch.no_grad():
                 z_sc0 = torch.cat([z, torch.zeros_like(z)], dim=-1)
@@ -473,12 +449,143 @@ class _LateCEBackbone(nn.Module):
         else:
             model_in = z
 
-        # False：denoise mode；仍计算 unembed logits（供 LateCE）
-        x_pred, logits = self.net_forward(
+        x_pred, _ = self.net_forward(
             model_in, t, decoder_step_active=False, deterministic=False,
-            self_cond_cfg_scale=self_cond_cfg,
         )
         v_pred = self._x_to_v(x_pred, z, t)
+        l2_per_token = ((v_pred - v_target) ** 2).mean(dim=-1)
+        return self._masked_mean(l2_per_token, loss_mask)
+
+    def _decode_loss(
+        self,
+        x0: torch.Tensor,
+        tokens: torch.Tensor,
+        *,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """t=1 decode CE（eval 用；对齐 ELF，与其 eval decode ppl 可比）。"""
+        bsz, seq_len, _ = x0.shape
+        device = x0.device
+        z_vals = (
+            torch.randn(bsz * seq_len, device=device, dtype=x0.dtype)
+            * self.decoder_p_std
+            + self.decoder_p_mean
+        )
+        lam = torch.sigmoid(z_vals).reshape(bsz, seq_len, 1)
+        noise = torch.randn_like(x0) * self.decoder_noise_scale
+        z_tilde = lam * x0 + (1.0 - lam) * noise
+        t = torch.ones(bsz, device=device, dtype=x0.dtype)
+
+        if self.self_cond_prob > 0:
+            model_in = torch.cat([z_tilde, torch.zeros_like(z_tilde)], dim=-1)
+        else:
+            model_in = z_tilde
+
+        _, logits = self.net_forward(
+            model_in, t, decoder_step_active=True, deterministic=False,
+        )
+        assert logits is not None
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        ce_per_token = -log_probs.gather(
+            -1, tokens.unsqueeze(-1),
+        ).squeeze(-1)
+        return self._masked_mean(ce_per_token, loss_mask)
+
+    def _train_loss(
+        self,
+        x0: torch.Tensor,
+        tokens: torch.Tensor,
+        *,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """变体 B：ELF per-example denoise/decode 混合 + denoise 行晚窗轨迹 CE。"""
+        bsz, seq_len, _ = x0.shape
+        device = x0.device
+        dtype = x0.dtype
+
+        t = self._sample_train_t(bsz, device).to(dtype=dtype)
+        noise = torch.randn_like(x0) * self.denoiser_noise_scale
+        t_exp = t.reshape(-1, 1, 1)
+        denoiser_z = t_exp * x0 + (1.0 - t_exp) * noise
+        v_target = (x0 - denoiser_z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
+
+        # ELF decode 分支：sigmoid-λ corruption + t=1 + mode ON（per-example）。
+        decoder_step_active = torch.bernoulli(
+            torch.full((bsz,), self.decoder_prob, dtype=torch.float32, device=device),
+        ).to(dtype=dtype)
+        decoder_mask_b11 = decoder_step_active.view(-1, 1, 1)
+        decoder_mask_b1 = decoder_step_active.view(-1, 1)
+
+        decoder_z_vals = (
+            torch.randn((bsz * seq_len,), dtype=dtype, device=device)
+            * self.decoder_p_std
+            + self.decoder_p_mean
+        )
+        decoder_lam = torch.sigmoid(decoder_z_vals).reshape(bsz, seq_len, 1)
+        decoder_noise = torch.randn_like(x0) * self.decoder_noise_scale
+        decoder_z = decoder_lam * x0 + (1.0 - decoder_lam) * decoder_noise
+
+        decoder_t = torch.ones_like(t)
+        t_mixed = decoder_step_active * decoder_t + (1.0 - decoder_step_active) * t
+        z_mixed = decoder_mask_b11 * decoder_z + (1.0 - decoder_mask_b11) * denoiser_z
+
+        self_cond_cfg: torch.Tensor | None = None
+        if self.num_self_cond_cfg_tokens > 0:
+            self_cond_cfg = self._sample_cfg_scale(bsz, device)
+            use_sc = (
+                (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
+                .reshape(-1, 1, 1)
+                .to(dtype=dtype)
+            )
+            with torch.no_grad():
+                z_sc0 = torch.cat([denoiser_z, torch.zeros_like(denoiser_z)], dim=-1)
+                x_init, _ = self.net_forward(
+                    z_sc0, t, decoder_step_active=False, deterministic=True,
+                    self_cond_cfg_scale=self_cond_cfg,
+                )
+            v_uncond = self._x_to_v(x_init, denoiser_z, t)
+            x_uncond = x_init.detach()
+            with torch.no_grad():
+                z_sc1 = torch.cat([denoiser_z, x_uncond], dim=-1)
+                x_cond, _ = self.net_forward(
+                    z_sc1, t, decoder_step_active=False, deterministic=True,
+                    self_cond_cfg_scale=self_cond_cfg,
+                )
+            v_cond = self._x_to_v(x_cond, denoiser_z, t)
+            sc_w = self_cond_cfg.reshape(-1, 1, 1)
+            sc_guidance = (1.0 - 1.0 / sc_w) * (v_cond - v_uncond)
+            sc_guidance = torch.where(
+                use_sc.bool(), sc_guidance, torch.zeros_like(sc_guidance),
+            )
+            v_target = (v_target + sc_guidance).detach()
+            # decode 行自条件半边清零（对齐 ELF）。
+            sc_half = x_uncond * use_sc * (1.0 - decoder_mask_b11)
+            model_in = torch.cat([z_mixed, sc_half], dim=-1)
+        elif self.self_cond_prob > 0:
+            use_sc = (
+                (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
+                .reshape(-1, 1, 1)
+                .to(dtype=dtype)
+            )
+            with torch.no_grad():
+                z_sc0 = torch.cat([denoiser_z, torch.zeros_like(denoiser_z)], dim=-1)
+                x_init, _ = self.net_forward(
+                    z_sc0, t, decoder_step_active=False, deterministic=True,
+                )
+            sc_half = x_init.detach() * use_sc * (1.0 - decoder_mask_b11)
+            model_in = torch.cat([z_mixed, sc_half], dim=-1)
+        else:
+            model_in = z_mixed
+
+        # decode 行 mode ON；unembed 恒计算（denoise 行 logits 供晚窗 CE）。
+        x_pred, logits = self.net_forward(
+            model_in,
+            t_mixed,
+            decoder_step_active=decoder_step_active,
+            deterministic=False,
+            self_cond_cfg_scale=self_cond_cfg,
+        )
+        v_pred = self._x_to_v(x_pred, denoiser_z, t)
         l2_per_token = ((v_pred - v_target) ** 2).mean(dim=-1)
 
         assert logits is not None
@@ -488,31 +595,70 @@ class _LateCEBackbone(nn.Module):
         ).squeeze(-1)
 
         loss_mask_f = loss_mask.to(dtype=ce_per_token.dtype)
+        ce_mask = loss_mask_f * decoder_mask_b1
+        l2_mask = loss_mask_f * (1.0 - decoder_mask_b1)
+        # LateCE：仅 denoise 行、原始 t 落在晚窗时叠加轨迹 CE。
         late_gate = self._late_ce_gate(t)
-        late_mask = loss_mask_f * late_gate.view(-1, 1)
-        late_term = self.late_ce_weight * (ce_per_token * late_mask).sum()
-        total_sum = (l2_per_token * loss_mask_f).sum() + late_term
+        late_mask = l2_mask * late_gate.view(-1, 1)
+        total_sum = (
+            (ce_per_token * ce_mask).sum()
+            + (l2_per_token * l2_mask).sum()
+            + self.late_ce_weight * (ce_per_token * late_mask).sum()
+        )
         loss = total_sum / torch.clamp(loss_mask_f.sum(), min=1.0)
 
+        # 分支指标：保持 detach 张量（不 .item()），避免 torch.compile 图断裂。
+        ce_denom = ce_mask.sum()
+        l2_denom = l2_mask.sum()
         late_denom = late_mask.sum()
+        nan_scalar = torch.full(
+            (), float("nan"),
+            device=ce_per_token.device, dtype=ce_per_token.dtype,
+        )
+        self.last_ce_loss = torch.where(
+            ce_denom > 0,
+            (ce_per_token * ce_mask).sum() / ce_denom.clamp(min=1.0),
+            nan_scalar,
+        ).detach()
+        self.last_l2_loss = torch.where(
+            l2_denom > 0,
+            (l2_per_token * l2_mask).sum() / l2_denom.clamp(min=1.0),
+            nan_scalar,
+        ).detach()
         self.last_late_ce_loss = torch.where(
             late_denom > 0,
             (ce_per_token * late_mask).sum() / late_denom.clamp(min=1.0),
-            torch.full(
-                (), float("nan"),
-                device=ce_per_token.device, dtype=ce_per_token.dtype,
-            ),
+            nan_scalar,
         ).detach()
-        self.last_l2_loss = (
-            (l2_per_token * loss_mask_f).sum()
-            / torch.clamp(loss_mask_f.sum(), min=1.0)
-        ).detach()
-        self.last_ce_loss = float("nan")  # 无 decode CE
-
-        # 训练不用 mode=decode，触摸 mode_tokens 以免 DDP 闲置
-        if self.mode_tokens is not None:
-            loss = loss + 0.0 * self.mode_tokens.sum()
         return loss
+
+    def _touch_unused_heads(self, loss: torch.Tensor) -> torch.Tensor:
+        """单分支 forced eval / 调试时保住两头参数在图内（对齐 ELF）。"""
+        touch = (
+            self.final_layer.linear.weight.sum()
+            + self.final_layer.linear.bias.sum()
+            + self.final_layer.norm_final.weight.sum()
+            + self.proj_kernel.sum()
+            + self.proj_bias.sum()
+            + self.unembed_kernel.sum()
+            + self.unembed_bias.sum()
+        )
+        if self.mode_tokens is not None:
+            touch = touch + self.mode_tokens.sum()
+        if self.self_cond_cfg_tokens is not None:
+            touch = (
+                touch
+                + self.self_cond_cfg_embedder.mlp_0.weight.sum()
+                + self.self_cond_cfg_embedder.mlp_2.weight.sum()
+                + self.self_cond_cfg_tokens.sum()
+            )
+        if self.self_cond_prob > 0:
+            touch = (
+                touch
+                + self.self_cond_proj.weight.sum()
+                + self.self_cond_proj.bias.sum()
+            )
+        return loss + 0.0 * touch
 
     def forward(
         self,
@@ -521,15 +667,32 @@ class _LateCEBackbone(nn.Module):
         *,
         branch: Literal["denoise", "decode"] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del targets, branch
+        del targets
         if idx.size(1) > self.max_seq_len:
             raise ValueError(
                 f"sequence length {idx.size(1)} exceeds max_seq_len {self.max_seq_len}"
             )
         loss_mask = self._token_loss_mask(idx)
         x0 = self.encode_tokens(idx, attention_mask=loss_mask.long())
-        loss = self._train_loss(x0, idx, loss_mask=loss_mask)
-        self.last_loss_branch = "mixed"
+
+        if branch == "decode":
+            loss = self._decode_loss(x0, idx, loss_mask=loss_mask)
+            self.last_loss_branch = "decode"
+            self.last_ce_loss = loss.detach()
+            self.last_l2_loss = float("nan")
+            self.last_late_ce_loss = float("nan")
+            loss = self._touch_unused_heads(loss)
+        elif branch == "denoise":
+            loss = self._denoise_loss(x0, loss_mask=loss_mask)
+            self.last_loss_branch = "denoise"
+            self.last_l2_loss = loss.detach()
+            self.last_ce_loss = float("nan")
+            self.last_late_ce_loss = float("nan")
+            loss = self._touch_unused_heads(loss)
+        else:
+            # 默认 / 训练：变体 B per-example 混合（两头都在图内）。
+            loss = self._train_loss(x0, idx, loss_mask=loss_mask)
+            self.last_loss_branch = "mixed"
         return torch.empty(0), loss
 
     # ------------------------------------------------------------------

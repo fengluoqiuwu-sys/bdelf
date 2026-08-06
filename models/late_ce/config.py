@@ -1,4 +1,4 @@
-"""LateCE configuration（均匀 t + 晚段轨迹 CE；无 ELF decode 分支）。"""
+"""LateCE 变体 B configuration（ELF decode 分支 + 晚段轨迹 CE）。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_LateCEConfig(PretrainedConfig):
-    """LateCE：Flow Matching + 时间门控轨迹 CE。"""
+    """LateCE 变体 B：ELF 双分支 + 晚段时间门控轨迹 CE。"""
 
     model_type = "fl_late_ce"
     _YAML_REQUIRED = frozenset(
@@ -33,6 +33,10 @@ class FL_LateCEConfig(PretrainedConfig):
             "denoiser_p_mean",
             "denoiser_p_std",
             "denoiser_noise_scale",
+            "decoder_prob",
+            "decoder_p_mean",
+            "decoder_p_std",
+            "decoder_noise_scale",
             "t_eps",
             "time_schedule",
             "late_ce_mode",
@@ -72,6 +76,10 @@ class FL_LateCEConfig(PretrainedConfig):
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         denoiser_noise_scale: float = 2.0,
+        decoder_prob: float = 0.2,
+        decoder_p_mean: float = 0.8,
+        decoder_p_std: float = 0.8,
+        decoder_noise_scale: float = 5.0,
         t_eps: float = 0.05,
         time_schedule: str = "uniform",
         late_ce_mode: str = "hard",
@@ -84,12 +92,8 @@ class FL_LateCEConfig(PretrainedConfig):
     ) -> None:
         if "block_size" in kwargs:
             max_seq_len = int(kwargs.pop("block_size"))
-        # 忽略旧 YAML / --set 残留的 ELF decode 兼容键
+        # 忽略旧 YAML / --set 残留的兼容键（decoder 四键已是正式配置）
         for obsolete in (
-            "decoder_prob",
-            "decoder_p_mean",
-            "decoder_p_std",
-            "decoder_noise_scale",
             "late_ce_enabled",
             "late_ce_decode_variant",
         ):
@@ -122,6 +126,10 @@ class FL_LateCEConfig(PretrainedConfig):
         self.denoiser_p_mean = denoiser_p_mean
         self.denoiser_p_std = denoiser_p_std
         self.denoiser_noise_scale = denoiser_noise_scale
+        self.decoder_prob = float(decoder_prob)
+        self.decoder_p_mean = float(decoder_p_mean)
+        self.decoder_p_std = float(decoder_p_std)
+        self.decoder_noise_scale = float(decoder_noise_scale)
         self.t_eps = t_eps
         self.time_schedule = time_schedule
         self.late_ce_mode = str(late_ce_mode)
@@ -163,6 +171,10 @@ class FL_LateCEConfig(PretrainedConfig):
             "denoiser_p_mean": self.denoiser_p_mean,
             "denoiser_p_std": self.denoiser_p_std,
             "denoiser_noise_scale": self.denoiser_noise_scale,
+            "decoder_prob": self.decoder_prob,
+            "decoder_p_mean": self.decoder_p_mean,
+            "decoder_p_std": self.decoder_p_std,
+            "decoder_noise_scale": self.decoder_noise_scale,
             "t_eps": self.t_eps,
             "time_schedule": self.time_schedule,
             "late_ce_mode": self.late_ce_mode,
