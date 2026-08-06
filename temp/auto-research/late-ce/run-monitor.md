@@ -28,3 +28,9 @@
 - time: 2026-08-04T19:24:08+08:00
 - fix: tokenizer/eval cache_dir offline
 - run: full/late_ce/c81ffbd037f6cd5d
+
+## 2026-08-06 同步 ELF 论文日程并重提
+- 改 `scripts/train/late_ce-100m-full.sh`：与 elf-cfg 相同 --set
+- 新 hash：`87e6aac8af3ccd2e`；旧 `c81ffbd037f6cd5d` 保留不删
+- 分析：旧曲线相对 ELF 的落差主因是算法配方而非日程；本轮先对齐日程，算法旋钮暂不动（见 schedule-sync.md）
+- 动作：scancel 14350 → 新 sbatch

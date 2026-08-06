@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# LateCE 100m full（均匀 t + 晚段 CE；无 decode 分支）。经 slurm/sbatch-train.sh 提交。
-# 数据与 ELF 相同：--preprocess elf。batch_size=16（alloc 查表：4090 / global_bs=512 / ws=2）。
+# LateCE 100m full（均匀 t + 晚段 CE；无 decode 分支）。
+# 训练日程与 elf-cfg-100m-full 对齐（论文 Tab.7）：
+#   - warmup_ratio=0.1
+#   - min_lr_ratio=1.0 → warmup 后 constant LR=0.002
+#   - target_tokens=45.2B
+#   - gen_eval_samples=32（控在线评测开销）
+# 经 slurm/sbatch-train.sh 提交；默认 2 GPU（prototype.slurm）。
+# batch_size=16（alloc：4090 / global_bs=512 / ws=2）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,4 +29,8 @@ exec "$PY" train.py \
   --config 100m-full \
   --dataset owt \
   --preprocess elf \
-  --generate eval
+  --generate eval \
+  --set eval.gen_eval_samples=32 \
+  --set schedule.warmup_ratio=0.1 \
+  --set schedule.min_lr_ratio=1.0 \
+  --set schedule.target_tokens=45200000000

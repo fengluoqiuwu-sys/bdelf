@@ -24,3 +24,9 @@
 
 ## 状态
 - 2026-08-04：冒烟通过，准备远端 full
+
+## 日程同步（2026-08-06）
+- 对齐 `elf-cfg-100m-full`：warmup=0.1 / constant LR / 45.2B / gen_eval=32
+- 新 run：`full/late_ce/87e6aac8af3ccd2e`
+- 旧 run 保留对照：`full/late_ce/c81ffbd037f6cd5d`（job 14350 将停）
+- 分析见 `schedule-sync.md`
