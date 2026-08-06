@@ -42,6 +42,21 @@ def build_eval_subset(
     return Subset(dataset, indices), sample_count
 
 
+def shard_eval_dataset(
+    dataset: Dataset,
+    *,
+    rank: int,
+    world_size: int,
+) -> Dataset:
+    """按 rank 均分 held-out 子集（``indices[rank::world_size]``）。"""
+    if world_size <= 1:
+        return dataset
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank={rank} out of range for world_size={world_size}")
+    indices = list(range(rank, len(dataset), world_size))
+    return Subset(dataset, indices)
+
+
 _PERM_CACHE: dict[tuple[int, int, int], np.ndarray] = {}
 _PERM_CACHE_MAX = 3
 

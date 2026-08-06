@@ -51,6 +51,7 @@ from train.batching import (
     build_eval_subset,
     collate_input_ids,
     fetch_train_batch,
+    shard_eval_dataset,
 )
 from train.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from train.ema import ema_update, init_ema, swap_ema_weights
@@ -783,6 +784,70 @@ def train_loop(
                 late_ce=late_ce,
             )
 
+            # 在线 eval 在各卡均摊（held-out 分片 + gen 分担）；写盘仍仅 rank0。
+            do_eval = (
+                (step + 1) % cfg.eval_step == 0 and eval_loader is not None
+            )
+            if do_eval:
+                with swap_ema_weights(model, ema_state):
+                    eval_loss, eval_ppl = eval_model_ppl(
+                        unwrap_model(model),
+                        eval_loader,
+                        device,
+                        amp_dtype,
+                        pbar_parent=pbar,
+                        is_distributed=is_distributed,
+                        log=(rank == 0),
+                    )
+                    gen_loss: float | None = None
+                    gen_ppl: float | None = None
+                    gen_uniq_mean: float | None = None
+                    gen_nonempty_frac: float | None = None
+                    if gpt2_model is not None:
+                        (
+                            gen_loss,
+                            gen_ppl,
+                            gen_uniq_mean,
+                            gen_nonempty_frac,
+                        ) = eval_one_batch_gen_ppl(
+                            model,
+                            gpt2_model,
+                            cfg=cfg,
+                            train_device=device,
+                            train_amp_dtype=amp_dtype,
+                            seed=cfg.seed + step,
+                            pbar_parent=pbar,
+                            rank=rank,
+                            world_size=world_size,
+                            is_distributed=is_distributed,
+                            log=(rank == 0),
+                        )
+                if rank == 0:
+                    eval_row = {
+                        "step": step,
+                        "tokens": cfg.tokens_seen_after_step(step),
+                        "eval_loss": round(eval_loss, 6),
+                        "eval_ppl": round(eval_ppl, 4),
+                        "gen_loss": (
+                            round(gen_loss, 6) if gen_loss is not None else ""
+                        ),
+                        "gen_ppl": (
+                            round(gen_ppl, 4) if gen_ppl is not None else ""
+                        ),
+                        "gen_uniq_mean": (
+                            round(gen_uniq_mean, 2)
+                            if gen_uniq_mean is not None
+                            else ""
+                        ),
+                        "gen_nonempty_frac": (
+                            round(gen_nonempty_frac, 4)
+                            if gen_nonempty_frac is not None
+                            else ""
+                        ),
+                        "lr": lr,
+                    }
+                    append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
+
             rank0_sync = False
             if rank == 0:
                 if mixed_branch:
@@ -825,63 +890,7 @@ def train_loop(
                     (step + 1) % cfg.eval_step == 0 or (step + 1) >= cfg.max_steps
                 )
                 if interval_done:
-                    if (
-                        (step + 1) % cfg.eval_step == 0
-                        and eval_loader is not None
-                    ):
-                        with swap_ema_weights(model, ema_state):
-                            eval_loss, eval_ppl = eval_model_ppl(
-                                unwrap_model(model),
-                                eval_loader,
-                                device,
-                                amp_dtype,
-                                pbar_parent=pbar,
-                            )
-                            gen_loss: float | None = None
-                            gen_ppl: float | None = None
-                            gen_uniq_mean: float | None = None
-                            gen_nonempty_frac: float | None = None
-                            if gpt2_model is not None:
-                                (
-                                    gen_loss,
-                                    gen_ppl,
-                                    gen_uniq_mean,
-                                    gen_nonempty_frac,
-                                ) = eval_one_batch_gen_ppl(
-                                    model,
-                                    gpt2_model,
-                                    cfg=cfg,
-                                    train_device=device,
-                                    train_amp_dtype=amp_dtype,
-                                    seed=cfg.seed + step,
-                                    pbar_parent=pbar,
-                                )
-                        eval_row = {
-                            "step": step,
-                            "tokens": cfg.tokens_seen_after_step(step),
-                            "eval_loss": round(eval_loss, 6),
-                            "eval_ppl": round(eval_ppl, 4),
-                            "gen_loss": (
-                                round(gen_loss, 6) if gen_loss is not None else ""
-                            ),
-                            "gen_ppl": (
-                                round(gen_ppl, 4) if gen_ppl is not None else ""
-                            ),
-                            "gen_uniq_mean": (
-                                round(gen_uniq_mean, 2)
-                                if gen_uniq_mean is not None
-                                else ""
-                            ),
-                            "gen_nonempty_frac": (
-                                round(gen_nonempty_frac, 4)
-                                if gen_nonempty_frac is not None
-                                else ""
-                            ),
-                            "lr": lr,
-                        }
-                        append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
                     rank0_sync = True
-
                     for line in format_interval_summary(step, cfg.max_steps, row):
                         _rank0_log(line, pbar)
 
@@ -1249,18 +1258,21 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     )
 
     eval_loader: DataLoader | None = None
-    if rank == 0:
-        if len(eval_ds) == 0:
+    if len(eval_ds) == 0:
+        if rank == 0:
             _train_log("WARNING: eval dataset is empty; eval will be skipped")
-        else:
-            eval_loader = DataLoader(
-                eval_ds,
-                batch_size=cfg.batch_size,
-                shuffle=False,
-                num_workers=cfg.num_workers,
-                pin_memory=torch.cuda.is_available(),
-                collate_fn=collate_input_ids,
-            )
+    else:
+        eval_ds_local = shard_eval_dataset(
+            eval_ds, rank=rank, world_size=world_size,
+        )
+        eval_loader = DataLoader(
+            eval_ds_local,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=collate_input_ids,
+        )
 
     model_cfg_path = resolve_model_config_path(model_name, model_size)
     import yaml
@@ -1304,18 +1316,34 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 f"eval subsample: {eval_run_size:,} / {len(eval_ds_full):,} "
                 f"(seed={cfg.eval_sample_seed})",
             )
+        if world_size > 1 and eval_loader is not None:
+            _train_log(
+                f"eval sharded across {world_size} ranks "
+                f"(~{eval_run_size // world_size} samples/rank)",
+            )
         _train_log(
             f"gen. ppl: {cfg.gen_eval_samples} samples / eval via "
             f"{cfg.gen_eval_model} "
-            f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device})",
+            f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device}"
+            + (f", sharded×{world_size}" if world_size > 1 else "")
+            + ")",
         )
 
-    gpt2_model: nn.Module | None = None
-    if rank == 0:
+    # 各卡加载 gpt2-large；缓存未命中时 rank0 先下，避免并发写 cache。
+    gpt2_model: nn.Module | None
+    if is_distributed:
+        if rank == 0:
+            gpt2_model = load_gen_eval_baseline(cfg)
+            dist.barrier()
+        else:
+            dist.barrier()
+            gpt2_model = load_gen_eval_baseline(cfg)
+    else:
         gpt2_model = load_gen_eval_baseline(cfg)
+    if rank == 0:
         _train_log(
             f"Loaded gen-eval baseline {cfg.gen_eval_model} "
-            f"on {cfg.gen_eval_model_device}",
+            f"on {cfg.gen_eval_model_device} (all {world_size} ranks)",
         )
 
     train_loop(

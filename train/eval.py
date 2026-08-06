@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -14,6 +15,14 @@ from preprocess import get_preprocess
 from train import FL_TrainConfig
 from train.checkpoint import unwrap_model
 from train.metrics import _TRAIN_LOG, _train_log, loss_to_ppl
+
+
+def _gen_eval_local_count(n_total: int, *, rank: int, world_size: int) -> int:
+    """把 ``n_total`` 均分到各 rank；余数给前 ``rem`` 个 rank。"""
+    if world_size <= 1:
+        return n_total
+    base, rem = divmod(n_total, world_size)
+    return base + (1 if rank < rem else 0)
 
 # Process-local tokenizer cache for gen-eval retokenization.
 _SRC_TOKENIZER_CACHE: dict[str, Any] = {}
@@ -69,19 +78,24 @@ def eval_model_ppl(
     amp_dtype: torch.dtype,
     *,
     pbar_parent: tqdm | None = None,
+    is_distributed: bool = False,
+    log: bool = True,
 ) -> tuple[float, float]:
-    """Eval split loss and exp(loss) PPL from the training model."""
+    """Eval split loss and exp(loss) PPL from the training model.
+
+    多卡时各 rank 只跑本地分片，再对 ``(sum_loss, n_batches)`` allreduce，
+    得到与单卡全量相同的按 batch 均权平均。
+    """
     was_training = model.training
     model.eval()
     branch = _eval_loss_branch(model)
     use_amp = device.type == "cuda"
     total_loss = 0.0
     batches = 0
-    if len(loader) == 0:
-        return float("nan"), float("nan")
 
     batch_iter: DataLoader | tqdm = loader
-    if pbar_parent is not None:
+    show_pbar = log and pbar_parent is not None and len(loader) > 0
+    if show_pbar:
         pbar_parent.clear()
         batch_iter = tqdm(
             loader,
@@ -101,14 +115,25 @@ def eval_model_ppl(
     finally:
         if isinstance(batch_iter, tqdm):
             batch_iter.close()
-        if pbar_parent is not None:
+        if show_pbar and pbar_parent is not None:
             pbar_parent.refresh()
         if was_training:
             model.train()
 
-    avg_loss = total_loss / max(1, batches)
+    if is_distributed:
+        stats = torch.tensor(
+            [total_loss, float(batches)], device=device, dtype=torch.float64,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss = float(stats[0].item())
+        batches = int(stats[1].item())
+
+    if batches == 0:
+        return float("nan"), float("nan")
+
+    avg_loss = total_loss / batches
     avg_ppl = loss_to_ppl(avg_loss)
-    if batches > 0:
+    if log:
         label = "decode ce" if branch == "decode" else "loss"
         summary = f"eval: {label} {avg_loss:.4f} ppl {avg_ppl:.2f}"
         if pbar_parent is not None:
@@ -231,11 +256,15 @@ def eval_one_batch_gen_ppl(
     train_amp_dtype: torch.dtype,
     seed: int,
     pbar_parent: tqdm | None = None,
+    rank: int = 0,
+    world_size: int = 1,
+    is_distributed: bool = False,
+    log: bool = True,
 ) -> tuple[float, float, float, float]:
     """Unconditional gen. PPL: sample with train model, score via gpt2-large.
 
-    Generates ``cfg.gen_eval_samples`` sequences (micro-batched by
-    ``cfg.batch_size``), then scores all nonempty decoded strings together.
+    全局共 ``cfg.gen_eval_samples`` 条；多卡时各 rank 分担采样与打分，再按
+    token 加权聚合 loss、按样本聚合 uniq / nonempty。
 
     Returns ``(gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac)``. The last
     two catch mode-collapse that can fake a very low gen_ppl (e.g. repeated ``/``).
@@ -253,117 +282,153 @@ def eval_one_batch_gen_ppl(
     use_gpt2_amp = gpt2_device.type == "cuda"
     gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
     n_total = int(cfg.gen_eval_samples)
+    n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
     micro_bs = max(1, int(cfg.batch_size))
+    local_seed = seed * max(1, world_size) + rank
 
-    if pbar_parent is not None:
+    if log and pbar_parent is not None:
         pbar_parent.clear()
         tqdm.write(
             f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen} "
-            f"(micro_bs={micro_bs}, seed={seed}) ...",
+            f"(world={world_size}, local={n_local}, micro_bs={micro_bs}, "
+            f"seed={local_seed}) ...",
         )
 
     # Isolate sampling RNG from the training loop.
     devices = [train_device] if train_device.type == "cuda" else []
-    chunks: list[torch.Tensor] = []
-    with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(seed)
-        if train_device.type == "cuda":
-            torch.cuda.manual_seed_all(seed)
-        gen_model = unwrap_model(train_model)
-        sampling_cfg = _gen_eval_sampling_cfg(cfg)
-        with torch.amp.autocast(
-            "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
-        ):
-            remaining = n_total
-            while remaining > 0:
-                this_bs = min(micro_bs, remaining)
-                generated, _nfe = gen_model.generate(
-                    num_samples=this_bs,
-                    seqlen=seqlen,
-                    for_eval=True,
-                    sampling_cfg=sampling_cfg,
-                )
-                chunks.append(generated.detach())
-                remaining -= this_bs
-    generated = torch.cat(chunks, dim=0)
-    assert generated.size(0) == n_total
+    uniq_sum = 0.0
+    nonempty_count = 0
+    loss_sum = 0.0
+    token_sum = 0
+    skipped_local = 0
 
-    # Collapse diagnostics on token ids (before skip_special decode).
-    uniq_counts = [
-        float(row.unique().numel()) for row in generated.detach().cpu()
-    ]
-    gen_uniq_mean = sum(uniq_counts) / max(len(uniq_counts), 1)
+    if n_local > 0:
+        chunks: list[torch.Tensor] = []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(local_seed)
+            if train_device.type == "cuda":
+                torch.cuda.manual_seed_all(local_seed)
+            gen_model = unwrap_model(train_model)
+            sampling_cfg = _gen_eval_sampling_cfg(cfg)
+            with torch.amp.autocast(
+                "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
+            ):
+                remaining = n_local
+                while remaining > 0:
+                    this_bs = min(micro_bs, remaining)
+                    generated, _nfe = gen_model.generate(
+                        num_samples=this_bs,
+                        seqlen=seqlen,
+                        for_eval=True,
+                        sampling_cfg=sampling_cfg,
+                    )
+                    chunks.append(generated.detach())
+                    remaining -= this_bs
+        generated = torch.cat(chunks, dim=0)
+        assert generated.size(0) == n_local
 
-    src_tok_name = get_preprocess(cfg.preprocess).tokenizer
-    src_tok = _get_src_tokenizer(src_tok_name)
-    texts = [
-        src_tok.decode(row.tolist(), skip_special_tokens=True)
-        for row in generated.detach().cpu()
-    ]
-    # Match official ELF: score only nonempty decoded strings.
-    nonempty = [t for t in texts if isinstance(t, str) and t.strip()]
-    skipped = len(texts) - len(nonempty)
-    gen_nonempty_frac = len(nonempty) / max(len(texts), 1)
-    if skipped > 0:
-        msg = f"eval/gen: skipped {skipped}/{len(texts)} empty samples"
+        # Collapse diagnostics on token ids (before skip_special decode).
+        uniq_counts = [
+            float(row.unique().numel()) for row in generated.detach().cpu()
+        ]
+        uniq_sum = float(sum(uniq_counts))
+
+        src_tok_name = get_preprocess(cfg.preprocess).tokenizer
+        src_tok = _get_src_tokenizer(src_tok_name)
+        texts = [
+            src_tok.decode(row.tolist(), skip_special_tokens=True)
+            for row in generated.detach().cpu()
+        ]
+        # Match official ELF: score only nonempty decoded strings.
+        nonempty = [t for t in texts if isinstance(t, str) and t.strip()]
+        skipped_local = len(texts) - len(nonempty)
+        nonempty_count = len(nonempty)
+
+        if nonempty:
+            # Score in micro-batches to keep gpt2 peak memory near one train batch.
+            score_bs = max(1, int(cfg.batch_size))
+            with torch.amp.autocast(
+                "cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp,
+            ):
+                for i in range(0, len(nonempty), score_bs):
+                    chunk = nonempty[i : i + score_bs]
+                    input_ids, labels, attention_mask = prepare_gpt2_eval_texts(
+                        chunk,
+                        gpt2_vocab_size=gpt2_vocab_size,
+                        fill_token_id=fill_token_id,
+                        device=gpt2_device,
+                        max_length=seqlen,
+                    )
+                    outputs = gpt2_model(
+                        input_ids, attention_mask=attention_mask, labels=labels,
+                    )
+                    loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+                    n_tok = int((labels != -100).sum().item())
+                    if n_tok > 0:
+                        loss_sum += float(loss.item()) * n_tok
+                        token_sum += n_tok
+
+    # [loss_sum, token_sum, uniq_sum, n_local, nonempty_count, skipped]
+    stats = torch.tensor(
+        [
+            loss_sum,
+            float(token_sum),
+            uniq_sum,
+            float(n_local),
+            float(nonempty_count),
+            float(skipped_local),
+        ],
+        device=train_device,
+        dtype=torch.float64,
+    )
+    if is_distributed:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    loss_sum = float(stats[0].item())
+    token_sum = int(stats[1].item())
+    uniq_sum = float(stats[2].item())
+    n_generated = int(stats[3].item())
+    nonempty_total = int(stats[4].item())
+    skipped = int(stats[5].item())
+
+    gen_uniq_mean = uniq_sum / max(n_generated, 1)
+    gen_nonempty_frac = nonempty_total / max(n_generated, 1)
+
+    if was_training:
+        train_model.train()
+    if log and pbar_parent is not None:
+        pbar_parent.refresh()
+
+    if log and skipped > 0:
+        msg = f"eval/gen: skipped {skipped}/{n_generated} empty samples"
         if pbar_parent is not None:
             tqdm.write(f"{_TRAIN_LOG} {msg}")
         else:
             _train_log(msg)
 
-    if not nonempty:
+    if nonempty_total == 0 or token_sum == 0:
         gen_loss = float("nan")
         gen_ppl = float("nan")
+        if nonempty_total == 0:
+            reason = "all samples empty"
+        else:
+            reason = "no scorable tokens"
         summary = (
-            f"eval/gen ({cfg.gen_eval_model}): all samples empty; "
+            f"eval/gen ({cfg.gen_eval_model}): {reason}; "
             f"loss nan ppl nan uniq_mean={gen_uniq_mean:.1f}"
         )
     else:
-        # Score in micro-batches to keep gpt2 peak memory near one train batch.
-        score_bs = max(1, int(cfg.batch_size))
-        loss_sum = 0.0
-        token_sum = 0
-        with torch.amp.autocast("cuda", dtype=gpt2_amp_dtype, enabled=use_gpt2_amp):
-            for i in range(0, len(nonempty), score_bs):
-                chunk = nonempty[i : i + score_bs]
-                input_ids, labels, attention_mask = prepare_gpt2_eval_texts(
-                    chunk,
-                    gpt2_vocab_size=gpt2_vocab_size,
-                    fill_token_id=fill_token_id,
-                    device=gpt2_device,
-                    max_length=seqlen,
-                )
-                outputs = gpt2_model(
-                    input_ids, attention_mask=attention_mask, labels=labels,
-                )
-                loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-                n_tok = int((labels != -100).sum().item())
-                if n_tok > 0:
-                    loss_sum += float(loss.item()) * n_tok
-                    token_sum += n_tok
-        if token_sum == 0:
-            gen_loss = float("nan")
-            gen_ppl = float("nan")
-            summary = (
-                f"eval/gen ({cfg.gen_eval_model}): no scorable tokens; "
-                f"loss nan ppl nan uniq_mean={gen_uniq_mean:.1f}"
-            )
+        gen_loss = loss_sum / token_sum
+        gen_ppl = loss_to_ppl(gen_loss)
+        summary = (
+            f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} "
+            f"ppl {gen_ppl:.2f} (n={nonempty_total} "
+            f"uniq_mean={gen_uniq_mean:.1f} nonempty={gen_nonempty_frac:.2f})"
+        )
+
+    if log:
+        if pbar_parent is not None:
+            tqdm.write(f"{_TRAIN_LOG} {summary}")
         else:
-            gen_loss = loss_sum / token_sum
-            gen_ppl = loss_to_ppl(gen_loss)
-            summary = (
-                f"eval/gen ({cfg.gen_eval_model}): loss {gen_loss:.4f} "
-                f"ppl {gen_ppl:.2f} (n={len(nonempty)} "
-                f"uniq_mean={gen_uniq_mean:.1f} nonempty={gen_nonempty_frac:.2f})"
-            )
-
-    if was_training:
-        train_model.train()
-    if pbar_parent is not None:
-        pbar_parent.refresh()
-
-    if pbar_parent is not None:
-        tqdm.write(f"{_TRAIN_LOG} {summary}")
-    else:
-        _train_log(summary)
+            _train_log(summary)
     return gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac
