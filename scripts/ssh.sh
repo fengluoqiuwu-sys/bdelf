@@ -74,6 +74,7 @@ if [[ "${PRINT}" -eq 1 ]]; then
   cat <<EOF
 名字=${SERVER_NAME}
 host=${REMOTE_HOST}
+user=${REMOTE_USER:-(默认)}
 port=${REMOTE_PORT:-22}
 工作目录=${REMOTE_DIR}
 调度类型=${SERVER_SCHEDULER}
@@ -90,9 +91,9 @@ remote_cd_prefix() {
 }
 
 if [[ ${#REMOTE_CMD[@]} -eq 0 ]]; then
-  echo "==> SSH ${SERVER_NAME} (${REMOTE_HOST}:${REMOTE_PORT:-22}) → ${REMOTE_DIR}" >&2
+  echo "==> SSH ${SERVER_NAME} (${REMOTE_SSH_TARGET}:${REMOTE_PORT:-22}) → ${REMOTE_DIR}" >&2
   # -t：分配伪终端，便于交互
-  exec "${SSH_BASE[@]}" -t "${REMOTE_HOST}" "$(remote_cd_prefix) && exec \"\${SHELL:-bash}\" -l"
+  exec "${SSH_BASE[@]}" -t "${REMOTE_SSH_TARGET}" "$(remote_cd_prefix) && exec \"\${SHELL:-bash}\" -l"
 fi
 
 # 非交互：把命令拼进远端 shell（与 ssh host 'cmd' 一致）
@@ -103,4 +104,4 @@ for a in "${REMOTE_CMD[@]}"; do
 done
 
 echo "==> SSH ${SERVER_NAME}: ${REMOTE_CMD[*]}" >&2
-exec "${SSH_BASE[@]}" "${REMOTE_HOST}" "${remote_script}"
+exec "${SSH_BASE[@]}" "${REMOTE_SSH_TARGET}" "${remote_script}"

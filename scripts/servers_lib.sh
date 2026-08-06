@@ -6,9 +6,11 @@ SERVERS_CSV="${SERVERS_CSV:-${SCRIPT_DIR}/servers.csv}"
 
 SERVER_NAME=""
 REMOTE_HOST=""
+REMOTE_USER=""
 REMOTE_PORT=""
 REMOTE_PASSWORD=""
 REMOTE_DIR=""
+REMOTE_SSH_TARGET="" # user@host 或 host（用户名为空时不加 user@）
 SERVER_SCHEDULER=""
 SSH_BASE=(ssh)
 
@@ -48,8 +50,10 @@ for row in csv.DictReader(lines):
         def g(k):
             return (row.get(k) or "").strip()
         host = g("IP") or want
+        user = g("用户名")
         for key, val in (
             ("REMOTE_HOST", host),
+            ("REMOTE_USER", user),
             ("REMOTE_PORT", g("SSH端口")),
             ("REMOTE_PASSWORD", g("连接密码")),
             ("REMOTE_DIR", g("工作目录")),
@@ -72,6 +76,11 @@ PY
 
   eval "${row}"
   SERVER_NAME="${name}"
+  if [[ -n "${REMOTE_USER}" ]]; then
+    REMOTE_SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
+  else
+    REMOTE_SSH_TARGET="${REMOTE_HOST}"
+  fi
 
   if [[ "${require_dir}" == "1" && -z "${REMOTE_DIR}" ]]; then
     echo "服务 ${name} 的「工作目录」为空" >&2

@@ -10,8 +10,8 @@ alwaysApply: true
 
 ## 主机与额度
 
-- 以 `scripts/servers.csv`（gitignore）为准：名字、IP/端口/密码、工作目录、显卡、单卡GB、最大使用显卡数量、单个 ai 任务最大使用显卡数量。
-- 空字段默认：IP→按名字 SSH；端口→22；密码→本机密钥。
+- 以 `scripts/servers.csv`（gitignore）为准：名字、IP/端口/用户名/密码、工作目录、显卡、单卡GB、最大使用显卡数量、单个 ai 任务最大使用显卡数量。
+- 空字段默认：IP→按名字 SSH；用户名→本机默认 SSH 用户；端口→22；密码→本机密钥。
 - 同步：`bash scripts/sync.sh <名字> …`；登录/执行：`bash scripts/ssh.sh <名字> [命令…]`。
 - 占 GPU 时：张数与**具体卡号**均须合规；合计张数 / 单任务张数不得超过 csv 上限；`gpu_ids` 不得与已登记作业重叠。
 

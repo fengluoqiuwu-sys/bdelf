@@ -57,7 +57,7 @@ RSYNC_CODE_FILTERS=(
 RSYNC_RSH=""
 
 remote_ssh() {
-  "${SSH_BASE[@]}" "${REMOTE_HOST}" "$@"
+  "${SSH_BASE[@]}" "${REMOTE_SSH_TARGET}" "$@"
 }
 
 rsync_to() {
@@ -92,10 +92,10 @@ EOF
 }
 
 push_code() {
-  echo "==> 推送代码到 ${REMOTE_HOST}:${REMOTE_DIR}（服务=${SERVER_NAME}；强制覆盖）..."
+  echo "==> 推送代码到 ${REMOTE_SSH_TARGET}:${REMOTE_DIR}（服务=${SERVER_NAME}；强制覆盖）..."
   rsync_to "${RSYNC_CODE_OPTS[@]}" \
     "${RSYNC_CODE_FILTERS[@]}" \
-    "${LOCAL_DIR}/" "${REMOTE_HOST}:${REMOTE_DIR}/"
+    "${LOCAL_DIR}/" "${REMOTE_SSH_TARGET}:${REMOTE_DIR}/"
 }
 
 ensure_remote_cache_dir() {
@@ -134,7 +134,7 @@ push_cache_content() {
       echo "    跳过 ${name}/（本地不存在）"
       continue
     fi
-    remote_dst="${REMOTE_HOST}:${REMOTE_DIR}/cache/${name}/"
+    remote_dst="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/${name}/"
     echo "    → ${name}/"
     rsync_to "${opts[@]}" \
       "${RSYNC_CACHE_CONTENT_EXCLUDES[@]}" \
@@ -204,16 +204,16 @@ pull_checkpoints() {
 
   local remote_src local_dst scope_msg
   if [[ -n "${name}" ]]; then
-    remote_src="${REMOTE_HOST}:${REMOTE_DIR}/cache/checkpoints/${name}/"
+    remote_src="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/checkpoints/${name}/"
     local_dst="${LOCAL_DIR}/cache/checkpoints/${name}/"
     scope_msg="checkpoints/${name}/"
   else
-    remote_src="${REMOTE_HOST}:${REMOTE_DIR}/cache/checkpoints/"
+    remote_src="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/checkpoints/"
     local_dst="${LOCAL_DIR}/cache/checkpoints/"
     scope_msg="checkpoints/"
   fi
 
-  echo "==> 从 ${REMOTE_HOST}（服务=${SERVER_NAME}）增量同步 ${scope_msg}（mode=${mode}）..."
+  echo "==> 从 ${REMOTE_SSH_TARGET}（服务=${SERVER_NAME}）增量同步 ${scope_msg}（mode=${mode}）..."
   ensure_remote_cache_dir
   mkdir -p "${local_dst}"
   if [[ ${#PULL_FILTERS[@]} -gt 0 ]]; then
@@ -232,10 +232,10 @@ pull_file() {
   fi
   local name="$1"
   local file="$2"
-  local remote_src="${REMOTE_HOST}:${REMOTE_DIR}/cache/checkpoints/${name}/${file}"
+  local remote_src="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/checkpoints/${name}/${file}"
   local local_dst="${LOCAL_DIR}/cache/checkpoints/${name}/${file}"
 
-  echo "==> 拉取 ${REMOTE_HOST}:cache/checkpoints/${name}/${file}（服务=${SERVER_NAME}）..."
+  echo "==> 拉取 ${REMOTE_SSH_TARGET}:cache/checkpoints/${name}/${file}（服务=${SERVER_NAME}）..."
   ensure_remote_cache_dir
   mkdir -p "$(dirname "${local_dst}")"
   rsync_to "${RSYNC_OPTS[@]}" "${remote_src}" "${local_dst}"
