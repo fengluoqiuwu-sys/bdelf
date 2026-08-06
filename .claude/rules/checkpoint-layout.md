@@ -21,5 +21,5 @@ cache/checkpoints/{fast|full}/{model}/{config-hash}/
   --dataset owt --preprocess default --generate eval
 ```
 
-- 本地 `hash_guide.csv` 可只读查阅；Claude 不负责 sync。
+- 本地 `hash_guide.csv`（仅 full）可只读查阅；Claude 不负责 sync。
 - 硬件锁定 / 训练哈希细节以仓库 Cursor rule 为准；Claude 侧只需能正确定位本机 checkpoint。

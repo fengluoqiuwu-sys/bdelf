@@ -2,6 +2,7 @@
 
 列：model, config, dataset, Preprocess, generate, hash, set
 按前六列字典序排序；``set`` 为 overrides 的单行 JSON。
+仅收录 ``full`` 变体；``fast`` 冒烟不写入。
 本文件仅本地维护，不随 sync push/pull。
 """
 
@@ -32,6 +33,10 @@ def hash_guide_path(root: Path | None = None) -> Path:
 
 def _set_json(overrides: Mapping[str, Any] | None) -> str:
     return json.dumps(dict(overrides or {}), ensure_ascii=False, separators=(",", ":"))
+
+
+def _is_full_train(train: Mapping[str, Any]) -> bool:
+    return str(train.get("variant") or "") == "full"
 
 
 def row_from_train(train: Mapping[str, Any]) -> dict[str, str]:
@@ -82,9 +87,11 @@ def upsert_hash_guide_row(
     train: Mapping[str, Any],
     *,
     root: Path | None = None,
-) -> Path:
-    """按 hash 覆盖/插入一行，再按约定列排序写回。"""
+) -> Path | None:
+    """按 hash 覆盖/插入一行，再按约定列排序写回。``fast`` 变体跳过。"""
     path = hash_guide_path(root)
+    if not _is_full_train(train):
+        return None
     new_row = row_from_train(train)
     rows = [r for r in _read_rows(path) if r.get("hash") != new_row["hash"]]
     rows.append(new_row)
@@ -93,10 +100,10 @@ def upsert_hash_guide_row(
 
 
 def rebuild_hash_guide(*, root: Path | None = None) -> Path:
-    """扫描 ``{fast|full}/{model}/{hash}/config.json`` 重建指引表。"""
+    """扫描 ``full/{model}/{hash}/config.json`` 重建指引表（不含 fast）。"""
     root = Path(root or CHECKPOINT_ROOT)
     rows: list[dict[str, str]] = []
-    for cfg_path in sorted(root.glob("*/*/*/config.json")):
+    for cfg_path in sorted(root.glob("full/*/*/config.json")):
         try:
             payload = json.loads(cfg_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -105,6 +112,8 @@ def rebuild_hash_guide(*, root: Path | None = None) -> Path:
         if not isinstance(train, dict):
             continue
         if not train.get("model") or not train.get("model_config"):
+            continue
+        if not _is_full_train(train):
             continue
         rows.append(row_from_train(train))
     # 同 hash 去重（后写覆盖）

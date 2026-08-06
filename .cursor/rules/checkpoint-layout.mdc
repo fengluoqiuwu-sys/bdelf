@@ -18,7 +18,7 @@ cache/checkpoints/{fast|full}/{model}/{config-hash}/
 - 进入指纹的 YAML：recipe / schedule / eval / generate / model arch / dataset / preprocess。
 - 实现：`train/run_path.py`；定位 CLI 见 skill `train`（`scripts/resolve_checkpoint.py`）。
 
-本地 `cache/checkpoints/hash_guide.csv` 给人看（训练时自动 upsert）；**不随 sync 推送/拉取**。
+本地 `cache/checkpoints/hash_guide.csv` 给人看（**仅 full** 训练时自动 upsert；fast 不写入）；**不随 sync 推送/拉取**。
 
 ## 硬件锁定（不进哈希）
 

@@ -69,6 +69,6 @@ description: >-
 
 - `checkpoint_latest.pt` / `checkpoint_step_*.pt`
 - `config.json`、`hardware.json`、`train_log.csv`、`eval_log.csv`、曲线图
-- 训练时 upsert 本地 `hash_guide.csv`（不同步）
+- full 训练时 upsert 本地 `hash_guide.csv`（fast 不写入；不同步）
 
 `resume` 默认 true：有 `checkpoint_latest.pt` 则续训。进度查看与评测拉数见 `train-ops` / `sync-ovan-server`；**不要在远端跑 generate/eval**。
