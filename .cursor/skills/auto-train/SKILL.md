@@ -168,8 +168,8 @@ git commit -m "<语义化描述>"
   未提交的改动，远端拿到的是无法从 git 恢复的环境——这是不允许的。
 - 本地验证通过后、确认改动可用即提交；提交信息写清改动内容与目的。
 - 提交后 `git status` 必须**干净**，再进入第 4 步。
-- 思路/实验记录（`temp/auto-research/<idea>/*.md`）属本地记录、不同步；`temp/` 在 `.gitignore` 中，版本化时用
-  `git add -f temp/auto-research/<idea>/...`。是否提交不影响远端 push。
+- 思路/实验记录（`temp/auto-research/<idea>/*.md`）属**仅本地**记录、不同步；`temp/` 在 `.gitignore` 中，
+  **禁止** `git add -f` 或其它方式纳入版本库。
 
 **3.6 VRAM 探针（显存相关改动后强制）**
 
