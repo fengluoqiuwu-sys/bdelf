@@ -30,7 +30,7 @@ TrainDtype = Literal["bf16", "fp16", "fp32"]
 TSub = TypeVar("TSub")
 
 _TRAIN_MODELS = (
-    "ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "cola_vae", "cola",
+    "ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "odar", "cola_vae", "cola",
 )
 _MODEL_CONFIG_RE = re.compile(r"^(100m)-(fast|full)$")
 # DataLoader workers per rank; world_size comes from visible GPU count at launch.
@@ -199,7 +199,7 @@ class FL_TrainConfig:
     def seq_tokens(self) -> int:
         chunk = int(self.extra.get("chunk_length", 1024))
         if self.model in (
-            "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "cola_vae", "cola",
+            "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "odar", "cola_vae", "cola",
         ):
             return chunk
         return max(1, chunk - 1)
@@ -607,7 +607,7 @@ def compose_train_config(
         * (
             chunk_length
             if model in (
-                "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "cola_vae", "cola",
+                "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "odar", "cola_vae", "cola",
             )
             else max(1, chunk_length - 1)
         )
