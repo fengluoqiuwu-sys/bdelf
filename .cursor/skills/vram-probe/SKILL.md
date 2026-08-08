@@ -30,7 +30,7 @@ description: >-
 
 候选集合：`1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128`。
 
-已知：目标卡 `total_memory_GiB`、本次 `global_batch_size`、`world_size`（AI full 默认 **2**）、表中该模型各档 `alloc`：
+已知：目标卡 `total_memory_GiB`、本次 `global_batch_size`、`world_size`（AI full 默认 **4**）、表中该模型各档 `alloc`：
 
 ```text
 budget = total_memory_GiB − 2
@@ -49,7 +49,7 @@ chosen = max { b ∈ 候选 |
 
 - 测**全** `--batches`（默认全候选）；**不**按 recipe 的 `global_batch_size` 过滤
 - 测量时 `grad_accum_steps=1`（单 micro-step 峰值与真实 accum / global_bs 无关）
-- `--world-size` 仅元数据（AI full 默认传 **2**）；探针进程始终 1 卡
+- `--world-size` 仅元数据（AI full 默认传 **4**）；探针进程始终 1 卡
 - `torch.compile` **跟随 schedule**（full 为 true）；可用 `--no-compile` 覆盖
 - 其它与训练对齐：bf16 autocast、`(loss/accum).backward()`、Muon/AdamW、EMA（若开）、常驻 gpt2-large、TF32 matmul
 - 填表：`ok` 行写入 `alloc_peak_GiB`；首次 OOM 的档写 `oom`，更大档保持 `—`（未测）

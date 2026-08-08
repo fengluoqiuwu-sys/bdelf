@@ -237,10 +237,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--world-size",
         type=int,
-        default=2,
+        default=4,
         dest="intended_world_size",
         help=(
-            "Intended multi-GPU world size (metadata only, default 2 for AI full). "
+            "Intended multi-GPU world size (metadata only, default 4 for AI full). "
             "Does not filter candidates; probe always runs on 1 GPU."
         ),
     )

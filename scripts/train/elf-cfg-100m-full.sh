@@ -4,7 +4,7 @@
 #   - min_lr_ratio=1.0 → warmup 后 constant LR=0.002（等价官方 lr_schedule=constant）
 #   - target_tokens=45.2B（5 × ~9.04B OWT）
 # 在线 gen-eval 仍用 32 samples 控开销（正式复现评测另用 1000）。
-# 经 slurm/sbatch-train.sh 提交；默认 2 GPU（prototype.slurm）。
+# 经 slurm/sbatch-train.sh 提交；默认 4 GPU（prototype.slurm）。
 # fingerprint：resolve_checkpoint.py … 下列 --set
 #   → full/elf/4ab96e311b796009（无 checkpoint 时从 step 0 开训）
 set -euo pipefail

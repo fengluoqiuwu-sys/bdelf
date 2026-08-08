@@ -6,6 +6,9 @@
 #   bash slurm/sbatch-train.sh elf-100m-full --name elf-cfg-100m-full
 #   bash slurm/sbatch-train.sh elf-100m-full --exclude=cls1-srv2
 #
+# 模板默认 4 GPU / 128G mem（与 servers.csv「单个 ai 任务最大使用显卡数量」对齐）；
+# 若要更少卡：追加 --gpus-per-node=2 --mem=64G。
+#
 # 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err} 与 gpu-{job-id}.log
 # 训练脚本默认在 scripts/train/ 下查找（可省略路径与 .sh）。
 # --name / -n 指定 Slurm job-name；其余参数原样传给 sbatch。

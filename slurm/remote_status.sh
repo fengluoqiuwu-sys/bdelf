@@ -90,7 +90,7 @@ def _gpus_from_record(rec: dict) -> int:
     m = re.search(r"gpu(?::[^=]+)?(?:=|:)(\d+)", gres, re.I)
     if m:
         return int(m.group(1))
-    return 2  # AI 训练默认 2
+    return 4  # AI 训练默认（与 prototype.slurm / servers.csv 单任务上限一致）
 
 
 def _load_agent_active(agent_root: Path) -> list[dict]:

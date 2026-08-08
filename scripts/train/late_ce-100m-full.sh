@@ -5,8 +5,8 @@
 #   - min_lr_ratio=1.0 → warmup 后 constant LR=0.002
 #   - target_tokens=45.2B
 #   - gen_eval_samples=32（控在线评测开销）
-# 经 slurm/sbatch-train.sh 提交；默认 2 GPU（prototype.slurm）。
-# batch_size=16（alloc：4090 / global_bs=512 / ws=2）。
+# 经 slurm/sbatch-train.sh 提交；默认 4 GPU（prototype.slurm）。
+# batch_size=16（alloc：4090 / global_bs=512 / ws=4）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

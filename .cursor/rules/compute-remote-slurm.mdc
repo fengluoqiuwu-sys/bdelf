@@ -13,7 +13,7 @@ common 远端见 rule「远端 common 计算约束」；本机见「本机计算
 - 主机：`ssh ovan-server`；**仅** `partition=cls1`。
 - `cls1-srv1`：8× A6000（48GB）；`cls1-srv[2-4]`：8× RTX 4090（24GB）。（与 `servers.csv` 中 `A6000|RTX4090` / `48|24` 一致。）
 - 单作业：最多 **1 node**；禁止跨节点。
-- AI 训练作业默认 **2 GPU / job**（`slurm/prototype.slurm`）；已登记未结束作业的 **合计 GPU ≤ 4**（含即将提交的本作业；见 csv「最大使用显卡数量」）。可并列多个 AI 任务，只要合计不超。单任务上限见 csv「单个 ai 任务最大使用显卡数量」（ovan 为 2）。
+- AI 训练作业默认 **4 GPU / job**（`slurm/prototype.slurm`；与 csv「单个 ai 任务最大使用显卡数量」一致）。已登记未结束作业的 **合计 GPU ≤ 4**（含即将提交的本作业；见 csv「最大使用显卡数量」）。ovan 单任务上限为 4，故默认满额度一次一作业；勿再叠加第二个 AI GPU 作业。
 
 ## 远端状态（强制前置）
 
@@ -29,7 +29,7 @@ bash slurm/remote_status.sh          # 或加 --json
 
 - 占 CPU/GPU 的工作必须经 Slurm；登录节点禁止非 Slurm 的重 Python 作业。
 - 登录节点只做轻量事：队列/状态、只读日志、写 `temp/` 登记。
-- 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 2 GPU）。
+- 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 4 GPU / 128G）。
 - VRAM 探针：`bash slurm/sbatch-vram-probe.sh …`；预处理：`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`。
 - **禁止** AI 提交 `slurm/sbatch-preprocess.sh` / 预处理作业。
 

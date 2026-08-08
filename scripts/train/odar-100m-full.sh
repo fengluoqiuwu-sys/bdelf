@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ODAR 100m full（DMA-H；配方对齐 ELF-100m full / elf-cfg 日程）。
-# 经 slurm/sbatch-train.sh 提交或本地直接跑；默认 2 GPU（prototype.slurm）。
+# 经 slurm/sbatch-train.sh 提交或本地直接跑；默认 4 GPU（prototype.slurm）。
 # 训练日程与 elf-cfg-100m-full 对齐（论文 Tab.7）：
 #   - warmup_ratio=0.1
 #   - min_lr_ratio=1.0 → warmup 后 constant LR=0.002
 #   - target_tokens=45.2B
 #   - gen_eval_samples=32（控在线评测开销）
-# batch_size=16（alloc：4090 / global_bs=512 / ws=2；A6000 可 --set 32）
+# batch_size=16（alloc：4090 / global_bs=512 / ws=4；A6000 可 --set 32）
 # 采样默认 FAR-SC：config/generate/odar → self_cond_cfg_scale=0.5
 set -euo pipefail
 

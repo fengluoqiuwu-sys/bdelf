@@ -19,9 +19,9 @@
 #SBATCH --nodelist=cls1-srv[2-4]
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=2
+#SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-gpu=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=2-00:00:00
 # 默认落点（包装器会用 --output/--error 覆盖到 logs/<server>/<ts>/）
 #SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/logs/ovan-server/_sbatch-default/%x-%j.out

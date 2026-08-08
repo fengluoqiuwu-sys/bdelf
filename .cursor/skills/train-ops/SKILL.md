@@ -89,7 +89,7 @@ bash scripts/ssh.sh <名字> -- \
 - [ ] bash scripts/sync.sh ovan-server push
 - [ ] bash slurm/remote_status.sh   # 强制；看 GPU / 队列 / AI 登记合计
 - [ ] agent_gpu_sum + 本作业 gpus ≤ 4（额度满则等；AVAIL 不足仍可排队提交）
-- [ ] bash slurm/sbatch-train.sh <name> […]   # prototype 默认 2 GPU
+- [ ] bash slurm/sbatch-train.sh <name> […]   # prototype 默认 4 GPU
 - [ ] 写 temp/agent/active/<job_id>.json + launched/<job_id>.json
 ```
 
@@ -98,11 +98,11 @@ bash scripts/ssh.sh <名字> -- \
 ```bash
 ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 # 例：bash slurm/sbatch-train.sh elf-100m-full --name elf-cfg-100m-full --exclude=cls1-srv2
-# 人工若要 4 卡：追加 --gpus-per-node=4 --mem=128G（AI 自动训练保持默认 2）
+# 若要 2 卡：追加 --gpus-per-node=2 --mem=64G
 # stdout 含 Submitted batch job <id> 与 log_dir=logs/ovan-server/<时间戳>
 ```
 
-禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 2 GPU**）。  
+禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 4 GPU / 128G**）。  
 日志目录：`logs/ovan-server/<时间戳>/`（`.out` / `.err` / `gpu-<job_id>.log`）。
 
 AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
@@ -133,7 +133,7 @@ AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote
   "job_id": "1234567",
   "job_name": "elf-100m-full",
   "script": "scripts/train/elf-100m-full.sh",
-  "gpus": 2,
+  "gpus": 4,
   "started_at": "2026-08-01T12:00:00+08:00",
   "state": "SUBMITTED",
   "holder": "auto-train:<idea>",
@@ -141,7 +141,7 @@ AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote
 }
 ```
 
-- `gpus`：本作业申请卡数（训练默认 **2**，vram-probe **1**）；`remote_status` 用其算 `agent_gpu_sum`。
+- `gpus`：本作业申请卡数（训练默认 **4**，vram-probe **1**）；`remote_status` 用其算 `agent_gpu_sum`。
 - `holder`：哪个 AI/思路登记的，便于区分多任务。
 - `state`：`SUBMITTED` | `RUNNING` | `COMPLETED` | `CANCELLED` | `FAILED`。
 - 结束/取消后：更新 `launched/`，**删除**对应 `active/<job_id>.json`。
@@ -150,7 +150,7 @@ AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote
 
 ```bash
 ssh ovan-server 'mkdir -p ~/source/bdelf/temp/agent/active ~/source/bdelf/temp/agent/launched && cat > ~/source/bdelf/temp/agent/active/<JOB_ID>.json <<EOF
-{"job_id":"<JOB_ID>","job_name":"<NAME>","script":"scripts/train/<name>.sh","gpus":2,"started_at":"<ISO>","state":"SUBMITTED","holder":"auto-train:<idea>","scheduler":"slurm"}
+{"job_id":"<JOB_ID>","job_name":"<NAME>","script":"scripts/train/<name>.sh","gpus":4,"started_at":"<ISO>","state":"SUBMITTED","holder":"auto-train:<idea>","scheduler":"slurm"}
 EOF
 cp ~/source/bdelf/temp/agent/active/<JOB_ID>.json ~/source/bdelf/temp/agent/launched/<JOB_ID>.json'
 ```
