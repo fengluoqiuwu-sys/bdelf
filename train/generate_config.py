@@ -27,12 +27,30 @@ class FL_GenerateConfig:
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_sampling_cfg(self) -> Dict[str, Any]:
-        """返回传给 ``model.generate(..., sampling_cfg=...)`` 的字典。"""
-        return {
+        """返回传给 ``model.generate(..., sampling_cfg=...)`` 的字典。
+
+        ACE 关闭时不写入 ``ace`` / ``ace_direction``，使缺省与旧 YAML 指纹一致。
+        """
+        out = {
             k: v
             for k, v in self.extra.items()
             if not str(k).startswith("_")
         }
+        ace = out.get("ace", False)
+        # 与 models.elf.ace.ace_is_enabled 对齐：未写 / false / 0 → 关
+        ace_off = (
+            ace is False
+            or ace is None
+            or (isinstance(ace, (int, float)) and float(ace) == 0.0)
+            or (isinstance(ace, str) and not str(ace).strip())
+        )
+        if ace_off:
+            out.pop("ace", None)
+            out.pop("ace_direction", None)
+        elif out.get("ace_direction") in (None, False, ""):
+            # 自动缓存方向时不把 null 写入采样字典 / 指纹
+            out.pop("ace_direction", None)
+        return out
 
 
 def generate_config_path(model: str, name: str) -> Path:

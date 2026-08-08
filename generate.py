@@ -346,6 +346,15 @@ def main() -> None:
         raise ValueError("Model config is missing tokenizer name")
     tokenizer = get_tokenizer(tokenizer_name)
 
+    if model_meta["name"] == "elf":
+        from models.elf.ace import attach_ace_identity, model_hash_from_checkpoint
+
+        ace_hash = model_hash_from_checkpoint(ckpt_path)
+        if ace_hash:
+            attach_ace_identity(
+                model, model_hash=ace_hash, step=step, tokenizer=tokenizer_name,
+            )
+
     prompt_text = resolve_prompt_text(args.prompt, args.prompt_file)
     prefix_tokens = None
     prefix_len = 0

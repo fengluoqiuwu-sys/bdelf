@@ -174,6 +174,8 @@ class ELFSamplingConfig:
     temperature: float = 1.0
     top_k: int | None = None
     self_cond_cfg_scale: float = 3.0  # training-time SC-CFG scale (paper default)
+    ace: bool | float | str = False  # ACE λ / 路径；false 关闭
+    ace_direction: str | None = None  # 显式方向 .pt；None 则 full/ace/{hash}/{step}/
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "ELFSamplingConfig":
