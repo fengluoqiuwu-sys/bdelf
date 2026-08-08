@@ -1,4 +1,8 @@
-"""Eval-split PPL and generative PPL scoring."""
+"""训练环内 held-out PPL 与在线 gen-eval 胶水。
+
+Gen.PPL 重分词 / 打分原语已上收至 ``eval.gen_ppl``；本模块仅保留
+DataLoader / DDP / 采样聚合逻辑，并 re-export 常用符号以兼容旧导入。
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from eval.gen_ppl import (  # noqa: F401 — re-export
+    get_gpt2_tokenizer as _get_gpt2_tokenizer,
+    get_src_tokenizer as _get_src_tokenizer,
+    prepare_gpt2_eval_batch,
+    prepare_gpt2_eval_texts,
+)
 from models import get_hf_model
 from preprocess import get_preprocess
 from train import FL_TrainConfig
@@ -23,10 +33,6 @@ def _gen_eval_local_count(n_total: int, *, rank: int, world_size: int) -> int:
         return n_total
     base, rem = divmod(n_total, world_size)
     return base + (1 if rank < rem else 0)
-
-# Process-local tokenizer cache for gen-eval retokenization.
-_SRC_TOKENIZER_CACHE: dict[str, Any] = {}
-_GPT2_TOKENIZER: Any | None = None
 
 
 def get_amp_dtype(dtype: str) -> torch.dtype:
@@ -141,91 +147,6 @@ def eval_model_ppl(
         else:
             _train_log(summary)
     return avg_loss, avg_ppl
-
-
-def _get_src_tokenizer(name: str) -> Any:
-    tok = _SRC_TOKENIZER_CACHE.get(name)
-    if tok is None:
-        from tokenizer import get_tokenizer
-
-        tok = get_tokenizer(name)
-        _SRC_TOKENIZER_CACHE[name] = tok
-    return tok
-
-
-def _get_gpt2_tokenizer() -> Any:
-    global _GPT2_TOKENIZER
-    if _GPT2_TOKENIZER is None:
-        from transformers import AutoTokenizer
-
-        # 与 config/tokenizers/gpt2 对齐；Slurm 离线时勿回落 huggingface/hub。
-        tok = AutoTokenizer.from_pretrained(
-            "gpt2",
-            cache_dir="cache/tokenizers/gpt2",
-        )
-        if tok.pad_token_id is None:
-            tok.pad_token = tok.eos_token
-        _GPT2_TOKENIZER = tok
-    return _GPT2_TOKENIZER
-
-
-def prepare_gpt2_eval_batch(
-    batch: torch.Tensor,
-    *,
-    src_tokenizer_name: str,
-    gpt2_vocab_size: int,
-    fill_token_id: int,
-    device: torch.device,
-    max_length: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decode with the train tokenizer, then re-encode with GPT-2 for Gen. PPL.
-
-    Unified path for all train tokenizers (GPT-2, T5, …): score text under the
-    gpt2-large baseline rather than assuming shared token ids.
-
-    Returns ``(input_ids, labels, attention_mask)``.
-    """
-    src_tok = _get_src_tokenizer(src_tokenizer_name)
-    texts = [
-        src_tok.decode(row.tolist(), skip_special_tokens=True)
-        for row in batch.detach().cpu()
-    ]
-    return prepare_gpt2_eval_texts(
-        texts,
-        gpt2_vocab_size=gpt2_vocab_size,
-        fill_token_id=fill_token_id,
-        device=device,
-        max_length=max_length,
-    )
-
-
-def prepare_gpt2_eval_texts(
-    texts: list[str],
-    *,
-    gpt2_vocab_size: int,
-    fill_token_id: int,
-    device: torch.device,
-    max_length: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Re-encode decoded texts with GPT-2 for Gen. PPL scoring."""
-    gpt2_tok = _get_gpt2_tokenizer()
-    encoded = gpt2_tok(
-        texts,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_length,
-        padding="max_length",
-        return_tensors="pt",
-    )
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded["attention_mask"].to(device)
-    labels = input_ids.clone()
-    # Mask pads via attention_mask (GPT-2 pad_id == eos_id, so id equality
-    # would also drop real </s> tokens inside the text).
-    labels[attention_mask == 0] = -100
-    oov = input_ids >= gpt2_vocab_size
-    input_ids[oov] = fill_token_id
-    return input_ids, labels, attention_mask
 
 
 def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
