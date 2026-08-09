@@ -20,8 +20,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-gpu=8
+#SBATCH --cpus-per-gpu=4
 #SBATCH --mem=128G
+# 说明：QOS normal MaxTRESPerUser cpu=64；旧默认 8×4=32 易与其它作业合计超限 → 4×4=16
 #SBATCH --time=2-00:00:00
 # 默认落点（包装器会用 --output/--error 覆盖到 logs/<server>/<ts>/）
 #SBATCH --output=/data/cls1-beegfs/home/csh/source/bdelf/logs/ovan-server/_sbatch-default/%x-%j.out

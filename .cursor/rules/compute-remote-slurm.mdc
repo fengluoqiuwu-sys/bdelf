@@ -29,7 +29,7 @@ bash slurm/remote_status.sh          # 或加 --json
 
 - 占 CPU/GPU 的工作必须经 Slurm；登录节点禁止非 Slurm 的重 Python 作业。
 - 登录节点只做轻量事：队列/状态、只读日志、写 `temp/` 登记。
-- 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 4 GPU / 128G）。
+- 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 4 GPU / 16 CPU / 128G）。
 - VRAM 探针：`bash slurm/sbatch-vram-probe.sh …`；预处理：`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`。
 - **禁止** AI 提交 `slurm/sbatch-preprocess.sh` / 预处理作业。
 

@@ -102,7 +102,7 @@ ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 # stdout 含 Submitted batch job <id> 与 log_dir=logs/ovan-server/<时间戳>
 ```
 
-禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 4 GPU / 128G**）。  
+禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 4 GPU / 16 CPU / 128G**）。  
 日志目录：`logs/ovan-server/<时间戳>/`（`.out` / `.err` / `gpu-<job_id>.log`）。
 
 AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
