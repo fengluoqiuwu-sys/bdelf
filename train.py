@@ -361,12 +361,25 @@ def _pick_resume_ckpt(run_dir: Path) -> Path | None:
     return None
 
 
+def _resume_stage_job_id() -> str:
+    """多进程共用的 /tmp staging 目录后缀。
+
+    Slurm 用 ``SLURM_JOB_ID``；common / ``mp.spawn`` 各 rank 的 ``getpid()``
+    不同——若用 pid，非 rank0 会等错路径并超时。优先显式 ``BDELF_JOB_ID``
+    （父进程 spawn 前写入），否则退回 ``getppid()``。
+    """
+    for key in ("SLURM_JOB_ID", "BDELF_JOB_ID"):
+        val = os.environ.get(key)
+        if val:
+            return str(val)
+    return str(os.getppid())
+
+
 def _stage_ckpt_to_local(
     src: Path, *, rank: int, is_distributed: bool,
 ) -> Path:
     """Rank0 copies BeeGFS ckpt to node-local /tmp; all ranks load from there."""
-    job = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
-    local = Path(f"/tmp/bdelf-resume-{job}") / src.name
+    local = Path(f"/tmp/bdelf-resume-{_resume_stage_job_id()}") / src.name
     if rank == 0:
         src = _wait_for_file(src)
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -1398,6 +1411,8 @@ def main() -> None:
             mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
+        # 子进程继承；供 _stage_ckpt_to_local 共用 /tmp 目录（勿用各 rank pid）
+        os.environ.setdefault("BDELF_JOB_ID", str(os.getpid()))
         _train_log(
             f"Auto-spawning {cfg.world_size} processes (spawn), "
             f"MASTER_PORT={os.environ.get('MASTER_PORT', '29500')}",
