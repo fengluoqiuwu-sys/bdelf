@@ -1,0 +1,20 @@
+# =============================================================================
+# TriFluency 多组 generate 扫参表
+# =============================================================================
+_doc: ODAR 扫 FAR-SC 与 ACE 开关  # 文件说明
+name: odar-sc-ace  # 表名；非 prototype 时与文件名一致
+generate: eval  # 基线 generate 配置名（config/generate/<model>/）
+num_samples: 1024  # 每组无条件样本数
+num_tokens: 1024  # 每样本生成长度
+seed: 42  # 各组共用基 seed（micro batch k 仍用 seed+k*100003）
+runs:  # 多组相对基线的覆盖（等价多次 --set）；至少一项
+  - self_cond_cfg_scale: 0.5  # FAR-SC / self-cond CFG 缩放
+    ace: false  # ACE：false/0 关闭；true≡λ=2
+  - self_cond_cfg_scale: 1.0  # FAR-SC / self-cond CFG 缩放
+    ace: false  # ACE：false/0 关闭；true≡λ=2
+  - self_cond_cfg_scale: 2.0  # FAR-SC / self-cond CFG 缩放
+    ace: false  # ACE：false/0 关闭；true≡λ=2
+  - self_cond_cfg_scale: 0.5  # FAR-SC / self-cond CFG 缩放
+    ace: true  # ACE：false/0 关闭；true≡λ=2
+  - self_cond_cfg_scale: 1.0  # FAR-SC / self-cond CFG 缩放
+    ace: true  # ACE：false/0 关闭；true≡λ=2

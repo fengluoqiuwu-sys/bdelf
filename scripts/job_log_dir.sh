@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 作业日志目录：logs/{server-name}/<时间戳>/
-# 由 slurm/sbatch-*.sh 与 scripts/launch-train.sh source；勿直接执行。
+# 由 slurm/sbatch-*.sh 与 scripts/launch-train.sh / launch-eval.sh source；勿直接执行。
 #
 # 用法（先设 ROOT 或传入）::
 #   source scripts/job_log_dir.sh

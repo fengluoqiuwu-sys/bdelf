@@ -5,15 +5,15 @@ description: >-
   sbatch-train (ovan-server; mandatory remote_status.sh) or common via
   scripts/launch-train.sh (--server + --gpus). Job logs unified under
   logs/<server>/<timestamp>/ (.out/.err/gpu.log). Agent registry in
-  temp/agent/active. Use when starting/stopping jobs, sbatch/scancel,
-  checking queues, or evaluating after pull. Hard limits in compute-local /
-  compute-remote-slurm / compute-remote-common; CLI in skill train.
+  temp/agent/active. Use when starting/stopping jobs, sbatch/scancel, or
+  checking queues. For TriFluency eval use skill eval. Hard limits in
+  compute-local / compute-remote-slurm / compute-remote-common; CLI in skill train.
 ---
 
 # train-ops
 
 操作流程 skill。硬约束见 rule「本机计算约束」「远端 Slurm 计算约束」「远端 common 计算约束」「脚本约定」「Python 虚拟环境」。  
-训练参数/配置见 skill `train`；同步见 `sync`；生成见 `generate`；显存定档见 `vram-probe`；
+训练参数/配置见 skill `train`；同步见 `sync`；生成见 `generate`；**离线 TriFluency eval 见 skill `eval`**；显存定档见 `vram-probe`；
 自动闭环见 `auto-train`。
 
 ## 本机 fast 冒烟
@@ -56,7 +56,7 @@ WHO="auto-train:<idea>"   # 或 human
 
 ## 远端状态工具（Slurm / ovan-server 强制）
 
-对 **ovan-server** 做作业相关操作（`sbatch` / `sbatch-train` / `sbatch-vram-probe` / `scancel`、改 agent 登记）之前，在本机**先**执行（见 rule「远端 Slurm 计算约束」）：
+对 **ovan-server** 做作业相关操作（`sbatch` / `sbatch-train` / `sbatch-eval` / `sbatch-vram-probe` / `scancel`、改 agent 登记）之前，在本机**先**执行（见 rule「远端 Slurm 计算约束」）：
 
 ```bash
 bash slurm/remote_status.sh          # 可读表；机器用加 --json
@@ -70,14 +70,14 @@ bash slurm/remote_status.sh          # 可读表；机器用加 --json
 对 `servers.csv` 中 `调度类型=common` 的远端机（见 rule「远端 common 计算约束」）：
 
 - 允许重 CPU，**不**登记 CPU、不经 `launch-train`。
-- 占 GPU 须用户授权；**禁止**直接跑 `scripts/train/*.sh`，须：
+- 占 GPU 须用户授权；**禁止**直接跑 `scripts/train/*.sh` / `scripts/eval/*.sh`，须经 `launch-train` / `launch-eval`（eval 细则见 skill `eval`）：
 
 ```bash
 bash scripts/ssh.sh <名字> -- \
   bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]
 ```
 
-- `launch-train` 自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<名字>/<时间戳>/` 下三个日志文件。
+- `launch-train` / `launch-eval` 自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<名字>/<时间戳>/` 下三个日志文件。
 - 作业前扫 active 的 `gpu_ids` + 可选 `nvidia-smi`；无 `remote_status.sh`。
 
 ## 远端提交 full（Slurm / ovan-server）
@@ -246,10 +246,7 @@ bash scripts/ssh.sh train-server-1 -- \
 看日志不要靠 pull；勿手写长串 `ssh ... tail`，除非脚本不可用。  
 查 GPU/队列/登记用 `remote_status.sh`（仅 ovan），不要再手拼 `gpu_availability` + `squeue` + `cat current.json`。
 
-## 效果评测（拉回本机）
+## 效果评测
 
-1. `bash scripts/sync.sh ovan-server pull --mode fast [NAME]`
-2. `bash scripts/sync.sh ovan-server pull-file NAME FILE`（或 `pull --mode common` 取 latest）
-3. 本机 `generate` / 分析；遵守 GPU 互斥、在 **`master`** 上跑（generate 不占工作区锁）。
-
-**禁止** AI 主动 `pull --mode full`。`NAME` 为 `{fast|full}/{model}/{hash}`（见 skill `train` / rule checkpoint）。
+TriFluency / 远端 eval / 扫参表 → skill **`eval`**。交互式续写 → skill **`generate`**。  
+需要权重时 `pull --mode fast|common` / `pull-file`（禁 AI 主动 `full`）；见 skill `sync`。

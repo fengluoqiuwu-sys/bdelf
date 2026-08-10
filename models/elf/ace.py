@@ -6,6 +6,9 @@
 方向 ``d`` 默认缓存在
 ``cache/checkpoints/full/ace/{model-hash}/{step}/direction.pt``：
 有则加载，换 hash/step（缓存未命中）时用当前权重现算并写入。
+
+估计轨迹兼容 ELF（``_sde/_ode_step`` → ``(z, x_pred)``）与 ODAR
+（``(z, x_pred, logits)``；有 ``_apply_dma`` 时按采样路径做 DMA-H 再收集 SC）。
 """
 
 from __future__ import annotations
@@ -228,6 +231,17 @@ def _log(msg: str) -> None:
     print(f"[ace] {msg}", file=sys.stderr, flush=True)
 
 
+def _unpack_sampler_step(out: Any) -> tuple[torch.Tensor, torch.Tensor | None, Any]:
+    """兼容 ELF ``(z, x_pred)`` 与 ODAR ``(z, x_pred, logits)`` 步进返回值。"""
+    if not isinstance(out, tuple) or len(out) < 2:
+        raise TypeError(
+            f"sampler step must return (z, x_pred[, ...]), got {type(out).__name__}"
+        )
+    z, x_pred = out[0], out[1]
+    logits = out[2] if len(out) >= 3 else None
+    return z, x_pred, logits
+
+
 @torch.no_grad()
 def _run_trajectory_collect_sc(
     backbone: Any,
@@ -235,7 +249,12 @@ def _run_trajectory_collect_sc(
     z: torch.Tensor,
     sampling_cfg: dict[str, Any],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """无 ACE 采样一条轨迹，返回 ``(z_final, 轨迹平均 SC 反馈 u)``，``u`` 为 ``(B, C)``。"""
+    """无 ACE 采样一条轨迹，返回 ``(z_final, 轨迹平均 SC 反馈 u)``，``u`` 为 ``(B, C)``。
+
+    步进返回值兼容 ELF 二元组与 ODAR 三元组（多出的 logits 仅用于可选 DMA）。
+    若 backbone 有 ``_apply_dma``（ODAR），在收集 SC 前按采样路径做 DMA-H，
+    使估计的吸引子方向与真实 SC 反馈一致。
+    """
     cfg = dict(sampling_cfg)
     cfg["ace"] = False
     cfg.pop("ace_direction", None)
@@ -264,6 +283,7 @@ def _run_trajectory_collect_sc(
     else:
         self_cond_cfg_scale = None
 
+    apply_dma = getattr(backbone, "_apply_dma", None)
     x_pred: torch.Tensor | None = None
     sc_sum: torch.Tensor | None = None
     sc_count = 0
@@ -272,17 +292,25 @@ def _run_trajectory_collect_sc(
         t = float(t_steps[i].item())
         t_next = float(t_steps[i + 1].item())
         if method == "sde":
-            z, x_pred = backbone._sde_step(
+            out = backbone._sde_step(
                 z, t, t_next, x_pred, sde_gamma,
                 self_cond_cfg_scale=self_cond_cfg_scale,
             )
         elif method == "ode":
-            z, x_pred = backbone._ode_step(
+            out = backbone._ode_step(
                 z, t, t_next, x_pred,
                 self_cond_cfg_scale=self_cond_cfg_scale,
             )
         else:
             raise ValueError(f"unknown sampling_method: {method}")
+        z, x_pred, step_logits = _unpack_sampler_step(out)
+        # ODAR：与 generate 一致，SC 反馈在送入下一步前经 DMA-H
+        if (
+            apply_dma is not None
+            and x_pred is not None
+            and step_logits is not None
+        ):
+            x_pred = apply_dma(x_pred, t, logits=step_logits)
         if x_pred is not None:
             # 池化长度维，与 ACE-DLM collect 一致
             u = x_pred.mean(dim=1)
@@ -291,9 +319,11 @@ def _run_trajectory_collect_sc(
 
     t = float(t_steps[-2].item())
     t_next = float(t_steps[-1].item())
-    z, _ = backbone._ode_step(
-        z, t, t_next, x_pred,
-        self_cond_cfg_scale=self_cond_cfg_scale,
+    z, _, _ = _unpack_sampler_step(
+        backbone._ode_step(
+            z, t, t_next, x_pred,
+            self_cond_cfg_scale=self_cond_cfg_scale,
+        )
     )
     if sc_sum is None or sc_count == 0:
         raise RuntimeError("ACE estimate collected no self-conditioning feedback")

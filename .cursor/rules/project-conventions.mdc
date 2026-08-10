@@ -11,7 +11,8 @@ alwaysApply: true
 config/{datasets,tokenizers,preprocess,models,train,generate}/
 dataset/  tokenizer/  models/
 scripts/  scripts/train/   # 辅助与训练启动 sh；common 用 launch-train.sh
-slurm/                     # prototype + sbatch-train/vram-probe/preprocess；gpu/tail/remote_status
+scripts/eval/              # 离线评测启动 sh；sbatch-eval / launch-eval
+slurm/                     # prototype + sbatch-train/eval/vram-probe/preprocess；gpu/tail/remote_status
 logs/<服务名>/<时间戳>/     # 作业 .out/.err/gpu.log（gitignore；pull 同步，push 不删远端）
 train.py  generate.py  hf_config.py
 cache/                     # gitignore
@@ -46,6 +47,7 @@ cache/                     # gitignore
 |-------|------|
 | `train` | `train.py` CLI、配置拼装、checkpoint 定位 |
 | `train-ops` | 本机冒烟与登记、Slurm 远端 sbatch/登记、common 远端 GPU 登记（不登记 CPU）；ovan 作业前必跑 `slurm/remote_status.sh` |
+| `eval` | TriFluency `eval.py`（本机扫参 / 远端 sbatch-eval·launch-eval / `cache/eval`） |
 | `vram-probe` | 单卡显存探针 → `temp/vram-probe/alloc.md`（model×batch）；开训查表选型 |
 | `generate` | 本机 `generate.py` |
 | `sync` | `scripts/sync.sh` / `scripts/ssh.sh`（`<服务名>` 见 `servers.csv`） |

@@ -27,25 +27,29 @@ alwaysApply: true
 
 ## 提交与运行
 
-- **禁止**直接 `bash scripts/train/<name>.sh --gpus …` 占 GPU；须经包装器（类比 `slurm/sbatch-train.sh`）：
+- **禁止**直接 `bash scripts/train/<name>.sh --gpus …` 或 `bash scripts/eval/<name>.sh` 占 GPU；须经包装器（类比 `slurm/sbatch-train.sh` / `sbatch-eval.sh`）：
 
 ```bash
 bash scripts/ssh.sh <名字> -- \
   bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]
+# 离线 eval（默认与训练同为 4 卡）：
+bash scripts/ssh.sh <名字> -- \
+  bash scripts/launch-eval.sh <name> --server <名字> --gpus 0,1,2,3 -- \
+    --run full/<model>/<hash>
 ```
 
-  `--gpus` 为物理卡号（逗号分隔）；张数须为 1/2/4/8。包装器后台拉起，并写入与 Slurm 同构的三个日志文件到 `logs/<名字>/<时间戳>/`：
-  `<job-name>-<pid>.out` / `.err` / `gpu-<pid>.log`（另有 `meta.json`）。
-- **允许** AI 做重 **CPU** 任务（如 `scripts/preprocess.py`）；**不**登记 CPU、不经 `launch-train`。
-- **禁止** AI **擅自**占 **GPU**；须用户明确授权，并指定 `--gpus`（`launch-train` 会写 `temp/agent`，含 `gpu_ids`）。
-- **generate / eval**：禁止在远端；拉回**本机**再测。
+ `--gpus` 为物理卡号（逗号分隔）；张数须为 1/2/4/8。包装器后台拉起，并写入与 Slurm 同构的三个日志文件到 `logs/<名字>/<时间戳>/`：
+ `<job-name>-<pid>.out` / `.err` / `gpu-<pid>.log`（另有 `meta.json`）。
+- **允许** AI 做重 **CPU** 任务（如 `scripts/preprocess.py`）；**不**登记 CPU、不经 `launch-train` / `launch-eval`。
+- **禁止** AI **擅自**占 **GPU**；须用户明确授权，并指定 `--gpus`（`launch-train` / `launch-eval` 会写 `temp/agent`，含 `gpu_ids`）。
+- **generate.py**：禁止在远端交互式跑；离线 eval 经 `launch-eval`；权重/产物 `scripts/sync.sh <名字> pull …` 后本机查看。
 - 可停本 `holder` 登记且仍存活的进程；勿杀用户自启 / 他人 holder。
 
 ## 文件系统
 
 - 项目树只读；改代码只在本地 → `bash scripts/sync.sh <名字> push` → 再跑。
 - 远端 AI **可写**：该机 `temp/`（agent 登记；不同步）与 `logs/`（作业日志；**pull 拉取**，push 不删远端）。
-- generate / eval：`scripts/sync.sh <名字> pull …` 后本机测。
+- generate / eval 产物：`scripts/sync.sh <名字> pull …`（pull 含 `logs/` 与 `cache/eval/`）后本机查看。
 
 ## AI 作业登记（仅占 GPU；登记用了哪几张卡）
 

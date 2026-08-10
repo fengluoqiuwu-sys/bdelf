@@ -73,19 +73,22 @@ usage() {
 
   <服务名>  scripts/servers.csv 中「名字」列（如 ovan-server）
 
-  push [--code-only] [--with-datasets] [--checksum]
+  push [--code-only] [--with-datasets] [--checksum] [--checkpoints NAME FILE]...
       强制覆盖推送代码到 <服务>:<工作目录>（删除远端多余文件；.venv/cache/temp 等排除项保留）
       默认再推 cache 内容：models/ tokenizers/（按 size+mtime 增量；排除 .cache/ 等）
       默认不推：datasets/、huggingface/、preprocessed_datasets/、checkpoints/、compile*
-      --with-datasets  额外推 datasets/
-      --checksum       cache 内容整文件校验后再传（本地 cache 在 /mnt/d 时很慢，慎用）
-      --code-only      只推代码，跳过 cache 内容
+      --with-datasets            额外推 datasets/
+      --checksum                 cache 内容（含指定 checkpoint 文件）整文件校验后再传（慢，慎用）
+      --code-only                只推代码，跳过 models/tokenizers（不影响 --checkpoints）
+      --checkpoints NAME FILE    额外推单个文件：cache/checkpoints/NAME/FILE（可重复）
+                                 NAME 形如 full/odar/<hash>；FILE 如 checkpoint_latest.pt
+                                 同时增量推对应 cache/eval/<model>/<hash>/（若本地有；避免远端重复评测）
       temp/ 不同步；logs/ gitignore，push 不覆盖/不删除远端，由 pull 拉取
-      cache/checkpoints/hash_guide.csv 仅本地（pull 亦排除）
+      cache/checkpoints/hash_guide.csv 仅本地（push/pull 均排除）
 
   pull [--mode MODE] [NAME]
       从远端增量同步 cache/checkpoints/[NAME]/（排除 hash_guide.csv）
-      并增量拉取 logs/（作业 .out/.err/gpu.log 等；体量小）
+      并增量拉取 logs/（作业 .out/.err/gpu.log）与 cache/eval/（体量小）
       --mode fast（默认）| common | full
 
   pull-file NAME FILE
@@ -147,6 +150,95 @@ push_cache_content() {
   done
 }
 
+# 推送指定 checkpoint 文件（NAME=variant/model/hash，FILE 如 checkpoint_latest.pt）；
+# 并对每个 NAME 增量推送对应 cache/eval/{model}/{hash}/（若存在），供远端 eval 跳过已跑组。
+# 不做 --delete。
+push_checkpoint_files() {
+  local use_checksum=0
+  local specs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --checksum) use_checksum=1; shift ;;
+      *) specs+=("$1"); shift ;;
+    esac
+  done
+  if [[ ${#specs[@]} -eq 0 ]]; then
+    return 0
+  fi
+  if (( ${#specs[@]} % 2 != 0 )); then
+    echo "内部错误: push_checkpoint_files 需要成对的 NAME FILE" >&2
+    exit 1
+  fi
+  local opts=("${RSYNC_CACHE_OPTS[@]}")
+  local mode_msg="size+mtime"
+  if [[ "${use_checksum}" -eq 1 ]]; then
+    opts=("${RSYNC_CACHE_CHECKSUM_OPTS[@]}")
+    mode_msg="checksum（整文件读盘）"
+  fi
+  local n_files=$(( ${#specs[@]} / 2 ))
+  echo "==> 推送指定 checkpoint 文件（${n_files} 个；${mode_msg}）..."
+  ensure_remote_cache_dir
+  local i name file local_src remote_dst
+  local -A EVAL_NAMES=()
+  for (( i = 0; i < ${#specs[@]}; i += 2 )); do
+    name="${specs[i]}"
+    file="${specs[i + 1]}"
+    if [[ "${name}" == *".."* ]] || [[ "${name}" == /* ]]; then
+      echo "非法 checkpoints NAME: ${name}" >&2
+      exit 1
+    fi
+    if [[ "${file}" == *".."* ]] || [[ "${file}" == /* ]] || [[ "${file}" == *\/* ]]; then
+      echo "非法 checkpoints FILE: ${file}（须为 NAME 目录下的单层文件名）" >&2
+      exit 1
+    fi
+    local_src="${LOCAL_DIR}/cache/checkpoints/${name}/${file}"
+    if [[ ! -f "${local_src}" ]]; then
+      echo "本地不存在 cache/checkpoints/${name}/${file}" >&2
+      exit 1
+    fi
+    remote_dst="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/checkpoints/${name}/${file}"
+    echo "    → checkpoints/${name}/${file}"
+    remote_ssh "mkdir -p ${REMOTE_DIR}/cache/checkpoints/${name}"
+    rsync_to "${opts[@]}" "${local_src}" "${remote_dst}"
+    EVAL_NAMES["${name}"]=1
+  done
+
+  echo "==> 推送对应 cache/eval/（与上述 NAME 对齐；无本地目录则跳过）..."
+  local variant model model_hash mid eval_rel eval_src eval_dst
+  for name in "${!EVAL_NAMES[@]}"; do
+    case "${name}" in
+      */*/*/*|*".."*)
+        echo "    跳过 eval（NAME 非法）: ${name}" >&2
+        continue
+        ;;
+      */*/*)
+        variant="${name%%/*}"
+        model_hash="${name##*/}"
+        mid="${name#*/}"
+        model="${mid%/*}"
+        ;;
+      *)
+        echo "    跳过 eval（NAME 须为 variant/model/hash）: ${name}" >&2
+        continue
+        ;;
+    esac
+    if [[ -z "${variant}" || -z "${model}" || -z "${model_hash}" || "${model}" == */* ]]; then
+      echo "    跳过 eval（NAME 解析失败）: ${name}" >&2
+      continue
+    fi
+    eval_rel="eval/${model}/${model_hash}"
+    eval_src="${LOCAL_DIR}/cache/${eval_rel}"
+    if [[ ! -d "${eval_src}" ]]; then
+      echo "    跳过 ${eval_rel}/（本地不存在）"
+      continue
+    fi
+    eval_dst="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/${eval_rel}/"
+    echo "    → ${eval_rel}/"
+    remote_ssh "mkdir -p ${REMOTE_DIR}/cache/${eval_rel}"
+    rsync_to "${opts[@]}" "${eval_src}/" "${eval_dst}"
+  done
+}
+
 pull_filters_for_mode() {
   local mode="$1"
   PULL_FILTERS=()
@@ -176,6 +268,18 @@ pull_logs() {
   echo "==> 从 ${REMOTE_SSH_TARGET}（服务=${SERVER_NAME}）增量同步 logs/..."
   if ! remote_ssh "test -d ${REMOTE_DIR}/logs"; then
     echo "    （远端尚无 logs/，跳过）"
+    return 0
+  fi
+  mkdir -p "${local_dst}"
+  rsync_to "${RSYNC_OPTS[@]}" "${remote_src}" "${local_dst}"
+}
+
+pull_eval() {
+  local remote_src="${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/eval/"
+  local local_dst="${LOCAL_DIR}/cache/eval/"
+  echo "==> 从 ${REMOTE_SSH_TARGET}（服务=${SERVER_NAME}）增量同步 cache/eval/..."
+  if ! remote_ssh "test -d ${REMOTE_DIR}/cache/eval"; then
+    echo "    （远端尚无 cache/eval/，跳过）"
     return 0
   fi
   mkdir -p "${local_dst}"
@@ -241,6 +345,7 @@ pull_checkpoints() {
       "${remote_src}" "${local_dst}"
   fi
   pull_logs
+  pull_eval
 }
 
 pull_file() {
@@ -287,18 +392,24 @@ case "${cmd}" in
     code_only=0
     with_datasets=0
     with_checksum=0
+    checkpoint_specs=()
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --code-only) code_only=1; shift ;;
         --with-datasets) with_datasets=1; shift ;;
         --checksum) with_checksum=1; shift ;;
+        --checkpoints)
+          [[ $# -ge 3 ]] || { echo "缺少 --checkpoints NAME FILE" >&2; exit 1; }
+          checkpoint_specs+=("$2" "$3")
+          shift 3
+          ;;
         --with-cache)
           echo "提示: --with-cache 已废弃；默认推 models/tokenizers（加 --with-datasets 才推数据集）" >&2
           shift
           ;;
         -h|--help) usage; exit 0 ;;
         *)
-          echo "未知 push 选项: $1（可用 --code-only / --with-datasets / --checksum）" >&2
+          echo "未知 push 选项: $1（可用 --code-only / --with-datasets / --checksum / --checkpoints）" >&2
           usage >&2
           exit 1
           ;;
@@ -315,7 +426,17 @@ case "${cmd}" in
         cache_args+=(datasets)
       fi
       push_cache_content "${cache_args[@]}"
-      echo "==> 未推送：huggingface/（缓冲区）、checkpoints/、预处理、compile*；datasets/ 默认跳过（需加 --with-datasets）"
+      if [[ ${#checkpoint_specs[@]} -eq 0 ]]; then
+        echo "==> 未推送：huggingface/（缓冲区）、checkpoints/、预处理、compile*；datasets/ 默认跳过（需加 --with-datasets）"
+      else
+        echo "==> 未推送：huggingface/（缓冲区）、未指定的 checkpoints/、预处理、compile*；datasets/ 默认跳过（需加 --with-datasets）"
+      fi
+    fi
+    if [[ ${#checkpoint_specs[@]} -gt 0 ]]; then
+      ckpt_args=()
+      [[ "${with_checksum}" -eq 1 ]] && ckpt_args+=(--checksum)
+      ckpt_args+=("${checkpoint_specs[@]}")
+      push_checkpoint_files "${ckpt_args[@]}"
     fi
     echo "==> push 完成（${SERVER_NAME}）"
     ;;

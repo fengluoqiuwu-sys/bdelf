@@ -30,6 +30,7 @@ bash slurm/remote_status.sh          # 或加 --json
 - 占 CPU/GPU 的工作必须经 Slurm；登录节点禁止非 Slurm 的重 Python 作业。
 - 登录节点只做轻量事：队列/状态、只读日志、写 `temp/` 登记。
 - 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 4 GPU / 16 CPU / 128G）。
+- Eval 提交：`bash slurm/sbatch-eval.sh <name> -- --run full/<model>/<hash> …`（脚本在 `scripts/eval/`；模板 `slurm/eval.slurm`，**默认卡数同训练 4 GPU**）。
 - VRAM 探针：`bash slurm/sbatch-vram-probe.sh …`；预处理：`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`。
 - **禁止** AI 提交 `slurm/sbatch-preprocess.sh` / 预处理作业。
 
@@ -46,5 +47,5 @@ bash slurm/remote_status.sh          # 或加 --json
 - `scheduler` 建议写 `"slurm"`；以 Slurm `job_id` 为键；`gpus` 计入 `agent_gpu_sum`。
 - 可同时跑多个，条件：登记合计 GPU + 本作业申请 ≤ 4。集群无空闲卡时仍可 `sbatch` 排队，勿空等 AVAIL。
 - 可 `scancel` **自己登记**的作业；勿动他人 / 未登记作业。
-- 禁止在远端 generate / eval / 看效果；拉回本机测。
+- 禁止在远端交互式 `generate.py` / 人工看效果；离线 TriFluency eval 须经 `bash slurm/sbatch-eval.sh <name> -- --run …`（默认 4 GPU，与训练一致；结果 `sync pull` 含 `cache/eval/`）。
 - 流程细节：skill `train-ops`、`sync`、`auto-train`。

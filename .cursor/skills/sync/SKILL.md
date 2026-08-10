@@ -27,6 +27,10 @@ SSH 登录/执行：`bash scripts/ssh.sh <服务名> [命令…]`（同读 `serv
 ```bash
 bash scripts/sync.sh ovan-server push            # 代码 + models/tokenizers
 bash scripts/sync.sh ovan-server push --code-only # 只推代码
+bash scripts/sync.sh ovan-server push --checkpoints full/odar/<hash> checkpoint_latest.pt
+bash scripts/sync.sh ovan-server push \
+  --checkpoints full/odar/<hash> checkpoint_step_0400000.pt \
+  --checkpoints full/odar/<hash> checkpoint_latest.pt
 ```
 
 - 代码镜像（`--delete`）；排除 `.venv` / `cache` 链接 / `temp/` / `.git` / `.cursor/` / `.claude/` 等。
@@ -34,9 +38,10 @@ bash scripts/sync.sh ovan-server push --code-only # 只推代码
 - 默认再推 cache **内容**目录：`models/` `tokenizers/`。
   - `--checksum`：先比对校验和，相同则不传。
   - **不**用 `-L`（保留 HF `snapshots→blobs` 软链）。
-  - 排除 `.cache/` `.locks/` `*.lock` 等；不推 `preprocessed_datasets/` / `checkpoints/` / `compile*`。
+  - 排除 `.cache/` `.locks/` `*.lock` 等；不推 `preprocessed_datasets/` / `compile*` / `eval/`。
   - `--with-datasets` 才额外推 `datasets/`。
-- `temp/` 与 `hash_guide.csv`：不同步（后者 pull 时也排除）。
+- **checkpoints 默认不推**；`--checkpoints NAME FILE`（可重复）只推 `cache/checkpoints/NAME/FILE`（通常为某个 `.pt`；不做 `--delete`），并**同时增量推**对应 `cache/eval/<model>/<hash>/`（若本地有；供远端 eval 跳过已跑组）。`NAME`=`{fast|full}/{model}/{hash}`。与 `pull-file` 对称。`--code-only` 仍可配合。评测流程见 skill `eval`。
+- `temp/` 与 `hash_guide.csv`：不同步（后者 push/pull 均排除）。
 
 ### pull
 
@@ -50,7 +55,7 @@ bash scripts/sync.sh ovan-server pull [--mode fast|common] [NAME]
 | `common` | 另含 `checkpoint_latest.pt` |
 | `full` | 全部 `.pt` — AI 默认禁止 |
 
-另：每次 `pull` 都会增量同步远端 `logs/` → 本地（作业 `.out` / `.err` / `gpu.log`；体量小）。
+另：每次 `pull` 都会增量同步远端 `logs/` → 本地（作业 `.out` / `.err` / `gpu.log`），以及 `cache/eval/` → 本地（评测产物；体量小）。
 
 `NAME`：`{fast|full}/{model}/{hash}`（用 `scripts/resolve_checkpoint.py` 解析）。省略则同步全部 run 的过滤结果。
 
