@@ -25,5 +25,5 @@ optimizer:
 # Batch（全局批；accum = global_batch_size / (batch_size * world_size)）
 # -----------------------------------------------------------------------------
 batch:
-  batch_size: 24  # 每 GPU 微批大小
-  global_batch_size: 192  # 全局批大小（推导梯度累积）
+  batch_size: 16  # 每 GPU 微批大小
+  global_batch_size: 512  # 全局批大小（推导梯度累积）

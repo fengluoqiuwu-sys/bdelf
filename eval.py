@@ -3,15 +3,16 @@
 
 布局::
 
-    cache/eval/{model}/{train-hash}/{eval-hash}/
+    cache/eval/{model}/{model-hash}/{step}/{generate-hash}/
       samples.txt   # 参数说明 + 逐样本（多指标）
       summary.txt   # 参数说明 + 语料汇总 / 等级
 
-``eval-hash`` = sha256(step + 生成配置 + 样本参数含 seed)[:16]。
+``generate-hash`` = sha256(生成配置 + 样本参数含 seed；不含 step)[:16]。
+``model-hash`` 即训练 config-hash（与 ``cache/checkpoints/full/{model}/{hash}/`` 一致）。
 
 Usage::
 
-    .venv/bin/python eval.py --run full/elf/<train-hash>
+    .venv/bin/python eval.py --run full/elf/<model-hash>
     .venv/bin/python eval.py --run full/elf/<hash> --generate eval \\
         --set self_cond_cfg_scale=2.0 --num-samples 1024 --seed 42
 """
@@ -76,7 +77,7 @@ def parse_generate_sets(items: list[str] | None) -> dict[str, Any]:
 
 
 def parse_full_run(ckpt_path: Path) -> tuple[str, str]:
-    """从 checkpoint 路径解析 ``(model, train_hash)``；要求 variant=full。"""
+    """从 checkpoint 路径解析 ``(model, model_hash)``；要求 variant=full。"""
     root = _checkpoint_root().resolve()
     try:
         rel = ckpt_path.resolve().parent.relative_to(root)
@@ -90,17 +91,16 @@ def parse_full_run(ckpt_path: Path) -> tuple[str, str]:
         raise ValueError(
             f"Expected cache/checkpoints/{{variant}}/{{model}}/{{hash}}/, got {rel}"
         )
-    variant, model, train_hash = parts
+    variant, model, model_hash = parts
     if variant != "full":
         raise ValueError(
             f"eval.py only supports variant=full (got {variant!r} from {rel})"
         )
-    return model, train_hash
+    return model, model_hash
 
 
-def eval_fingerprint(
+def generate_fingerprint(
     *,
-    step: int,
     generate_profile: str,
     sampling_cfg: dict[str, Any],
     num_samples: int,
@@ -112,8 +112,8 @@ def eval_fingerprint(
     gen_eval_dtype: str,
     protocol: str = "trifluency-v1",
 ) -> dict[str, Any]:
+    """进入 generate-hash 的字段（不含 step；step 在目录路径中）。"""
     return {
-        "step": int(step),
         "generate_profile": generate_profile,
         "sampling": dict(sampling_cfg),
         "num_samples": int(num_samples),
@@ -127,9 +127,13 @@ def eval_fingerprint(
     }
 
 
-def eval_hash_from_fingerprint(fp: dict[str, Any]) -> str:
+def generate_hash_from_fingerprint(fp: dict[str, Any]) -> str:
     digest = hashlib.sha256(canonical_json(fp).encode("utf-8")).hexdigest()
     return digest[:CONFIG_HASH_LEN]
+
+
+def eval_out_dir(model: str, model_hash: str, step: int, generate_hash: str) -> Path:
+    return EVAL_ROOT / model / model_hash / str(int(step)) / generate_hash
 
 
 def load_model_with_ema(
@@ -169,7 +173,7 @@ def generate_texts_chunked(
     """按 micro batch 生成。
 
     第 ``k`` 个 batch 使用 ``seed + k * 100003``。复现须固定 ``micro_bs``
-    （已写入 eval-hash）。
+    （已写入 generate-hash）。
     """
     texts: list[str] = []
     last_nfe = 0
@@ -228,13 +232,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--seed",
         type=int,
         default=42,
-        help="Base seed; batch k uses seed + k*100003 (micro_bs enters eval-hash)",
+        help="Base seed; batch k uses seed + k*100003 (micro_bs enters generate-hash)",
     )
     p.add_argument(
         "--micro-bs",
         type=int,
         default=8,
-        help="Generate micro-batch size (default: 8; part of eval-hash)",
+        help="Generate micro-batch size (default: 8; part of generate-hash)",
     )
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-k", type=int, default=None)
@@ -273,7 +277,7 @@ def main() -> None:
         return
 
     ckpt_path = resolve_checkpoint(checkpoint=args.checkpoint, run=args.run)
-    model_name, train_hash = parse_full_run(ckpt_path)
+    model_name, model_hash = parse_full_run(ckpt_path)
     device = resolve_device(args.device)
 
     _log(f"Loading checkpoint: {ckpt_path}")
@@ -296,7 +300,7 @@ def main() -> None:
         from models.elf.ace import attach_ace_identity
 
         attach_ace_identity(
-            model, model_hash=train_hash, step=step, tokenizer=tokenizer_name,
+            model, model_hash=model_hash, step=step, tokenizer=tokenizer_name,
         )
 
     overrides = parse_generate_sets(args.set_items)
@@ -308,8 +312,7 @@ def main() -> None:
         sampling_cfg["top_k"] = args.top_k
 
     use_ema = (not args.no_ema) and bool(ema_state)
-    fp = eval_fingerprint(
-        step=step,
+    fp = generate_fingerprint(
         generate_profile=args.generate,
         sampling_cfg=sampling_cfg,
         num_samples=args.num_samples,
@@ -320,16 +323,16 @@ def main() -> None:
         gen_eval_model=args.gen_eval_model,
         gen_eval_dtype=args.gen_eval_dtype,
     )
-    ehash = eval_hash_from_fingerprint(fp)
-    out_dir = EVAL_ROOT / model_name / train_hash / ehash
+    ghash = generate_hash_from_fingerprint(fp)
+    out_dir = eval_out_dir(model_name, model_hash, step, ghash)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     params: dict[str, Any] = {
         "checkpoint": str(ckpt_path),
-        "run": f"full/{model_name}/{train_hash}",
+        "run": f"full/{model_name}/{model_hash}",
         "model": model_name,
-        "train_hash": train_hash,
-        "eval_hash": ehash,
+        "model_hash": model_hash,
+        "generate_hash": ghash,
         "step": step,
         "out_dir": str(out_dir),
         **fp,
@@ -341,7 +344,7 @@ def main() -> None:
     )
 
     _log(
-        f"model={model_name} train_hash={train_hash} eval_hash={ehash} "
+        f"model={model_name} model_hash={model_hash} generate_hash={ghash} "
         f"step={step} samples={args.num_samples}x{args.num_tokens} "
         f"seed={args.seed} ema={use_ema} generate={args.generate} "
         f"sampling={sampling_cfg}",
