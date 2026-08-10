@@ -37,6 +37,42 @@ def embed_tokens_table(
     return ((emb - float(latent_mean)) / scale).to(dtype=dtype)
 
 
+def commit_mse(
+    x: torch.Tensor,
+    *,
+    logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    latent_mean: float,
+    latent_std: float,
+    t: torch.Tensor,
+    t0: float,
+    loss_mask: torch.Tensor,
+    extra_gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """DMA-commit：``‖x - sg(embed(argmax(logits)))‖²``，仅 ``t≥t0``（及可选 gate）。
+
+    梯度只流向 ``x``（连续预测）；argmax / 查表路径无梯度。无触发样本时返回 0。
+    """
+    gate = dma_gate(t, t0)
+    if extra_gate is not None:
+        gate = gate * extra_gate.to(dtype=gate.dtype)
+    if float(gate.max().item()) <= 0.0:
+        return x.new_zeros(())
+
+    token_ids = logits.argmax(dim=-1)
+    x_hard = embed_tokens_table(
+        token_ids,
+        embed_weight=embed_weight,
+        latent_mean=latent_mean,
+        latent_std=latent_std,
+        dtype=x.dtype,
+    ).detach()
+    per_token = ((x - x_hard) ** 2).mean(dim=-1)
+    mask = loss_mask.to(dtype=per_token.dtype) * gate.squeeze(-1)
+    denom = torch.clamp(mask.sum(), min=1.0)
+    return (per_token * mask).sum() / denom
+
+
 def round_trip_st(
     x: torch.Tensor,
     *,

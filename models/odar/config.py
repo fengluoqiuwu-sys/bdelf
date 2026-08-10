@@ -42,6 +42,7 @@ class FL_ODARConfig(PretrainedConfig):
             "dma_t0",
             "dma_mode",
             "dma_tau",
+            # dma_commit_lambda 可选：默认 0；不进 required，旧 YAML 可加载
         }
     )
 
@@ -85,6 +86,9 @@ class FL_ODARConfig(PretrainedConfig):
         dma_t0: float = 0.5,
         dma_mode: str = "round_trip",
         dma_tau: float = 1.0,
+        # DMA-commit：主损失上对 x_pred 的 commitment 辅助项；0=关闭（旧行为）
+        # 仅当 YAML / --set 显式写入时进指纹；默认不写 YAML → 旧 hash 不变
+        dma_commit_lambda: float = 0.0,
         sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -127,6 +131,7 @@ class FL_ODARConfig(PretrainedConfig):
         self.dma_t0 = float(dma_t0)
         self.dma_mode = str(dma_mode)
         self.dma_tau = float(dma_tau)
+        self.dma_commit_lambda = float(dma_commit_lambda)
         self.sampling = sampling or {}
 
     def token_layout(self) -> FL_TokenLayout:
@@ -170,6 +175,7 @@ class FL_ODARConfig(PretrainedConfig):
             "dma_t0": self.dma_t0,
             "dma_mode": self.dma_mode,
             "dma_tau": self.dma_tau,
+            "dma_commit_lambda": self.dma_commit_lambda,
         }
 
 

@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from models.elf.ace import apply_ace_steer, resolve_ace_steering
 from models.odar.config import FL_ODARConfig
-from models.odar.dma import round_trip_st
+from models.odar.dma import commit_mse, round_trip_st
 from models.odar.layers import (
     BottleneckTextProj,
     ODARBlock,
@@ -89,6 +89,7 @@ class _ODARBackbone(nn.Module):
         dma_t0: float = 0.5,
         dma_mode: str = "round_trip",
         dma_tau: float = 1.0,
+        dma_commit_lambda: float = 0.0,
     ) -> None:
         super().__init__()
         if num_time_tokens <= 0:
@@ -123,9 +124,11 @@ class _ODARBackbone(nn.Module):
         self.dma_t0 = float(dma_t0)
         self.dma_mode = str(dma_mode)
         self.dma_tau = float(dma_tau)
+        self.dma_commit_lambda = float(dma_commit_lambda)
         self.last_loss_branch = ""
         self.last_l2_loss = float("nan")
         self.last_ce_loss = float("nan")
+        self.last_commit_loss = float("nan")
 
         # Lazy frozen T5; held in a list so PyTorch does not auto-register it
         # as a submodule (avoids DDP / checkpoint surprises).
@@ -264,6 +267,30 @@ class _ODARBackbone(nn.Module):
             t0=self.dma_t0,
             mode=self.dma_mode,
             tau=self.dma_tau,
+            extra_gate=extra_gate,
+        )
+
+    def _dma_commit_loss(
+        self,
+        x_pred: torch.Tensor,
+        logits: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        loss_mask: torch.Tensor,
+        extra_gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Commitment 辅助损失；``dma_commit_lambda<=0`` 时返回 0（零开销）。"""
+        if float(self.dma_commit_lambda) <= 0.0:
+            return x_pred.new_zeros(())
+        return commit_mse(
+            x_pred,
+            logits=logits,
+            embed_weight=self._token_embed_weight(),
+            latent_mean=self.latent_mean,
+            latent_std=self.latent_std,
+            t=t,
+            t0=self.dma_t0,
+            loss_mask=loss_mask,
             extra_gate=extra_gate,
         )
 
@@ -466,12 +493,21 @@ class _ODARBackbone(nn.Module):
         else:
             model_in = z
 
-        x_pred, _ = self.net_forward(
+        x_pred, logits_pred = self.net_forward(
             model_in, t, decoder_step_active=False, deterministic=False,
         )
         v_pred = self._x_to_v(x_pred, z, t)
         l2_per_token = ((v_pred - v_target) ** 2).mean(dim=-1)
-        return self._masked_mean(l2_per_token, loss_mask)
+        loss = self._masked_mean(l2_per_token, loss_mask)
+        if logits_pred is not None and float(self.dma_commit_lambda) > 0.0:
+            commit = self._dma_commit_loss(
+                x_pred, logits_pred, t, loss_mask=loss_mask,
+            )
+            self.last_commit_loss = commit.detach()
+            loss = loss + float(self.dma_commit_lambda) * commit
+        else:
+            self.last_commit_loss = float("nan")
+        return loss
 
     def _decode_loss(
         self,
@@ -647,6 +683,20 @@ class _ODARBackbone(nn.Module):
             (l2_per_token * l2_mask).sum() / l2_denom.clamp(min=1.0),
             torch.full((), float("nan"), device=l2_per_token.device, dtype=l2_per_token.dtype),
         ).detach()
+
+        # DMA-commit：仅 denoiser 行 + t≥dma_t0；λ=0 时跳过
+        if float(self.dma_commit_lambda) > 0.0:
+            commit = self._dma_commit_loss(
+                x_pred,
+                logits,
+                t,
+                loss_mask=loss_mask,
+                extra_gate=(1.0 - decoder_mask_b11),
+            )
+            self.last_commit_loss = commit.detach()
+            loss = loss + float(self.dma_commit_lambda) * commit
+        else:
+            self.last_commit_loss = float("nan")
         return loss
 
     def _touch_unused_heads(self, loss: torch.Tensor) -> torch.Tensor:
@@ -922,6 +972,26 @@ class _ODARBackbone(nn.Module):
             expected_dim=self.text_encoder_dim,
             backbone=self,
         )
+        # 采样期 DMA 消融开关（仅推理；训练路径不变）
+        # dma: 默认开；false/0 关闭采样硬化
+        # dma_ace_order: after=先 ACE 再 DMA（默认）| before=先 DMA 再 ACE
+        #                 | skip_with_ace=开 ACE 时跳过 DMA
+        dma_raw = cfg.get("dma", True)
+        dma_on = not (
+            dma_raw is False
+            or dma_raw is None
+            or (isinstance(dma_raw, (int, float)) and float(dma_raw) == 0.0)
+            or (
+                isinstance(dma_raw, str)
+                and str(dma_raw).strip().lower() in ("false", "0", "off", "no")
+            )
+        )
+        dma_ace_order = str(cfg.get("dma_ace_order", "after")).lower().strip()
+        if dma_ace_order not in ("after", "before", "skip_with_ace"):
+            raise ValueError(
+                f"unknown dma_ace_order={dma_ace_order!r}; "
+                "expected after|before|skip_with_ace"
+            )
         t_steps = self._get_sampling_steps(num_sampling_steps, device, dtype)
         z = (
             torch.randn(
@@ -959,12 +1029,26 @@ class _ODARBackbone(nn.Module):
                 )
             else:
                 raise ValueError(f"unknown sampling_method: {method}")
-            if ace_d is not None and x_pred is not None:
+            # ACE / DMA 顺序可扫；开 ACE 且 skip_with_ace 时不做采样 DMA
+            apply_dma = dma_on and not (
+                ace_d is not None and dma_ace_order == "skip_with_ace"
+            )
+            if (
+                ace_d is not None
+                and x_pred is not None
+                and dma_ace_order != "before"
+            ):
                 x_pred = apply_ace_steer(x_pred, lam=ace_lam, direction=ace_d)
             # DMA-H：硬化本步 x_pred，供下一步 SC 反馈（门控用当前 t）
             # 量化用同前向 decode logits；末步 x_pred 无人消费，不做 DMA
-            if x_pred is not None:
+            if apply_dma and x_pred is not None:
                 x_pred = self._apply_dma(x_pred, t, logits=step_logits)
+            if (
+                ace_d is not None
+                and x_pred is not None
+                and dma_ace_order == "before"
+            ):
+                x_pred = apply_ace_steer(x_pred, lam=ace_lam, direction=ace_d)
             nfe += 1
 
         t = float(t_steps[-2].item())
