@@ -50,6 +50,30 @@ class FL_GenerateConfig:
         elif out.get("ace_direction") in (None, False, ""):
             # 自动缓存方向时不把 null 写入采样字典 / 指纹
             out.pop("ace_direction", None)
+
+        # 采样 DMA 默认开：缺省/true 不写入，保持与旧 YAML 指纹一致
+        if "dma" in out:
+            dma = out.get("dma", True)
+            dma_off = (
+                dma is False
+                or (isinstance(dma, (int, float)) and float(dma) == 0.0)
+                or (
+                    isinstance(dma, str)
+                    and str(dma).strip().lower() in ("false", "0", "off", "no")
+                )
+            )
+            if dma_off:
+                out["dma"] = False
+            else:
+                out.pop("dma", None)
+
+        # dma_ace_order 默认 after（先 ACE 再 DMA）；缺省/after 不写入
+        if "dma_ace_order" in out:
+            order = str(out.get("dma_ace_order") or "after").lower().strip()
+            if order in ("", "after"):
+                out.pop("dma_ace_order", None)
+            else:
+                out["dma_ace_order"] = order
         return out
 
 

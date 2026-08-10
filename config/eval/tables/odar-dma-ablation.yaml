@@ -1,0 +1,22 @@
+# =============================================================================
+# ODAR 采样期 DMA 零成本消融（同 ckpt，只改推理）
+# =============================================================================
+_doc: 关采样 DMA / ACE×DMA 互斥与调序；对照已有 odar-sc-ace 缓存  # 文件说明
+name: odar-dma-ablation  # 表名；非 prototype 时与文件名一致
+generate: eval  # 基线 generate 配置名（config/generate/<model>/）
+num_samples: 1024  # 每组无条件样本数
+num_tokens: 1024  # 每样本生成长度
+seed: 42  # 各组共用基 seed
+runs:  # 多组相对基线的覆盖（等价多次 --set）；至少一项
+  # 1) 无 ACE、关采样 DMA → 若 B↓ 则伤害主要来自采样硬化
+  - self_cond_cfg_scale: 0.5  # FAR-SC
+    ace: false  # 关 ACE
+    dma: false  # 关采样 DMA
+  # 2) ACE 开、关采样 DMA → 测 ACE×DMA 共谋
+  - self_cond_cfg_scale: 0.5  # FAR-SC
+    ace: true  # 开 ACE
+    dma: false  # 关采样 DMA
+  # 3) ACE 开、先 DMA 再 ACE（默认是先 ACE 再 DMA）
+  - self_cond_cfg_scale: 0.5  # FAR-SC
+    ace: true  # 开 ACE
+    dma_ace_order: before  # 先硬化再 steer
