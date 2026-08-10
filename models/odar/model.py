@@ -90,6 +90,7 @@ class _ODARBackbone(nn.Module):
         dma_mode: str = "round_trip",
         dma_tau: float = 1.0,
         dma_commit_lambda: float = 0.0,
+        dma_commit_t0: float | None = None,
     ) -> None:
         super().__init__()
         if num_time_tokens <= 0:
@@ -125,6 +126,10 @@ class _ODARBackbone(nn.Module):
         self.dma_mode = str(dma_mode)
         self.dma_tau = float(dma_tau)
         self.dma_commit_lambda = float(dma_commit_lambda)
+        # None → 沿用 dma_t0（旧行为）；显式 0.0 → commit 覆盖全部 denoiser 行
+        self.dma_commit_t0 = (
+            float(dma_commit_t0) if dma_commit_t0 is not None else float(dma_t0)
+        )
         self.last_loss_branch = ""
         self.last_l2_loss = float("nan")
         self.last_ce_loss = float("nan")
@@ -289,7 +294,7 @@ class _ODARBackbone(nn.Module):
             latent_mean=self.latent_mean,
             latent_std=self.latent_std,
             t=t,
-            t0=self.dma_t0,
+            t0=self.dma_commit_t0,
             loss_mask=loss_mask,
             extra_gate=extra_gate,
         )

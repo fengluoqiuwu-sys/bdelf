@@ -30,4 +30,5 @@ exec "$PY" train.py \
   --set schedule.min_lr_ratio=1.0 \
   --set schedule.target_tokens=45200000000 \
   --set model.dma_commit_lambda=0.1 \
+  --set model.dma_commit_t0=0.0 \
   "$@"
