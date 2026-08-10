@@ -49,16 +49,14 @@ def commit_mse(
     loss_mask: torch.Tensor,
     extra_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """DMA-commit：``‖x - sg(embed(argmax(logits)))‖²``，仅 ``t≥t0``（及可选 gate）。
+    """DMA-commit：相对 ‖x-sg(embed(argmax))‖² / ‖sg(embed)‖²，仅 ``t≥t0``。
 
-    梯度只流向 ``x``（连续预测）；argmax / 查表路径无梯度。无触发样本时返回 0。
+    用相对尺度，使 λ≈0.1 与早期 mse 同量级；梯度只流向 ``x``。无触发时返回 0。
     """
     gate = dma_gate(t, t0)
     if extra_gate is not None:
         gate = gate * extra_gate.to(dtype=gate.dtype)
-    if float(gate.max().item()) <= 0.0:
-        return x.new_zeros(())
-
+    # 避免 .item() 触发 dynamo graph break；无触发时乘 0 即可
     token_ids = logits.argmax(dim=-1)
     x_hard = embed_tokens_table(
         token_ids,
@@ -68,8 +66,11 @@ def commit_mse(
         dtype=x.dtype,
     ).detach()
     per_token = ((x - x_hard) ** 2).mean(dim=-1)
+    hard_norm = (x_hard ** 2).mean(dim=-1).clamp(min=1e-4)
+    per_token = per_token / hard_norm
     mask = loss_mask.to(dtype=per_token.dtype) * gate.squeeze(-1)
     denom = torch.clamp(mask.sum(), min=1.0)
+    # gate 全 0 时仍返回有限 0（mask 和为 0 → denom=1 但分子为 0）
     return (per_token * mask).sum() / denom
 
 
