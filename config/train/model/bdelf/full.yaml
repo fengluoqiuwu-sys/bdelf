@@ -1,7 +1,7 @@
 # =============================================================================
 # 模型训练配方（optimizer + batch；由 CLI --config 100m-{variant} 选择本文件）
 # =============================================================================
-_doc: BDELF 100m · full（对齐 ELF：Muon lr/wd/ema；in-context 条件无 AdaLN）  # 文件说明，写入 extra
+_doc: BDELF 100m · full（token emb latent；Muon lr/wd/ema；in-context 条件）  # 文件说明，写入 extra
 name: bdelf  # 模型名；与目录名一致
 variant: full  # 训练变体：fast | full
 

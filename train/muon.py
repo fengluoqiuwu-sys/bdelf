@@ -20,7 +20,18 @@ _HIDDEN_LINEAR_WEIGHT_RE = re.compile(
 def _is_muon_weight(name: str, param: nn.Parameter) -> bool:
     if param.dim() != 2:
         return False
-    if "wte" in name or "lm_head" in name:
+    # 嵌入 / 解码头 / latent 投影走 AdamW（含 ELF/BDELF factored unembed）。
+    if any(
+        key in name
+        for key in (
+            "wte",
+            "lm_head",
+            "unembed",
+            "proj_kernel",
+            "text_proj",
+            "final_layer",
+        )
+    ):
         return False
     return _HIDDEN_LINEAR_WEIGHT_RE.search(name) is not None
 

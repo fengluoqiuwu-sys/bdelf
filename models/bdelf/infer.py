@@ -2,6 +2,7 @@
 
 条件（time / SC-CFG / mode）以 in-context token 形式只注入 suffix 流；
 已解码 prefix 不依赖 t，仍可缓存（对齐「无 AdaLN」后的 ELF 式条件）。
+pair 在 latent 空间缓冲，进 backbone 前经 text_proj。
 """
 
 from __future__ import annotations
@@ -114,23 +115,14 @@ def build_suffix_cross_mask(
 
   q_len = cond_len + content.size(0)
   kv_len = cond_len + kv_content.numel()
-  # KV 布局：[prefix_content | cond | suffix]；Q 布局：[cond | suffix]
-  # prefix 段长度：
   prefix_kv = 0 if stride == 0 else 2 * stride * db
   out = torch.ones(q_len, kv_len, dtype=torch.bool, device=device)
-  # content→content 子块：Q 的 content 对 KV 的 [prefix|suffix]
-  # KV indices after inserting cond after prefix:
-  #   [0, prefix_kv) = prefix
-  #   [prefix_kv, prefix_kv+cond_len) = cond
-  #   [prefix_kv+cond_len, kv_len) = suffix
-  # content mask 原布局 KV=[prefix|suffix]，需拆到新布局。
   q_off = cond_len
   if prefix_kv > 0:
     out[q_off:, :prefix_kv] = content[:, :prefix_kv]
     out[q_off:, prefix_kv + cond_len:] = content[:, prefix_kv:]
   else:
     out[q_off:, cond_len:] = content
-  # cond 行：可见全部 KV；content 行：可见全部 cond（已由 ones 覆盖）
   return bool_mask_to_sdpa_additive(out)
 
 
@@ -166,7 +158,7 @@ class BDELFInferState:
     self.seqlen = seqlen
     self.device = device
     self.dtype = dtype
-    d = backbone.n_embd
+    d = backbone.text_encoder_dim
 
     self.z_buf = torch.zeros(n_samples, seqlen, d, device=device, dtype=dtype)
     self.x0_buf = torch.zeros_like(self.z_buf)
@@ -198,15 +190,17 @@ class BDELFInferState:
     self.x0_buf[:, off:off + self.db] = z_block
 
   def _gather_prefix_pair(self, stride: int) -> torch.Tensor | None:
+    """Latent prefix → text_proj → (B, 2*stride*db, n_embd)。"""
     if stride == 0:
       return None
-    z_p = self.bb.drop(self.z_buf[:, :stride * self.db])
-    x0_p = self.bb.drop(self.x0_buf[:, :stride * self.db])
+    z_p = self.bb.text_proj(self.bb.drop(self.z_buf[:, :stride * self.db]))
+    x0_p = self.bb.text_proj(self.bb.drop(self.x0_buf[:, :stride * self.db]))
     return torch.cat([z_p, x0_p], dim=1)
 
   def _gather_suffix_pair(self, z_block: torch.Tensor) -> torch.Tensor:
-    z = self.bb.drop(z_block)
-    return torch.cat([z, z], dim=1)
+    """当前块 latent → text_proj；x0 半暂用同一 z（ODE 过程中）。"""
+    z_h = self.bb.text_proj(self.bb.drop(z_block))
+    return torch.cat([z_h, z_h], dim=1)
 
   def _prefix_positions(self, stride: int) -> torch.Tensor:
     return pair_positions(stride * self.db, self.device)
@@ -326,6 +320,7 @@ class BDELFInferState:
     sc_prev: torch.Tensor | None = None,
     self_cond_cfg_scale: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    """返回当前块 z-half 的 hidden（n_embd），供 FinalLayer / unembed。"""
     win_len = (stride + 1) * self.db
     z_in = self.bb._apply_self_cond(z_block, sc_prev)
     suffix_pair = self._gather_suffix_pair(z_in)
@@ -343,17 +338,13 @@ class BDELFInferState:
     )
     suffix_pos = self._suffix_positions(stride, cond_len)
 
-    # Prefix KV 在 KV 中排在 cond 之前；cond 的 K/V 与 suffix 一起现算。
-    # forward_suffix_cross: K = cat([k_prefix, k_from_x])，x=[cond|suffix]
-    # → KV = [prefix | cond | suffix]，与 mask 一致。
     for layer_idx, block in enumerate(self.bb.h):
       k_p, v_p = (None, None)
       if self._prefix_kv_cache:
         k_p, v_p = self._prefix_kv_cache[layer_idx]
       x = block.forward_infer_suffix(x, k_p, v_p, cross_mask, suffix_pos)
     x = self.bb.ln_f(x)
-    # z 半：跳过 cond，取 suffix 前 db
-    return self.bb.x_pred_head(x[:, cond_len:cond_len + self.db])
+    return x[:, cond_len:cond_len + self.db]
 
   def ode_step(
     self,
@@ -368,11 +359,12 @@ class BDELFInferState:
     self.write_suffix(z_block, stride)
     bsz = z_block.size(0)
     t_batch = t.expand(bsz)
-    x_pred_block = self._suffix_forward(
+    hidden = self._suffix_forward(
       z_block, stride, t_batch, decode=False,
       sc_prev=sc_prev,
       self_cond_cfg_scale=self_cond_cfg_scale,
     )
+    x_pred_block = self.bb.final_layer(hidden)
     denom = torch.clamp(1.0 - t, min=self.bb.t_eps)
     v = (x_pred_block - z_block) / denom
     return z_block + (t_next - t) * v, x_pred_block
@@ -389,31 +381,14 @@ class BDELFInferState:
     self.write_suffix(z_block, stride)
     bsz = z_block.size(0)
     t_batch = torch.ones(bsz, device=self.device, dtype=z_block.dtype)
-    # decode 头用 lm_head；先取 hidden 再投影
-    win_len = (stride + 1) * self.db
-    z_in = self.bb._apply_self_cond(z_block, None)
-    suffix_pair = self._gather_suffix_pair(z_in)
-    cond = self.bb.build_context(
-      t_batch, self_cond_cfg_scale=self_cond_cfg_scale, decode=True,
-    ).to(dtype=suffix_pair.dtype)
-    cond_len = cond.size(1)
-    x = torch.cat([cond, suffix_pair], dim=1)
-    cross_mask = self._get_mask(
-      ("suffix", win_len, stride, cond_len),
-      lambda: build_suffix_cross_mask(
-        win_len, stride, self.db, self.device, cond_len=cond_len,
-      ),
+    hidden = self._suffix_forward(
+      z_block, stride, t_batch, decode=True,
+      sc_prev=None,
+      self_cond_cfg_scale=self_cond_cfg_scale,
     )
-    suffix_pos = self._suffix_positions(stride, cond_len)
-    for layer_idx, block in enumerate(self.bb.h):
-      k_p, v_p = (None, None)
-      if self._prefix_kv_cache:
-        k_p, v_p = self._prefix_kv_cache[layer_idx]
-      x = block.forward_infer_suffix(x, k_p, v_p, cross_mask, suffix_pos)
-    x = self.bb.ln_f(x)
-    hidden = x[:, cond_len:cond_len + self.db]
+    logits = self.bb._decode_logits(hidden)
     return sample_from_logits(
-      self.bb.lm_head(hidden),
+      logits,
       temperature=temperature,
       top_k=top_k,
     )

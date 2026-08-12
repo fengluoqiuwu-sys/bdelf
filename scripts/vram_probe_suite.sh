@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在单卡上依次对多个模型跑 scripts/vram_probe.py。
-# 跳过 bdelf（模型仍在修）与 cola 系列（缺 VAE / 暂不测）。
+# 跳过 cola 系列（缺 VAE / 暂不测）。
 # 由 slurm/sbatch-vram-probe.sh --suite 提交；也可在已分配 GPU 的作业内直接跑。
 # 结果供 AI 填入本地 temp/vram-probe/alloc.md（model×batch→GiB）；不按 global_bs 过滤。
 set -euo pipefail
@@ -25,12 +25,13 @@ MODELS=(
   "ar1_5|default"
   "ar2|default"
   "bd3lm|default"
+  "bdelf|default"
   "elf|elf"
 )
 
 echo "=== vram_probe_suite start: $(date -Is) host=$(hostname) ==="
 echo "world_size(metadata)=$WORLD_SIZE batches=$BATCHES"
-echo "skip: bdelf (模型仍在修); cola, cola_vae (cola 系列暂不测)"
+echo "skip: cola, cola_vae (cola 系列暂不测)"
 
 overall=0
 for entry in "${MODELS[@]}"; do

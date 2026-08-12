@@ -1,10 +1,11 @@
 """Block Diffusion + Embedded Language Flow (BDELF).
 
-Within the BD3LM block-diffusion attention framework, replaces in-block MDLM
-discrete masking with ELF-style continuous flow matching:
-  - Conditioning: in-context time / mode / SC-CFG tokens（对齐 ELF，无 AdaLN）
-  - Training: per-example denoise MSE + decode CE mix（mixed_branch）+ SC-CFG
-  - Inference: semi-AR per-block ODE + final decode，支持 self-cond / SC-CFG
+Within the BD3LM block-diffusion attention framework, continuous flow matching
+in a **token embedding** latent（非双向 T5，避免前文泄漏未来）:
+  - x0 = normalize(wte[token])；与 unembed 解耦（factored head）
+  - Conditioning: in-context time / mode / SC-CFG tokens
+  - Training: emb 查表 → per-example denoise MSE + decode CE mix + SC-CFG
+  - Inference: semi-AR per-block ODE；完成后文写回 wte[采样 token]
 
 References:
   - Block Diffusion: https://arxiv.org/abs/2503.09573
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -27,10 +28,10 @@ from models.bd3lm.model import (
   MLP,
   block_diff_mask,
   bool_mask_to_sdpa_additive,
-  build_block_diff_mask,
 )
 from models.bdelf.config import FL_BDELFConfig
 from models.bdelf.infer import BDELFInferState, build_window_pair_mask
+from models.elf.layers import BottleneckTextProj, FinalLayer
 from models.model import (
   FL_PreTrainedModel,
   ensure_token_layout,
@@ -201,21 +202,22 @@ class FlowBlock(nn.Module):
 
 
 class _BDELFBackbone(nn.Module):
-  """Block diffusion continuous-flow LM；ELF 式 in-context 条件 + SC-CFG。"""
+  """Block diffusion continuous-flow LM；token emb latent + in-context 条件。"""
 
   full_sequence_training = True
   dual_branch_logging = True
-  # 与 ELF 一致：单次 forward 内按样本混合 denoise/decode。
   mixed_branch_training = True
 
   def __init__(
     self,
     token_layout: FL_TokenLayout,
-    max_seq_len: int = 4096,
-    diffusion_block_size: int = 32,
+    max_seq_len: int = 1024,
+    text_encoder_dim: int = 512,
+    bottleneck_dim: int = 128,
+    diffusion_block_size: int = 16,
     n_layer: int = 12,
     n_head: int = 12,
-    n_embd: int = 672,
+    n_embd: int = 768,
     dropout: float = 0.0,
     attn_backend: str = "flex",
     num_time_tokens: int = 4,
@@ -224,6 +226,8 @@ class _BDELFBackbone(nn.Module):
     self_cond_prob: float = 0.5,
     self_cond_cfg_min: float = 0.5,
     self_cond_cfg_max: float = 5.0,
+    latent_mean: float = 0.0,
+    latent_std: float = 0.2,
     denoiser_p_mean: float = -1.5,
     denoiser_p_std: float = 0.8,
     denoiser_noise_scale: float = 2.0,
@@ -251,6 +255,10 @@ class _BDELFBackbone(nn.Module):
     self.token_layout = token_layout
     self.vocab_size = token_layout.vocab_size
     self.n_embd = n_embd
+    self.text_encoder_dim = text_encoder_dim
+    self.bottleneck_dim = bottleneck_dim
+    self.latent_mean = latent_mean
+    self.latent_std = latent_std
     self.fix_bos = fix_bos
     self.num_time_tokens = num_time_tokens
     self.num_self_cond_cfg_tokens = num_self_cond_cfg_tokens
@@ -268,8 +276,14 @@ class _BDELFBackbone(nn.Module):
     self.t_eps = t_eps
     self.time_schedule = time_schedule
 
-    self.wte = nn.Embedding(token_layout.vocab_size, n_embd)
+    # 可学习 token emb → flow 空间；与 unembed 解耦，避免 CE 抄表崩塌。
+    self.wte = nn.Embedding(token_layout.vocab_size, text_encoder_dim)
+
     self.drop = nn.Dropout(dropout)
+    self.self_cond_proj = nn.Linear(2 * text_encoder_dim, text_encoder_dim, bias=True)
+    nn.init.xavier_uniform_(self.self_cond_proj.weight)
+    nn.init.zeros_(self.self_cond_proj.bias)
+    self.text_proj = BottleneckTextProj(text_encoder_dim, n_embd, bottleneck_dim)
 
     self.t_embedder = TimestepEmbedder(n_embd)
     self.t_emb_tokens = nn.Parameter(torch.empty(1, num_time_tokens, n_embd))
@@ -293,11 +307,6 @@ class _BDELFBackbone(nn.Module):
     else:
       self.mode_tokens = None
 
-    self.self_cond_proj = nn.Linear(2 * n_embd, n_embd, bias=True)
-    nn.init.xavier_uniform_(self.self_cond_proj.weight)
-    nn.init.zeros_(self.self_cond_proj.bias)
-
-    # Mid-depth dropout（官方 ELF）：仅 [depth/4, 3*depth/4) 层启用。
     q1, q3 = n_layer // 4, n_layer // 4 * 3
     blocks = []
     for i in range(n_layer):
@@ -306,18 +315,28 @@ class _BDELFBackbone(nn.Module):
     self.h = nn.ModuleList(blocks)
 
     self.ln_f = nn.LayerNorm(n_embd)
-    # ELF FinalLayer 风格：零初始化 x-pred 头，起步接近恒等流。
-    self.x_pred_head = nn.Linear(n_embd, n_embd, bias=True)
-    nn.init.zeros_(self.x_pred_head.weight)
-    nn.init.zeros_(self.x_pred_head.bias)
-    self.lm_head = nn.Linear(n_embd, token_layout.vocab_size, bias=False)
-    self.lm_head.weight = self.wte.weight
+    self.final_layer = FinalLayer(n_embd, text_encoder_dim)
+
+    self.proj_kernel = nn.Parameter(torch.empty(n_embd, text_encoder_dim))
+    self.proj_bias = nn.Parameter(torch.empty(text_encoder_dim))
+    self.unembed_kernel = nn.Parameter(
+      torch.empty(text_encoder_dim, token_layout.vocab_size)
+    )
+    self.unembed_bias = nn.Parameter(torch.empty(token_layout.vocab_size))
+    nn.init.xavier_uniform_(self.proj_kernel)
+    nn.init.zeros_(self.proj_bias)
+    nn.init.xavier_uniform_(self.unembed_kernel)
+    nn.init.zeros_(self.unembed_bias)
 
     self.apply(self._init_weights)
-    # 覆盖：embedding / x_pred_head / 条件 token 已在上面设好。
-    nn.init.normal_(self.wte.weight, mean=0.0, std=0.02)
-    nn.init.zeros_(self.x_pred_head.weight)
-    nn.init.zeros_(self.x_pred_head.bias)
+    # FinalLayer / unembed / wte 已在构造里设好，勿被 _init_weights 覆盖。
+    nn.init.normal_(self.wte.weight, mean=latent_mean, std=max(float(latent_std), 1e-8))
+    nn.init.zeros_(self.final_layer.linear.weight)
+    nn.init.zeros_(self.final_layer.linear.bias)
+    nn.init.xavier_uniform_(self.proj_kernel)
+    nn.init.zeros_(self.proj_bias)
+    nn.init.xavier_uniform_(self.unembed_kernel)
+    nn.init.zeros_(self.unembed_bias)
 
     self._pair_sdpa_mask_cache: dict[tuple, torch.Tensor] = {}
     self._flex_block_mask_cache: dict[tuple, object] = {}
@@ -351,6 +370,18 @@ class _BDELFBackbone(nn.Module):
         torch.nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+  def encode_tokens(
+    self,
+    idx: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+  ) -> torch.Tensor:
+    """Token → 归一化 embedding（逐位置查表，无双向上下文）。"""
+    emb = self.wte(idx)
+    out = (emb - self.latent_mean) / max(float(self.latent_std), 1e-8)
+    if attention_mask is not None:
+      out = out * attention_mask.unsqueeze(-1).to(dtype=out.dtype)
+    return out
 
   def _get_pair_sdpa_mask(self, n: int, device: torch.device) -> torch.Tensor:
     key = ("train", n, self.cond_prefix_len, device)
@@ -407,9 +438,6 @@ class _BDELFBackbone(nn.Module):
       self._pair_sdpa_mask_cache[key] = cached
     return cached
 
-  def _tokens_to_emb(self, idx: torch.Tensor) -> torch.Tensor:
-    return self.wte(idx)
-
   def build_context(
     self,
     t: torch.Tensor,
@@ -451,9 +479,15 @@ class _BDELFBackbone(nn.Module):
   def _embed_continuous_pair(
     self, z_half: torch.Tensor, x0_half: torch.Tensor,
   ) -> torch.Tensor:
-    z = self.drop(z_half)
-    x0 = self.drop(x0_half)
+    """Latent pair → 按半段 BottleneckTextProj → (B, 2L, n_embd)。"""
+    z = self.text_proj(self.drop(z_half))
+    x0 = self.text_proj(self.drop(x0_half))
     return torch.cat([z, x0], dim=1)
+
+  def _decode_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+    xf = hidden.to(dtype=self.proj_kernel.dtype)
+    mid = F.gelu(xf @ self.proj_kernel + self.proj_bias, approximate="tanh")
+    return mid @ self.unembed_kernel + self.unembed_bias
 
   def _backbone(
     self,
@@ -468,9 +502,9 @@ class _BDELFBackbone(nn.Module):
     """Block-diffusion backbone with ELF-style condition prefix.
 
     Args:
-      pair_emb: (B, 2*L, D)
+      pair_emb: (B, 2*L, n_embd) — 已投影到 hidden
       t: (B,) timesteps
-      decode: bool 或 (B,) gate；控制 mode tokens
+      decode: bool 或 (B,) gate；控制 mode tokens；tensor 时始终算 logits
       window_len: 推理时单半长度；None 表示训练
     """
     bsz = pair_emb.size(0)
@@ -494,7 +528,6 @@ class _BDELFBackbone(nn.Module):
       if window_len is None:
         flex_mask = self._get_flex_block_mask(half, x.device)
       else:
-        # 推理窗口走 SDPA 扩展 mask（fast infer 在 infer.py 内处理）。
         sdpa_mask = self._get_infer_pair_sdpa_mask(window_len, x.device)
     elif window_len is None:
       sdpa_mask = self._get_pair_sdpa_mask(half, x.device)
@@ -506,13 +539,14 @@ class _BDELFBackbone(nn.Module):
 
     x = self.ln_f(x)
     x_content = x[:, prefix_len:]
-    x_pred = self.x_pred_head(x_content[:, :half])
+    z_half_h = x_content[:, :half]
+    x_pred = self.final_layer(z_half_h)
 
     need_logits = (
       True if isinstance(decode, torch.Tensor)
       else bool(decode)
     )
-    logits = self.lm_head(x_content[:, :half]) if need_logits else None
+    logits = self._decode_logits(z_half_h) if need_logits else None
     return x_pred, logits
 
   def _sample_train_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -524,7 +558,7 @@ class _BDELFBackbone(nn.Module):
   def _sample_cfg_scale(
     self, batch_size: int, device: torch.device,
   ) -> torch.Tensor:
-    """Log-uniform CFG scale in [1+min, 1+max]-1（对齐 ELF）。"""
+    """Log-uniform CFG scale（对齐 ELF）。"""
     u = torch.rand(batch_size, device=device, dtype=torch.float32)
     a = torch.as_tensor(1.0 + self.self_cond_cfg_min, device=device, dtype=u.dtype)
     b = torch.as_tensor(1.0 + self.self_cond_cfg_max, device=device, dtype=u.dtype)
@@ -690,7 +724,6 @@ class _BDELFBackbone(nn.Module):
     log_probs = F.log_softmax(logits.float(), dim=-1)
     ce_per_token = -log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
-    # 忽略 pad / ignore_index
     valid = (tokens != self.token_layout.ignore_index).to(dtype=ce_per_token.dtype)
     if self.token_layout.pad_token_id is not None:
       valid = valid * (tokens != self.token_layout.pad_token_id).to(dtype=valid.dtype)
@@ -702,7 +735,6 @@ class _BDELFBackbone(nn.Module):
 
     ce_denom = ce_mask.sum()
     l2_denom = l2_mask.sum()
-    # 本微批无 decode 样本时记 nan，避免 0/1→ce=0→假 ppl=1.0。
     self.last_ce_loss = torch.where(
       ce_denom > 0,
       (ce_per_token * ce_mask).sum() / ce_denom.clamp(min=1.0),
@@ -717,9 +749,13 @@ class _BDELFBackbone(nn.Module):
 
   def _touch_unused_heads(self, loss: torch.Tensor) -> torch.Tensor:
     touch = (
-      self.x_pred_head.weight.sum()
-      + self.x_pred_head.bias.sum()
-      + self.lm_head.weight.sum()
+      self.wte.weight.sum()
+      + self.final_layer.linear.weight.sum()
+      + self.final_layer.linear.bias.sum()
+      + self.proj_kernel.sum()
+      + self.proj_bias.sum()
+      + self.unembed_kernel.sum()
+      + self.unembed_bias.sum()
     )
     if self.mode_tokens is not None:
       touch = touch + self.mode_tokens.sum()
@@ -744,7 +780,10 @@ class _BDELFBackbone(nn.Module):
     del targets
     bsz, seq_len = idx.shape
     self._validate_seq_len(seq_len)
-    x0_emb = self._tokens_to_emb(idx)
+    loss_mask = (idx != self.token_layout.pad_token_id).to(
+      dtype=next(self.parameters()).dtype,
+    )
+    x0_emb = self.encode_tokens(idx, attention_mask=loss_mask.long())
 
     if branch == "decode":
       loss = self._decode_loss(x0_emb, idx)
@@ -845,12 +884,13 @@ class _BDELFBackbone(nn.Module):
     device: torch.device,
     dtype: torch.dtype,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build full-length prefix z/x0 halves；window_start 恒为 0。"""
+    """Build full-length prefix z/x0 halves（latent 维）；window_start 恒为 0。"""
     n_samples = z_block.size(0)
     win_len = end_idx - start_idx
     db = self.diffusion_block_size
     ctx_len = emb_accum.size(1)
-    z_win = torch.zeros(n_samples, win_len, self.n_embd, device=device, dtype=dtype)
+    d = self.text_encoder_dim
+    z_win = torch.zeros(n_samples, win_len, d, device=device, dtype=dtype)
     x0_win = torch.zeros_like(z_win)
 
     g = torch.arange(start_idx, end_idx, device=device)
@@ -899,6 +939,7 @@ class _BDELFBackbone(nn.Module):
     nfe = 0
     t_steps = self._get_sampling_steps(num_ode_steps, device)
     sc_cfg = self._resolve_sc_cfg(n_samples, device, dtype, self_cond_cfg_scale)
+    latent_dim = self.text_encoder_dim
 
     if not use_fast_infer:
       return self._semi_ar_flow_sampler_legacy(
@@ -922,7 +963,7 @@ class _BDELFBackbone(nn.Module):
           f"prefix length {prefix_len} must be a positive multiple of "
           f"diffusion_block_size ({db}) and less than seqlen ({seqlen})"
         )
-      emb_accum = self._tokens_to_emb(prefix_tokens)
+      emb_accum = self.encode_tokens(prefix_tokens)
       state.set_emb_accum(emb_accum)
       state.tokens_buf[:, :prefix_len] = prefix_tokens
       state.token_len = prefix_len
@@ -932,16 +973,16 @@ class _BDELFBackbone(nn.Module):
         state.on_stride_complete(block_emb, stride)
     else:
       emb_accum = torch.zeros(
-        n_samples, 0, self.n_embd, device=device, dtype=dtype,
+        n_samples, 0, latent_dim, device=device, dtype=dtype,
       )
 
     for stride in range(start_stride, num_strides):
       z_block = torch.randn(
-        n_samples, db, self.n_embd, device=device, dtype=dtype,
+        n_samples, db, latent_dim, device=device, dtype=dtype,
       ) * self.denoiser_noise_scale
 
       if stride == 0 and bos is not None:
-        bos_emb = self._tokens_to_emb(
+        bos_emb = self.encode_tokens(
           torch.full((n_samples, 1), bos, device=device, dtype=torch.long),
         )
         z_block[:, 0] = bos_emb[:, 0]
@@ -969,7 +1010,8 @@ class _BDELFBackbone(nn.Module):
       if stride == 0 and bos is not None:
         block_tokens[:, 0] = bos
 
-      emb_block = self._tokens_to_emb(block_tokens)
+      # 与训练一致：已完成块的 clean 前文 = wte[token]（非 ODE x_pred / 非双向编码）。
+      emb_block = self.encode_tokens(block_tokens)
       emb_accum = torch.cat([emb_accum, emb_block], dim=1)
       state.on_stride_complete(emb_block, stride)
       state.append_tokens(block_tokens)
@@ -997,6 +1039,7 @@ class _BDELFBackbone(nn.Module):
     dtype = next(self.parameters()).dtype
     num_strides = seqlen // db
     nfe = 0
+    latent_dim = self.text_encoder_dim
     if t_steps is None:
       t_steps = self._get_sampling_steps(num_ode_steps, device)
 
@@ -1010,22 +1053,22 @@ class _BDELFBackbone(nn.Module):
           f"prefix length {prefix_len} must be a positive multiple of "
           f"diffusion_block_size ({db}) and less than seqlen ({seqlen})"
         )
-      emb_accum = self._tokens_to_emb(prefix_tokens)
+      emb_accum = self.encode_tokens(prefix_tokens)
       tokens = prefix_tokens.clone()
       start_stride = prefix_len // db
     else:
       tokens = torch.zeros(n_samples, 0, dtype=torch.long, device=device)
       emb_accum = torch.zeros(
-        n_samples, 0, self.n_embd, device=device, dtype=dtype,
+        n_samples, 0, latent_dim, device=device, dtype=dtype,
       )
 
     for stride in range(start_stride, num_strides):
       z_block = torch.randn(
-        n_samples, db, self.n_embd, device=device, dtype=dtype,
+        n_samples, db, latent_dim, device=device, dtype=dtype,
       ) * self.denoiser_noise_scale
 
       if stride == 0 and bos is not None:
-        bos_emb = self._tokens_to_emb(
+        bos_emb = self.encode_tokens(
           torch.full((n_samples, 1), bos, device=device, dtype=torch.long),
         )
         z_block[:, 0] = bos_emb[:, 0]
@@ -1040,7 +1083,6 @@ class _BDELFBackbone(nn.Module):
         z_win, x0_win = self._build_window(
           emb_accum, z_block, start_idx, end_idx, device, dtype,
         )
-        # self-cond 只作用在当前块；扩展到整窗时其余位置填 0
         sc_win = None
         if x_pred is not None and self.self_cond_prob > 0:
           sc_win = torch.zeros_like(z_win)
@@ -1069,7 +1111,7 @@ class _BDELFBackbone(nn.Module):
       if stride == 0 and bos is not None:
         block_tokens[:, 0] = bos
 
-      emb_block = self._tokens_to_emb(block_tokens)
+      emb_block = self.encode_tokens(block_tokens)
       emb_accum = torch.cat([emb_accum, emb_block], dim=1)
       tokens = torch.cat([tokens, block_tokens], dim=1)
 
@@ -1091,7 +1133,7 @@ class _BDELFBackbone(nn.Module):
     cfg = sampling_cfg or {}
     if seqlen is None:
       raise ValueError("generate requires an explicit seqlen")
-    num_ode_steps = num_steps if num_steps is not None else cfg.get("num_ode_steps", 8)
+    num_ode_steps = num_steps if num_steps is not None else cfg.get("num_ode_steps", 32)
     temperature = float(cfg.get("temperature", temperature))
     top_k = cfg.get("top_k", top_k)
     if top_k is not None:
