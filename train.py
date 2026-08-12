@@ -652,6 +652,20 @@ def train_loop(
                 f"t={getattr(bb, 'time_schedule', '?')}); "
                 "metrics: mse / ce / late_ce",
             )
+        elif cfg.model == "lexce":
+            bb = unwrap_model(model).backbone
+            decoder_prob = float(getattr(bb, "decoder_prob", 0.2))
+            _train_log(
+                f"LEXCE: per-example denoise:decode ≈ "
+                f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+                f"+ 分位晚窗 CE (mode={getattr(bb, 'lex_ce_mode', '?')}, "
+                f"delta={getattr(bb, 'lex_ce_delta', '?')}, "
+                f"weight={getattr(bb, 'lex_ce_weight', '?')}, "
+                f"region={getattr(bb, 'lex_ce_region', '?')}, "
+                f"t={getattr(bb, 'time_schedule', '?')}, "
+                f"t0≈{getattr(bb, '_lex_ce_threshold', lambda: '?')():.3f}); "
+                "metrics: mse / ce / lex_ce",
+            )
         else:
             decoder_prob = float(
                 getattr(unwrap_model(model).backbone, "decoder_prob", 0.2)
@@ -769,16 +783,19 @@ def train_loop(
                 denoise_mse = raw_for_log.last_l2_loss
                 decode_ce = raw_for_log.last_ce_loss
                 late_ce = getattr(raw_for_log, "last_late_ce_loss", float("nan"))
+                lex_ce = getattr(raw_for_log, "last_lex_ce_loss", float("nan"))
             elif dual_branch:
                 loss_branch = train_branch if train_branch else ""
                 denoise_mse = None
                 decode_ce = None
                 late_ce = None
+                lex_ce = None
             else:
                 loss_branch = ""
                 denoise_mse = None
                 decode_ce = None
                 late_ce = None
+                lex_ce = None
             elapsed = time.time() - t0
             # 每微批消耗一整份数据 batch（与是否 denoise/decode 混合无关）。
             seq_tokens = batch.size(0) * (
@@ -794,7 +811,7 @@ def train_loop(
                 tokens_per_sec,
                 dual_branch=dual_branch, loss_branch=loss_branch,
                 denoise_mse=denoise_mse, decode_ce=decode_ce,
-                late_ce=late_ce,
+                late_ce=late_ce, lex_ce=lex_ce,
             )
 
             # 在线 eval 在各卡均摊（held-out 分片 + gen 分担）；写盘仍仅 rank0。
@@ -876,6 +893,8 @@ def train_loop(
                         postfix["mse"] = f"{denoise_mse:.3f}"
                     if late_ce is not None and late_ce == late_ce:
                         postfix["late_ce"] = f"{late_ce:.3f}"
+                    if lex_ce is not None and lex_ce == lex_ce:
+                        postfix["lex_ce"] = f"{lex_ce:.3f}"
                 elif dual_branch and loss_branch == "decode":
                     postfix = {
                         "ce": f"{train_loss:.3f}",

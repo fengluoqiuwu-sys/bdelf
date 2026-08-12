@@ -346,7 +346,7 @@ def main() -> None:
         raise ValueError("Model config is missing tokenizer name")
     tokenizer = get_tokenizer(tokenizer_name)
 
-    if model_meta["name"] in ("elf", "odar"):
+    if model_meta["name"] in ("elf", "odar", "lexce"):
         from models.elf.ace import attach_ace_identity, model_hash_from_checkpoint
 
         ace_hash = model_hash_from_checkpoint(ckpt_path)
@@ -359,7 +359,7 @@ def main() -> None:
     prefix_tokens = None
     prefix_len = 0
     if prompt_text is not None:
-        if model_meta["name"] in ("elf", "late_ce", "odar"):
+        if model_meta["name"] in ("elf", "late_ce", "odar", "lexce"):
             raise ValueError(
                 f"{model_meta['name']} generation is unconditional; "
                 "--prompt is not supported"
