@@ -9,14 +9,17 @@ num_tokens: 1024  # 每样本生成长度
 seed: 42  # 各组共用基 seed
 runs:  # 多组相对基线的覆盖（等价多次 --set）；至少一项
   # 1) 无 ACE、关采样 DMA → 若 B↓ 则伤害主要来自采样硬化
-  - self_cond_cfg_scale: 0.5  # FAR-SC
+  - name: sc0.5-nodma  # 本组显示名；写入 results.csv，不进 generate-hash
+    self_cond_cfg_scale: 0.5  # FAR-SC
     ace: false  # 关 ACE
     dma: false  # 关采样 DMA
   # 2) ACE 开、关采样 DMA → 测 ACE×DMA 共谋
-  - self_cond_cfg_scale: 0.5  # FAR-SC
+  - name: ace-sc0.5-nodma  # 本组显示名；写入 results.csv，不进 generate-hash
+    self_cond_cfg_scale: 0.5  # FAR-SC
     ace: true  # 开 ACE
     dma: false  # 关采样 DMA
   # 3) ACE 开、先 DMA 再 ACE（默认是先 ACE 再 DMA）
-  - self_cond_cfg_scale: 0.5  # FAR-SC
+  - name: ace-sc0.5-dma-before  # 本组显示名；写入 results.csv，不进 generate-hash
+    self_cond_cfg_scale: 0.5  # FAR-SC
     ace: true  # 开 ACE
     dma_ace_order: before  # 先硬化再 steer

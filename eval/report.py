@@ -2,9 +2,102 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+# ``{step}/results.csv`` 列顺序：name 后接语料级指标
+CSV_METRIC_KEYS: tuple[str, ...] = (
+    "accept_at_human",
+    "median_rep",
+    "nonword_word_pct",
+    "nonword_sample_pct",
+    "clean_ppl",
+    "clean_ppl_status",
+    "n_accept",
+    "cola_g",
+    "raw_gen_ppl",
+    "mean_entropy",
+    "n",
+    "nonempty_frac",
+)
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+RESULTS_CSV_NAME = "results.csv"
+RESULTS_CHART_NAME = "results.png"
+RESULTS_TABLE_NAME = "results_table.png"
+
+# 人类可读表 / 图中优先展示的主指标（CSV 仍写全量列）
+_DISPLAY_METRICS: tuple[tuple[str, str], ...] = (
+    ("accept_at_human", "accept@human"),
+    ("median_rep", "median_rep"),
+    ("nonword_word_pct", "nonword%"),
+    ("clean_ppl", "clean_ppl"),
+    ("cola_g", "cola_g"),
+    ("raw_gen_ppl", "raw_gen_ppl"),
+    ("mean_entropy", "entropy"),
+    ("n_accept", "n_accept"),
+)
+
+# 这些列按整数写出，不做四位小数
+_INT_METRIC_KEYS = frozenset({"n", "n_accept"})
+# 这些列保持原文字符串
+_STR_METRIC_KEYS = frozenset({"clean_ppl_status"})
+
+
+def _fmt4(val: Any) -> str:
+    """浮点保留四位小数；非有限 → nan；其余原样。"""
+    if val is None or val == "":
+        return ""
+    if isinstance(val, bool):
+        return "1" if val else "0"
+    if isinstance(val, int) and not isinstance(val, bool):
+        return str(val)
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            return "nan"
+        return f"{val:.4f}"
+    if isinstance(val, str):
+        # 已是格式化字符串或 status
+        try:
+            f = float(val)
+        except ValueError:
+            return val
+        if not math.isfinite(f):
+            return "nan"
+        return f"{f:.4f}"
+    return str(val)
+
+
+def _as_float(val: Any) -> float:
+    if val is None or val == "":
+        return float("nan")
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            return float("nan")
+    return float("nan")
+
+
+def _csv_cell(key: str, val: Any) -> Any:
+    if key == "name":
+        return val
+    if key in _STR_METRIC_KEYS:
+        return "" if val is None else str(val)
+    if key in _INT_METRIC_KEYS:
+        if val is None or val == "":
+            return ""
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return val
+    return _fmt4(val)
 
 
 METRIC_GUIDE = """\
@@ -46,6 +139,254 @@ def _fmt(x: Any) -> str:
     if isinstance(x, bool):
         return "1" if x else "0"
     return str(x)
+
+
+def validate_run_name(name: str) -> str:
+    """校验评测名（不进 generate-hash；用于 CSV 首列）。"""
+    raw = str(name).strip()
+    if not raw:
+        raise ValueError("run name must be non-empty")
+    if not _NAME_RE.fullmatch(raw):
+        raise ValueError(
+            f"invalid run name {name!r}; use [A-Za-z0-9._+-], "
+            "starting with alphanumeric"
+        )
+    return raw
+
+
+def _fmt_name_token(v: Any) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        if math.isfinite(v) and v == int(v):
+            return str(int(v))
+        return str(v)
+    return str(v)
+
+
+def suggest_run_name(
+    overrides: Mapping[str, Any] | None,
+    *,
+    sampling: Mapping[str, Any] | None = None,
+) -> str:
+    """从 generate overrides（必要时补 sampling）推导可读名。"""
+    ov = dict(overrides or {})
+    samp = dict(sampling or {})
+    parts: list[str] = []
+
+    ace = ov.get("ace", None)
+    if ace is True or ace == 1:
+        parts.append("ace")
+
+    sc = ov.get("self_cond_cfg_scale", None)
+    if sc is None:
+        sc = samp.get("self_cond_cfg_scale")
+    if sc is not None:
+        parts.append(f"sc{_fmt_name_token(sc)}")
+
+    if ov.get("dma") is False or ov.get("dma") == 0:
+        parts.append("nodma")
+
+    order = ov.get("dma_ace_order")
+    if order is not None:
+        parts.append(f"dma-{_fmt_name_token(order)}")
+
+    known = {"ace", "self_cond_cfg_scale", "dma", "dma_ace_order"}
+    for key in sorted(ov.keys(), key=str):
+        if key in known or str(key).startswith("_"):
+            continue
+        parts.append(f"{key}{_fmt_name_token(ov[key])}")
+
+    if not parts:
+        return "default"
+    return validate_run_name("-".join(parts))
+
+
+def rewrite_step_results_csv(step_dir: Path | str) -> Path | None:
+    """扫描 ``{step}/{generate-hash}/``，写出 ``results.csv`` + 图表。
+
+    同时生成：
+    - ``results.csv``：全量指标，浮点四位小数
+    - ``results.png``：主指标柱状图
+    - ``results_table.png``：给人看的汇总表（四位小数）
+
+    仅收录同时具备 ``summary.json`` 与 fingerprint ``name`` 的子目录。
+    同名多条时保留 generate-hash 字典序最后一条。
+    无有效行则删除旧产物并返回 None。
+    """
+    step_dir = Path(step_dir)
+    if not step_dir.is_dir():
+        return None
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for child in sorted(step_dir.iterdir(), key=lambda p: p.name):
+        if not child.is_dir():
+            continue
+        summary_path = child / "summary.json"
+        fp_path = child / "fingerprint.json"
+        if not summary_path.is_file() or not fp_path.is_file():
+            continue
+        try:
+            fp = json.loads(fp_path.read_text(encoding="utf-8"))
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(fp, dict) or not isinstance(summary, dict):
+            continue
+        name_raw = fp.get("name")
+        if not name_raw:
+            continue
+        try:
+            name = validate_run_name(str(name_raw))
+        except ValueError:
+            continue
+        row: dict[str, Any] = {"name": name}
+        for key in CSV_METRIC_KEYS:
+            val = summary.get(key, "")
+            if isinstance(val, float) and not math.isfinite(val):
+                val = float("nan")
+            row[key] = val
+        by_name[name] = row
+
+    out_path = step_dir / RESULTS_CSV_NAME
+    chart_path = step_dir / RESULTS_CHART_NAME
+    table_path = step_dir / RESULTS_TABLE_NAME
+    if not by_name:
+        for p in (out_path, chart_path, table_path):
+            if p.is_file():
+                p.unlink()
+        return None
+
+    fieldnames = ["name", *CSV_METRIC_KEYS]
+    rows = [by_name[k] for k in sorted(by_name.keys())]
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _csv_cell(k, row.get(k, "")) for k in fieldnames})
+
+    _write_results_chart(chart_path, rows, title=str(step_dir))
+    _write_results_table_fig(table_path, rows, title=str(step_dir))
+    return out_path
+
+
+def _write_results_chart(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    title: str,
+) -> None:
+    """主指标柱状图（按 name）。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names = [str(r["name"]) for r in rows]
+    plot_keys = [
+        ("accept_at_human", "accept@human ↑"),
+        ("median_rep", "median_rep ↓"),
+        ("nonword_word_pct", "nonword% ↓"),
+        ("clean_ppl", "clean_ppl ↓"),
+        ("cola_g", "cola_g ↑"),
+    ]
+    n_panel = len(plot_keys)
+    fig_h = max(2.4 * n_panel, 6.0)
+    fig, axes = plt.subplots(
+        n_panel, 1, figsize=(max(8.0, 0.55 * len(names) + 3.0), fig_h), sharex=True,
+    )
+    if n_panel == 1:
+        axes = [axes]
+    x = list(range(len(names)))
+    for ax, (key, ylabel) in zip(axes, plot_keys):
+        vals = [_as_float(r.get(key)) for r in rows]
+        colors = ["#4C72B0" if math.isfinite(v) else "#CCCCCC" for v in vals]
+        plot_vals = [0.0 if not math.isfinite(v) else v for v in vals]
+        bars = ax.bar(x, plot_vals, color=colors, width=0.72)
+        for bar, v in zip(bars, vals):
+            if not math.isfinite(v):
+                continue
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{v:.4f}",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                rotation=0,
+            )
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(True, axis="y", alpha=0.25)
+        finite = [v for v in vals if math.isfinite(v)]
+        if finite:
+            lo, hi = min(finite), max(finite)
+            pad = (hi - lo) * 0.15 if hi > lo else (abs(hi) * 0.1 + 0.05)
+            ax.set_ylim(max(0.0, lo - pad) if lo >= 0 else lo - pad, hi + pad)
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(names, rotation=35, ha="right", fontsize=8)
+    short = title if len(title) <= 80 else "…" + title[-79:]
+    fig.suptitle(f"TriFluency  {short}", fontsize=11)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_results_table_fig(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    title: str,
+) -> None:
+    """给人阅读的汇总表图（数值四位小数）。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    headers = ["name", *[lab for _, lab in _DISPLAY_METRICS]]
+    cell_rows: list[list[str]] = []
+    for r in rows:
+        line = [str(r["name"])]
+        for key, _lab in _DISPLAY_METRICS:
+            if key in _INT_METRIC_KEYS:
+                line.append(_csv_cell(key, r.get(key, "")))
+            else:
+                line.append(_fmt4(r.get(key, "")))
+        cell_rows.append(line)
+
+    n_row = len(cell_rows)
+    n_col = len(headers)
+    fig_w = max(10.0, 1.15 * n_col + 2.0)
+    fig_h = max(1.8, 0.42 * n_row + 1.6)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    short = title if len(title) <= 90 else "…" + title[-89:]
+    ax.set_title(f"TriFluency results  {short}", fontsize=11, pad=12)
+
+    table = ax.table(
+        cellText=cell_rows,
+        colLabels=headers,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.35)
+    for (r_i, c_i), cell in table.get_celld().items():
+        cell.set_edgecolor("#DDDDDD")
+        if r_i == 0:
+            cell.set_facecolor("#EEF2F7")
+            cell.set_text_props(weight="bold")
+        elif r_i % 2 == 0:
+            cell.set_facecolor("#FAFAFA")
+        if c_i == 0:
+            cell.set_text_props(ha="left")
+
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _grade_accept(v: float) -> str:

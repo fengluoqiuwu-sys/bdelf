@@ -3,27 +3,35 @@
 
 布局::
 
-    cache/eval/{model}/{model-hash}/{step}/{generate-hash}/
-      samples.txt   # 参数说明 + 逐样本（多指标）
-      summary.txt   # 参数说明 + 语料汇总 / 等级
+    cache/eval/{model}/{model-hash}/{step}/
+      results.csv / results.png / results_table.png
+      {generate-hash}/
+        fingerprint.json          # 含 name（name 不进 generate-hash）
+        samples.txt / summary.*
 
-``generate-hash`` = sha256(生成配置 + 样本参数含 seed；不含 step)[:16]。
+``generate-hash`` = sha256(生成配置 + 样本参数含 seed；不含 step / name)[:16]。
 ``model-hash`` 即训练 config-hash（与 ``cache/checkpoints/full/{model}/{hash}/`` 一致）。
+``results.*`` 浮点均保留四位小数；每次评测结束自动刷新。
 
-单组（兼容旧用法）::
+单组（须 ``--name``）::
 
-    .venv/bin/python eval.py --run full/elf/<model-hash> --micro-bs 8
-    .venv/bin/python eval.py --run full/elf/<hash> --generate eval \\
+    .venv/bin/python eval.py --run full/elf/<model-hash> --name sc0.5 --micro-bs 8
+    .venv/bin/python eval.py --run full/elf/<hash> --name ace-sc2 --generate eval \\
         --set self_cond_cfg_scale=2.0 --num-samples 1024 --seed 42 --micro-bs 8
 
-多组扫参（生成模型与 gpt2/CoLA 各只加载一次）::
+多组扫参（表内每组须有 ``name``；生成模型与 gpt2/CoLA 各只加载一次）::
 
     .venv/bin/python eval.py --run full/odar/<hash> \\
         --table odar-sc-ace --micro-bs 8
 
+仅根据已有 ``summary.json`` 补 name 并刷新各 step 的 ``results.csv``（不占 GPU）::
+
+    .venv/bin/python eval.py --rebuild-csv
+
 ``--table`` 解析 ``config/eval/tables/<name>.yaml``，或接受显式 ``*.yaml`` 路径；
 扫参模式必须同时给 ``--micro-bs``（本机生成 micro-batch）。
-流程：先按表逐组生成并落盘指纹，释放生成模型后再加载 gpt2/CoLA 统一打分。
+流程：先按表逐组生成并落盘指纹，释放生成模型后再加载 gpt2/CoLA 统一打分；
+每组结束后刷新该 step 的 ``results.csv``。
 """
 
 from __future__ import annotations
@@ -54,6 +62,15 @@ from tokenizer import get_tokenizer
 from train.ema import swap_ema_weights
 from train.generate_config import get_generate
 from train.run_path import CONFIG_HASH_LEN, canonical_json
+
+from eval.report import (
+    RESULTS_CHART_NAME,
+    RESULTS_CSV_NAME,
+    RESULTS_TABLE_NAME,
+    rewrite_step_results_csv,
+    suggest_run_name,
+    validate_run_name,
+)
 
 _EVAL_LOG = "[eval]"
 EVAL_ROOT = Path("cache/eval")
@@ -165,6 +182,7 @@ def resolve_eval_table_path(table: str) -> Path:
 class EvalJob:
     """一组待跑的 generate 评测。"""
 
+    name: str
     generate_profile: str
     overrides: dict[str, Any]
     num_samples: int
@@ -184,14 +202,14 @@ class PendingScore:
 
 
 def load_eval_table(path: Path) -> tuple[dict[str, Any], list[EvalJob]]:
-    """加载扫参表；返回 (表头元数据, jobs)。"""
+    """加载扫参表；返回 (表头元数据, jobs)。每组 ``runs[]`` 须含 ``name``。"""
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: YAML root must be a mapping")
-    name = raw.get("name")
-    if not name or name == "prototype":
-        raise ValueError(f"{path}: invalid name {name!r}")
+    table_name = raw.get("name")
+    if not table_name or table_name == "prototype":
+        raise ValueError(f"{path}: invalid name {table_name!r}")
     generate_profile = str(raw.get("generate") or "eval")
     num_samples = int(raw.get("num_samples", 1024))
     num_tokens = int(raw.get("num_tokens", 1024))
@@ -200,16 +218,27 @@ def load_eval_table(path: Path) -> tuple[dict[str, Any], list[EvalJob]]:
     if not isinstance(runs, list) or not runs:
         raise ValueError(f"{path}: runs must be a non-empty list")
     jobs: list[EvalJob] = []
+    seen_names: set[str] = set()
     for i, item in enumerate(runs):
         if not isinstance(item, dict):
             raise ValueError(f"{path}: runs[{i}] must be a mapping of overrides")
+        if "name" not in item or item["name"] is None:
+            raise ValueError(
+                f"{path}: runs[{i}] missing required name "
+                "(display label; not part of generate-hash)"
+            )
+        run_name = validate_run_name(str(item["name"]))
+        if run_name in seen_names:
+            raise ValueError(f"{path}: duplicate run name {run_name!r}")
+        seen_names.add(run_name)
         overrides = {
             k: v
             for k, v in item.items()
-            if not str(k).startswith("_")
+            if k != "name" and not str(k).startswith("_")
         }
         jobs.append(
             EvalJob(
+                name=run_name,
                 generate_profile=generate_profile,
                 overrides=overrides,
                 num_samples=num_samples,
@@ -220,10 +249,108 @@ def load_eval_table(path: Path) -> tuple[dict[str, Any], list[EvalJob]]:
         )
     meta = {
         "table": str(path),
-        "table_name": name,
+        "table_name": table_name,
         "n_runs": len(jobs),
     }
     return meta, jobs
+
+
+def _write_fingerprint(out_dir: Path, params: dict[str, Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "fingerprint.json").write_text(
+        json.dumps(params, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _refresh_step_csv(step_dir: Path) -> None:
+    path = rewrite_step_results_csv(step_dir)
+    if path is not None:
+        _log(f"wrote {path}")
+        chart = step_dir / RESULTS_CHART_NAME
+        table = step_dir / RESULTS_TABLE_NAME
+        if chart.is_file():
+            _log(f"wrote {chart}")
+        if table.is_file():
+            _log(f"wrote {table}")
+    else:
+        for name in (RESULTS_CSV_NAME, RESULTS_CHART_NAME, RESULTS_TABLE_NAME):
+            p = step_dir / name
+            if p.is_file():
+                _log(f"removed empty {p}")
+
+
+def rebuild_eval_csvs(*, root: Path = EVAL_ROOT) -> int:
+    """扫描已有评测：补 fingerprint.name，并刷新各 step 的 results.csv。"""
+    if not root.is_dir():
+        _log(f"No eval root at {root}")
+        return 0
+    step_dirs: set[Path] = set()
+    named = 0
+    inferred = 0
+    for summary_path in sorted(root.rglob("summary.json")):
+        out_dir = summary_path.parent
+        fp_path = out_dir / "fingerprint.json"
+        if not fp_path.is_file():
+            _log(f"skip (no fingerprint): {out_dir}")
+            continue
+        try:
+            fp = json.loads(fp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log(f"skip (bad fingerprint): {out_dir} ({exc})")
+            continue
+        if not isinstance(fp, dict):
+            _log(f"skip (fingerprint not mapping): {out_dir}")
+            continue
+
+        existing = fp.get("name")
+        need_infer = True
+        if existing:
+            try:
+                name = validate_run_name(str(existing))
+                need_infer = False
+                named += 1
+            except ValueError:
+                name = ""
+        if need_infer:
+            name = suggest_run_name(
+                fp.get("generate_overrides") or {},
+                sampling=fp.get("sampling") or {},
+            )
+            inferred += 1
+
+        step_dir = out_dir.parent
+        taken: set[str] = set()
+        for sib_fp in step_dir.glob("*/fingerprint.json"):
+            if sib_fp.parent == out_dir:
+                continue
+            try:
+                sib = json.loads(sib_fp.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            sib_name = sib.get("name")
+            if not sib_name:
+                continue
+            try:
+                taken.add(validate_run_name(str(sib_name)))
+            except ValueError:
+                pass
+        if name in taken:
+            name = validate_run_name(f"{name}-{out_dir.name[:8]}")
+
+        if fp.get("name") != name:
+            fp["name"] = name
+            _write_fingerprint(out_dir, fp)
+            _log(f"named {out_dir.relative_to(root)} -> {name}")
+        step_dirs.add(step_dir)
+
+    for step_dir in sorted(step_dirs):
+        _refresh_step_csv(step_dir)
+    _log(
+        f"rebuild-csv done steps={len(step_dirs)} "
+        f"kept_name={named} inferred={inferred}"
+    )
+    return len(step_dirs)
 
 
 def load_model_with_ema(
@@ -344,7 +471,9 @@ def prepare_job_params(
     )
     ghash = generate_hash_from_fingerprint(fp)
     out_dir = eval_out_dir(model_name, model_hash, step, ghash)
+    # name 写入 fingerprint.json / CSV，但不进入 generate-hash
     params: dict[str, Any] = {
+        "name": job.name,
         "checkpoint": str(ckpt_path),
         "run": f"full/{model_name}/{model_hash}",
         "model": model_name,
@@ -396,13 +525,14 @@ def score_and_write(
         + "\n",
         encoding="utf-8",
     )
+    _refresh_step_csv(out_dir.parent)
 
     _log(f"wrote {samples_path}")
     _log(f"wrote {summary_path}")
     clean = summary["clean_ppl"]
     clean_s = f"{clean:.4f}" if isinstance(clean, float) and clean == clean else "nan"
     _log(
-        f"DONE[{job.index + 1}] accept@human={summary['accept_at_human']:.4f} "
+        f"DONE[{job.name}] accept@human={summary['accept_at_human']:.4f} "
         f"median_rep={summary['median_rep']:.4f} "
         f"nonword%={summary['nonword_word_pct']:.3f} "
         f"clean_ppl={clean_s} "
@@ -423,6 +553,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--run",
         help="Run relpath: full/{model}/{train-hash}",
+    )
+    p.add_argument(
+        "--name",
+        default=None,
+        help=(
+            "Display name for this run (CSV first column; not in generate-hash). "
+            "Required for single-run; table runs use runs[].name"
+        ),
     )
     p.add_argument(
         "--table",
@@ -483,6 +621,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List full runs with checkpoint_latest.pt and exit",
     )
+    p.add_argument(
+        "--rebuild-csv",
+        action="store_true",
+        help=(
+            "Scan cache/eval, infer/keep fingerprint name, "
+            f"rewrite each step/{RESULTS_CSV_NAME}; no GPU"
+        ),
+    )
     return p
 
 
@@ -503,6 +649,10 @@ def main() -> None:
             _log(f"{rel}\t{ckpt}")
         return
 
+    if args.rebuild_csv:
+        rebuild_eval_csvs()
+        return
+
     table_meta: dict[str, Any] | None = None
     if args.table is not None:
         if args.micro_bs is None:
@@ -510,6 +660,10 @@ def main() -> None:
         if args.set_items:
             raise SystemExit(
                 "--set cannot be combined with --table (put overrides in runs:)"
+            )
+        if args.name is not None:
+            raise SystemExit(
+                "--name cannot be combined with --table (put name in each runs: entry)"
             )
         micro_bs = int(args.micro_bs)
         table_path = resolve_eval_table_path(args.table)
@@ -528,10 +682,15 @@ def main() -> None:
             f"n_runs={table_meta['n_runs']} micro_bs={micro_bs}",
         )
     else:
+        if not args.name:
+            raise SystemExit(
+                "single-run requires --name (display label; not in generate-hash)"
+            )
         micro_bs = 8 if args.micro_bs is None else int(args.micro_bs)
         overrides = parse_generate_sets(args.set_items)
         jobs = [
             EvalJob(
+                name=validate_run_name(args.name),
                 generate_profile=args.generate or "eval",
                 overrides=overrides,
                 num_samples=int(args.num_samples or 1024),
@@ -564,7 +723,7 @@ def main() -> None:
         raise ValueError("Model config missing tokenizer")
     tokenizer = get_tokenizer(tokenizer_name)
 
-    if model_name in ("elf", "odar", "lexce"):
+    if model_name in ("elf", "odar", "lexce", "trace"):
         from models.elf.ace import attach_ace_identity
 
         attach_ace_identity(
@@ -575,6 +734,7 @@ def main() -> None:
     # 同 generate-hash 已有 summary.json 则跳过（--force 才重跑）
     skip_existing = not args.force
     pending: list[PendingScore] = []
+    touched_steps: set[Path] = set()
 
     # ---------- 阶段 1：生成模型只加载一次，扫完全部 generate 配置 ----------
     for job in jobs:
@@ -592,20 +752,35 @@ def main() -> None:
             top_k=args.top_k,
         )
         ghash = params["generate_hash"]
+        touched_steps.add(out_dir.parent)
         if skip_existing and (out_dir / "summary.json").is_file():
+            # 跳过生成/打分，但仍写入 name 并刷新 CSV
+            if (out_dir / "fingerprint.json").is_file():
+                try:
+                    old = json.loads(
+                        (out_dir / "fingerprint.json").read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    old = {}
+                if isinstance(old, dict):
+                    old["name"] = job.name
+                    # 保留旧指纹其余字段，避免改 hash 相关内容
+                    _write_fingerprint(out_dir, old)
+                else:
+                    _write_fingerprint(out_dir, params)
+            else:
+                _write_fingerprint(out_dir, params)
+            _refresh_step_csv(out_dir.parent)
             _log(
                 f"[{job.index + 1}/{len(jobs)}] skip existing "
-                f"generate_hash={ghash} overrides={job.overrides}",
+                f"name={job.name} generate_hash={ghash} overrides={job.overrides}",
             )
             continue
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "fingerprint.json").write_text(
-            json.dumps(params, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        _write_fingerprint(out_dir, params)
         _log(
-            f"[{job.index + 1}/{len(jobs)}] generate generate_hash={ghash} "
+            f"[{job.index + 1}/{len(jobs)}] generate name={job.name} "
+            f"generate_hash={ghash} "
             f"step={step} samples={job.num_samples}x{job.num_tokens} "
             f"seed={job.seed} micro_bs={micro_bs} ema={use_ema} "
             f"overrides={job.overrides} sampling={sampling_cfg}",
@@ -637,6 +812,8 @@ def main() -> None:
     _log(f"Released generative model; pending_score={len(pending)}")
 
     if not pending:
+        for step_dir in sorted(touched_steps):
+            _refresh_step_csv(step_dir)
         _log("Nothing to score (all skipped or empty).")
         return
 
@@ -652,6 +829,7 @@ def main() -> None:
         for item in pending:
             _log(
                 f"[{item.job.index + 1}/{len(jobs)}] score "
+                f"name={item.job.name} "
                 f"generate_hash={item.params['generate_hash']}",
             )
             score_and_write(

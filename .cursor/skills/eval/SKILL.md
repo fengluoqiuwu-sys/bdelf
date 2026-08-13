@@ -22,23 +22,28 @@ description: >-
 ## 输出布局
 
 ```text
-cache/eval/{model}/{model-hash}/{step}/{generate-hash}/
-  fingerprint.json
-  samples.txt
-  summary.txt
-  summary.json
+cache/eval/{model}/{model-hash}/{step}/
+  results.csv                      # 同 step 各组 name × 指标（浮点四位小数；自动刷新）
+  results.png                      # 主指标柱状图（柱顶四位小数）
+  results_table.png                # 给人看的汇总表图（四位小数）
+  {generate-hash}/
+    fingerprint.json               # 含 name（name 不进 generate-hash）
+    samples.txt
+    summary.txt
+    summary.json
 ```
 
-- `generate-hash`：生成配置 + 样本参数（含 seed / micro_bs；**不含** step）
-- 同 `generate-hash` 已有 `summary.json` → **默认跳过**；`--force` 才重跑
+- `generate-hash`：生成配置 + 样本参数（含 seed / micro_bs；**不含** step / **name**）
+- 同 `generate-hash` 已有 `summary.json` → **默认跳过**（仍会写 name 并刷新 CSV/图）；`--force` 才重跑
+- 仅刷新已有结果的 CSV / 图 / 补 name（不占 GPU）：`.venv/bin/python eval.py --rebuild-csv`
 
 ## 本机
 
 ### 单组
 
 ```bash
-.venv/bin/python eval.py --run full/<model>/<hash> --micro-bs 8
-.venv/bin/python eval.py --run full/<model>/<hash> --generate eval \
+.venv/bin/python eval.py --run full/<model>/<hash> --name sc0.5 --micro-bs 8
+.venv/bin/python eval.py --run full/<model>/<hash> --name ace-sc2 --generate eval \
   --set self_cond_cfg_scale=2.0 --num-samples 1024 --seed 42 --micro-bs 8
 ```
 
@@ -51,17 +56,19 @@ cache/eval/{model}/{model-hash}/{step}/{generate-hash}/
 
 | 参数 | 说明 |
 |------|------|
+| `--name` | 单组**必填**显示名（CSV 首列；**不进** generate-hash）；不可与 `--table` 同用 |
 | `--table` | `config/eval/tables/<name>.yaml`，或显式 `*.yaml` 路径；扫参模式**必填** `--micro-bs` |
 | `--micro-bs` | 生成 micro-batch（进 generate-hash）；本机 5080 常用 8 |
 | `--force` | 忽略已有 `summary.json` |
 | `--set` | 仅单组；**不可**与 `--table` 同用（覆盖写在表的 `runs:`） |
+| `--rebuild-csv` | 扫描 `cache/eval`，补 name 并重写各 `results.csv` |
 
-流程：按表逐组生成 → 释放生成模型 → 加载 gpt2-large + CoLA 一次打分。
+流程：按表逐组生成 → 释放生成模型 → 加载 gpt2-large + CoLA 一次打分 → 刷新 `{step}/results.csv`。
 
 ### 扫参表
 
 路径：`config/eval/tables/`（`prototype.yaml` 不可直接 `--table`）。  
-字段：`generate` / `num_samples` / `num_tokens` / `seed` + `runs:`（每项一组相对基线的覆盖）。
+字段：`generate` / `num_samples` / `num_tokens` / `seed` + `runs:`（每项须含 `name` + 相对基线的覆盖）。
 
 示例：`config/eval/tables/odar-sc-ace.yaml`；启动包装：`scripts/eval/odar-sc-ace.sh`。
 
@@ -76,8 +83,7 @@ cache/eval/{model}/{model-hash}/{step}/{generate-hash}/
 ```bash
 bash scripts/sync.sh ovan-server push
 bash slurm/remote_status.sh    # 强制；agent_gpu_sum + 本作业 ≤ 4
-bash scripts/ssh.sh ovan-server -- \
-  bash slurm/sbatch-eval.sh odar-sc-ace -- --run full/odar/<hash>
+ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-eval.sh odar-sc-ace -- --run full/odar/<hash>'
 # 少卡：追加 --gpus-per-node=1 --mem=64G
 ```
 
@@ -87,9 +93,7 @@ bash scripts/ssh.sh ovan-server -- \
 ### common
 
 ```bash
-bash scripts/ssh.sh <名字> -- \
-  bash scripts/launch-eval.sh odar-sc-ace --server <名字> --gpus 0,1,2,3 -- \
-    --run full/odar/<hash>
+ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-eval.sh odar-sc-ace --server <名字> --gpus 0,1,2,3 -- --run full/odar/<hash>'
 ```
 
 禁止直接 `bash scripts/eval/*.sh` 占 GPU；`launch-eval` 自动写 agent + 三日志文件。
