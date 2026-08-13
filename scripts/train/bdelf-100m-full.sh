@@ -14,10 +14,13 @@ else
   exit 1
 fi
 
+# eval 条数 = ELF 默认（1024 / 256）的 1/4；经 --set 覆盖共享 eval/default.yaml
 exec "$PY" train.py \
   --model bdelf \
   --config 100m-full \
   --dataset owt \
   --preprocess default \
   --generate eval \
+  --set eval.eval_sample_count=256 \
+  --set eval.gen_eval_samples=64 \
   "$@"
