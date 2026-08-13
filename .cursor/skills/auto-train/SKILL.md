@@ -200,8 +200,8 @@ git commit -m "<语义化描述>"
          → AVAIL 不足仍 sbatch 排队 → ssh 后 bash slurm/sbatch-train.sh <name>
          → 写 active/<job_id>.json（gpus:4, holder:auto-train:<idea>, scheduler:slurm）
 - common：扫该机 active → 选不冲突 --gpus（张数≤csv 单任务上限）
-         → bash scripts/ssh.sh <服务名> -- bash scripts/launch-train.sh <name> \
-              --server <服务名> --gpus … --holder auto-train:<idea>
+         → ssh <服务名> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> \
+              --server <服务名> --gpus … --holder auto-train:<idea>'
          （自动写 agent + logs/<服务名>/<时间戳>/；见远端 common 规则）
 - 若已 RUNNING → 启动「5 分钟后首次唤醒」（见「唤醒调度」）
 - slurm 仍 PENDING → 按「资源等待」睡 60min 再看，拉起后改用「唤醒调度」

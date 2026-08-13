@@ -11,7 +11,7 @@
 脚本不发起 SSH。本机查远端日志时，先 push，再：
 
     ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py 1234567'
-    bash scripts/ssh.sh train-server-1 -- .venv/bin/python slurm/tail_remote_logs.py pid12345
+    ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345'
 
 示例（在目标机仓库根执行）::
 

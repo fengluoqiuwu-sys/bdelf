@@ -73,8 +73,7 @@ bash slurm/remote_status.sh          # 可读表；机器用加 --json
 - 占 GPU 须用户授权；**禁止**直接跑 `scripts/train/*.sh` / `scripts/eval/*.sh`，须经 `launch-train` / `launch-eval`（eval 细则见 skill `eval`）：
 
 ```bash
-bash scripts/ssh.sh <名字> -- \
-  bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]
+ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]'
 ```
 
 - `launch-train` / `launch-eval` 自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<名字>/<时间戳>/` 下三个日志文件。
@@ -237,10 +236,8 @@ ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py
 ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120'
 ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --server ovan-server --list'
 # common
-bash scripts/ssh.sh train-server-1 -- \
-  .venv/bin/python slurm/tail_remote_logs.py pid12345 --server train-server-1
-bash scripts/ssh.sh train-server-1 -- \
-  .venv/bin/python slurm/tail_remote_logs.py pid12345 --which gpu
+ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server train-server-1'
+ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --which gpu'
 ```
 
 看日志不要靠 pull；勿手写长串 `ssh ... tail`，除非脚本不可用。  

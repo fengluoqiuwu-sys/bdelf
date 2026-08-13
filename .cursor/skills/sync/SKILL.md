@@ -11,8 +11,8 @@ description: >-
 # sync
 
 仓库根：`bash scripts/sync.sh <服务名> …`。  
-SSH 登录/执行：`bash scripts/ssh.sh <服务名> [命令…]`（同读 `servers.csv`）。  
-`<服务名>` 必须是 `scripts/servers.csv` 的「名字」列（该文件 gitignore；含主机/端口/密码/工作目录等）。  
+登录/执行：系统 `ssh <服务名> 'cd ~/source/bdelf && …'`（「名字」即可 SSH）。  
+`<服务名>` 必须是 `scripts/servers.csv` 的「名字」列（该文件 gitignore；含调度类型/工作目录/显卡额度等）。  
 执行目录见 rule「脚本约定」。Checkpoint 路径见 rule「Checkpoint 路径与配置哈希」。
 
 ## 禁止

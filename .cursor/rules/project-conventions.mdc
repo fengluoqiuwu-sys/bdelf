@@ -50,7 +50,7 @@ cache/                     # gitignore
 | `eval` | TriFluency `eval.py`（本机扫参 / 远端 sbatch-eval·launch-eval / `cache/eval`） |
 | `vram-probe` | 单卡显存探针 → `temp/vram-probe/alloc.md`（model×batch）；开训查表选型 |
 | `generate` | 本机 `generate.py` |
-| `sync` | `scripts/sync.sh` / `scripts/ssh.sh`（`<服务名>` 见 `servers.csv`） |
+| `sync` | `scripts/sync.sh`（`<服务名>` 见 `servers.csv`；登录用系统 `ssh <服务名>`） |
 | `auto-train` | 用户明确「自动执行」后的闭环优化；**须先确认训练服务名**（见「本机计算约束」） |
 | `research-scout` | 自由探索找未充分做过的 idea → `temp/research-scout/` |
 | `paper-ingest` | 下载论文并编 AI 用 INDEX（供 scout subagent；仅 auto） |
