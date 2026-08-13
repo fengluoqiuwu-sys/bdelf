@@ -666,6 +666,18 @@ def train_loop(
                 f"t0≈{getattr(bb, '_lex_ce_threshold', lambda: '?')():.3f}); "
                 "metrics: mse / ce / lex_ce",
             )
+        elif cfg.model == "trace":
+            bb = unwrap_model(model).backbone
+            decoder_prob = float(getattr(bb, "decoder_prob", 0.2))
+            _train_log(
+                f"TRACE: per-example denoise:decode ≈ "
+                f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+                f"+ L_attr (w={getattr(bb, 'attr_weight', '?')}, "
+                f"warmup_opt={getattr(bb, 'attr_warmup_steps', '?')}, "
+                f"d_every={getattr(bb, 'attr_d_every', '?')}, "
+                f"freeze_d={getattr(bb, 'attr_freeze_d', '?')}); "
+                "fast 变体跳过估 d；metrics: mse / ce / attr",
+            )
         else:
             decoder_prob = float(
                 getattr(unwrap_model(model).backbone, "decoder_prob", 0.2)
@@ -767,6 +779,21 @@ def train_loop(
                     optimizer.step()
                     if ema_state is not None:
                         ema_update(ema_state, model, ema_decay)
+                    if cfg.model == "trace":
+                        from models.trace.track import maybe_refresh_attr_d
+
+                        maybe_refresh_attr_d(
+                            model,
+                            ema_state=ema_state,
+                            opt_step=(step + 1) // cfg.grad_accum_steps,
+                            variant=cfg.variant,
+                            generate_sampling=cfg.generate_sampling,
+                            rank=rank,
+                            world_size=world_size,
+                            is_distributed=is_distributed,
+                            device=device,
+                            log=_train_log if rank == 0 else None,
+                        )
                 elif rank == 0:
                     _train_log(
                         f"Skipping optimizer step at step {step}: non-finite gradients",
@@ -784,18 +811,21 @@ def train_loop(
                 decode_ce = raw_for_log.last_ce_loss
                 late_ce = getattr(raw_for_log, "last_late_ce_loss", float("nan"))
                 lex_ce = getattr(raw_for_log, "last_lex_ce_loss", float("nan"))
+                attr_loss = getattr(raw_for_log, "last_attr_loss", float("nan"))
             elif dual_branch:
                 loss_branch = train_branch if train_branch else ""
                 denoise_mse = None
                 decode_ce = None
                 late_ce = None
                 lex_ce = None
+                attr_loss = None
             else:
                 loss_branch = ""
                 denoise_mse = None
                 decode_ce = None
                 late_ce = None
                 lex_ce = None
+                attr_loss = None
             elapsed = time.time() - t0
             # 每微批消耗一整份数据 batch（与是否 denoise/decode 混合无关）。
             seq_tokens = batch.size(0) * (
@@ -811,7 +841,7 @@ def train_loop(
                 tokens_per_sec,
                 dual_branch=dual_branch, loss_branch=loss_branch,
                 denoise_mse=denoise_mse, decode_ce=decode_ce,
-                late_ce=late_ce, lex_ce=lex_ce,
+                late_ce=late_ce, lex_ce=lex_ce, attr=attr_loss,
             )
 
             # 在线 eval 在各卡均摊（held-out 分片 + gen 分担）；写盘仍仅 rank0。
@@ -895,6 +925,8 @@ def train_loop(
                         postfix["late_ce"] = f"{late_ce:.3f}"
                     if lex_ce is not None and lex_ce == lex_ce:
                         postfix["lex_ce"] = f"{lex_ce:.3f}"
+                    if attr_loss is not None and attr_loss == attr_loss:
+                        postfix["attr"] = f"{attr_loss:.3f}"
                 elif dual_branch and loss_branch == "decode":
                     postfix = {
                         "ce": f"{train_loss:.3f}",

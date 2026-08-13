@@ -1,0 +1,48 @@
+_doc: TrACE config template (Tracked ACE on ELF; not instantiable)
+
+name: prototype
+tokenizer: t5-small
+max_seq_len: 1024
+encoder_model_name: t5-small
+text_encoder_dim: 512
+bottleneck_dim: 128
+n_layer: 12
+n_head: 12
+n_embd: 768
+dropout: 0.0
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+self_cond_prob: 0.5
+self_cond_cfg_min: 0.5
+self_cond_cfg_max: 5.0
+latent_mean: 0.0
+latent_std: 0.2
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+decoder_prob: 0.2
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+decoder_noise_scale: 5.0
+t_eps: 0.05
+time_schedule: logit_normal
+
+attr_weight: 7.0                 # L_attr 权重；App.E 短 FT=7，长训须重扫
+attr_warmup_steps: 1000          # 冷启动优化器步；此前 w_attr 等效 0（d 无效）
+attr_d_every: 1000               # 重估 d 间隔（优化器步）；长训默认 1k
+attr_d_ema_beta: 0.9             # 按「次」EMA：d ← β d + (1-β) d̂
+attr_estimate_n: 128             # Alg.1 轨迹数
+attr_estimate_bs: 8              # 估 d 微批
+attr_estimate_seed: 0            # 估 d 种子
+attr_min_rep_gap: 0.01           # tertile seq-rep-4 间隙低于此则不更新 d
+attr_freeze_d: false             # true=估一次后冻结（仅短 FT）
+attr_d_init: null                # 预载 direction.pt / random；null 则冷启动
+
+sampling:
+  sampling_method: sde
+  num_sampling_steps: 32
+  sde_gamma: 1.5
+  time_schedule: logit_normal
+  temperature: 0.0
+  self_cond_cfg_scale: 3.0
