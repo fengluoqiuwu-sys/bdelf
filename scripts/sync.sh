@@ -107,8 +107,9 @@ push_code() {
 }
 
 ensure_remote_cache_dir() {
-  # 远端 cache 必须是真实目录；若曾被误推为软链接则先删除
-  remote_ssh "d=${REMOTE_DIR}/cache; [ -L \"\$d\" ] && rm \"\$d\"; mkdir -p \"\$d\""
+  # 允许远端 cache 为指向数据盘的软链（如 autodl-tmp）；mkdir -p 会沿软链创建目标。
+  # 勿删除软链，否则 push/pull 会把大文件写回系统盘。
+  remote_ssh "mkdir -p ${REMOTE_DIR}/cache"
 }
 
 push_cache_content() {
