@@ -34,8 +34,10 @@ cache/eval/{model}/{model-hash}/{step}/
 ```
 
 - `generate-hash`：生成配置 + 样本参数（含 seed / micro_bs；**不含** step / **name**）
-- 同 `generate-hash` 已有 `summary.json` → **默认跳过**（仍会写 name 并刷新 CSV/图）；`--force` 才重跑
+- 同 `generate-hash` 已有 `summary.json` **且含** `glue_token_pct` → **默认跳过**（仍会写 name 并刷新 CSV/图）；`--force` 才整组重跑
+- 已有 `summary.json` 但**缺** `glue_token_pct`：有 `samples.txt` 则只补 glue（不重新生成 / 不跑 gpt2）；没有样本则整组重跑
 - 仅刷新已有结果的 CSV / 图 / 补 name（不占 GPU）：`.venv/bin/python eval.py --rebuild-csv`
+- 只给已有样本补 glue：`.venv/bin/python eval.py --rescore-glue --run full/<model>/<hash>`
 
 ## 本机
 
@@ -72,7 +74,7 @@ cache/eval/{model}/{model-hash}/{step}/
 
 示例：`config/eval/tables/odar-sc-ace.yaml`；启动包装：`scripts/eval/odar-sc-ace.sh`。
 
-## 远端提交（默认卡数与训练相同：4）
+## 远端提交（默认卡数与 csv「单个ai任务最大使用显卡数量」相同）
 
 须先把权重推到目标机。`--checkpoints NAME FILE` 会**同时**推对应 `cache/eval/<model>/<hash>/`（若本地有），供跳过已跑组（见 skill `sync`）。
 
@@ -82,13 +84,13 @@ cache/eval/{model}/{model-hash}/{step}/
 
 ```bash
 bash scripts/sync.sh ovan-server push
-bash slurm/remote_status.sh    # 强制；agent_gpu_sum + 本作业 ≤ 4
+bash slurm/remote_status.sh    # 强制；agent_gpu_sum + 本作业 ≤ agent_gpu_budget（csv「最大使用显卡数量」）
 ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-eval.sh odar-sc-ace -- --run full/odar/<hash>'
 # 少卡：追加 --gpus-per-node=1 --mem=64G
 ```
 
-模板：`slurm/eval.slurm`（默认 4 GPU / 16 CPU / 128G，与 `prototype.slurm` 对齐）。  
-日志：`logs/ovan-server/<时间戳>/`；AI 须登记 `temp/agent/active/<job_id>.json`（`gpus: 4`）。
+模板：`slurm/eval.slurm`（默认 GPU 数须与 csv 单任务上限一致 / 16 CPU / 128G，与 `prototype.slurm` 对齐）。  
+日志：`logs/ovan-server/<时间戳>/`；AI 须登记 `temp/agent/active/<job_id>.json`（`gpus` 取 csv 单任务上限）。
 
 ### common
 

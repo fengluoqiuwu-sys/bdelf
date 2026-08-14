@@ -7,7 +7,7 @@
 #   bash slurm/sbatch-train.sh elf-100m-full --exclude=cls1-srv2
 #
 # 模板默认 4 GPU / 16 CPU（cpus-per-gpu=4）/ 128G mem
-# （与 servers.csv「单个 ai 任务最大使用显卡数量」对齐；QOS cpu/user=64）；
+# 模板默认 GPU 数须与 servers.csv「单个 ai 任务最大使用显卡数量」对齐（QOS cpu/user=64）；
 # 若要更少卡：追加 --gpus-per-node=2 --mem=64G。
 #
 # 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err} 与 gpu-{job-id}.log

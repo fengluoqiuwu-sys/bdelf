@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # 本机工具（ovan-server / Slurm 专属）：一次 ssh 汇总远端 GPU / 队列 / agent 登记。
 # 远端作业操作（sbatch / scancel 等）之前必须先跑本脚本（见 rule「远端 Slurm 计算约束」）。
+# 合计 GPU 额度现场读本机 scripts/servers.csv「最大使用显卡数量」，不写死。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+SCRIPT_DIR="$ROOT/scripts"
+# shellcheck source=../scripts/servers_lib.sh
+source "${SCRIPT_DIR}/servers_lib.sh"
 
 REMOTE_HOST="${REMOTE_HOST:-ovan-server}"
-REMOTE_ROOT="${REMOTE_ROOT:-~/source/bdelf}"
 JSON=0
 
 usage() {
@@ -19,7 +22,10 @@ usage() {
   - squeue -u $USER
   - temp/agent/active/*.json（AI 作业登记；兼容旧 current.json）
 
-环境变量：REMOTE_HOST（默认 ovan-server）、REMOTE_ROOT（默认 ~/source/bdelf）
+环境变量：REMOTE_HOST（默认 ovan-server）。
+远端工作目录与 GPU 额度：scripts/servers.csv 该行的「工作目录」/
+「最大使用显卡数量」（合计）/「单个ai任务最大使用显卡数量」。
+可用 REMOTE_ROOT 覆盖工作目录。
 EOF
 }
 
@@ -31,9 +37,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+load_server "$REMOTE_HOST" || exit 1
+REMOTE_ROOT="${REMOTE_ROOT:-$REMOTE_DIR}"
+
 # 远端脚本内不 SSH；本工具负责本机 → 登录节点。
+# 额度从本机 csv 传入（csv 不同步到远端）。
 # shellcheck disable=SC2029
-ssh "$REMOTE_HOST" "cd $REMOTE_ROOT && JSON=$JSON bash -s" <<'REMOTE'
+ssh "$REMOTE_HOST" "cd $REMOTE_ROOT && JSON=$JSON AGENT_GPU_BUDGET=$SERVER_GPU_MAX GPU_PER_JOB=$SERVER_GPU_PER_JOB bash -s" <<'REMOTE'
 set -euo pipefail
 
 if [[ ! -x .venv/bin/python ]]; then
@@ -90,7 +100,7 @@ def _gpus_from_record(rec: dict) -> int:
     m = re.search(r"gpu(?::[^=]+)?(?:=|:)(\d+)", gres, re.I)
     if m:
         return int(m.group(1))
-    return 4  # AI 训练默认（与 prototype.slurm / servers.csv 单任务上限一致）
+    return int(os.environ["GPU_PER_JOB"])  # 缺 gpus 字段时用 csv 单任务上限
 
 
 def _load_agent_active(agent_root: Path) -> list[dict]:
@@ -130,7 +140,8 @@ print(
             "squeue": rows,
             "agent_active": agent_jobs,
             "agent_gpu_sum": agent_gpu_sum,
-            "agent_gpu_budget": 4,
+            "agent_gpu_budget": int(os.environ["AGENT_GPU_BUDGET"]),
+            "gpu_per_job": int(os.environ["GPU_PER_JOB"]),
         },
         ensure_ascii=False,
         indent=2,
@@ -151,17 +162,18 @@ else
       echo "--- $(basename "$f") ---"
       cat "$f"
       echo
-      g=$(.venv/bin/python -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('gpus') or 2))" "$f")
+      g=$(.venv/bin/python -c "import json,os,sys; d=json.load(open(sys.argv[1])); print(int(d['gpus']) if d.get('gpus') else int(os.environ['GPU_PER_JOB']))" "$f")
       sum=$((sum + g))
     done
-    echo "agent_gpu_sum=${sum} / budget=4"
+    echo "agent_gpu_sum=${sum} / budget=${AGENT_GPU_BUDGET} (csv 最大使用显卡数量; per_job=${GPU_PER_JOB})"
   elif [[ -f temp/agent/current.json ]]; then
     echo "(legacy current.json)"
     cat temp/agent/current.json
     echo
+    echo "agent_gpu_sum=? / budget=${AGENT_GPU_BUDGET} (csv 最大使用显卡数量; per_job=${GPU_PER_JOB})"
   else
     echo "none"
-    echo "agent_gpu_sum=0 / budget=4"
+    echo "agent_gpu_sum=0 / budget=${AGENT_GPU_BUDGET} (csv 最大使用显卡数量; per_job=${GPU_PER_JOB})"
   fi
 fi
 REMOTE

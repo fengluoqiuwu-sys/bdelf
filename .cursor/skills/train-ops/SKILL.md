@@ -62,8 +62,8 @@ WHO="auto-train:<idea>"   # 或 human
 bash slurm/remote_status.sh          # 可读表；机器用加 --json
 ```
 
-一次 ssh，汇总：`gpu_availability` + `squeue` + `temp/agent/active/*.json`（及 `agent_gpu_sum`）。  
-确认 **AI 登记合计 GPU + 本作业申请 ≤ 4** 后再 `sbatch`。`AVAIL` 仅作参考——不足时仍应提交让 Slurm 排队，**不要**空等空闲卡。不要手拼多条 ssh 代替本工具。
+一次 ssh，汇总：`gpu_availability` + `squeue` + `temp/agent/active/*.json`（及 `agent_gpu_sum`、`agent_gpu_budget`）。  
+确认 **AI 登记合计 GPU + 本作业申请 ≤ `agent_gpu_budget`**（csv「最大使用显卡数量」，现场读，不要默记）后再 `sbatch`。`AVAIL` 仅作参考——不足时仍应提交让 Slurm 排队，**不要**空等空闲卡。不要手拼多条 ssh 代替本工具。
 
 ## common 远端
 
@@ -86,9 +86,9 @@ ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server 
 ```text
 - [ ] scripts/train/<name>.sh 已就绪（full）
 - [ ] bash scripts/sync.sh ovan-server push
-- [ ] bash slurm/remote_status.sh   # 强制；看 GPU / 队列 / AI 登记合计
-- [ ] agent_gpu_sum + 本作业 gpus ≤ 4（额度满则等；AVAIL 不足仍可排队提交）
-- [ ] bash slurm/sbatch-train.sh <name> […]   # prototype 默认 4 GPU
+- [ ] bash slurm/remote_status.sh   # 强制；看 GPU / 队列 / AI 登记合计与 csv 额度
+- [ ] agent_gpu_sum + 本作业 gpus ≤ agent_gpu_budget（csv「最大使用显卡数量」；额度满则等；AVAIL 不足仍可排队提交）
+- [ ] bash slurm/sbatch-train.sh <name> […]   # GPU 数须与 csv 单任务上限一致
 - [ ] 写 temp/agent/active/<job_id>.json + launched/<job_id>.json
 ```
 
@@ -101,10 +101,10 @@ ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 # stdout 含 Submitted batch job <id> 与 log_dir=logs/ovan-server/<时间戳>
 ```
 
-禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（**默认 4 GPU / 16 CPU / 128G**）。  
+禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（GPU 数须与 csv「单个ai任务最大使用显卡数量」一致；16 CPU / 128G）。  
 日志目录：`logs/ovan-server/<时间戳>/`（`.out` / `.err` / `gpu-<job_id>.log`）。
 
-AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
+AI 合计将超 `agent_gpu_budget`：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
 
 ## VRAM 探针（填 alloc 表；开训查表选型）
 
@@ -140,7 +140,7 @@ AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote
 }
 ```
 
-- `gpus`：本作业申请卡数（训练默认 **4**，vram-probe **1**）；`remote_status` 用其算 `agent_gpu_sum`。
+- `gpus`：本作业申请卡数（训练默认取 csv「单个ai任务最大使用显卡数量」，vram-probe **1**）；`remote_status` 用其算 `agent_gpu_sum`。
 - `holder`：哪个 AI/思路登记的，便于区分多任务。
 - `state`：`SUBMITTED` | `RUNNING` | `COMPLETED` | `CANCELLED` | `FAILED`。
 - 结束/取消后：更新 `launched/`，**删除**对应 `active/<job_id>.json`。
@@ -149,7 +149,7 @@ AI 合计将超 4：auto-train 按「资源等待」睡 **60 分钟**再 `remote
 
 ```bash
 ssh ovan-server 'mkdir -p ~/source/bdelf/temp/agent/active ~/source/bdelf/temp/agent/launched && cat > ~/source/bdelf/temp/agent/active/<JOB_ID>.json <<EOF
-{"job_id":"<JOB_ID>","job_name":"<NAME>","script":"scripts/train/<name>.sh","gpus":4,"started_at":"<ISO>","state":"SUBMITTED","holder":"auto-train:<idea>","scheduler":"slurm"}
+{"job_id":"<JOB_ID>","job_name":"<NAME>","script":"scripts/train/<name>.sh","gpus":<csv单任务上限>,"started_at":"<ISO>","state":"SUBMITTED","holder":"auto-train:<idea>","scheduler":"slurm"}
 EOF
 cp ~/source/bdelf/temp/agent/active/<JOB_ID>.json ~/source/bdelf/temp/agent/launched/<JOB_ID>.json'
 ```

@@ -28,7 +28,7 @@ alwaysApply: true
 ## SSH 边界
 
 - `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**不得在进程内发起 SSH**；在目标机直接跑。
-- 本机查 ovan-server 作业前置状态：`bash slurm/remote_status.sh`（本机 ssh 汇总；**Slurm 远端任务前必跑**，见 rule「远端 Slurm 计算约束」；输出含 `agent_gpu_sum`）。
+- 本机查 ovan-server 作业前置状态：`bash slurm/remote_status.sh`（本机 ssh 汇总；**Slurm 远端任务前必跑**，见 rule「远端 Slurm 计算约束」；输出含 `agent_gpu_sum` 与 csv 现场额度 `agent_gpu_budget`）。
 - common 远端：`ssh <名字>`；占 GPU 须 `scripts/launch-train.sh` / `scripts/launch-eval.sh`（`--server` + `--gpus`），写 `temp/agent` 与 `logs/<名字>/<时间戳>/`；无 `remote_status.sh`（见 rule「远端 common 计算约束」）。
 - 本机读远端日志：push（如需）→ `ssh <服务名> 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`（可加 `--server <服务名>`）。
 - 具体命令与登记流程见 skill `train-ops` / `sync`。

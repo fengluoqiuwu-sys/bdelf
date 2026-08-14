@@ -5,7 +5,7 @@ description: >-
   gpt2-large + train model/optimizer/EMA, measure peak memory across micro-batch
   sizes, stop on OOM. Fills model×batch alloc table under temp/vram-probe/;
   train-time queries the table against the target GPU budget and global_batch_size.
-  Mutex via train-ops agent registry (multi-job; AI GPU sum ≤ 4); 2 GiB safety margin is an AI selection rule,
+  Mutex via train-ops agent registry (multi-job; AI GPU sum ≤ csv「最大使用显卡数量」); 2 GiB safety margin is an AI selection rule,
   not coded into the probe.
 ---
 
@@ -63,7 +63,7 @@ chosen = max { b ∈ 候选 |
 ```text
 - [ ] bash scripts/sync.sh ovan-server push   # 探针/脚本有更新时
 - [ ] bash slurm/remote_status.sh           # 强制
-- [ ] agent_gpu_sum + 1 ≤ 4（额度满则 auto-train 睡 60m；AVAIL 不足仍先排队）
+- [ ] agent_gpu_sum + 1 ≤ agent_gpu_budget（csv「最大使用显卡数量」；额度满则 auto-train 睡 60m；AVAIL 不足仍先排队）
 - [ ] ssh 后 bash slurm/sbatch-vram-probe.sh …
 - [ ] 写 temp/agent/active/<job_id>.json（gpus:1）+ launched/<job_id>.json
 - [ ] 结束后更新 launched、删除 active/<job_id>.json

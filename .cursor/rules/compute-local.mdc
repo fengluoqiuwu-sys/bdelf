@@ -14,7 +14,7 @@ alwaysApply: true
   `.venv/bin/python scripts/workspace_lock.py acquire --holder …`；释锁用 `release`；
   抢不到则睡 30min 再试（见 skill `train-ops`）。
 - **改动兼容性**：默认只做向前兼容、且不影响其他模型训练/推理的改动；破坏性 / 修实现错误会改旧数值等须向用户二次确认（见 `auto-train`「改动兼容性」、rule「Checkpoint 路径与配置哈希」）。
-- **推理/评测**：本机可直接 `eval.py` / `generate.py`；远端 TriFluency eval 须经 `slurm/sbatch-eval.sh`（Slurm）或 `scripts/launch-eval.sh`（common），默认卡数与训练相同（4）；结果经 `sync pull`（含 `cache/eval/`）拉回查看。`generate.py` 交互式续写仍只在本机。
+- **推理/评测**：本机可直接 `eval.py` / `generate.py`；远端 TriFluency eval 须经 `slurm/sbatch-eval.sh`（Slurm）或 `scripts/launch-eval.sh`（common），默认卡数与 csv「单个ai任务最大使用显卡数量」相同；结果经 `sync pull`（含 `cache/eval/`）拉回查看。`generate.py` 交互式续写仍只在本机。
 - **自动训练目标机（强制）**：启动 `auto-train` / 远端 full 前，必须先与用户确认
   `scripts/servers.csv` 中的**服务名**（及对应调度类型 `slurm`|`common`）。未确认不得默认
   `ovan-server` 或其它主机；确认后写入 `temp/auto-research/<idea>/README.md` 并全程只用该名字

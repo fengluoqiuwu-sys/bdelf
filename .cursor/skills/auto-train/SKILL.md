@@ -113,7 +113,7 @@ WHO="auto-train:<idea>"
 3. 本地验证：抢锁 → master 上 fast 冒烟；generate 不占锁 → 释锁
 3.6 显存探针（强制，见「VRAM 探针」）：改动影响显存时 → push → vram-probe → 填 alloc.md
 4. push 到 <服务名> → 按表+global_bs 选型 → 按调度类型提交 full
-   （slurm：remote_status，AI 合计 GPU+2≤4；额度满睡 60m；勿因 AVAIL=0 空等 → sbatch 排队）
+   （slurm：remote_status，AI 合计 GPU+本作业 ≤ csv「最大使用显卡数量」；额度满睡 60m；勿因 AVAIL=0 空等 → sbatch 排队）
    （common：选卡 → launch-train --server --gpus，遵守 csv 额度；自动登记）
    → 写 active/（slurm 手写；common 由 launch-train 写）→ 起唤醒调度
 5. 唤醒循环：5m → 15m → 30m → 此后每 60m（见「唤醒调度」）
@@ -176,7 +176,7 @@ git commit -m "<语义化描述>"
 凡改动会影响显存占用（模型结构、精度、序列长 / chunk、EMA、优化器状态规模等），在提交 full **之前**必须：
 
 1. 工作区已提交且干净（3.5）；`bash scripts/sync.sh <服务名> push`
-2. 按 skill **`vram-probe`** + **`train-ops`**（slurm 主机：`remote_status` → 若合计 GPU+1>4 则睡 60m 再看；
+2. 按 skill **`vram-probe`** + **`train-ops`**（slurm 主机：`remote_status` → 若合计 GPU+1 > csv「最大使用显卡数量」则睡 60m 再看；
    **AVAIL 不足仍先 sbatch 排队**；写 `active/` → `bash slurm/sbatch-vram-probe.sh …`。
    common 主机：按该机额度选空闲 `--gpus` 后跑探针，勿超 csv 上限）
 3. 读日志；把各档 **`alloc_peak_GiB`**（及 `oom`）填入 **`temp/vram-probe/alloc.md`** 对应行
@@ -196,9 +196,9 @@ git commit -m "<语义化描述>"
 - [前置] 已按表 + 当前卡 + global_bs 定好 batch_size（必要时 scripts/train 含 --set）
 - bash scripts/sync.sh <服务名> push
 - 确认 `scripts/train/<name>.sh` 为 full 配置（禁止 preprocess）
-- slurm：bash slurm/remote_status.sh → 若 agent_gpu_sum+4>4 则睡 60min 再看
+- slurm：bash slurm/remote_status.sh → 若 agent_gpu_sum+本作业 > agent_gpu_budget 则睡 60min 再看
          → AVAIL 不足仍 sbatch 排队 → ssh 后 bash slurm/sbatch-train.sh <name>
-         → 写 active/<job_id>.json（gpus:4, holder:auto-train:<idea>, scheduler:slurm）
+         → 写 active/<job_id>.json（gpus: csv 单任务上限, holder:auto-train:<idea>, scheduler:slurm）
 - common：扫该机 active → 选不冲突 --gpus（张数≤csv 单任务上限）
          → ssh <服务名> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> \
               --server <服务名> --gpus … --holder auto-train:<idea>'
@@ -207,7 +207,7 @@ git commit -m "<语义化描述>"
 - slurm 仍 PENDING → 按「资源等待」睡 60min 再看，拉起后改用「唤醒调度」
 ```
 
-slurm：登记合计 GPU ≤ 该机 csv「最大使用显卡数量」（ovan 默认本作业 4 卡计入，通常一次一作业）。集群无空闲卡时靠排队，不靠轮询 AVAIL。
+slurm：登记合计 GPU ≤ 该机 csv「最大使用显卡数量」（以 `remote_status` 的 `agent_gpu_budget` 为准；本作业卡数默认取「单个ai任务最大使用显卡数量」，若两者相等则一次一作业）。集群无空闲卡时靠排队，不靠轮询 AVAIL。
 
 **5. 唤醒循环与判据**
 
@@ -293,7 +293,7 @@ Cursor agent 无自主闹钟；用 ``scripts/agent_wakeup.py`` 后台 sleep，�
 
 | 条件 | 动作 |
 |------|------|
-| `agent_gpu_sum` + 本作业卡数将 > 4 | **先不提交**；`agent_wakeup.py --after 60m --tag resource-wait -- '…'` → 再 `remote_status` → 仍满则重复 |
+| `agent_gpu_sum` + 本作业卡数将 > csv「最大使用显卡数量」（`remote_status` 的 `agent_gpu_budget`） | **先不提交**；`agent_wakeup.py --after 60m --tag resource-wait -- '…'` → 再 `remote_status` → 仍满则重复 |
 | 已 sbatch 但仍 PENDING（集群无空闲卡、在排队） | `agent_wakeup.py --after 60m --tag queue-wait -- '…'` → 再看队列；已 RUNNING 则改用 `--nth` 唤醒 |
 | 本机锁：`scripts/workspace_lock.py acquire` 失败 | `agent_wakeup.py --after 30m --tag lock-wait -- '再抢锁…'` → 再抢 → 仍失败则重复 |
 
@@ -325,6 +325,6 @@ Cursor agent 无自主闹钟；用 ``scripts/agent_wakeup.py`` 后台 sleep，�
 - 不用 `pull --mode full`（体积风险，见 sync skill 硬性禁令）。
 - 不 push 非 full 的 slurm 脚本；不用 preprocess 作业。
 - 不删 / 不 `scancel` 非本 `holder` 登记范围内他人的 job / checkpoint。
-- slurm：ovan 默认每作业 4 GPU（与 csv 单任务上限一致）；提交前确认 `agent_gpu_sum+4≤4`。
+- slurm：每作业 GPU 数取 csv「单个ai任务最大使用显卡数量」；提交前确认 `agent_gpu_sum`+本作业 ≤ `agent_gpu_budget`（现场读 csv，不要默记）。
 - **不为 idea fork git 分支**；代码改动只在 `master`，思路隔离用 `temp/auto-research/`。
 - **不自动落地非向前兼容 / 可能影响其他模型训练或推理的改动**；须向用户二次确认。

@@ -9,6 +9,8 @@ SERVER_NAME=""
 REMOTE_DIR=""
 REMOTE_SSH_TARGET="" # 即服务「名字」
 SERVER_SCHEDULER=""
+SERVER_GPU_MAX=""      # csv「最大使用显卡数量」：AI 合计额度
+SERVER_GPU_PER_JOB=""  # csv「单个ai任务最大使用显卡数量」
 SSH_BASE=(ssh)
 
 list_server_names() {
@@ -49,6 +51,8 @@ for row in csv.DictReader(lines):
         for key, val in (
             ("REMOTE_DIR", g("工作目录")),
             ("SERVER_SCHEDULER", g("调度类型")),
+            ("SERVER_GPU_MAX", g("最大使用显卡数量")),
+            ("SERVER_GPU_PER_JOB", g("单个ai任务最大使用显卡数量")),
         ):
             print(f"{key}={shlex.quote(val)}")
         sys.exit(0)
@@ -72,6 +76,14 @@ PY
 
   if [[ "${require_dir}" == "1" && -z "${REMOTE_DIR}" ]]; then
     echo "服务 ${name} 的「工作目录」为空" >&2
+    return 1
+  fi
+  if [[ ! "${SERVER_GPU_MAX}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "服务 ${name} 的「最大使用显卡数量」无效（须为正整数）: ${SERVER_GPU_MAX:-<empty>}" >&2
+    return 1
+  fi
+  if [[ ! "${SERVER_GPU_PER_JOB}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "服务 ${name} 的「单个ai任务最大使用显卡数量」无效（须为正整数）: ${SERVER_GPU_PER_JOB:-<empty>}" >&2
     return 1
   fi
   return 0
