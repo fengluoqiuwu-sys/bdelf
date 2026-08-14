@@ -666,6 +666,15 @@ def train_loop(
                 f"t0≈{getattr(bb, '_lex_ce_threshold', lambda: '?')():.3f}); "
                 "metrics: mse / ce / lex_ce",
             )
+        elif cfg.model == "posbeta":
+            bb = unwrap_model(model).backbone
+            decoder_prob = float(getattr(bb, "decoder_prob", 0.2))
+            _train_log(
+                f"POSBETA: per-example denoise:decode ≈ "
+                f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+                f"+ Posβ interpolant (κ={getattr(bb, 'pos_beta_kappa', '?')}); "
+                "κ=0 退回各向同性 ELF；metrics: mse / ce",
+            )
         elif cfg.model == "trace":
             bb = unwrap_model(model).backbone
             decoder_prob = float(getattr(bb, "decoder_prob", 0.2))

@@ -799,7 +799,7 @@ def main() -> None:
         raise ValueError("Model config missing tokenizer")
     tokenizer = get_tokenizer(tokenizer_name)
 
-    if model_name in ("elf", "odar", "lexce", "trace"):
+    if model_name in ("elf", "odar", "lexce", "posbeta", "trace"):
         from models.elf.ace import attach_ace_identity
 
         attach_ace_identity(

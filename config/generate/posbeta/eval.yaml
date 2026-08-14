@@ -1,0 +1,15 @@
+# =============================================================================
+# 生成 / 采样（generate=正式生成；eval=训练在线 gen-eval / 测试）
+# =============================================================================
+_doc: Posβ 训练在线 gen-eval / 测试采样  # 文件说明，写入 extra
+name: eval  # 配置名；非 prototype 时与文件名一致
+sampling_method: sde  # 采样方法：sde | ode
+num_sampling_steps: 32  # 采样步数（论文主设置≤32）
+sde_gamma: 1.5  # SDE 噪声系数
+time_schedule: logit_normal  # 时间调度：logit_normal 等
+temperature: 0.0  # 采样温度；0 为 argmax（论文 decode）
+self_cond_cfg_scale: 3.0  # Self-cond CFG 缩放
+ace: false  # ACE：false/0 关闭；true≡λ=2；正数=λ；或显式方向 .pt（λ=2）
+ace_direction: null  # 显式方向 .pt；null 则用 full/ace/{hash}/{step}/（缺则现算）
+ace_step_lo: null  # ACE 起始 denoise 步（含）；null=全程（与 ace_step_hi 皆 null）
+ace_step_hi: null  # ACE 结束 denoise 步（含）；null=全程
