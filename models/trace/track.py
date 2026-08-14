@@ -101,11 +101,14 @@ def maybe_refresh_attr_d(
     last = int(bb.attr_d_last_opt.item())
     if opt_step < warmup:
         return False
-    if valid and (opt_step - last) < every:
+    # 冷却只看上次尝试（成功或因 gap 跳过都拨 last），与 d 是否已有效无关。
+    # 否则 gap 不够时 last 不前进，每个 opt-step 都会重跑 Alg.1。
+    if last > 0 and (opt_step - last) < every:
         return False
 
     n = int(getattr(bb, "attr_estimate_n", 128))
     if n < 6:
+        bb.attr_d_last_opt.fill_(int(opt_step))
         if rank == 0 and log is not None:
             log(f"TrACE skip 估 d：attr_estimate_n={n} < 6")
         return False
@@ -151,10 +154,13 @@ def maybe_refresh_attr_d(
     d_hat, meta = direction_from_sc_rep_pairs(feats, reps)
     gap = float(meta["rep_gap"])
     if gap < min_gap:
+        bb.attr_d_last_opt.fill_(int(opt_step))
+        nxt = int(opt_step) + every
         if rank == 0 and log is not None:
             log(
                 f"TrACE 跳过更新 d：rep_gap={gap:.4f} < {min_gap:g} "
-                f"(rep_lo={meta['rep_lo']:.4f} rep_hi={meta['rep_hi']:.4f})"
+                f"(rep_lo={meta['rep_lo']:.4f} rep_hi={meta['rep_hi']:.4f})；"
+                f"下次不早于 opt_step={nxt}"
             )
         if was_training:
             model.train()

@@ -102,6 +102,42 @@ def ace_is_enabled(ace: Any) -> bool:
     return True
 
 
+def parse_ace_step_range(cfg: dict[str, Any]) -> tuple[int | None, int | None]:
+    """ACE 生效的 denoise 步区间 ``[lo, hi]``（含端点）；``(None, None)``=全程。
+
+    可读根级 ``ace_step_lo`` / ``ace_step_hi``，或 ``ace`` 字典内的
+    ``step_lo`` / ``step_hi``。只给一端时另一端放开（lo→0，hi→很大）。
+    """
+    lo = cfg.get("ace_step_lo", None)
+    hi = cfg.get("ace_step_hi", None)
+    ace = cfg.get("ace")
+    if isinstance(ace, dict):
+        if lo is None:
+            lo = ace.get("step_lo", ace.get("ace_step_lo"))
+        if hi is None:
+            hi = ace.get("step_hi", ace.get("ace_step_hi"))
+    if lo is None and hi is None:
+        return None, None
+    lo_i = 0 if lo is None else int(lo)
+    hi_i = 10**9 if hi is None else int(hi)
+    if lo_i > hi_i:
+        raise ValueError(f"ace step range invalid: lo={lo_i} > hi={hi_i}")
+    return lo_i, hi_i
+
+
+def ace_step_active(
+    step_idx: int,
+    *,
+    step_lo: int | None,
+    step_hi: int | None,
+) -> bool:
+    """当前 denoise 步是否施加 ACE。"""
+    if step_lo is None and step_hi is None:
+        return True
+    assert step_lo is not None and step_hi is not None
+    return int(step_lo) <= int(step_idx) <= int(step_hi)
+
+
 def parse_ace_lambda(ace: Any) -> float:
     """解析 ACE 剂量 λ；关闭时返回 0。"""
     if not ace_is_enabled(ace):

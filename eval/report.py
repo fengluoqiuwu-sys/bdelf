@@ -15,6 +15,7 @@ CSV_METRIC_KEYS: tuple[str, ...] = (
     "median_rep",
     "nonword_word_pct",
     "nonword_sample_pct",
+    "glue_token_pct",
     "clean_ppl",
     "clean_ppl_status",
     "n_accept",
@@ -30,11 +31,36 @@ RESULTS_CSV_NAME = "results.csv"
 RESULTS_CHART_NAME = "results.png"
 RESULTS_TABLE_NAME = "results_table.png"
 
+# OWT eval 切片参照（elf preprocess、L=1024、N=1024、seed=42；2026-08-13）。
+# 说明：temp/OWT_TRIFLUENCY_REF.md ；原始 summary：temp/nonword-source/out/owt_eval_1024_seed42/
+REF_OWT_EVAL_NAME = "owt-eval-1024"
+REF_OWT_EVAL_1024: dict[str, Any] = {
+    "name": REF_OWT_EVAL_NAME,
+    "accept_at_human": 0.6572265625,
+    "median_rep": 0.011867873563758013,
+    "nonword_word_pct": 1.274578684144842,
+    "nonword_sample_pct": 81.4453125,
+    "glue_token_pct": 0.9789466857910156,
+    "clean_ppl": 18.61915240137523,
+    "clean_ppl_status": "ok",
+    "n_accept": 673,
+    "cola_g": 0.8793478018122217,
+    "raw_gen_ppl": 17.00826710142166,
+    "mean_entropy": 5.433196176173972,
+    "n": 1024,
+    "nonempty_frac": 1.0,
+}
+_REF_BAR_COLOR = "#C9A227"
+_RUN_BAR_COLOR = "#4C72B0"
+_NAN_BAR_COLOR = "#CCCCCC"
+_REF_ROW_FACE = "#FFF4CC"
+
 # 人类可读表 / 图中优先展示的主指标（CSV 仍写全量列）
 _DISPLAY_METRICS: tuple[tuple[str, str], ...] = (
     ("accept_at_human", "accept@human"),
     ("median_rep", "median_rep"),
     ("nonword_word_pct", "nonword%"),
+    ("glue_token_pct", "glue_tok%"),
     ("clean_ppl", "clean_ppl"),
     ("cola_g", "cola_g"),
     ("raw_gen_ppl", "raw_gen_ppl"),
@@ -114,6 +140,7 @@ METRIC_GUIDE = """\
 #   nonword_count       本样本假词个数
 #   nonword_word_pct    语料级假词率 %（↓好）
 #   nonword_sample_pct  语料级：含 ≥1 假词的样本比例 %（↓好）
+#   glue_token_pct      glue 假词占用的 T5 piece 数 / (N×1024) ×100（↓好）
 #
 # C′ 通顺（禁止用裸 Gen.PPL 排序）
 #   gen_ppl / raw_gen_ppl  GPT-2 Large 因果 PPL；raw=全库（可被重复 hack）
@@ -128,6 +155,11 @@ METRIC_GUIDE = """\
 #   clean_ppl    : S≤16    A∈(16,24]       B∈(24,32]      C>32 或 invalid
 #   cola_g       : S≥0.95  A∈[0.90,0.95)   B∈[0.80,0.90)  C<0.80
 #   raw_gen_ppl  : 仅对照；<15 且 accept 很低 → 高度可疑（naive hack）
+#
+# OWT eval 切片实测参照（N=1024, seed=42, 2026-08-13；图/CSV 第一行 name=owt-eval-1024）
+#   accept=0.6572  median_rep=0.0119  nonword%=1.2746  glue_tok%=0.9789
+#   clean_ppl=18.6192  cola_g=0.8793  raw_ppl=17.0083  entropy=5.4332
+#   详见 temp/OWT_TRIFLUENCY_REF.md（BBC 人类 nonword 0.20% 不是这组数）
 """
 
 
@@ -202,13 +234,26 @@ def suggest_run_name(
     return validate_run_name("-".join(parts))
 
 
+def ref_owt_eval_row() -> dict[str, Any]:
+    """OWT eval 1024 参照行（硬编码；与 ``temp/OWT_TRIFLUENCY_REF.md`` 一致）。"""
+    return dict(REF_OWT_EVAL_1024)
+
+
+def rows_with_owt_ref(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """把 OWT 参照插到第一行；同名实验行丢掉以免重复。"""
+    rest = [
+        dict(r) for r in rows if str(r.get("name", "")) != REF_OWT_EVAL_NAME
+    ]
+    return [ref_owt_eval_row(), *rest]
+
+
 def rewrite_step_results_csv(step_dir: Path | str) -> Path | None:
     """扫描 ``{step}/{generate-hash}/``，写出 ``results.csv`` + 图表。
 
     同时生成：
-    - ``results.csv``：全量指标，浮点四位小数
-    - ``results.png``：主指标柱状图
-    - ``results_table.png``：给人看的汇总表（四位小数）
+    - ``results.csv``：全量指标，浮点四位小数；**第一行固定为 OWT 参照**
+    - ``results.png``：主指标柱状图（第一柱为参照）
+    - ``results_table.png``：给人看的汇总表（第一行为参照）
 
     仅收录同时具备 ``summary.json`` 与 fingerprint ``name`` 的子目录。
     同名多条时保留 generate-hash 字典序最后一条。
@@ -258,7 +303,7 @@ def rewrite_step_results_csv(step_dir: Path | str) -> Path | None:
         return None
 
     fieldnames = ["name", *CSV_METRIC_KEYS]
-    rows = [by_name[k] for k in sorted(by_name.keys())]
+    rows = rows_with_owt_ref([by_name[k] for k in sorted(by_name.keys())])
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -287,6 +332,7 @@ def _write_results_chart(
         ("accept_at_human", "accept@human ↑"),
         ("median_rep", "median_rep ↓"),
         ("nonword_word_pct", "nonword% ↓"),
+        ("glue_token_pct", "glue_tok% ↓"),
         ("clean_ppl", "clean_ppl ↓"),
         ("cola_g", "cola_g ↑"),
     ]
@@ -300,7 +346,14 @@ def _write_results_chart(
     x = list(range(len(names)))
     for ax, (key, ylabel) in zip(axes, plot_keys):
         vals = [_as_float(r.get(key)) for r in rows]
-        colors = ["#4C72B0" if math.isfinite(v) else "#CCCCCC" for v in vals]
+        colors = []
+        for i, v in enumerate(vals):
+            if not math.isfinite(v):
+                colors.append(_NAN_BAR_COLOR)
+            elif i == 0:
+                colors.append(_REF_BAR_COLOR)
+            else:
+                colors.append(_RUN_BAR_COLOR)
         plot_vals = [0.0 if not math.isfinite(v) else v for v in vals]
         bars = ax.bar(x, plot_vals, color=colors, width=0.72)
         for bar, v in zip(bars, vals):
@@ -325,7 +378,7 @@ def _write_results_chart(
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels(names, rotation=35, ha="right", fontsize=8)
     short = title if len(title) <= 80 else "…" + title[-79:]
-    fig.suptitle(f"TriFluency  {short}", fontsize=11)
+    fig.suptitle(f"TriFluency  {short}  (1st bar: {REF_OWT_EVAL_NAME})", fontsize=11)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=140, bbox_inches="tight")
@@ -362,7 +415,11 @@ def _write_results_table_fig(
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis("off")
     short = title if len(title) <= 90 else "…" + title[-89:]
-    ax.set_title(f"TriFluency results  {short}", fontsize=11, pad=12)
+    ax.set_title(
+        f"TriFluency results  {short}  (1st row: {REF_OWT_EVAL_NAME})",
+        fontsize=11,
+        pad=12,
+    )
 
     table = ax.table(
         cellText=cell_rows,
@@ -377,6 +434,9 @@ def _write_results_table_fig(
         cell.set_edgecolor("#DDDDDD")
         if r_i == 0:
             cell.set_facecolor("#EEF2F7")
+            cell.set_text_props(weight="bold")
+        elif r_i == 1:
+            cell.set_facecolor(_REF_ROW_FACE)
             cell.set_text_props(weight="bold")
         elif r_i % 2 == 0:
             cell.set_facecolor("#FAFAFA")
@@ -498,6 +558,7 @@ def write_samples_report(
                 f"  accept={_fmt(row.get('accept'))}"
                 f"  nonword_frac={_fmt(row.get('nonword_word_frac'))}"
                 f"  nonword_n={_fmt(row.get('nonword_count'))}"
+                f"  glue_n={_fmt(row.get('glue_token_n'))}"
                 f"  cola_g={_fmt(row.get('cola_g'))}\n"
             )
             f.write("=" * 72 + "\n")
@@ -544,6 +605,9 @@ def write_summary_report(
         )
         f.write(
             f"# nonword_sample_pct={_fmt(summary.get('nonword_sample_pct'))}\n"
+        )
+        f.write(
+            f"# glue_token_pct={_fmt(summary.get('glue_token_pct'))}\n"
         )
         f.write(
             f"# clean_ppl={_fmt(clean)}  status={status}  "

@@ -9,7 +9,7 @@ from pathlib import Path
 
 _HEADER_RE = re.compile(r"^#\s*(.+)$")
 _SAMPLE_HDR_RE = re.compile(
-    r"^###\s*sample\s+(\d+)/(\d+)(?:\s+gen_ppl=(\S+))?(?:\s+entropy=(\S+))?\s*$"
+    r"^###\s*sample\s+(\d+)/(\d+)(?:\s+gen_ppl=(\S+))?(?:\s+entropy=(\S+))?"
 )
 
 

@@ -12,6 +12,8 @@
 ``generate-hash`` = sha256(生成配置 + 样本参数含 seed；不含 step / name)[:16]。
 ``model-hash`` 即训练 config-hash（与 ``cache/checkpoints/full/{model}/{hash}/`` 一致）。
 ``results.*`` 浮点均保留四位小数；每次评测结束自动刷新。
+第一行/第一柱固定为 OWT eval 1024 参照（``owt-eval-1024``，见 ``eval/report.py``）。
+``summary.json`` 缺 ``glue_token_pct`` 时，再次 ``eval.py`` **不跳过**：有 ``samples.txt`` 则只补 glue（不重新生成）；没有样本则整组重跑。
 
 单组（须 ``--name``）::
 
@@ -27,6 +29,7 @@
 仅根据已有 ``summary.json`` 补 name 并刷新各 step 的 ``results.csv``（不占 GPU）::
 
     .venv/bin/python eval.py --rebuild-csv
+    .venv/bin/python eval.py --rescore-glue --run full/elf/<hash>
 
 ``--table`` 解析 ``config/eval/tables/<name>.yaml``，或接受显式 ``*.yaml`` 路径；
 扫参模式必须同时给 ``--micro-bs``（本机生成 micro-batch）。
@@ -263,6 +266,31 @@ def _write_fingerprint(out_dir: Path, params: dict[str, Any]) -> None:
     )
 
 
+def _keep_fingerprint_name(out_dir: Path, name: str, fallback: dict[str, Any]) -> None:
+    """刷新 fingerprint.name，不改 generate-hash 相关字段。"""
+    fp_path = out_dir / "fingerprint.json"
+    if fp_path.is_file():
+        try:
+            old = json.loads(fp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            old = {}
+        if isinstance(old, dict):
+            old["name"] = name
+            _write_fingerprint(out_dir, old)
+            return
+    _write_fingerprint(out_dir, fallback)
+
+
+def _latest_eval_step_dir(model: str, model_hash: str) -> Path | None:
+    root = EVAL_ROOT / model / model_hash
+    if not root.is_dir():
+        return None
+    steps = [p for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
+    if not steps:
+        return None
+    return max(steps, key=lambda p: int(p.name))
+
+
 def _refresh_step_csv(step_dir: Path) -> None:
     path = rewrite_step_results_csv(step_dir)
     if path is not None:
@@ -495,6 +523,7 @@ def score_and_write(
     gen_eval_model: str,
     gen_eval_dtype: str,
     scorers,
+    tokenizer_name: str = "t5-small",
 ) -> dict[str, Any]:
     from eval.protocol import _sanitize, compute_trifluency
     from eval.report import write_samples_report, write_summary_report
@@ -512,6 +541,7 @@ def score_and_write(
         gen_eval_model=gen_eval_model,
         gen_eval_dtype=gen_eval_dtype,
         scorers=scorers,
+        tokenizer_name=tokenizer_name,
     )
 
     samples_path = out_dir / "samples.txt"
@@ -535,6 +565,7 @@ def score_and_write(
         f"DONE[{job.name}] accept@human={summary['accept_at_human']:.4f} "
         f"median_rep={summary['median_rep']:.4f} "
         f"nonword%={summary['nonword_word_pct']:.3f} "
+        f"glue_tok%={summary.get('glue_token_pct', float('nan')):.3f} "
         f"clean_ppl={clean_s} "
         f"cola_g={summary['cola_g']:.4f} "
         f"raw_gen_ppl={summary['raw_gen_ppl']:.4f}",
@@ -629,6 +660,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"rewrite each step/{RESULTS_CSV_NAME}; no GPU"
         ),
     )
+    p.add_argument(
+        "--rescore-glue",
+        action="store_true",
+        help=(
+            "Patch glue_token_pct into existing summaries from samples.txt "
+            "(no generate / no gpt2). Requires --run. Missing samples skipped."
+        ),
+    )
     return p
 
 
@@ -651,6 +690,43 @@ def main() -> None:
 
     if args.rebuild_csv:
         rebuild_eval_csvs()
+        return
+
+    if args.rescore_glue:
+        if not args.run:
+            raise SystemExit("--rescore-glue requires --run full/{model}/{hash}")
+        parts = Path(str(args.run)).parts
+        if len(parts) < 3 or parts[0] != "full":
+            raise SystemExit(f"--run must be full/{{model}}/{{hash}}, got {args.run!r}")
+        model_name, model_hash = parts[1], parts[2]
+        step_dir = _latest_eval_step_dir(model_name, model_hash)
+        if step_dir is None:
+            raise SystemExit(
+                f"no eval step dir under {EVAL_ROOT / model_name / model_hash}"
+            )
+        tok_name = "t5-small"
+        if model_name in ("ar", "ar2", "ar1_5", "bd3lm", "bdelf", "cola", "cola_vae"):
+            tok_name = "gpt2"
+        from eval.glue import rescore_glue_step_dir, summary_has_glue
+
+        patched = rescore_glue_step_dir(
+            step_dir, tokenizer_name=tok_name, force=bool(args.force),
+        )
+        n_all = sum(
+            1
+            for p in step_dir.iterdir()
+            if p.is_dir() and (p / "summary.json").is_file()
+        )
+        n_have = sum(
+            1
+            for p in step_dir.iterdir()
+            if p.is_dir() and summary_has_glue(p)
+        )
+        _refresh_step_csv(step_dir)
+        _log(
+            f"rescore-glue done step={step_dir} patched={len(patched)} "
+            f"with_glue={n_have}/{n_all} tokenizer={tok_name}"
+        )
         return
 
     table_meta: dict[str, Any] | None = None
@@ -731,7 +807,7 @@ def main() -> None:
         )
 
     use_ema = (not args.no_ema) and bool(ema_state)
-    # 同 generate-hash 已有 summary.json 则跳过（--force 才重跑）
+    # 同 generate-hash 已有完整 summary（含 glue）则跳过；缺 glue 列则从 samples 补
     skip_existing = not args.force
     pending: list[PendingScore] = []
     touched_steps: set[Path] = set()
@@ -753,27 +829,35 @@ def main() -> None:
         )
         ghash = params["generate_hash"]
         touched_steps.add(out_dir.parent)
-        if skip_existing and (out_dir / "summary.json").is_file():
-            # 跳过生成/打分，但仍写入 name 并刷新 CSV
-            if (out_dir / "fingerprint.json").is_file():
-                try:
-                    old = json.loads(
-                        (out_dir / "fingerprint.json").read_text(encoding="utf-8")
-                    )
-                except (OSError, json.JSONDecodeError):
-                    old = {}
-                if isinstance(old, dict):
-                    old["name"] = job.name
-                    # 保留旧指纹其余字段，避免改 hash 相关内容
-                    _write_fingerprint(out_dir, old)
-                else:
-                    _write_fingerprint(out_dir, params)
-            else:
-                _write_fingerprint(out_dir, params)
+        from eval.glue import patch_glue_summary, summary_has_glue
+
+        summary_path = out_dir / "summary.json"
+        samples_path = out_dir / "samples.txt"
+        if skip_existing and summary_path.is_file() and summary_has_glue(out_dir):
+            _keep_fingerprint_name(out_dir, job.name, params)
             _refresh_step_csv(out_dir.parent)
             _log(
                 f"[{job.index + 1}/{len(jobs)}] skip existing "
                 f"name={job.name} generate_hash={ghash} overrides={job.overrides}",
+            )
+            continue
+        if (
+            skip_existing
+            and summary_path.is_file()
+            and samples_path.is_file()
+            and not summary_has_glue(out_dir)
+        ):
+            _keep_fingerprint_name(out_dir, job.name, params)
+            gsum = patch_glue_summary(
+                out_dir,
+                tokenizer_name=tokenizer_name,
+                seq_len=job.num_tokens,
+            )
+            _refresh_step_csv(out_dir.parent)
+            _log(
+                f"[{job.index + 1}/{len(jobs)}] rescore glue "
+                f"name={job.name} generate_hash={ghash} "
+                f"glue_token_pct={gsum['glue_token_pct']:.4f}",
             )
             continue
 
@@ -839,6 +923,7 @@ def main() -> None:
                 gen_eval_model=args.gen_eval_model,
                 gen_eval_dtype=args.gen_eval_dtype,
                 scorers=scorers,
+                tokenizer_name=tokenizer_name,
             )
     finally:
         scorers.close()

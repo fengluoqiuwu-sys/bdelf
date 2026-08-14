@@ -47,9 +47,17 @@ class FL_GenerateConfig:
         if ace_off:
             out.pop("ace", None)
             out.pop("ace_direction", None)
-        elif out.get("ace_direction") in (None, False, ""):
-            # 自动缓存方向时不把 null 写入采样字典 / 指纹
-            out.pop("ace_direction", None)
+            out.pop("ace_step_lo", None)
+            out.pop("ace_step_hi", None)
+        else:
+            if out.get("ace_direction") in (None, False, ""):
+                # 自动缓存方向时不把 null 写入采样字典 / 指纹
+                out.pop("ace_direction", None)
+            # 全程 ACE（null）不写入，保持与旧「全步 ACE」指纹一致
+            if out.get("ace_step_lo") is None:
+                out.pop("ace_step_lo", None)
+            if out.get("ace_step_hi") is None:
+                out.pop("ace_step_hi", None)
 
         # 采样 DMA 默认开：缺省/true 不写入，保持与旧 YAML 指纹一致
         if "dma" in out:

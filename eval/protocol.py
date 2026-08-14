@@ -13,6 +13,7 @@ import torch
 
 from eval.cola_score import COLA_MODEL_ID, load_cola, score_cola
 from eval.gen_ppl import score_texts
+from eval.glue import GLUE_SEQ_LEN, score_glue
 from eval.nonword import score_nonwords
 from eval.repetition import TAU_H, score_repetition
 
@@ -111,6 +112,7 @@ def compute_trifluency(
     skip_cola: bool = False,
     skip_gen_ppl: bool = False,
     scorers: TrifluencyScorers | None = None,
+    tokenizer_name: str = "t5-small",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """对 ``texts`` 跑完整协议；返回 (per_sample 行, summary)。
 
@@ -141,6 +143,11 @@ def compute_trifluency(
     try:
         reps, accepts, rep_sum = score_repetition(texts, tau_h=tau_h)
         nw_fracs, nw_counts, nw_sum = score_nonwords(texts)
+        glue_fracs, glue_counts, glue_sum = score_glue(
+            texts,
+            tokenizer_name=tokenizer_name,
+            seq_len=max_length or GLUE_SEQ_LEN,
+        )
 
         amp_dtype = scorers.amp_dtype
         per_ppl: list[float]
@@ -203,6 +210,9 @@ def compute_trifluency(
             "median_rep": rep_sum["median_rep"],
             "nonword_word_pct": nw_sum["nonword_word_pct"],
             "nonword_sample_pct": nw_sum["nonword_sample_pct"],
+            "glue_token_pct": glue_sum["glue_token_pct"],
+            "glue_token_mean": glue_sum["glue_token_mean"],
+            "glue_seq_len": glue_sum["glue_seq_len"],
             "clean_ppl": clean_ppl,
             "clean_ppl_status": clean_status,
             "n_accept": n_accept,
@@ -227,6 +237,8 @@ def compute_trifluency(
                     "accept": bool(accepts[i]),
                     "nonword_word_frac": nw_fracs[i],
                     "nonword_count": nw_counts[i],
+                    "glue_token_frac": glue_fracs[i],
+                    "glue_token_n": glue_counts[i],
                     "gen_ppl": per_ppl[i],
                     "entropy": per_ent[i],
                     "cola_g": cola_per[i],
@@ -251,6 +263,7 @@ def run_trifluency(
     skip_cola: bool = False,
     skip_gen_ppl: bool = False,
     scorers: TrifluencyScorers | None = None,
+    tokenizer_name: str = "t5-small",
 ) -> dict[str, Any]:
     """对 ``texts`` 跑完整协议，写入 ``out_dir`` 的 csv/json，返回 summary。"""
     out_dir = Path(out_dir)
@@ -267,6 +280,7 @@ def run_trifluency(
         skip_cola=skip_cola,
         skip_gen_ppl=skip_gen_ppl,
         scorers=scorers,
+        tokenizer_name=tokenizer_name,
     )
     clean_status = str(summary.get("clean_ppl_status", ""))
 
@@ -280,6 +294,8 @@ def run_trifluency(
                 "accept",
                 "nonword_word_frac",
                 "nonword_count",
+                "glue_token_frac",
+                "glue_token_n",
                 "gen_ppl",
                 "entropy",
                 "cola_g",
@@ -294,6 +310,8 @@ def run_trifluency(
                     int(row["accept"]),
                     f"{row['nonword_word_frac']:.6g}",
                     row["nonword_count"],
+                    f"{row['glue_token_frac']:.6g}",
+                    row["glue_token_n"],
                     _fmt(row["gen_ppl"]),
                     _fmt(row["entropy"]),
                     _fmt(row["cola_g"]),
@@ -311,6 +329,7 @@ def run_trifluency(
     print(
         f"[trifluency] accept={summary['accept_at_human']:.3f} "
         f"nonword%={summary['nonword_word_pct']:.2f} "
+        f"glue_tok%={summary['glue_token_pct']:.3f} "
         f"clean_ppl={_fmt(summary['clean_ppl'])}({clean_status}) "
         f"cola_g={_fmt(summary['cola_g'])} "
         f"raw_ppl={_fmt(summary['raw_gen_ppl'])}",

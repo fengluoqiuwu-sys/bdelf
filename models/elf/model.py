@@ -21,7 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.elf.ace import apply_ace_steer, resolve_ace_steering
+from models.elf.ace import (
+    ace_step_active,
+    apply_ace_steer,
+    parse_ace_step_range,
+    resolve_ace_steering,
+)
 from models.elf.config import FL_ELFConfig
 from models.elf.layers import (
     BottleneckTextProj,
@@ -858,6 +863,7 @@ class _ELFBackbone(nn.Module):
             expected_dim=self.text_encoder_dim,
             backbone=self,
         )
+        ace_step_lo, ace_step_hi = parse_ace_step_range(cfg)
         t_steps = self._get_sampling_steps(num_sampling_steps, device, dtype)
         z = (
             torch.randn(
@@ -895,7 +901,11 @@ class _ELFBackbone(nn.Module):
                 )
             else:
                 raise ValueError(f"unknown sampling_method: {method}")
-            if ace_d is not None and x_pred is not None:
+            if (
+                ace_d is not None
+                and x_pred is not None
+                and ace_step_active(i, step_lo=ace_step_lo, step_hi=ace_step_hi)
+            ):
                 x_pred = apply_ace_steer(x_pred, lam=ace_lam, direction=ace_d)
             nfe += 1
 
