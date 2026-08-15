@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M1 曲线：对稀疏 opt-step 快照只评 sc0.5（ACE=off）。
-# 128 / 512 / 1k / 2k / 5k opt-step → micro 2048 / 8192 / 16000 / 32000 / 80000。
+# save_step=128 → 文件名按 2048 micro 对齐：128 / 512 / 1024 / 2048 / 5000 opt。
 # 传入 --run full/trace/<hash>。缺文件则跳过。
 set -euo pipefail
 
@@ -47,8 +47,8 @@ if [[ ! -d "$CKPT_DIR" ]]; then
   exit 1
 fi
 
-# accum=16：opt-step × 16 = checkpoint 文件名里的 micro-step。
-STEPS=(0002048 0008192 0016000 0032000 0080000)
+# accum=16 且每 128 opt 存盘：对齐到实际文件名（约 128/512/1k/2k/5k opt）。
+STEPS=(0002048 0008192 0016384 0032768 0080000)
 
 eval_one() {
   local ckpt=$1
