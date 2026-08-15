@@ -25,8 +25,13 @@ def elf_generate_latent(
     num_samples: int,
     seqlen: int,
     sampling_cfg: dict[str, Any],
+    skip_decode: bool = False,
+    bgee: bool = False,
 ) -> tuple[torch.Tensor, int, torch.Tensor]:
-    """复制 ``_ELFBackbone.generate``，始终多返回终态 ``z``。"""
+    """复制 ``_ELFBackbone.generate``，始终多返回终态 ``z``。
+
+    skip_decode：只跑去噪（拆墙钟）。bgee：每步额外跑一次 full native g。
+    """
     cfg = sampling_cfg or {}
     if seqlen > backbone.max_seq_len:
         raise ValueError(
@@ -91,6 +96,8 @@ def elf_generate_latent(
             and ace_step_active(i, step_lo=ace_step_lo, step_hi=ace_step_hi)
         ):
             x_pred = apply_ace_steer(x_pred, lam=ace_lam, direction=ace_d)
+        if bgee:
+            elf_decode_probe(backbone, z, self_cond_cfg_scale)
         nfe += 1
 
     t = float(t_steps[-2].item())
@@ -102,6 +109,13 @@ def elf_generate_latent(
     nfe += 1
     if not torch.isfinite(z).all():
         raise RuntimeError("ELF sampling produced non-finite latents")
+    if bgee:
+        elf_decode_probe(backbone, z, self_cond_cfg_scale)
+    if skip_decode:
+        dummy = torch.zeros(
+            num_samples, seqlen, dtype=torch.long, device=z.device,
+        )
+        return dummy, nfe, z
 
     tokens = backbone._decode_tokens(
         z,

@@ -587,6 +587,225 @@ def merge_m1(out_dir: Path, shards: int) -> dict[str, Any]:
     return merged
 
 
+def cuda_ms(fn):
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out = fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return out, (time.perf_counter() - t0) * 1000.0
+
+
+def _mean_std(xs: list[float]) -> dict[str, float]:
+    if not xs:
+        return {"mean": float("nan"), "std": float("nan")}
+    m = sum(xs) / len(xs)
+    var = sum((x - m) ** 2 for x in xs) / max(len(xs) - 1, 1)
+    return {"mean": m, "std": var ** 0.5}
+
+
+def run_m2_shard(
+    *,
+    args: argparse.Namespace,
+    n_local: int,
+    seed: int,
+    out_dir: Path,
+) -> dict[str, Any]:
+    """墙钟拆解：去噪 / DiT decode / unembed / ZSBD / BGEE。"""
+    device = resolve_device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = resolve_checkpoint(checkpoint=None, run=args.run)
+    _log(f"M2 load {ckpt} n={n_local} seed={seed} device={device}")
+    model, model_meta, step, train_cfg = load_model_from_checkpoint(ckpt, device)
+    dtype = resolve_dtype(device, train_cfg)
+    if model_meta["name"] == "elf":
+        from models.elf.ace import attach_ace_identity
+
+        attach_ace_identity(
+            model,
+            model_hash=Path(args.run).name,
+            step=step,
+            tokenizer=model_meta["config"].get("tokenizer") or "t5-small",
+        )
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    ema_raw = ck.get("ema")
+    ema_state = None
+    if isinstance(ema_raw, dict) and ema_raw:
+        ema_state = {k: v.to(device=device) for k, v in ema_raw.items()}
+    del ck
+    sampling_cfg = get_generate(
+        model_meta["name"], args.generate, overrides=None,
+    ).to_sampling_cfg()
+    bb = getattr(model, "backbone", model)
+    emb_norm = load_t5_emb(device, dtype)
+    repeats = max(int(getattr(args, "repeats", 5)), 2)
+    warmup = 1
+    bs = min(args.micro_bs, n_local)
+    keys = (
+        "e2e_native", "denoise", "decode_g", "decode_no_g",
+        "unembed", "zsbd", "e2e_zsbd", "e2e_bgee",
+    )
+    buckets: dict[str, list[float]] = {k: [] for k in keys}
+
+    def gen(**kw):
+        return elf_generate_latent(
+            bb,
+            num_samples=bs,
+            seqlen=args.num_tokens,
+            sampling_cfg=sampling_cfg,
+            **kw,
+        )
+
+    with swap_ema_weights(model, ema_state):
+        model.eval()
+        set_seed(seed)
+        _log(f"M2 warmup bs={bs} repeats={repeats}")
+        with torch.no_grad(), torch.amp.autocast(
+            device.type, dtype=dtype, enabled=device.type == "cuda",
+        ):
+            for w in range(warmup):
+                set_seed(seed + w)
+                gen()
+            for r in range(repeats):
+                set_seed(seed + 1000 + r)
+                (_tok, _nfe, z), ms = cuda_ms(lambda: gen())
+                buckets["e2e_native"].append(ms / bs)
+
+                set_seed(seed + 2000 + r)
+                _, ms = cuda_ms(lambda: gen(skip_decode=True))
+                buckets["denoise"].append(ms / bs)
+
+                sc = sc_cfg_tensor(bb, sampling_cfg, bs, device, z.dtype)
+                (logits, hidden), ms = cuda_ms(
+                    lambda: elf_decode_probe(bb, z, sc)
+                )
+                buckets["decode_g"].append(ms / bs)
+
+                t = torch.ones(bs, device=device, dtype=z.dtype)
+                model_in = (
+                    torch.cat([z, torch.zeros_like(z)], dim=-1)
+                    if bb.self_cond_prob > 0 else z
+                )
+
+                def _dit_no_g():
+                    return bb.net_forward(
+                        model_in, t, decoder_step_active=False,
+                        deterministic=True, self_cond_cfg_scale=sc,
+                    )
+
+                _, ms = cuda_ms(_dit_no_g)
+                buckets["decode_no_g"].append(ms / bs)
+
+                def _unembed():
+                    lg = hidden @ bb.unembed_kernel + bb.unembed_bias
+                    return lg.argmax(dim=-1)
+
+                _, ms = cuda_ms(_unembed)
+                buckets["unembed"].append(ms / bs)
+
+                _, ms = cuda_ms(lambda: zsbd_topk(z, emb_norm))
+                buckets["zsbd"].append(ms / bs)
+
+                set_seed(seed + 3000 + r)
+
+                def _e2e_zsbd():
+                    _t, _n, zz = gen(skip_decode=True)
+                    zsbd_topk(zz, emb_norm)
+                    return zz
+
+                _, ms = cuda_ms(_e2e_zsbd)
+                buckets["e2e_zsbd"].append(ms / bs)
+
+                set_seed(seed + 4000 + r)
+                _, ms = cuda_ms(lambda: gen(skip_decode=True, bgee=True))
+                buckets["e2e_bgee"].append(ms / bs)
+                _log(
+                    f"M2 r={r+1}/{repeats} e2e={buckets['e2e_native'][-1]:.2f} "
+                    f"denoise={buckets['denoise'][-1]:.2f} "
+                    f"g={buckets['decode_g'][-1]:.2f} "
+                    f"unemb={buckets['unembed'][-1]:.2f} "
+                    f"zsbd={buckets['zsbd'][-1]:.2f} ms/sample"
+                )
+
+    stats = {k: _mean_std(v) for k, v in buckets.items()}
+    e2e = stats["e2e_native"]["mean"]
+    den = stats["denoise"]["mean"]
+    unemb = stats["unembed"]["mean"]
+    zsbd_t = stats["zsbd"]["mean"]
+    skip_g = stats["e2e_zsbd"]["mean"]
+    unembed_share = unemb / e2e if e2e > 0 else float("nan")
+    speedup_skip_g = e2e / skip_g if skip_g > 0 else float("nan")
+    denoise_share = den / e2e if e2e > 0 else float("nan")
+    # C1 前置：即便门免费，端到端也要能到 ~1.3×；否则 unembed 不是瓶颈
+    bottleneck = bool(speedup_skip_g >= 1.25 or unembed_share >= 0.15)
+    summary = {
+        "shard": args.shard,
+        "n_per_repeat": bs,
+        "repeats": repeats,
+        "ms_per_sample": stats,
+        "unembed_share": unembed_share,
+        "denoise_share": denoise_share,
+        "speedup_if_skip_native_g": speedup_skip_g,
+        "unembed_is_e2e_bottleneck": bottleneck,
+        "step": int(step),
+        "run": args.run,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"shard{args.shard}_m2.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _log(
+        f"M2 shard{args.shard} e2e={e2e:.3f} denoise_share={denoise_share:.3f} "
+        f"unembed_share={unembed_share:.4f} skip_g_speedup={speedup_skip_g:.3f} "
+        f"bottleneck={bottleneck}"
+    )
+    del model, ema_state, emb_norm
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return summary
+
+
+def merge_m2(out_dir: Path, shards: int) -> dict[str, Any]:
+    rows = []
+    for i in range(shards):
+        rows.append(json.loads((out_dir / f"shard{i}_m2.json").read_text(encoding="utf-8")))
+    keys = rows[0]["ms_per_sample"].keys()
+    ms = {
+        k: _mean_std([r["ms_per_sample"][k]["mean"] for r in rows])
+        for k in keys
+    }
+    e2e = ms["e2e_native"]["mean"]
+    skip = ms["e2e_zsbd"]["mean"]
+    unemb = ms["unembed"]["mean"]
+    den = ms["denoise"]["mean"]
+    speedup = e2e / skip if skip > 0 else float("nan")
+    unembed_share = unemb / e2e if e2e > 0 else float("nan")
+    denoise_share = den / e2e if e2e > 0 else float("nan")
+    bottleneck = bool(speedup >= 1.25 or unembed_share >= 0.15)
+    merged = {
+        "shards": shards,
+        "ms_per_sample": ms,
+        "unembed_share": unembed_share,
+        "denoise_share": denoise_share,
+        "speedup_if_skip_native_g": speedup,
+        "unembed_is_e2e_bottleneck": bottleneck,
+        "c1_prefail": (not bottleneck),
+        "verdict": (
+            "unembed(+softmax) 是端到端可测瓶颈"
+            if bottleneck
+            else "unembed(+softmax) 不是端到端瓶颈（去噪 NFE 占主导）"
+        ),
+        "shards_detail": rows,
+    }
+    (out_dir / "summary.json").write_text(
+        json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _log(f"M2 merge {merged['verdict']} speedup={speedup:.3f} denoise_share={denoise_share:.3f}")
+    return merged
+
+
 def spawn_workers(args: argparse.Namespace, gpus: list[int]) -> int:
     counts = shard_counts(args.num_samples, len(gpus))
     procs: list[subprocess.Popen] = []
@@ -606,6 +825,7 @@ def spawn_workers(args: argparse.Namespace, gpus: list[int]) -> int:
             "--micro-bs", str(args.micro_bs),
             "--seed", str(args.seed + i * 1_000_003),
             "--generate", args.generate,
+            "--repeats", str(getattr(args, "repeats", 5)),
             "--out", args.out,
             "--shard", str(i),
             "--shards", str(len(gpus)),
@@ -624,7 +844,7 @@ def spawn_workers(args: argparse.Namespace, gpus: list[int]) -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="I-1 hybrid readout M0/M1 probe")
     p.add_argument("--run", default="full/elf/official-owt-b")
-    p.add_argument("--stage", default="m0m1", choices=("m0", "m1", "m0m1"))
+    p.add_argument("--stage", default="m0m1", choices=("m0", "m1", "m0m1", "m2"))
     p.add_argument("--num-samples", type=int, default=1024)
     p.add_argument("--num-tokens", type=int, default=1024)
     p.add_argument("--micro-bs", type=int, default=16)
@@ -633,7 +853,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="temp/auto-research/hybrid-i1")
     p.add_argument("--shard", type=int, default=None)
     p.add_argument("--shards", type=int, default=None)
-    p.add_argument("--worker", action="store_true")
+    p.add_argument("--repeats", type=int, default=5)
     return p.parse_args()
 
 
@@ -641,8 +861,12 @@ def main() -> int:
     args = parse_args()
     out = Path(args.out)
     m0_dir = out / "m0"
-    m0_dir.mkdir(parents=True, exist_ok=True)
+    m2_dir = out / "m2"
     gpus = visible_gpu_ids()
+    if args.stage == "m2":
+        m2_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        m0_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.worker and args.shard is None and len(gpus) > 1:
         _log(f"parent spawn on gpus={gpus} stage={args.stage}")
@@ -650,6 +874,17 @@ def main() -> int:
         if rc != 0:
             _log(f"worker failed rc={rc}")
             return rc
+        if args.stage == "m2":
+            merged = merge_m2(m2_dir, len(gpus))
+            (out / "STATUS.md").write_text(
+                f"# hybrid-i1 status {_now()}\n\n"
+                f"M2: {merged['verdict']}\n"
+                f"speedup_if_skip_g={merged['speedup_if_skip_native_g']:.3f}\n"
+                f"denoise_share={merged['denoise_share']:.3f}\n"
+                f"c1_prefail={merged['c1_prefail']}\n",
+                encoding="utf-8",
+            )
+            return 0
         m0 = merge_m0(m0_dir, len(gpus))
         if args.stage in ("m1", "m0m1"):
             merge_m1(m0_dir, len(gpus))
@@ -665,6 +900,19 @@ def main() -> int:
     if args.shard is None:
         args.shard = 0
         args.shards = 1
+    if args.stage == "m2":
+        run_m2_shard(
+            args=args, n_local=args.num_samples, seed=args.seed, out_dir=m2_dir,
+        )
+        if not args.worker:
+            merged = merge_m2(m2_dir, 1)
+            (out / "STATUS.md").write_text(
+                f"# hybrid-i1 status {_now()}\n\n"
+                f"M2: {merged['verdict']}\n"
+                f"c1_prefail={merged['c1_prefail']}\n",
+                encoding="utf-8",
+            )
+        return 0
     m0 = run_m0_shard(
         args=args,
         n_local=args.num_samples,
