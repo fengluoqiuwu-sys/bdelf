@@ -277,8 +277,7 @@ class _ELFBackbone(nn.Module):
         deterministic: bool = True,
         attention_mask: Optional[torch.Tensor] = None,
         self_cond_cfg_scale: torch.Tensor | None = None,
-        return_decode_hidden: bool = False,  # True 时多返回 512-d unembed 前 hidden
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]] | tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """``x`` is (B, S, C) or (B, S, 2C) with self-conditioning.
 
         ``self_cond_cfg_scale`` is an optional (B,) SC-CFG scale prepended as
@@ -344,7 +343,6 @@ class _ELFBackbone(nn.Module):
 
         with torch.amp.autocast("cuda", enabled=False):
             decoder_logits = None
-            hidden = None
             # Official: whenever decoder_step_active is provided (incl. a (B,)
             # tensor that may be all zeros), always run the unembed head so
             # mixed-branch DDP never sees unused parameters.
@@ -356,8 +354,6 @@ class _ELFBackbone(nn.Module):
                 )
                 decoder_logits = hidden @ self.unembed_kernel + self.unembed_bias
             x_pred = self.final_layer(x_h.to(dtype=param_dtype))
-        if return_decode_hidden:
-            return x_pred, decoder_logits, hidden
         return x_pred, decoder_logits
 
     # ------------------------------------------------------------------
@@ -833,8 +829,7 @@ class _ELFBackbone(nn.Module):
         bos_token_id: int | None = None,
         prefix_tokens: torch.Tensor | None = None,
         sampling_cfg: dict | None = None,
-        return_latent: bool = False,  # True 时多返回终态 z（探针；默认行为不变）
-    ) -> tuple[torch.Tensor, int] | tuple[torch.Tensor, int, torch.Tensor]:
+    ) -> tuple[torch.Tensor, int]:
         del bos_token_id, prefix_tokens  # unconditional ELF
         cfg = sampling_cfg or {}
         if seqlen is None:
@@ -936,8 +931,6 @@ class _ELFBackbone(nn.Module):
             eos_token_id=self.token_layout.eos_token_id,
             pad_token_id=self.token_layout.pad_token_id,
         )
-        if return_latent:
-            return tokens, nfe, z
         return tokens, nfe
 
 

@@ -23,6 +23,8 @@ import torch.nn.functional as F
 import repo_env
 
 ROOT = repo_env.ensure_repo_root()
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
 
 import hf_config  # noqa: F401
 from eval.gen_ppl import score_texts
@@ -33,6 +35,7 @@ from generate import (
     resolve_dtype,
     set_seed,
 )
+from hybrid_readout_elf import elf_decode_probe, elf_generate_latent
 from models.elf.t5_encoder import ensure_t5_encoder_cached
 from tokenizer import get_tokenizer
 from train.ema import swap_ema_weights
@@ -284,26 +287,13 @@ def run_m0_shard(
             with torch.no_grad(), torch.amp.autocast(
                 device.type, dtype=dtype, enabled=device.type == "cuda",
             ):
-                tokens, _nfe, z = model.generate(
+                _tokens, _nfe, z = elf_generate_latent(
+                    bb,
                     num_samples=bs,
                     seqlen=args.num_tokens,
                     sampling_cfg=sampling_cfg,
-                    return_latent=True,
                 )
-                t = torch.ones(bs, device=device, dtype=z.dtype)
-                if bb.self_cond_prob > 0:
-                    model_in = torch.cat([z, torch.zeros_like(z)], dim=-1)
-                else:
-                    model_in = z
-                _xp, logits, hidden = bb.net_forward(
-                    model_in,
-                    t,
-                    decoder_step_active=True,
-                    deterministic=True,
-                    self_cond_cfg_scale=sc,
-                    return_decode_hidden=True,
-                )
-            assert logits is not None and hidden is not None
+                logits, hidden = elf_decode_probe(bb, z, sc)
             top2 = logits.float().topk(2, dim=-1)
             native = top2.indices[..., 0]
             margin = top2.values[..., 0] - top2.values[..., 1]
