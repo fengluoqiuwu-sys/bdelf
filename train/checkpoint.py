@@ -158,3 +158,48 @@ def load_checkpoint(
         if "cuda" in rng and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(rng["cuda"])
     return int(ck["step"]), ema_state
+
+
+def load_init_weights(
+    path: Path,
+    model: nn.Module,
+    device: torch.device,
+) -> tuple[dict[str, torch.Tensor] | None, dict[str, Any]]:
+    """从另一 run 的 ckpt **只加载权重**（及可选 EMA），不恢复优化器 / step / RNG。
+
+    允许源 ``model`` 名不同（如 ELF → TrACE）；``strict=False`` 以容纳
+    新增 buffer（``attr_d`` 等）。训练从 step 0 开始，写入新 hash 目录。
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"init-ckpt 不存在: {path}")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    raw = unwrap_model(model)
+    src = ck.get("model")
+    if not isinstance(src, dict) or not src:
+        raise ValueError(f"{path}: checkpoint 无 model 权重")
+    dst_keys = set(raw.state_dict().keys())
+    n_overlap = sum(1 for k in src if k in dst_keys)
+    if n_overlap < 1:
+        raise ValueError(
+            f"{path}: 与当前模型没有任何同名权重 "
+            f"(src={len(src)} keys, dst={len(dst_keys)} keys)"
+        )
+    incompatible = raw.load_state_dict(src, strict=False)
+    saved_cfg = ck.get("train_config") or {}
+    saved_meta = ck.get("model_meta") or {}
+    info: dict[str, Any] = {
+        "path": str(path),
+        "src_step": int(ck.get("step", -1)),
+        "src_run": saved_cfg.get("name"),
+        "src_model": saved_meta.get("name"),
+        "n_src": len(src),
+        "n_overlap": n_overlap,
+        "missing": list(incompatible.missing_keys),
+        "unexpected": list(incompatible.unexpected_keys),
+    }
+    ema_raw = ck.get("ema")
+    ema_loaded: dict[str, torch.Tensor] | None = None
+    if isinstance(ema_raw, dict) and ema_raw:
+        ema_loaded = {k: v.to(device=device) for k, v in ema_raw.items()}
+    return ema_loaded, info

@@ -53,7 +53,12 @@ from train.batching import (
     fetch_train_batch,
     shard_eval_dataset,
 )
-from train.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
+from train.checkpoint import (
+    load_checkpoint,
+    load_init_weights,
+    save_checkpoint,
+    unwrap_model,
+)
 from train.ema import ema_update, init_ema, swap_ema_weights
 from train.eval import (
     eval_model_ppl,
@@ -632,6 +637,55 @@ def train_loop(
                     f"Reached max_steps={cfg.max_steps}; training is already complete"
                 )
             return
+    else:
+        init_spec = cfg.extra.get("init_ckpt")
+        if init_spec:
+            repo = Path(__file__).resolve().parent
+            init_path = Path(str(init_spec))
+            if not init_path.is_absolute():
+                init_path = (repo / init_path).resolve()
+            init_path = _stage_ckpt_to_local(
+                init_path, rank=rank, is_distributed=is_distributed,
+            )
+            loaded_ema, init_info = load_init_weights(init_path, model, device)
+            if ema_state is not None:
+                if loaded_ema:
+                    n_ema = 0
+                    for k, v in loaded_ema.items():
+                        if k in ema_state:
+                            ema_state[k].copy_(v.to(device=ema_state[k].device))
+                            n_ema += 1
+                    if rank == 0:
+                        _train_log(
+                            f"init-ckpt EMA 覆盖: {n_ema}/{len(ema_state)} 键"
+                        )
+                elif rank == 0:
+                    _train_log("init-ckpt 无 EMA；已用加载后的模型权重重建 EMA")
+                    ema_state = init_ema(model)
+            if rank == 0:
+                miss = init_info["missing"]
+                unexp = init_info["unexpected"]
+                _train_log(
+                    f"init-ckpt: {init_info['path']} "
+                    f"(src_model={init_info['src_model']!r} "
+                    f"src_run={init_info['src_run']!r} "
+                    f"src_step={init_info['src_step']}) "
+                    f"overlap={init_info['n_overlap']}/{init_info['n_src']} "
+                    f"missing={len(miss)} unexpected={len(unexp)}"
+                )
+                if miss:
+                    _train_log(
+                        "init-ckpt missing (ok if new buffers): "
+                        + ", ".join(miss[:12])
+                        + (" ..." if len(miss) > 12 else "")
+                    )
+                if unexp:
+                    _train_log(
+                        "init-ckpt unexpected: "
+                        + ", ".join(unexp[:12])
+                        + (" ..." if len(unexp) > 12 else "")
+                    )
+            step = 0
 
     if is_distributed:
         dist.barrier()
@@ -1090,7 +1144,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Train configs: 100m-{fast,full}\n"
             "Generate configs: config/generate/<model>/<name>.yaml\n"
             "Overrides: --set section.key=value "
-            "(sections: optimizer, batch, schedule, eval, generate, model)"
+            "(sections: optimizer, batch, schedule, eval, generate, model, extra)"
         ),
     )
     parser.add_argument(
@@ -1133,7 +1187,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Override a train hyperparameter after loading YAML "
             "(repeatable). Examples: optimizer.learning_rate=1e-3, "
             "batch.batch_size=16, schedule.target_tokens=1e9, "
-            "eval.gen_eval_samples=64, generate.temperature=0.8"
+            "eval.gen_eval_samples=64, generate.temperature=0.8, "
+            "extra.init_ckpt=cache/checkpoints/full/elf/<hash>/checkpoint_latest.pt"
+        ),
+    )
+    parser.add_argument(
+        "--init-ckpt",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load model(+EMA) weights from another run and start a new hash "
+            "(does not restore optimizer/step/RNG). Equivalent to "
+            "--set extra.init_ckpt=PATH. Path relative to repo root."
         ),
     )
     parser.add_argument(
@@ -1176,6 +1241,27 @@ def apply_cuda_visible_devices(gpus: str | None) -> list[int] | None:
         raise SystemExit(f"--gpus 有重复卡号: {gpus!r}")
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ids)
     return ids
+
+
+def _normalize_init_ckpt(spec: str) -> str:
+    """把 ``--init-ckpt`` 收成相对仓库根的 posix 路径（进指纹）。
+
+    相对路径 **不** ``resolve()`` 软链，避免 ``cache → /mnt/...`` 把绝对路径写进 hash。
+    """
+    repo = Path(__file__).resolve().parent
+    raw = spec.strip().replace("\\", "/")
+    if not raw:
+        raise SystemExit("--init-ckpt 不能为空")
+    p = Path(raw)
+    if p.is_absolute():
+        try:
+            return p.resolve().relative_to(repo).as_posix()
+        except ValueError:
+            return str(p)
+    cand = repo / raw
+    if not cand.is_file():
+        raise SystemExit(f"--init-ckpt 不存在: {cand}")
+    return Path(raw).as_posix()
 
 
 def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
@@ -1237,6 +1323,16 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         overrides = parse_train_overrides(args.overrides)
     except ValueError as exc:
         raise SystemExit(f"Invalid --set override: {exc}") from exc
+
+    if getattr(args, "init_ckpt", None):
+        rel = _normalize_init_ckpt(args.init_ckpt)
+        extra_ov = overrides.setdefault("extra", {})
+        prev = extra_ov.get("init_ckpt")
+        if prev not in (None, rel):
+            raise SystemExit(
+                f"--init-ckpt={rel!r} 与 --set extra.init_ckpt={prev!r} 冲突"
+            )
+        extra_ov["init_ckpt"] = rel
 
     try:
         launch_world_size = _resolve_launch_world_size()

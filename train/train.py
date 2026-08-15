@@ -255,7 +255,7 @@ def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
 
 
 _OVERRIDE_SECTIONS = frozenset(
-    {"optimizer", "batch", "schedule", "eval", "generate", "model"}
+    {"optimizer", "batch", "schedule", "eval", "generate", "model", "extra"}
 )
 
 
@@ -263,8 +263,9 @@ def parse_train_overrides(items: list[str] | None) -> dict[str, dict[str, Any]]:
     """Parse CLI ``section.key=value`` overrides into nested dicts.
 
     Values are parsed with ``yaml.safe_load`` (so ``1e-3``, ``true``, ``null`` work).
-    Allowed sections: optimizer, batch, schedule, eval, generate, model.
+    Allowed sections: optimizer, batch, schedule, eval, generate, model, extra.
     ``model.*`` 覆盖 ``config/models/<model>/<size>.yaml`` 键（进指纹）。
+    ``extra.init_ckpt`` 为跨 run 初始化权重路径（进指纹；不恢复优化器）。
     """
     if not items:
         return {}
@@ -533,8 +534,9 @@ def compose_train_config(
       - generate ← ``config/generate/<model>/<generate>.yaml``
 
     ``overrides`` may contain ``optimizer`` / ``batch`` / ``schedule`` /
-    ``eval`` / ``generate`` / ``model`` dicts applied before dataclass
-    validation（CLI ``--set section.key=value``；``model.*`` 覆盖架构 YAML）。
+    ``eval`` / ``generate`` / ``model`` / ``extra`` dicts applied before dataclass
+    validation（CLI ``--set section.key=value``；``model.*`` 覆盖架构 YAML；
+    ``extra.init_ckpt`` 跨 run 加载权重）。
 
     ``dataset`` / ``preprocess`` / ``generate`` are supplied at launch
     (not from the train recipe yaml).
@@ -655,6 +657,7 @@ def compose_train_config(
         schedule.extra,
         eval_cfg.extra,
         batch.extra,
+        dict(ov.get("extra") or {}),
         {
             "chunk_length": chunk_length,
             "tokens_per_optimizer_step": tokens_per_step,

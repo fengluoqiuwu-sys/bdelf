@@ -1,0 +1,19 @@
+# =============================================================================
+# TriFluency 多组 generate 扫参表
+# =============================================================================
+_doc: TrACE 主表 SC（ACE=off）；M3 / 端点评测  # 文件说明
+name: trace-sc  # 表名；非 prototype 时与文件名一致
+generate: eval  # 基线 generate 配置名（config/generate/<model>/）
+num_samples: 1024  # 每组无条件样本数
+num_tokens: 1024  # 每样本生成长度
+seed: 42  # 各组共用基 seed（micro batch k 仍用 seed+k*100003）
+runs:  # 多组相对基线的覆盖（等价多次 --set）；至少一项
+  - name: sc0.5  # 本组显示名；写入 results.csv，不进 generate-hash
+    self_cond_cfg_scale: 0.5  # FAR-SC / self-cond CFG 缩放
+    ace: false  # ACE：false/0 关闭；true≡λ=2
+  - name: sc1  # 本组显示名；写入 results.csv，不进 generate-hash
+    self_cond_cfg_scale: 1.0  # FAR-SC / self-cond CFG 缩放
+    ace: false  # ACE：false/0 关闭；true≡λ=2
+  - name: sc3  # 本组显示名；写入 results.csv，不进 generate-hash
+    self_cond_cfg_scale: 3.0  # FAR-SC / self-cond CFG 缩放
+    ace: false  # ACE：false/0 关闭；true≡λ=2
