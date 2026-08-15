@@ -41,6 +41,8 @@ class FL_BDELFConfig(PretrainedConfig):
             "t_eps",
             "time_schedule",
             "fix_bos",
+            "freeze_wte",
+            "wte_init",
         }
     )
 
@@ -73,13 +75,15 @@ class FL_BDELFConfig(PretrainedConfig):
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         denoiser_noise_scale: float = 2.0,
-        decoder_prob: float = 0.2,
+        decoder_prob: float = 0.5,
         decoder_p_mean: float = 0.8,
         decoder_p_std: float = 0.8,
         decoder_noise_scale: float = 5.0,
         t_eps: float = 0.05,
         time_schedule: str = "logit_normal",
         fix_bos: bool = True,
+        freeze_wte: bool = True,
+        wte_init: str = "gpt2",
         sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -120,6 +124,8 @@ class FL_BDELFConfig(PretrainedConfig):
         self.t_eps = t_eps
         self.time_schedule = time_schedule
         self.fix_bos = fix_bos
+        self.freeze_wte = freeze_wte
+        self.wte_init = wte_init
         self.sampling = sampling or {}
 
     def token_layout(self) -> FL_TokenLayout:
@@ -161,6 +167,8 @@ class FL_BDELFConfig(PretrainedConfig):
             "t_eps": self.t_eps,
             "time_schedule": self.time_schedule,
             "fix_bos": self.fix_bos,
+            "freeze_wte": self.freeze_wte,
+            "wte_init": self.wte_init,
         }
 
 
@@ -176,7 +184,7 @@ class FlowSamplingConfig:
     use_fast_infer: bool = True
     temperature: float = 1.0
     top_k: int | None = None
-    self_cond_cfg_scale: float = 3.0
+    self_cond_cfg_scale: float = 1.0
 
     @classmethod
     def from_dict(cls, cfg: dict) -> FlowSamplingConfig:

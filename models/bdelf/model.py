@@ -2,14 +2,16 @@
 
 Within the BD3LM block-diffusion attention framework, continuous flow matching
 in a **token embedding** latent（非双向 T5，避免前文泄漏未来）:
-  - x0 = normalize(wte[token])；与 unembed 解耦（factored head）
+  - x0 = normalize(wte[token])；默认冻结 GPT-2 表，与 unembed 解耦
+  - 训练与推理同构：过去块干净、当前块加噪（x0 半段= z）、未来块为 0；只监督当前块
   - Conditioning: in-context time / mode / SC-CFG tokens
-  - Training: emb 查表 → per-example denoise MSE + decode CE mix + SC-CFG
+  - Training: 当前块 denoise MSE + decode CE mix
   - Inference: semi-AR per-block ODE；完成后文写回 wte[采样 token]
 
 References:
   - Block Diffusion: https://arxiv.org/abs/2503.09573
   - ELF: https://arxiv.org/abs/2605.10938
+  - Cola DLM: https://arxiv.org/abs/2605.06548
 """
 
 from __future__ import annotations
@@ -39,6 +41,11 @@ from models.model import (
   split_model_cfg,
 )
 from models.rope import pair_positions
+from models.hf_model import (
+  download_hf_model,
+  is_hf_model_cached,
+  resolve_hf_model_cache_path,
+)
 from models.tokens import FL_TokenLayout, apply_token_layout_to_config, token_layout_from_cfg
 
 try:
@@ -47,6 +54,28 @@ try:
   _FLEX_IMPORT_OK = True
 except ImportError:
   _FLEX_IMPORT_OK = False
+
+
+def _load_gpt2_wte(vocab_size: int, dim: int) -> torch.Tensor:
+  """加载 GPT-2 输入 embedding，投影到 ``dim``；多出的特殊符号用均值填充。"""
+  import hf_config  # noqa: F401
+  from safetensors.torch import load_file
+
+  cache_dir = resolve_hf_model_cache_path("gpt2")
+  if not is_hf_model_cached("gpt2", cache_dir):
+    cache_dir = download_hf_model("gpt2")
+  src = load_file(str(cache_dir / "model.safetensors"))["wte.weight"].float()
+  if src.size(1) != dim:
+    g = torch.Generator(device="cpu").manual_seed(0)
+    proj = torch.randn(src.size(1), dim, generator=g)
+    proj = proj / proj.norm(dim=0, keepdim=True).clamp(min=1e-8)
+    src = src @ proj
+  table = src.new_zeros(vocab_size, dim)
+  n = min(vocab_size, src.size(0))
+  table[:n] = src[:n]
+  if vocab_size > src.size(0):
+    table[src.size(0):] = src.mean(dim=0)
+  return table
 
 
 def block_diff_mask_with_prefix(
@@ -238,6 +267,8 @@ class _BDELFBackbone(nn.Module):
     t_eps: float = 0.05,
     time_schedule: str = "logit_normal",
     fix_bos: bool = True,
+    freeze_wte: bool = True,
+    wte_init: str = "gpt2",
   ) -> None:
     super().__init__()
     if attn_backend == "flex" and not FLEX_ATTN_AVAILABLE:
@@ -275,8 +306,10 @@ class _BDELFBackbone(nn.Module):
     self.decoder_noise_scale = decoder_noise_scale
     self.t_eps = t_eps
     self.time_schedule = time_schedule
+    self.freeze_wte = freeze_wte
+    self.wte_init = wte_init
 
-    # 可学习 token emb → flow 空间；与 unembed 解耦，避免 CE 抄表崩塌。
+    # 可学习或冻结的 token emb → flow 空间；与 unembed 解耦。
     self.wte = nn.Embedding(token_layout.vocab_size, text_encoder_dim)
 
     self.drop = nn.Dropout(dropout)
@@ -330,7 +363,7 @@ class _BDELFBackbone(nn.Module):
 
     self.apply(self._init_weights)
     # FinalLayer / unembed / wte 已在构造里设好，勿被 _init_weights 覆盖。
-    nn.init.normal_(self.wte.weight, mean=latent_mean, std=max(float(latent_std), 1e-8))
+    self._init_wte_table()
     nn.init.zeros_(self.final_layer.linear.weight)
     nn.init.zeros_(self.final_layer.linear.bias)
     nn.init.xavier_uniform_(self.proj_kernel)
@@ -370,6 +403,25 @@ class _BDELFBackbone(nn.Module):
         torch.nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+  def _init_wte_table(self) -> None:
+    """GPT-2 冻结表或随机初始化；冻结时用表统计量做归一化。"""
+    init = str(self.wte_init).lower()
+    if init not in ("gpt2", "random"):
+      raise ValueError(f"unknown wte_init: {self.wte_init}")
+    if init == "gpt2":
+      table = _load_gpt2_wte(self.vocab_size, self.text_encoder_dim)
+      self.wte.weight.data.copy_(table.to(dtype=self.wte.weight.dtype))
+      self.latent_mean = float(table.mean().item())
+      self.latent_std = float(table.std().clamp(min=1e-8).item())
+    else:
+      nn.init.normal_(
+        self.wte.weight,
+        mean=self.latent_mean,
+        std=max(float(self.latent_std), 1e-8),
+      )
+    if self.freeze_wte:
+      self.wte.weight.requires_grad_(False)
 
   def encode_tokens(
     self,
@@ -578,71 +630,118 @@ class _BDELFBackbone(nn.Module):
       z[:, 0] = x0_emb[:, 0]
     return z
 
+  def _current_block_masks(
+    self, batch_size: int, seq_len: int, device: torch.device,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """每条样本抽一个当前块；返回 (cur, future) 布尔掩码 (B, L)。"""
+    n_blocks = max(1, seq_len // self.diffusion_block_size)
+    b_cur = torch.randint(0, n_blocks, (batch_size, 1), device=device)
+    block_of = torch.arange(seq_len, device=device) // self.diffusion_block_size
+    cur = block_of.unsqueeze(0) == b_cur
+    future = block_of.unsqueeze(0) > b_cur
+    return cur, future
+
+  def _assemble_aligned(
+    self,
+    x0_emb: torch.Tensor,
+    z_current: torch.Tensor,
+    cur: torch.Tensor,
+    future: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """推理同构 pair：过去=GT，当前=z_current，未来=0。"""
+    cur3 = cur.unsqueeze(-1)
+    fut3 = future.unsqueeze(-1)
+    z = torch.where(cur3, z_current, x0_emb)
+    z = torch.where(fut3, torch.zeros_like(z), z)
+    if self.fix_bos:
+      z = z.clone()
+      bos_cur = cur[:, 0].unsqueeze(-1)
+      z[:, 0] = torch.where(bos_cur, x0_emb[:, 0], z[:, 0])
+    x0_ctx = torch.where(cur3, z.detach(), x0_emb)
+    x0_ctx = torch.where(fut3, torch.zeros_like(x0_ctx), x0_ctx)
+    return z, x0_ctx
+
+  def _token_valid_mask(
+    self, tokens: torch.Tensor, dtype: torch.dtype,
+  ) -> torch.Tensor:
+    valid = (tokens != self.token_layout.ignore_index).to(dtype=dtype)
+    if self.token_layout.pad_token_id is not None:
+      valid = valid * (tokens != self.token_layout.pad_token_id).to(dtype=dtype)
+    return valid
+
   def _denoise_loss(self, x0_emb: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-    del tokens
-    bsz = x0_emb.shape[0]
-    t = self._sample_train_t(bsz, x0_emb.device).to(dtype=x0_emb.dtype)
+    bsz, seq_len, _ = x0_emb.shape
+    device = x0_emb.device
+    dtype = x0_emb.dtype
+    cur, future = self._current_block_masks(bsz, seq_len, device)
+    t = self._sample_train_t(bsz, device).to(dtype=dtype)
     t_exp = t[:, None, None]
     noise = torch.randn_like(x0_emb) * self.denoiser_noise_scale
-    z_t = t_exp * x0_emb + (1.0 - t_exp) * noise
-    z_t = self._fix_bos_emb(z_t, x0_emb)
+    z_t_cur = t_exp * x0_emb + (1.0 - t_exp) * noise
+    z_t, x0_ctx = self._assemble_aligned(x0_emb, z_t_cur, cur, future)
     v_target = (x0_emb - z_t) / torch.clamp(1.0 - t_exp, min=self.t_eps)
 
     if self.self_cond_prob > 0:
       use_sc = (
-        (torch.rand((bsz,), device=x0_emb.device, dtype=x0_emb.dtype) < self.self_cond_prob)
+        (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
         .reshape(-1, 1, 1)
-        .to(dtype=x0_emb.dtype)
+        .to(dtype=dtype)
       )
       with torch.no_grad():
         z_in0 = self._apply_self_cond(z_t, None)
-        pair0 = self._embed_continuous_pair(z_in0, x0_emb)
+        pair0 = self._embed_continuous_pair(z_in0, x0_ctx)
         x_init, _ = self._backbone(pair0, t, decode=False)
-      sc_half = x_init.detach() * use_sc
+      sc_half = x_init.detach() * use_sc * cur.unsqueeze(-1)
       z_in = self._apply_self_cond(z_t, sc_half)
     else:
       z_in = z_t
 
-    pair = self._embed_continuous_pair(z_in, x0_emb)
+    pair = self._embed_continuous_pair(z_in, x0_ctx)
     x_pred, _ = self._backbone(pair, t, decode=False)
     v_pred = self._x_to_v(x_pred, z_t, t)
-    return ((v_pred - v_target) ** 2).mean()
+    l2 = ((v_pred - v_target) ** 2).mean(dim=-1)
+    valid = self._token_valid_mask(tokens, l2.dtype) * cur.to(dtype=l2.dtype)
+    return (l2 * valid).sum() / valid.sum().clamp(min=1.0)
 
   def _decode_loss(self, x0_emb: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
     bsz, seq_len, _ = x0_emb.shape
+    device = x0_emb.device
+    dtype = x0_emb.dtype
+    cur, future = self._current_block_masks(bsz, seq_len, device)
     lam = torch.sigmoid(
-      torch.randn(bsz, seq_len, 1, device=x0_emb.device, dtype=x0_emb.dtype)
+      torch.randn(bsz, seq_len, 1, device=device, dtype=dtype)
       * self.decoder_p_std
       + self.decoder_p_mean
     )
     noise = torch.randn_like(x0_emb) * self.decoder_noise_scale
-    z_tilde = lam * x0_emb + (1.0 - lam) * noise
-    z_tilde = self._fix_bos_emb(z_tilde, x0_emb)
-    t = torch.ones(bsz, device=x0_emb.device, dtype=x0_emb.dtype)
+    z_tilde_cur = lam * x0_emb + (1.0 - lam) * noise
+    z_tilde, x0_ctx = self._assemble_aligned(x0_emb, z_tilde_cur, cur, future)
+    t = torch.ones(bsz, device=device, dtype=dtype)
     z_in = self._apply_self_cond(z_tilde, None)
-    pair = self._embed_continuous_pair(z_in, x0_emb)
+    pair = self._embed_continuous_pair(z_in, x0_ctx)
     _, logits = self._backbone(pair, t, decode=True)
     assert logits is not None
-    return F.cross_entropy(
-      logits.reshape(-1, self.vocab_size),
-      tokens.reshape(-1),
-      ignore_index=self.token_layout.ignore_index,
-    )
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    ce = -log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+    valid = self._token_valid_mask(tokens, ce.dtype) * cur.to(dtype=ce.dtype)
+    return (ce * valid).sum() / valid.sum().clamp(min=1.0)
 
   def _mixed_branch_loss(
     self, x0_emb: torch.Tensor, tokens: torch.Tensor,
   ) -> torch.Tensor:
-    """Per-example denoise/decode mix + training-time SC-CFG（对齐 ELF）。"""
+    """当前块 denoise/decode 混合；pair 与推理同构（过去干净 / 当前=z / 未来 0）。"""
     bsz, seq_len, _ = x0_emb.shape
     device = x0_emb.device
     dtype = x0_emb.dtype
+    cur, future = self._current_block_masks(bsz, seq_len, device)
+    cur3 = cur.unsqueeze(-1)
 
     t = self._sample_train_t(bsz, device).to(dtype=dtype)
     noise = torch.randn_like(x0_emb) * self.denoiser_noise_scale
     t_exp = t.reshape(-1, 1, 1)
-    denoiser_z = t_exp * x0_emb + (1.0 - t_exp) * noise
-    denoiser_z = self._fix_bos_emb(denoiser_z, x0_emb)
-    v_target = (x0_emb - denoiser_z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
+    denoiser_z_cur = t_exp * x0_emb + (1.0 - t_exp) * noise
+    den_z, den_x0 = self._assemble_aligned(x0_emb, denoiser_z_cur, cur, future)
+    v_target = (x0_emb - den_z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
 
     decoder_step_active = torch.bernoulli(
       torch.full((bsz,), self.decoder_prob, dtype=torch.float32, device=device),
@@ -656,15 +755,14 @@ class _BDELFBackbone(nn.Module):
       + self.decoder_p_mean
     )
     decoder_noise = torch.randn_like(x0_emb) * self.decoder_noise_scale
-    decoder_z = decoder_lam * x0_emb + (1.0 - decoder_lam) * decoder_noise
-    decoder_z = self._fix_bos_emb(decoder_z, x0_emb)
+    decoder_z_cur = decoder_lam * x0_emb + (1.0 - decoder_lam) * decoder_noise
 
     decoder_t = torch.ones_like(t)
     t_mixed = decoder_step_active * decoder_t + (1.0 - decoder_step_active) * t
-    z_mixed = decoder_mask_b11 * decoder_z + (1.0 - decoder_mask_b11) * denoiser_z
+    z_mixed_cur = decoder_mask_b11 * decoder_z_cur + (1.0 - decoder_mask_b11) * denoiser_z_cur
 
     self_cond_cfg: torch.Tensor | None = None
-    sc_half = torch.zeros_like(denoiser_z)
+    sc_half = torch.zeros_like(den_z)
 
     if self.num_self_cond_cfg_tokens > 0:
       self_cond_cfg = self._sample_cfg_scale(bsz, device)
@@ -674,28 +772,28 @@ class _BDELFBackbone(nn.Module):
         .to(dtype=dtype)
       )
       with torch.no_grad():
-        z_in0 = self._apply_self_cond(denoiser_z, None)
-        pair0 = self._embed_continuous_pair(z_in0, x0_emb)
+        z_in0 = self._apply_self_cond(den_z, None)
+        pair0 = self._embed_continuous_pair(z_in0, den_x0)
         x_init, _ = self._backbone(
           pair0, t, decode=False, self_cond_cfg_scale=self_cond_cfg,
         )
-      v_uncond = self._x_to_v(x_init, denoiser_z, t)
+      v_uncond = self._x_to_v(x_init, den_z, t)
       x_uncond = x_init.detach()
       with torch.no_grad():
-        z_in1 = self._apply_self_cond(denoiser_z, x_uncond)
-        pair1 = self._embed_continuous_pair(z_in1, x0_emb)
+        z_in1 = self._apply_self_cond(den_z, x_uncond)
+        pair1 = self._embed_continuous_pair(z_in1, den_x0)
         x_cond, _ = self._backbone(
           pair1, t, decode=False, self_cond_cfg_scale=self_cond_cfg,
         )
-      v_cond = self._x_to_v(x_cond, denoiser_z, t)
+      v_cond = self._x_to_v(x_cond, den_z, t)
 
       sc_w = self_cond_cfg.reshape(-1, 1, 1)
       sc_guidance = (1.0 - 1.0 / sc_w) * (v_cond - v_uncond)
       sc_guidance = torch.where(
-        use_sc.bool(), sc_guidance, torch.zeros_like(sc_guidance),
+        use_sc.bool() & cur3, sc_guidance, torch.zeros_like(sc_guidance),
       )
       v_target = (v_target + sc_guidance).detach()
-      sc_half = x_uncond * use_sc * (1.0 - decoder_mask_b11)
+      sc_half = x_uncond * use_sc * (1.0 - decoder_mask_b11) * cur3
     elif self.self_cond_prob > 0:
       use_sc = (
         (torch.rand((bsz,), device=device, dtype=dtype) < self.self_cond_prob)
@@ -703,13 +801,14 @@ class _BDELFBackbone(nn.Module):
         .to(dtype=dtype)
       )
       with torch.no_grad():
-        z_in0 = self._apply_self_cond(denoiser_z, None)
-        pair0 = self._embed_continuous_pair(z_in0, x0_emb)
+        z_in0 = self._apply_self_cond(den_z, None)
+        pair0 = self._embed_continuous_pair(z_in0, den_x0)
         x_init, _ = self._backbone(pair0, t, decode=False)
-      sc_half = x_init.detach() * use_sc * (1.0 - decoder_mask_b11)
+      sc_half = x_init.detach() * use_sc * (1.0 - decoder_mask_b11) * cur3
 
+    z_mixed, x0_ctx = self._assemble_aligned(x0_emb, z_mixed_cur, cur, future)
     z_in = self._apply_self_cond(z_mixed, sc_half)
-    pair = self._embed_continuous_pair(z_in, x0_emb)
+    pair = self._embed_continuous_pair(z_in, x0_ctx)
     x_pred, logits = self._backbone(
       pair,
       t_mixed,
@@ -717,21 +816,21 @@ class _BDELFBackbone(nn.Module):
       self_cond_cfg_scale=self_cond_cfg,
     )
 
-    v_pred = self._x_to_v(x_pred, denoiser_z, t)
+    v_pred = self._x_to_v(x_pred, den_z, t)
     l2_per_token = ((v_pred - v_target) ** 2).mean(dim=-1)
 
     assert logits is not None
     log_probs = F.log_softmax(logits.float(), dim=-1)
     ce_per_token = -log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
-    valid = (tokens != self.token_layout.ignore_index).to(dtype=ce_per_token.dtype)
-    if self.token_layout.pad_token_id is not None:
-      valid = valid * (tokens != self.token_layout.pad_token_id).to(dtype=valid.dtype)
-
-    ce_mask = valid * decoder_mask_b1
-    l2_mask = valid * (1.0 - decoder_mask_b1)
-    total_sum = (ce_per_token * ce_mask).sum() + (l2_per_token * l2_mask).sum()
-    loss = total_sum / torch.clamp(valid.sum(), min=1.0)
+    valid = self._token_valid_mask(tokens, ce_per_token.dtype)
+    cur_f = cur.to(dtype=valid.dtype)
+    ce_mask = valid * decoder_mask_b1 * cur_f
+    l2_mask = valid * (1.0 - decoder_mask_b1) * cur_f
+    sup = ce_mask + l2_mask
+    loss = (
+      (ce_per_token * ce_mask).sum() + (l2_per_token * l2_mask).sum()
+    ) / torch.clamp(sup.sum(), min=1.0)
 
     ce_denom = ce_mask.sum()
     l2_denom = l2_mask.sum()
@@ -1144,7 +1243,7 @@ class _BDELFBackbone(nn.Module):
     infer_schedule = cfg.get("time_schedule")
     if infer_schedule is not None:
       self._infer_time_schedule = infer_schedule
-    sc_cfg_w = float(cfg.get("self_cond_cfg_scale", 3.0))
+    sc_cfg_w = float(cfg.get("self_cond_cfg_scale", 1.0))
 
     self._validate_seq_len(seqlen)
     use_fast_infer = cfg.get("use_fast_infer", True)

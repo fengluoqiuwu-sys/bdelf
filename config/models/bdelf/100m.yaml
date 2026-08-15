@@ -22,13 +22,15 @@ latent_std: 0.2                    # emb 归一化标准差
 denoiser_p_mean: -1.5              # denoise t 的 logit-normal 均值
 denoiser_p_std: 0.8                # denoise t 的 logit-normal 标准差
 denoiser_noise_scale: 2.0          # denoise 噪声尺度
-decoder_prob: 0.2                  # mixed 中 decode 样本比例
+decoder_prob: 0.5                  # mixed 中 decode 样本比例
 decoder_p_mean: 0.8                # decode λ 的 logit-normal 均值
 decoder_p_std: 0.8                 # decode λ 的 logit-normal 标准差
 decoder_noise_scale: 5.0           # decode 噪声尺度
 t_eps: 0.05                        # 1-t 下界，防除零
 time_schedule: logit_normal        # 训练时间调度
 fix_bos: true                      # 是否固定 BOS 位置为干净 latent
+freeze_wte: true                   # 冻结 token embedding，避免与 unembed 合谋
+wte_init: gpt2                     # embedding 初始化：gpt2 | random
 
 sampling:
   temperature: 1.0                 # 采样温度；≤0 为 argmax
