@@ -854,6 +854,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shard", type=int, default=None)
     p.add_argument("--shards", type=int, default=None)
     p.add_argument("--repeats", type=int, default=5)
+    p.add_argument("--worker", action="store_true")
     return p.parse_args()
 
 
