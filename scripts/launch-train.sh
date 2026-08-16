@@ -203,10 +203,15 @@ ARGS_FILE=$(printf '%q' "$ARGS_FILE")
 OUT="\$LOG_DIR/\${JOB_NAME}-\${JOB_ID}.out"
 ERR="\$LOG_DIR/\${JOB_NAME}-\${JOB_ID}.err"
 GPU_LOG="\$LOG_DIR/gpu-\${JOB_ID}.log"
+# shellcheck source=job_log_dir.sh
+source $(printf '%q' "$ROOT/scripts/job_log_dir.sh")
+bdelf_export_scratch_tmpdir
+export BDELF_JOB_ID="\$JOB_ID"
 exec >>"\$OUT" 2>>"\$ERR"
 echo "=== job start: \$(date -Is) | host: \$(hostname) | pid: \$JOB_ID ==="
 echo "TRAIN_SCRIPT=\$TRAIN_SCRIPT"
 echo "JOB_LOG_DIR=\$LOG_DIR"
+echo "TMPDIR=\${TMPDIR:-/tmp} BDELF_JOB_ID=\$BDELF_JOB_ID"
 echo "gpus via train.py --gpus (see train.args)"
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || true
 (
@@ -218,7 +223,7 @@ nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,nohea
   done
 ) > "\$GPU_LOG" 2>&1 &
 GPU_MON_PID=\$!
-trap 'kill "\$GPU_MON_PID" 2>/dev/null || true' EXIT
+trap 'kill "\$GPU_MON_PID" 2>/dev/null || true; bdelf_rm_job_scratch "\$JOB_ID"' EXIT
 mapfile -d '' -t TRAIN_ARGV < "\$ARGS_FILE"
 if [[ \${#TRAIN_ARGV[@]} -gt 0 && -z "\${TRAIN_ARGV[-1]}" ]]; then
   unset 'TRAIN_ARGV[-1]'

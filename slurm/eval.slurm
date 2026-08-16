@@ -91,7 +91,7 @@ GPU_LOG="$JOB_LOG_DIR/gpu-${SLURM_JOB_ID}.log"
   done
 ) > "$GPU_LOG" 2>&1 &
 GPU_MON_PID=$!
-trap 'kill "$GPU_MON_PID" 2>/dev/null || true' EXIT
+trap 'kill "$GPU_MON_PID" 2>/dev/null || true; rm -rf -- "${SLURM_TMPDIR:-/tmp}/bdelf-compile-${SLURM_JOB_ID}" "${SLURM_TMPDIR:-/tmp}/bdelf-resume-${SLURM_JOB_ID}"' EXIT
 
 if [[ ${#EVAL_ARGV[@]} -gt 0 ]]; then
   bash "$BDELF_EVAL_SCRIPT" "${EVAL_ARGV[@]}"

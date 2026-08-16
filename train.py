@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -167,14 +168,28 @@ _patch_inductor_bool_eq()
 # =============================================================================
 
 
-def _local_compile_root() -> str | None:
-    """Pick a writable node-local directory for Triton/Inductor caches.
+def _is_safe_job_id(val: str) -> bool:
+    if not val or len(val) > 64:
+        return False
+    return all(c.isalnum() or c in "._-" for c in val)
 
-    Triton and Inductor rely on temp-file + rename; that protocol breaks on
-    BeeGFS/NFS (missing ``*.cubin`` / cache files under concurrent compile
-    workers). Prefer Slurm node scratch, then TMPDIR, then /tmp.
+
+def _scratch_job_id() -> str:
+    """多进程共用的 scratch 目录后缀。
+
+    Slurm 用 ``SLURM_JOB_ID``；common / ``mp.spawn`` 各 rank 的 ``getpid()``
+    不同——若用 pid，非 rank0 会等错路径并超时。优先显式 ``BDELF_JOB_ID``
+    （launch 包装器或父进程 spawn 前写入），否则退回 ``getppid()``。
     """
-    job = os.environ.get("SLURM_JOB_ID") or f"pid{os.getpid()}"
+    for key in ("SLURM_JOB_ID", "BDELF_JOB_ID"):
+        val = os.environ.get(key)
+        if val and _is_safe_job_id(val):
+            return str(val)
+    return str(os.getppid())
+
+
+def _scratch_root() -> Path | None:
+    """节点本地可写 scratch：``SLURM_TMPDIR`` → ``TMPDIR`` → ``/tmp``。"""
     for candidate in (
         os.environ.get("SLURM_TMPDIR"),
         os.environ.get("TMPDIR"),
@@ -183,21 +198,89 @@ def _local_compile_root() -> str | None:
         if not candidate:
             continue
         try:
-            if not os.path.isdir(candidate) or not os.access(candidate, os.W_OK):
-                continue
-            root = os.path.join(candidate, f"bdelf-compile-{job}")
-            os.makedirs(root, exist_ok=True)
-            return root
+            path = Path(candidate)
+            if path.is_dir() and os.access(path, os.W_OK):
+                return path
         except OSError:
             continue
     return None
 
 
-def _isolate_compile_cache(local_rank: int) -> None:
-    """Point each local rank at its own Triton/Inductor cache on local disk.
+def _scratch_job_dirs() -> list[Path]:
+    """本 job 的 resume / compile 根目录（含 /tmp 旧路径，便于清残留）。"""
+    job = _scratch_job_id()
+    roots: list[Path] = []
+    scratch = _scratch_root()
+    if scratch is not None:
+        roots.append(scratch)
+    tmp = Path("/tmp")
+    try:
+        extra_tmp = scratch is None or scratch.resolve() != tmp.resolve()
+    except OSError:
+        extra_tmp = True
+    if extra_tmp:
+        roots.append(tmp)
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        for name in (
+            f"bdelf-resume-{job}",
+            f"bdelf-compile-{job}",
+            f"bdelf-compile-pid{os.getpid()}",
+        ):
+            path = root / name
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            dirs.append(path)
+    return dirs
 
-    Always prefer node-local scratch over any shared-FS path set by Slurm
-    (BeeGFS). Per-rank subdirs additionally avoid same-node contention.
+
+def _rmtree_job_scratch(path: Path) -> None:
+    name = path.name
+    if not (name.startswith("bdelf-resume-") or name.startswith("bdelf-compile-")):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _cleanup_this_job_scratch() -> None:
+    """只删本 job id / 本 pid 的 scratch，禁止通配 ``bdelf-*``。"""
+    for path in _scratch_job_dirs():
+        _rmtree_job_scratch(path)
+
+
+def _cleanup_compile_rank(local_rank: int, compile_root: str) -> None:
+    """子进程只清本 rank 子目录，避免先退出的 rank 删掉仍在跑的缓存。"""
+    for sub in ("inductor", "triton"):
+        shutil.rmtree(
+            os.path.join(compile_root, sub, f"rank{local_rank}"),
+            ignore_errors=True,
+        )
+
+
+def _local_compile_root() -> str | None:
+    """选节点本地目录给 Triton/Inductor 缓存。
+
+    Triton / Inductor 依赖 temp-file + rename；BeeGFS/NFS 上并发编译会丢
+    ``*.cubin``。优先 Slurm 节点盘，再 TMPDIR，最后 /tmp。
+    一次作业一个根（job id），rank 子目录隔离。
+    """
+    scratch = _scratch_root()
+    if scratch is None:
+        return None
+    root = scratch / f"bdelf-compile-{_scratch_job_id()}"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return str(root)
+    except OSError:
+        return None
+
+
+def _isolate_compile_cache(local_rank: int) -> None:
+    """每个 local rank 使用节点本地盘上独立的 Triton/Inductor 缓存。
+
+    始终优先节点本地 scratch，而不是 Slurm 设在共享盘（BeeGFS）上的路径。
     """
     local_root = _local_compile_root()
     for var, subdir in (
@@ -213,6 +296,10 @@ def _isolate_compile_cache(local_rank: int) -> None:
         per_rank = os.path.join(base, f"rank{local_rank}")
         os.makedirs(per_rank, exist_ok=True)
         os.environ[var] = per_rank
+    if local_root is not None and "RANK" in os.environ:
+        atexit.register(_cleanup_compile_rank, local_rank, local_root)
+    else:
+        atexit.register(_cleanup_this_job_scratch)
 
 
 def setup_distributed(cfg: FL_TrainConfig) -> tuple[int, int, torch.device, bool]:
@@ -366,25 +453,12 @@ def _pick_resume_ckpt(run_dir: Path) -> Path | None:
     return None
 
 
-def _resume_stage_job_id() -> str:
-    """多进程共用的 /tmp staging 目录后缀。
-
-    Slurm 用 ``SLURM_JOB_ID``；common / ``mp.spawn`` 各 rank 的 ``getpid()``
-    不同——若用 pid，非 rank0 会等错路径并超时。优先显式 ``BDELF_JOB_ID``
-    （父进程 spawn 前写入），否则退回 ``getppid()``。
-    """
-    for key in ("SLURM_JOB_ID", "BDELF_JOB_ID"):
-        val = os.environ.get(key)
-        if val:
-            return str(val)
-    return str(os.getppid())
-
-
 def _stage_ckpt_to_local(
     src: Path, *, rank: int, is_distributed: bool,
 ) -> Path:
-    """Rank0 copies BeeGFS ckpt to node-local /tmp; all ranks load from there."""
-    local = Path(f"/tmp/bdelf-resume-{_resume_stage_job_id()}") / src.name
+    """Rank0 把 BeeGFS ckpt 拷到节点本地 scratch；各 rank 从该副本 load。"""
+    scratch = _scratch_root() or Path("/tmp")
+    local = scratch / f"bdelf-resume-{_scratch_job_id()}" / src.name
     if rank == 0:
         src = _wait_for_file(src)
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -395,6 +469,28 @@ def _stage_ckpt_to_local(
     if is_distributed:
         dist.barrier()
     return _wait_for_file(local)
+
+
+def _release_staged_ckpt(
+    local: Path, *, rank: int, is_distributed: bool,
+) -> None:
+    """各 rank 已 load 进内存后，rank0 删掉本 job 的 staged 副本。"""
+    if is_distributed:
+        dist.barrier()
+    if rank != 0:
+        return
+    parent = local.parent
+    if not parent.name.startswith("bdelf-resume-"):
+        return
+    try:
+        local.unlink(missing_ok=True)
+        local.with_suffix(local.suffix + ".partial").unlink(missing_ok=True)
+        try:
+            next(parent.iterdir())
+        except StopIteration:
+            parent.rmdir()
+    except OSError:
+        pass
 
 
 def _grads_are_finite(model: nn.Module) -> bool:
@@ -608,6 +704,9 @@ def train_loop(
             resume_path, model, optimizer, device,
             cfg=cfg, model_meta=model_meta, restore_rng=(rank == 0),
         )
+        _release_staged_ckpt(
+            resume_path, rank=rank, is_distributed=is_distributed,
+        )
         if ema_state is not None:
             if loaded_ema:
                 for k, v in loaded_ema.items():
@@ -648,6 +747,9 @@ def train_loop(
                 init_path, rank=rank, is_distributed=is_distributed,
             )
             loaded_ema, init_info = load_init_weights(init_path, model, device)
+            _release_staged_ckpt(
+                init_path, rank=rank, is_distributed=is_distributed,
+            )
             if ema_state is not None:
                 if loaded_ema:
                     n_ema = 0
@@ -1543,6 +1645,9 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    # launch 包装器会先写入 runner pid；此处仅在未设置时用本进程 pid。
+    os.environ.setdefault("BDELF_JOB_ID", str(os.getpid()))
+    atexit.register(_cleanup_this_job_scratch)
     # 须在 validate_args → device_count 之前屏蔽可见卡（common 机看得到全部 GPU）
     gpu_ids = apply_cuda_visible_devices(args.gpus)
     if gpu_ids is not None:
@@ -1575,26 +1680,28 @@ def main() -> None:
             mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
-        # 子进程继承；供 _stage_ckpt_to_local 共用 /tmp 目录（勿用各 rank pid）
-        os.environ.setdefault("BDELF_JOB_ID", str(os.getpid()))
+        # 子进程继承 BDELF_JOB_ID，stage/compile 共用同一 job 目录（勿用各 rank pid）
         _train_log(
             f"Auto-spawning {cfg.world_size} processes (spawn), "
             f"MASTER_PORT={os.environ.get('MASTER_PORT', '29500')}",
         )
-        mp.spawn(
-            _spawn_worker,
-            args=(
-                model_name,
-                args.train_config,
-                cfg.world_size,
-                args.dataset,
-                args.preprocess,
-                args.generate,
-                (cfg.extra.get("config_refs") or {}).get("overrides") or None,
-            ),
-            nprocs=cfg.world_size,
-            join=True,
-        )
+        try:
+            mp.spawn(
+                _spawn_worker,
+                args=(
+                    model_name,
+                    args.train_config,
+                    cfg.world_size,
+                    args.dataset,
+                    args.preprocess,
+                    args.generate,
+                    (cfg.extra.get("config_refs") or {}).get("overrides") or None,
+                ),
+                nprocs=cfg.world_size,
+                join=True,
+            )
+        finally:
+            _cleanup_this_job_scratch()
         return
 
     run_training(model_name, model_size, cfg)
