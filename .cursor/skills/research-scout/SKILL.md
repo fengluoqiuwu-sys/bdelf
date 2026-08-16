@@ -14,15 +14,15 @@ description: >-
 自由探索：从用户给的**范围或种子论文**出发，**尽量自主假设**，再查重留下**还不错、显得没做过/做得少**的 idea，写给人筛选。  
 **不是**写论文综述；**不**交接 auto-train；**不**改代码、不占 GPU、不提交远端作业。
 
-配合 skill `paper-ingest`（读全文/编 INDEX）与本目录 [brainstorm.md](brainstorm.md)、[idea-explore.md](idea-explore.md)、[critic.md](critic.md)；均须 Task subagent。  
-**主 agent 不独自想 idea**：候选由 brainstorm 出；主循环只筛选、多样性、查重、送审。explore 先新颖性后可行性；数学由 critic 他评。
+配合 skill `paper-ingest`（读全文/编 INDEX）与本目录 [brainstorm.md](brainstorm.md)、[idea-explore.md](idea-explore.md)、[critic.md](critic.md)、[potential.md](potential.md)；均须 Task subagent。  
+**主 agent 不独自想 idea**：候选由 brainstorm 出；主循环只筛选、多样性、查重、送审。explore 先新颖性后可行性；数学由 critic 他评；**研究潜力在数学通过后由独立 potential 重评**。
 
 ## 硬边界
 
 - 只写 `temp/`：本 run 目录 + 通过 ingest 写的 `temp/papers/<slug>/`。
 - 禁止：改仓库代码/`config/`、训练/占 GPU、远端作业、往 `temp/ideas/` 写（正式开题由人确认后走 `idea-kickoff`）。亦禁止写 `temp/idea/`、`temp/auto-research/`。
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
-- 开 brainstorm / explore / ingest 时 **必须**把三类模型块写入该层 prompt（见 rule「subagent 模型」），禁止只给 README 路径。
+- 开 brainstorm / explore / ingest 时 **必须**把三类模型块写入该层 prompt（见 rule「subagent 模型」），禁止只给 README 路径。explore 开 critic / potential / ingest 时同样写入。
 - 与当前仓库实现**解耦**：不要求 repo-novel；自由探索即可。
 
 ## 落盘
@@ -89,7 +89,7 @@ temp/research-scout/<run-slug>/
   → loop:
        候选池空且 `可行 + 在飞 < K` → Task(brainstorm) 写 brainstorm/R-{r}.md（可并行多角度）
        主 agent **只筛选**：
-         丢掉连 B 档都难的、与已有 I/D 重复的；
+         丢掉连 B刊/B会都难的、与已有 I/D 重复的；
          **多样性**：按角度聚类（机制 / 目标 / 表征 / 数据 / 评测…），每簇最多送审 1 条；同质的记 log 不送
          轻量检索查重
        需要机制细节才 → Task(paper-ingest)（**仅新 ingest 计 N**；缓存命中不计）
@@ -128,7 +128,7 @@ Prompt 须包含：
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/idea-explore.md`
-- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」；内层 critic/ingest 必须再写入 prompt）
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」；内层 critic / potential / ingest 必须再写入 prompt）
 - 目标目录：`temp/research-scout/<run-slug>/ideas/I-{n}/`（绝对路径）
 - 假设陈述 + 已做轻量查重摘要
 - run `README.md` 绝对路径（范围 / 非目标 / kill / 算力上限 / **三类 subagent 模型**）
@@ -161,14 +161,14 @@ Prompt 须包含：
 
 ### Idea 来源
 
-1. **brainstorm（默认）**：凭空或从范围推；可参考 future work。预估**连 B 档都难**的不准进 `R-{r}.md`。
+1. **brainstorm（默认）**：凭空或从范围推；可参考 future work。预估**连 B刊/B会都难**的不准进 `R-{r}.md`。
 2. 主 agent **只筛选、查重、按角度去同质**；不要跳过 brainstorm 直接写 idea。每簇最多送审 1 条。
 3. 自主假设枯竭、brainstorm 连续空轮 → 停新开，不要降到 C 去凑。
 
 ### `ideas/I-{n}/` 与 `D-{n}/`
 
 `n` 从 1 起单调递增（每次送审占一个号，**不复用**）。探索过程写入 `ideas/I-{n}/`；返回后失败则改名为 `ideas/D-{n}/`。  
-**K 只计仍叫 `I-*` 的夹**（未触 kill/非目标，且新颖性、现实性、critic 通过，未超算力）。并行收尾时 `I-*` 可以多于 K。  
+**K 只计仍叫 `I-*` 的夹**（未触 kill/非目标，且新颖性、现实性、critic 通过、**potential 已评档**，未超算力）。并行收尾时 `I-*` 可以多于 K。  
 `D-*` 仍进 `ideas.md`，但放在文末 **Deprecated**，并写明失败原因；不计入 K。
 
 夹内文稿由 `idea-explore` 写，**正文不得含 `I-{n}` / `D-{n}`**（可能被外部重排）。
@@ -187,13 +187,13 @@ Prompt 须包含：
 
 每条 keep/fail 返回后更新索引；run 结束再按分数重排可行区。
 
-研究潜力对标（可行区抄 `idea.md` 的档；必填一档，勿用中间值）。成功可能性为 0～1 的确信程度（抄 `idea.md`）：
+研究潜力对标（可行区抄 `idea.md`，而 `idea.md` **必须抄** `potential.md` 独立重评；brainstorm 预估不算官方档）。成功可能性为 0～1 的确信程度（抄 `idea.md`）：
 
 | 档 | 对标 |
 |---|---|
-| A+ / A / A- | A 档文章的上 / 中 / 下 |
-| B+ / B / B- | B 档文章的上 / 中 / 下 |
-| C | 普通论文（够写成一篇，够不上 A/B 档） |
+| A+ / A / A- | **A刊 / A会** 的上 / 中 / 下 |
+| B+ / B / B- | **B刊 / B会** 的上 / 中 / 下 |
+| C | 普通论文（够写成一篇，够不上 A/B 刊会） |
 
 scout 主循环里轻量查重已撞车、尚未送审的假设：不必建夹，`log.md` 记一行即可。  
 送审后失败：只改名为 `D-{n}/`，不要删夹。

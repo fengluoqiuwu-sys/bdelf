@@ -23,7 +23,7 @@ description: >-
 - 只写 `temp/ideas/<name>/`；补文献时可通过 ingest 写 `temp/papers/<slug>/`。
 - **拷贝、不搬移**：禁止改、删、重命名 scout 的 `I-*` / `D-*`。
 - 禁止：改仓库代码、训练/占 GPU、远端作业、写稿/审稿模拟、把工程冒烟当可行性通过。
-- 源夹必须是**可行**（`idea.md` 状态为可行，且新颖性 / 现实性 / critic 均为 PASS）。`D-*` 或失败条 → **拒绝开题**。
+- 源夹必须是**可行**（`idea.md` 状态为可行，且新颖性 / 现实性 / critic 均为 PASS，且有 `potential.md` 档）。`D-*` 或失败条 → **拒绝开题**。
 - 开题文稿**禁止**写 `I-{n}` / `D-{n}`。
 - **阶段只写 `stage.md`**：禁止把某一阶段的闸 / 产物 / 下一步写进 `README.md`。
 - **禁止把开题捏成一次做完**：综述 → 规格 → 报告，顺序强制；前一步 FAIL 则停，不写后面的。
@@ -58,7 +58,7 @@ temp/ideas/<name>/
   → cp -a 源夹 → temp/ideas/<name>/
   → 主 agent 只写 SOURCE.md + 薄 README.md + stage.md（当前=开题，步骤=综述）
   → 三类 subagent 模型：抄 scout README，缺则先问，写入 stage.md
-  → 确认拷贝的 novelty / reality / critic 均为 PASS；缺一则停
+  → 确认拷贝的 novelty / reality / critic 均为 PASS，且 `potential.md` 有档；缺一则停
   → Task(survey) 写 survey.md
        FAIL → stage.md 标失败；停；不写规格/报告
   → Task(spec) 写 scope / claims / grounding / risk / protocol

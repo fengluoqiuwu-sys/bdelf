@@ -9,7 +9,7 @@
 
 - 只写父代理给定的 run 目录下 `brainstorm/`（及可选追加 `backlog.md` 查询词）。禁止写 `ideas/`、`temp/ideas/`、`temp/papers/`。
 - **默认不 ingest**。只做 WebSearch / arXiv 摘要级检索；要读机制留给 explore。
-- **尽量自主假设**；可参考 future work，但预估**连 B 档都难**的不要列入。
+- **尽量自主假设**；可参考 future work，但预估**连 B刊/B会都难**的不要列入。
 - 禁止为凑条数灌水。宁缺，回报「本轮无合格候选」。
 - 面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`；见 rule「subagent 模型」）。即使本步不 ingest 也要传齐，禁止只给 README 路径。
 
@@ -26,7 +26,7 @@ brainstorm/R-{r}.md   # 本轮候选（可并行多路，r 由 scout 分配）
 ```
 scout 传入：范围/种子、约束摘要、已有可行与 Deprecated 短标题（避免重复）、本轮角度（可选）、r
   → 发散若干**不同角度**的可检验假设（机制 / 目标 / 表征 / 数据 / 评测不要挤在同一条缝）
-  → 每条自估研究潜力；够不上 B- 的丢掉
+  → 每条自估研究潜力（**仅预估**，正式档在 explore 数学通过后由独立 potential 重评）；够不上 B- 的丢掉
   → 写 brainstorm/R-{r}.md
   → 回报：候选条数 + 短标题列表（或 0）
 ```
@@ -44,7 +44,7 @@ scout 传入：范围/种子、约束摘要、已有可行与 Deprecated 短标�
 - 陈述: …
 - 为何可能好: …
 - 来源: 自主 / 参考 future work（哪篇，一句话）
-- 预估研究潜力: A+ / A / A- / B+ / B / B- （低于 B- 不准出现）
+- 预估研究潜力: A+ / A / A- / B+ / B / B- （低于 B- 不准出现；非正式档）
 - 预估成功可能性: 0～1
 ```
 

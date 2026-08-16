@@ -14,7 +14,7 @@ alwaysApply: true
 
 | 类型 | 何时 | 现有 Task |
 |------|------|-----------|
-| **research** | 普通调查 | brainstorm、idea-explore、survey、spec、proposal |
+| **research** | 普通调查 | brainstorm、idea-explore、**potential**、survey、spec、proposal |
 | **research-high** | 高难度（数学原理等） | critic |
 | **ingest** | 查文献并总结 | paper-ingest |
 

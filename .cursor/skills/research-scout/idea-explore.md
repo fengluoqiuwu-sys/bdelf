@@ -3,9 +3,9 @@
 `research-scout` 的配套流程（本文件不是独立 skill）：对一条已轻量查重的假设做深化，写入 scout 指定的 `ideas/I-{n}/`。  
 **不是**给用户指定 idea 的入口；**不**改代码、不占 GPU、不提交远端作业。
 
-配合 skill `paper-ingest`（读全文/编 INDEX）与本目录 [critic.md](critic.md)（数学他评）。
+配合 skill `paper-ingest`（读全文/编 INDEX）与本目录 [critic.md](critic.md)（数学他评）、[potential.md](potential.md)（潜力独立重评）。
 
-**顺序强制：先新颖性，通过后再可行性（现实性 → 数学 → critic → 机制 → 里程碑）。**
+**顺序强制：先新颖性，通过后再可行性（现实性 → 数学 → critic → 潜力重评 → 机制 → 里程碑）。**
 
 ## 硬边界
 
@@ -14,7 +14,8 @@
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
 - **钉住本题**：变体只进本夹 `backlog.md`；不自行改题、不另开号。
 - **文稿禁止出现 `I-{n}` / `D-{n}` / 条目编号**（夹名可能被外部重排）。标题只用短标题。
-- 本流程面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`）。嵌套 critic / ingest 时**原样再写入**其 prompt（只改本 Task 类型）。未收到完整块 → 不准开更内层 Task。见 rule「subagent 模型」。
+- 本流程面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`）。嵌套 critic / potential / ingest 时**原样再写入**其 prompt（只改本 Task 类型）。未收到完整块 → 不准开更内层 Task。见 rule「subagent 模型」。
+- **禁止自己给研究潜力定档**：critic 通过后必须 Task(potential)；`idea.md` / `SPEC.md` 只许**抄** `potential.md` 的档。
 - 对照 scout 传入的 run `README.md`：**非目标 / Kill 条件** 命中 → **fail**；**算力上限** 里程碑合计超标 → **fail**。
 
 ## 落盘
@@ -30,6 +31,7 @@ ideas/I-{n}/
   reality.md      # 数据 / 指标 / 可复现（新颖性通过后）
   math.md         # 底层数学
   critic.md       # 数学他评（由 critic 子代理写）
+  potential.md    # 研究潜力独立重评（由 potential 子代理写；数学通过后）
   SPEC.md         # 机制 + 成功判据
   milestones.md   # 里程碑；M0 = 最便宜证伪
   backlog.md
@@ -63,9 +65,10 @@ scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、ru
        REVISE → 按反驳改 math.md（必要时同步 base.md 数学衔接；**禁止换题**；换题才能过 → 当作 FAIL）
                  k ← k+1，再 Task(critic)；最多反驳 **2** 次（k=1、2 可 REVISE）
                  第 3 次 critic（k=3）非 PASS → idea.md 标 失败（数学）；回报 fail；结束
-  → 6. 细化机制 + 成功判据 → SPEC.md
-  → 7. 写 milestones.md（M0 = 最便宜证伪；对照 README 算力；超标 fail）
-  → 8. idea.md 标 可行；回报 keep；结束探索
+  → 6. Task(potential) 写 potential.md（独立重评研究潜力；禁止自己定档）
+  → 7. 细化机制 + 成功判据 → SPEC.md（潜力档**抄** potential.md）
+  → 8. 写 milestones.md（M0 = 最便宜证伪；对照 README 算力；超标 fail）
+  → 9. idea.md 标 可行（潜力档抄 potential.md）；回报 keep；结束探索
 ```
 
 需要机制细节才 Task(paper-ingest)；**仅新 ingest 计 N**；缓存命中不计。
@@ -98,6 +101,19 @@ Prompt 须包含：
 
 接到 `REVISE`：`log.md` 记一轮；只改数学表述，不改 `idea.md` 陈述。已反驳 2 次仍接到 `REVISE` → 按 FAIL 处理。
 
+### 开 potential subagent（强制，critic 最后一轮 PASS 后）
+
+用 Task，`subagent_type: generalPurpose`，**`model` 用 README 已指定的 research**（见 rule「subagent 模型」；禁 `*-fast`）。须为**新 Task**，禁止 explore 自己写档。
+
+Prompt 须包含：
+
+- 读并遵循 `.cursor/skills/research-scout/potential.md`
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
+- 夹内绝对路径；只写 `potential.md`
+- 回报：档 + 一句理由
+
+接到后把档**原样**写入 `idea.md` 与随后的 `SPEC.md`，禁止上调。
+
 ### `idea.md` 格式
 
 ```markdown
@@ -110,11 +126,11 @@ Prompt 须包含：
 - 查重: 搜过什么 → 未见 / 有近邻（链接） / 已有强重叠
 - 依据: INDEX 锚点 或 纯假设+检索
 - 粗成本: 小 / 中 / 大
-- 研究潜力: A+ / A / A- / B+ / B / B- / C
+- 研究潜力: 待独立重评 / A+ / A / A- / B+ / B / B- / C（**仅抄** potential.md；未评前写待独立重评）
 - 成功可能性: 0～1（本题能做成的确信程度；一位小数，如 0.6；失败可接近 0）
 ```
 
-失败时保留已写出的 `related.md` / `base.md` / `novelty.md` / `reality.md` / `math.md` / `critic.md`；不写或删未完成的 `SPEC.md` / `milestones.md`。
+失败时保留已写出的 `related.md` / `base.md` / `novelty.md` / `reality.md` / `math.md` / `critic.md` / `potential.md`；不写或删未完成的 `SPEC.md` / `milestones.md`。
 
 ### `base.md` 格式
 
@@ -171,13 +187,13 @@ PASS / FAIL：…
 
 新逻辑必须**逻辑自洽**且**数学上可行、合理**。是否通过以 `critic.md` **最后一轮**为准（中间可以 REVISE，explore 改完再送审；禁止在本文件写「判定通过」）。
 
-### `SPEC.md` 格式（仅 critic **最后一轮 PASS** 后）
+### `SPEC.md` 格式（仅 **potential 重评之后**）
 
 ```markdown
 # <短标题>
 
 - 粗成本: 小 / 中 / 大
-- 研究潜力: A+ / A / A- / B+ / B / B- / C（本条复评）
+- 研究潜力: A+ / A / A- / B+ / B / B- / C（**抄** potential.md，禁止 explore 改档）
 - 成功可能性: 0～1（确信程度）
 
 ## 钉住的假设
@@ -199,7 +215,7 @@ PASS / FAIL：…
 …
 ```
 
-### `milestones.md` 格式（仅 critic **最后一轮 PASS** 后）
+### `milestones.md` 格式（仅 **potential 重评之后**）
 
 - **M0（强制）**：最便宜的证伪实验——怎样用最少卡时证明这题不成立。不要一上来完整训练。
 - 其后 M1… 才是逐步做正的路径。
@@ -222,13 +238,7 @@ PASS / FAIL：…
 
 估算不含「无目的扫参」。
 
-研究潜力对标（必填一档，勿用中间值）：
-
-| 档 | 对标 |
-|---|---|
-| A+ / A / A- | A 档文章的上 / 中 / 下 |
-| B+ / B / B- | B 档文章的上 / 中 / 下 |
-| C | 普通论文（够写成一篇，够不上 A/B 档） |
+研究潜力对标见 [potential.md](potential.md)。**官方档以 `potential.md` 为准**（brainstorm / explore 自估不算数）。explore 只抄档，禁止上调。
 
 成功可能性（必填）：`[0,1]`，表示**本题能做成的确信程度**（与研究潜力档独立；失败条也可填，通常接近 0）。critic **FAIL** 后须下调，不得维持高分；**REVISE** 后可略降，最终须以最后一轮 PASS 为准。
 

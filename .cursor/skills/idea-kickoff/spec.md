@@ -42,7 +42,7 @@
 - A100: … 卡时
 （从 scout README 抄数字，禁止只写「见 scout README」）
 ## 听众 / 预期档
-研究潜力抄 idea.md
+研究潜力抄 idea.md（官方档来自独立 `potential.md` 重评）
 ```
 
 ### `claims.md`
