@@ -843,6 +843,20 @@ def train_loop(
                 f"freeze_d={getattr(bb, 'attr_freeze_d', '?')}); "
                 "fast 变体跳过估 d；metrics: mse / ce / attr",
             )
+        elif cfg.model == "denoiser_chart":
+            bb = unwrap_model(model).backbone
+            decoder_prob = float(getattr(bb, "decoder_prob", 0.2))
+            _train_log(
+                f"DENOISER_CHART: per-example denoise:decode ≈ "
+                f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+                f"+ W_t(warp={getattr(bb, 'chart_warp_enabled', '?')}, "
+                f"leak={getattr(bb, 'chart_leak_decode', '?')}) "
+                f"+ L_chart(w={getattr(bb, 'chart_weight', '?')}, "
+                f"t∈[{getattr(bb, 'chart_t_min', '?')},"
+                f"{getattr(bb, 'chart_t_max', '?')}]); "
+                f"freeze_U={getattr(bb, 'freeze_unembed', '?')}; "
+                "metrics: mse / ce / chart_ce",
+            )
         elif cfg.model == "bdelf":
             bb = unwrap_model(model).backbone
             _train_log(
@@ -985,6 +999,7 @@ def train_loop(
                 late_ce = getattr(raw_for_log, "last_late_ce_loss", float("nan"))
                 lex_ce = getattr(raw_for_log, "last_lex_ce_loss", float("nan"))
                 attr_loss = getattr(raw_for_log, "last_attr_loss", float("nan"))
+                chart_ce = getattr(raw_for_log, "last_chart_ce_loss", float("nan"))
             elif dual_branch:
                 loss_branch = train_branch if train_branch else ""
                 denoise_mse = None
@@ -992,6 +1007,7 @@ def train_loop(
                 late_ce = None
                 lex_ce = None
                 attr_loss = None
+                chart_ce = None
             else:
                 loss_branch = ""
                 denoise_mse = None
@@ -999,6 +1015,7 @@ def train_loop(
                 late_ce = None
                 lex_ce = None
                 attr_loss = None
+                chart_ce = None
             elapsed = time.time() - t0
             # 每微批消耗一整份数据 batch（与是否 denoise/decode 混合无关）。
             seq_tokens = batch.size(0) * (
@@ -1015,6 +1032,7 @@ def train_loop(
                 dual_branch=dual_branch, loss_branch=loss_branch,
                 denoise_mse=denoise_mse, decode_ce=decode_ce,
                 late_ce=late_ce, lex_ce=lex_ce, attr=attr_loss,
+                chart_ce=chart_ce,
             )
 
             # 在线 eval 在各卡均摊（held-out 分片 + gen 分担）；写盘仍仅 rank0。
@@ -1100,6 +1118,8 @@ def train_loop(
                         postfix["lex_ce"] = f"{lex_ce:.3f}"
                     if attr_loss is not None and attr_loss == attr_loss:
                         postfix["attr"] = f"{attr_loss:.3f}"
+                    if chart_ce is not None and chart_ce == chart_ce:
+                        postfix["chart_ce"] = f"{chart_ce:.3f}"
                 elif dual_branch and loss_branch == "decode":
                     postfix = {
                         "ce": f"{train_loss:.3f}",

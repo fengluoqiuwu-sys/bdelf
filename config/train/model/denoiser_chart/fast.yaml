@@ -1,0 +1,29 @@
+# =============================================================================
+# 模型训练配方（optimizer + batch；由 CLI --config 100m-{variant} 选择本文件）
+# =============================================================================
+_doc: DenoiserChart 100m（ELF 复制 + 隔离 W_t + 中段 CE） · fast（论文 Muon lr/wd/ema）  # 文件说明，写入 extra
+name: denoiser_chart  # 模型名；与目录名一致
+variant: fast  # 训练变体：fast | full
+
+# -----------------------------------------------------------------------------
+# 优化器（Muon + AdamW 混合）
+# -----------------------------------------------------------------------------
+optimizer:
+  dtype: bf16  # 训练精度：bf16 | fp16 | fp32
+  learning_rate: 0.002  # AdamW 学习率
+  weight_decay: 0  # AdamW weight decay
+  beta1: 0.9  # AdamW β1
+  beta2: 0.95  # AdamW β2
+  grad_clip: 1  # 梯度裁剪阈值
+  muon_learning_rate: 0.002  # Muon 学习率
+  muon_weight_decay: 0  # Muon weight decay
+  muon_momentum: 0.95  # Muon momentum
+  muon_ns_steps: 5  # Muon Newton–Schulz 步数
+  ema_decay: 0.9999  # EMA 衰减；0 表示关闭
+
+# -----------------------------------------------------------------------------
+# Batch（全局批；accum = global_batch_size / (batch_size * world_size)）
+# -----------------------------------------------------------------------------
+batch:
+  batch_size: 2  # 每 GPU 微批大小
+  global_batch_size: 8  # 全局批大小（推导梯度累积）

@@ -25,6 +25,7 @@ TRAIN_CSV_FIELDS = [
     "late_ce",
     "lex_ce",
     "attr",
+    "chart_ce",
     "lr",
     "tokens_per_sec",
 ]
@@ -518,6 +519,7 @@ def build_train_row(
     late_ce: float | None = None,
     lex_ce: float | None = None,
     attr: float | None = None,
+    chart_ce: float | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "step": step,
@@ -530,6 +532,7 @@ def build_train_row(
         "late_ce": "",
         "lex_ce": "",
         "attr": "",
+        "chart_ce": "",
         "lr": lr,
         "tokens_per_sec": round(tokens_per_sec, 2),
     }
@@ -540,6 +543,7 @@ def build_train_row(
         lce = _as_optional_float(late_ce)
         lxce = _as_optional_float(lex_ce)
         attr_v = _as_optional_float(attr)
+        chart_v = _as_optional_float(chart_ce)
         if loss_branch == "mixed":
             # Official-style combined loss; still record both branch metrics.
             if mse is not None:
@@ -554,6 +558,8 @@ def build_train_row(
                 row["lex_ce"] = round(lxce, 6)
             if attr_v is not None:
                 row["attr"] = round(attr_v, 6)
+            if chart_v is not None:
+                row["chart_ce"] = round(chart_v, 6)
         elif loss_branch == "denoise":
             # MSE is not a CE; leave train_ppl empty (same as BDELF).
             row["denoise_mse"] = round(train_loss, 6) if train_loss == train_loss else ""

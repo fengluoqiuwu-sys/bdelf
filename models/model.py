@@ -219,6 +219,12 @@ class FL_PreTrainedModel(PreTrainedModel):
             getattr(self.backbone, "last_attr_loss", float("nan"))
         )
 
+    @property
+    def last_chart_ce_loss(self) -> float:
+        return _metric_to_float(
+            getattr(self.backbone, "last_chart_ce_loss", float("nan"))
+        )
+
     def generate(
         self,
         *args: Any,
