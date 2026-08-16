@@ -22,7 +22,7 @@ alwaysApply: true
 
 ## 逐层传递（开 Task 强制）
 
-每开一层 Task，**prompt 必须原文写入**下面整块（三类取值都要有）。禁止只给 README / `stage.md` 路径代替取值。子代理再开更内层时**原样写入**（只改「本 Task 类型」），不得改值、不得省略。未收到完整块 → **不准**开更内层 Task。
+每开一层 Task，**prompt 必须原文写入**下面整块（三类取值 + **禁止 fast** 都要有）。禁止只给 README / `stage.md` 路径代替取值。子代理再开更内层时**原样写入**（只改「本 Task 类型」），不得改值、不得省略禁止 fast。未收到完整块（缺取值或缺禁止 fast）→ **不准**开更内层 Task。
 
 ```markdown
 ## subagent 模型（原样向内传，禁止改、禁止省）
@@ -30,10 +30,11 @@ alwaysApply: true
 - research: …
 - research-high: …
 - ingest: …
+- 禁止 fast: 一律禁止 `*-fast`；点了 fast 或指定模型不可用 → 拒绝并再问，禁止改用 fast 或擅自换
 ```
 
 ## 落盘
 
-- scout：`temp/research-scout/<run>/README.md` 必填三项；开 Task 仍须把取值写入 prompt。
-- 开题：抄 scout README 或问用户，写入 `stage.md`；开 Task 同样写入 prompt。
+- scout：`temp/research-scout/<run>/README.md` 必填三项，并写上禁止 fast；开 Task 仍须把整块（含禁止 fast）写入 prompt。
+- 开题：抄 scout README 或问用户，写入 `stage.md`；开 Task 同样写入整块（含禁止 fast）。
 - 单独 ingest：未指定则先问。

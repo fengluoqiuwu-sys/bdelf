@@ -18,7 +18,7 @@ description: >-
 - 只写 `temp/papers/<slug>/`（及其中 `paper/`）。
 - 禁止改代码、开训/占 GPU、远端作业、clone GitHub/`sources/`（除非用户明示）。
 - **不产出完整 research idea**（那是 scout / idea-explore 的事）；INDEX 里只给「可跟线索」。
-- 本 skill 面向 **subagent**：`model` 必须用已指定的 **ingest**。父代理 **必须**在 prompt 写入三类模型块（本 Task=`ingest` + 三值）。禁止默认、禁止 `*-fast`、禁止只给 README 路径。未指定则父代理先问用户，不要开 Task。
+- 本 skill 面向 **subagent**：`model` 必须用已指定的 **ingest**。父代理 **必须**在 prompt 写入三类模型块（本 Task=`ingest` + 三值 + **禁止 fast**）。禁止默认、禁止 `*-fast`、禁止只给 README 路径。未指定则父代理先问用户，不要开 Task。
 
 ## 输入
 

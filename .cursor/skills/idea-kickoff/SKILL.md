@@ -27,7 +27,7 @@ description: >-
 - 开题文稿**禁止**写 `I-{n}` / `D-{n}`。
 - **阶段只写 `stage.md`**：禁止把某一阶段的闸 / 产物 / 下一步写进 `README.md`。
 - **禁止把开题捏成一次做完**：综述 → 规格 → 报告，顺序强制；前一步 FAIL 则停，不写后面的。
-- 开任何 research / research-high / ingest Task **必须**把三类模型块写入 prompt 并逐层原样传递（见 rule「subagent 模型」）；禁 fast、禁默填。
+- 开任何 research / research-high / ingest Task **必须**把三类模型块写入 prompt 并逐层原样传递（见 rule「subagent 模型」；**含禁止 fast**）；禁 fast、禁默填。
 - 最终判断（是否真开实验、改 claim、停题）仍归用户。
 
 ## 落盘
@@ -89,7 +89,7 @@ cp -a <源夹绝对路径> temp/ideas/<name>
 - 步骤: 综述 / 规格 / 报告 / 待人确认 / 失败
 - 状态: 进行中 / 待人确认 / 失败
 - 更新: YYYY-MM-DD
-- subagent 模型: research … / research-high … / ingest …（抄 scout 或人指定；禁 fast）
+- subagent 模型: research … / research-high … / ingest … / 禁止 fast: 一律禁止 `*-fast`（抄 scout 或人指定；向内传须带上本行）
 ## 本阶段产物
 （只列已完成步骤的文件；综述未完不要预列报告）
 ## 闸 / 禁止
@@ -108,7 +108,7 @@ cp -a <源夹绝对路径> temp/ideas/<name>
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/idea-kickoff/survey.md`
-- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」；内层 ingest 必须再写入 prompt）
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文 + **禁止 fast**；见 rule「subagent 模型」；内层 ingest 必须再写入 prompt）
 - 目标夹绝对路径；`SOURCE.md` 里 scout README 路径
 - 只写该夹 `survey.md` 与 `temp/papers/`（ingest）
 - 回报：`PASS` 或 `FAIL`、一句原因、新 ingest 数
@@ -123,7 +123,7 @@ Prompt 须包含：
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/idea-kickoff/spec.md`
-- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文 + **禁止 fast**；见 rule「subagent 模型」）
 - 目标夹绝对路径；scout README 路径（算力上限必须抄进本夹）
 - 只写 scope / claims / grounding / risk / protocol
 - 回报：`PASS` 或 `FAIL`、一句原因
@@ -138,7 +138,7 @@ Prompt 须包含：
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/idea-kickoff/proposal.md`
-- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文 + **禁止 fast**；见 rule「subagent 模型」）
 - 目标夹绝对路径
 - 只写 `proposal/` 或 fallback 的 `proposal.md`
 - 回报：`pdf` 或 `md`、路径、若 fallback 写明原因

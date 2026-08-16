@@ -22,7 +22,7 @@ description: >-
 - 只写 `temp/`：本 run 目录 + 通过 ingest 写的 `temp/papers/<slug>/`。
 - 禁止：改仓库代码/`config/`、训练/占 GPU、远端作业、往 `temp/ideas/` 写（正式开题由人确认后走 `idea-kickoff`）。亦禁止写 `temp/idea/`、`temp/auto-research/`。
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
-- 开 brainstorm / explore / ingest 时 **必须**把三类模型块写入该层 prompt（见 rule「subagent 模型」），禁止只给 README 路径。explore 开 critic / potential / ingest 时同样写入。
+- 开 brainstorm / explore / ingest 时 **必须**把三类模型块写入该层 prompt（见 rule「subagent 模型」；**含禁止 fast**），禁止只给 README 路径。explore 开 critic / potential / ingest 时同样写入。
 - 与当前仓库实现**解耦**：不要求 repo-novel；自由探索即可。
 
 ## 落盘
@@ -62,6 +62,7 @@ temp/research-scout/<run-slug>/
   - research: …
   - research-high: …
   - ingest: …
+  - 禁止 fast: 一律禁止 `*-fast`；点了 fast 或指定模型不可用 → 拒绝并再问，禁止改用 fast 或擅自换
 - N / K: …
 - 停止原因: （结束时再填）
 ```
@@ -110,7 +111,7 @@ temp/research-scout/<run-slug>/
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/brainstorm.md`
-- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文 + **禁止 fast**；见 rule「subagent 模型」）
 - run 目录绝对路径、本轮 `r`、用户范围/种子
 - 已有可行与 Deprecated 的短标题（避免重复）
 - 可选本轮角度（如机制 / 目标 / 表征，便于并行发散）
@@ -128,7 +129,7 @@ Prompt 须包含：
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/idea-explore.md`
-- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」；内层 critic / potential / ingest 必须再写入 prompt）
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文 + **禁止 fast**；见 rule「subagent 模型」；内层 critic / potential / ingest 必须再写入 prompt）
 - 目标目录：`temp/research-scout/<run-slug>/ideas/I-{n}/`（绝对路径）
 - 假设陈述 + 已做轻量查重摘要
 - run `README.md` 绝对路径（范围 / 非目标 / kill / 算力上限 / **三类 subagent 模型**）
@@ -152,7 +153,7 @@ Prompt 须包含：
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/paper-ingest/SKILL.md`
-- **三类 subagent 模型块**（本 Task 类型=`ingest` + 三值原文；见 rule「subagent 模型」）
+- **三类 subagent 模型块**（本 Task 类型=`ingest` + 三值原文 + **禁止 fast**；见 rule「subagent 模型」）
 - 目标 arXiv/URL/slug
 - 只写 `temp/papers/<slug>/`
 - 回报：INDEX 路径 + `new` 或 `cache` + 可跟线索 + related 种子（勿贴全文）

@@ -40,7 +40,7 @@ cache/                     # gitignore
 - 注释主体用**中文**（专有名词可英文）；改到的英文注释顺手改中文。
 - 最小改动；复用 registry/config 加载；不主动加未要求的测试/文档。
 - AI 改代码默认在 **`master`** + 工作区锁；须向前兼容、不影响其他模型；破坏性改动二次确认（见 `auto-train` / 「本机计算约束」）。
-- Task / subagent 模型见 rule「subagent 模型」：用户指定 `research` / `research-high` / `ingest` 三类；开 Task 必须把整块写入 prompt 并逐层原样传递；禁默认与 `*-fast`。
+- Task / subagent 模型见 rule「subagent 模型」：用户指定 `research` / `research-high` / `ingest` 三类；开 Task 必须把整块写入 prompt 并逐层原样传递（**含禁止 fast**）；禁默认与 `*-fast`。
 
 ## Agent skills（按需读）
 
