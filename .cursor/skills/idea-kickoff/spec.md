@@ -8,13 +8,13 @@
 - 只写父代理给定夹内：`scope.md` / `claims.md` / `grounding.md` / `risk.md` / `protocol.md`。
 - 禁止写 `survey.md` / `proposal*` / `stage.md` / `README.md`；禁止改 `milestones.md`（路线权威是拷贝来的该文件，本步只对齐、不另写一套里程碑）。
 - 文稿禁止出现 `I-{n}` / `D-{n}`。
-- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+- 面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`；见 rule「subagent 模型」）。
 - 不 ingest（文献缺口应已在综述解决；仍缺则 **FAIL** 并说明，让父代理决定是否退回综述）。
 
 ## 主循环
 
 ```
-父代理传入：目标夹、scout README 路径（须含算力上限）
+父代理传入：目标夹、scout README 路径（须含算力上限）、**三类 subagent 模型块**
   → 读 survey.md（须已 PASS）+ idea.md / SPEC.md / milestones.md / novelty / reality / critic
   → 写 grounding.md（从综述抽出最近邻 + residual，短）
   → 写 scope.md（问题、贡献 ≤3、非目标、kill；**把 scout 卡时上限抄进本文件**）

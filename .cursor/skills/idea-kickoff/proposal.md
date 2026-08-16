@@ -9,13 +9,13 @@
 
 - 只写父代理给定夹内的 `proposal/`（tex + bib + pdf）或 fallback 的 `proposal.md`。
 - 禁止写 `survey.md` / `scope.md` / `stage.md` / `README.md`；禁止改 `milestones.md`。
-- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+- 面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`；见 rule「subagent 模型」）。
 - 进度节对齐 `milestones.md`；实验方案节对齐 `protocol.md`；相关工作节对齐 `survey.md`（短引，不要再写一篇综述）。
 
 ## 主循环
 
 ```
-父代理传入：目标夹
+父代理传入：目标夹、**三类 subagent 模型块**
   → 读 survey / scope / claims / protocol / milestones / SPEC / risk
   → 探测 LaTeX（见下）
   → 有工具链：写 proposal/proposal.tex + refs.bib，立刻编译 PDF

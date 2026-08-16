@@ -16,7 +16,7 @@
 | `scripts.mdc` | 工作目录=仓库根；SSH 边界 |
 | `project-conventions.mdc` | 通用目录、中文注释、skill 索引 |
 | `git-commit.mdc` | 人说才提交；禁机密；多逻辑先问再拆 |
-| `subagent-model.mdc` | Task 只用 inherit / auto / composer-2.5，禁 fast；ingest 默认同此，DeepSeek/Qwen 等优先 inherit |
+| `subagent-model.mdc` | 三类模型须用户指定、写入每层 Task prompt 并原样向内传；禁默认与 fast |
 
 未纳入：自动训练、具体模型/配置/checkpoint 哈希、YAML 行内注释等同构。
 

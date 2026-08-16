@@ -14,7 +14,7 @@
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
 - **钉住本题**：变体只进本夹 `backlog.md`；不自行改题、不另开号。
 - **文稿禁止出现 `I-{n}` / `D-{n}` / 条目编号**（夹名可能被外部重排）。标题只用短标题。
-- 本流程面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+- 本流程面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`）。嵌套 critic / ingest 时**原样再写入**其 prompt（只改本 Task 类型）。未收到完整块 → 不准开更内层 Task。见 rule「subagent 模型」。
 - 对照 scout 传入的 run `README.md`：**非目标 / Kill 条件** 命中 → **fail**；**算力上限** 里程碑合计超标 → **fail**。
 
 ## 落盘
@@ -47,7 +47,7 @@ ideas/I-{n}/
 ## 主循环（顺序强制）
 
 ```
-scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、run README 路径（范围/非目标/kill/算力）
+scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、run README 路径（范围/非目标/kill/算力/**三类 subagent 模型**）
   → 建夹；idea.md 先钉住假设（状态: 探索中）
        违反 README 非目标或 Kill → idea.md 标 失败；回报 fail；结束
   → 1. 查相关论文（ingest 仅新计 N）→ related.md
@@ -72,23 +72,25 @@ scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、ru
 
 ### 开 paper-ingest subagent（强制）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（默认 `auto` / `composer-2.5`；主模型为 DeepSeek/Qwen 等时优先 `inherit`；禁 `*-fast`）。  
+用 Task，`subagent_type: generalPurpose`，**`model` 用 README 已指定的 ingest**（见 rule「subagent 模型」；禁 `*-fast`）。  
 `run_in_background: false`（除非并行多篇且能合并结果）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/paper-ingest/SKILL.md`
+- **三类 subagent 模型块**（本 Task 类型=`ingest` + 三值原文；见 rule「subagent 模型」）
 - 目标 arXiv/URL/slug
 - 只写 `temp/papers/<slug>/`
 - 回报：INDEX 路径 + `new` 或 `cache` + 可跟线索 + related 种子（勿贴全文）
 
 ### 开 critic subagent（强制，数学写完或按反驳改完后）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+用 Task，`subagent_type: generalPurpose`，**`model` 用 README 已指定的 research-high**（见 rule「subagent 模型」；禁 `*-fast`）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/critic.md`
+- **三类 subagent 模型块**（本 Task 类型=`research-high` + 三值原文；见 rule「subagent 模型」）
 - 夹内绝对路径；只追加 `critic.md` 本轮一节
 - 当前轮次 `k`（1 / 2 / 3）与已反驳次数（`k-1`）
 - `k=3` 时写明：禁止 `REVISE`，非 PASS 即 FAIL

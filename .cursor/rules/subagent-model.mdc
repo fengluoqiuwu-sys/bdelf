@@ -1,44 +1,39 @@
 ---
-description: Task/subagent 只用原模型（inherit / auto / composer-2.5），禁 fast；ingest 默认同此，主模型为 DeepSeek/Qwen 等时优先 inherit
+description: 三类 subagent 模型须用户指定、写入每层 Task prompt 并原样向内传；禁默认与 fast
 alwaysApply: true
 ---
 
 # Subagent 模型
 
-凡 `Task` / subagent，**只能**用原模型，禁止一切 fast 变体与其它显式模型。
+开 **research / research-high / ingest** 类 Task **之前**，用户必须指定三类各用什么模型。  
+**禁止默认、禁止猜测、禁止用主模型顶替**（除非用户明确写 `inherit`）。缺任一类 → **停下来问**，写入后再启动。
 
-## 允许（一般 subagent）
+一律禁止 `*-fast`。用户点了 fast → 拒绝并再问。指定的模型不可用 → 再问，禁止改用 fast 或擅自换。
 
-| `model` | 含义 |
-|---------|------|
-| `inherit`（默认） | 与**主 agent 同一模型**；主 agent 本身是 fast 时**禁止** inherit |
-| `auto` | Cursor Auto（非 Fast） |
-| `composer-2.5` | Composer 2.5（非 Fast） |
+## 三类（按任务选 `model`）
 
-禁止：`composer-2.5-fast`、`auto-fast`、任何 `*-fast`；禁止显式点名 Claude / GPT / Grok 等（主 agent 是这些模型时只能靠 `inherit`）。  
-运行时若没有非 fast 的 `composer-2.5`，改用 `auto` 或 `inherit`，**禁止**退回 `*-fast`。
+| 类型 | 何时 | 现有 Task |
+|------|------|-----------|
+| **research** | 普通调查 | brainstorm、idea-explore、survey、spec、proposal |
+| **research-high** | 高难度（数学原理等） | critic |
+| **ingest** | 查文献并总结 | paper-ingest |
 
-## paper-ingest
+`inherit` 仅当用户点名且主 agent 非 fast。
 
-默认只允许 `auto` 或 `composer-2.5`。禁止把 Claude / GPT / Grok 等经 `inherit` 传给 ingest；禁止 `*-fast`。
+## 逐层传递（开 Task 强制）
 
-**例外（优先）**：主 agent 或当前父代理属于**中国便宜模型**（名称/slug 含 `deepseek`、`qwen`；同类如 `glm`、`kimi`、`minimax`）且非 fast 时，ingest **必须优先 `inherit`**，不要改用 auto / composer-2.5。
+每开一层 Task，**prompt 必须原文写入**下面整块（三类取值都要有）。禁止只给 README / `stage.md` 路径代替取值。子代理再开更内层时**原样写入**（只改「本 Task 类型」），不得改值、不得省略。未收到完整块 → **不准**开更内层 Task。
 
+```markdown
+## subagent 模型（原样向内传，禁止改、禁止省）
+- 本 Task 类型: research | research-high | ingest
+- research: …
+- research-high: …
+- ingest: …
 ```
-# 一般：OK
-Task(..., model="inherit")          # 主 agent 非 fast
-Task(..., model="auto")
-Task(..., model="composer-2.5")
 
-# ingest：主模型是 DeepSeek/Qwen 等 → 优先 inherit
-Task(..., model="inherit")
+## 落盘
 
-# ingest：主模型不是上述族 → auto 或 composer-2.5
-Task(..., model="auto")
-Task(..., model="composer-2.5")
-
-# 禁止
-Task(..., model="composer-2.5-fast")
-Task(..., model="inherit")          # ingest 且将被继承的是 Grok/Claude/GPT 等
-Task(..., model="claude-opus-5-thinking-high")
-```
+- scout：`temp/research-scout/<run>/README.md` 必填三项；开 Task 仍须把取值写入 prompt。
+- 开题：抄 scout README 或问用户，写入 `stage.md`；开 Task 同样写入 prompt。
+- 单独 ingest：未指定则先问。

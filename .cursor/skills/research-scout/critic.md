@@ -8,7 +8,7 @@
 - 只写父代理给定夹内的 `critic.md`。禁止改 `math.md` / `SPEC.md` / 其它文件，禁止 ingest、改代码、占 GPU。
 - 只读：`idea.md`、`base.md`、`math.md`、`related.md`、已有 `critic.md`（历史轮次）、run `README.md`（算力约束若有）。
 - 钢人反驳：尽量证伪，不帮作者圆场。
-- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+- 面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research-high`；见 rule「subagent 模型」）。禁止只给 README 路径。
 - 本轮追加一节，**不要抹掉**前轮。explore 会传入当前轮次 `1/2/3`。
 
 ## 判定

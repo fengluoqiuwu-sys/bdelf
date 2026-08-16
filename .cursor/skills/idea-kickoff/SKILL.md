@@ -27,6 +27,7 @@ description: >-
 - 开题文稿**禁止**写 `I-{n}` / `D-{n}`。
 - **阶段只写 `stage.md`**：禁止把某一阶段的闸 / 产物 / 下一步写进 `README.md`。
 - **禁止把开题捏成一次做完**：综述 → 规格 → 报告，顺序强制；前一步 FAIL 则停，不写后面的。
+- 开任何 research / research-high / ingest Task **必须**把三类模型块写入 prompt 并逐层原样传递（见 rule「subagent 模型」）；禁 fast、禁默填。
 - 最终判断（是否真开实验、改 claim、停题）仍归用户。
 
 ## 落盘
@@ -56,6 +57,7 @@ temp/ideas/<name>/
   → 解析 <name>；目标已存在 → 停下来问，禁止覆盖
   → cp -a 源夹 → temp/ideas/<name>/
   → 主 agent 只写 SOURCE.md + 薄 README.md + stage.md（当前=开题，步骤=综述）
+  → 三类 subagent 模型：抄 scout README，缺则先问，写入 stage.md
   → 确认拷贝的 novelty / reality / critic 均为 PASS；缺一则停
   → Task(survey) 写 survey.md
        FAIL → stage.md 标失败；停；不写规格/报告
@@ -75,7 +77,7 @@ cp -a <源夹绝对路径> temp/ideas/<name>
 
 ### 主 agent 可写的身份文件
 
-`SOURCE.md`：拷贝自哪、时间、scout run README 路径（范围 / 非目标 / kill / **算力上限**）。源夹未改。
+`SOURCE.md`：拷贝自哪、时间、scout run README 路径（范围 / 非目标 / kill / **算力上限** / **三类 subagent 模型**）。源夹未改。三类模型若 scout README 没有 → **先问用户**，写入 `stage.md` 后再开 survey。
 
 `README.md`（仅当尚无此文件）：标题、陈述、来源指针、「当前阶段见 stage.md」。禁止写闸、产物、下一步。已有则不要覆盖。
 
@@ -87,6 +89,7 @@ cp -a <源夹绝对路径> temp/ideas/<name>
 - 步骤: 综述 / 规格 / 报告 / 待人确认 / 失败
 - 状态: 进行中 / 待人确认 / 失败
 - 更新: YYYY-MM-DD
+- subagent 模型: research … / research-high … / ingest …（抄 scout 或人指定；禁 fast）
 ## 本阶段产物
 （只列已完成步骤的文件；综述未完不要预列报告）
 ## 闸 / 禁止
@@ -100,11 +103,12 @@ cp -a <源夹绝对路径> temp/ideas/<name>
 ### 开 survey subagent（强制，综述）
 
 综述**必须**交给 survey，主 agent **禁止**自己写 `survey.md` 或把综述揉进开题报告。  
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+用 Task，`subagent_type: generalPurpose`，**`model` 用已指定的 research**（见 rule「subagent 模型」；禁 `*-fast`）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/idea-kickoff/survey.md`
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」；内层 ingest 必须再写入 prompt）
 - 目标夹绝对路径；`SOURCE.md` 里 scout README 路径
 - 只写该夹 `survey.md` 与 `temp/papers/`（ingest）
 - 回报：`PASS` 或 `FAIL`、一句原因、新 ingest 数
@@ -114,11 +118,12 @@ Prompt 须包含：
 ### 开 spec subagent（强制，仅综述 PASS 后）
 
 规格与实验协议**必须**交给 spec，主 agent **禁止**自己写 `scope.md` / `claims.md` / `protocol.md` 等。  
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+用 Task，`subagent_type: generalPurpose`，**`model` 用已指定的 research**（见 rule「subagent 模型」；禁 `*-fast`）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/idea-kickoff/spec.md`
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
 - 目标夹绝对路径；scout README 路径（算力上限必须抄进本夹）
 - 只写 scope / claims / grounding / risk / protocol
 - 回报：`PASS` 或 `FAIL`、一句原因
@@ -128,11 +133,12 @@ Prompt 须包含：
 ### 开 report subagent（强制，仅规格 PASS 后）
 
 开题报告**必须**交给 report，主 agent **禁止**自己写 `proposal.tex` / `proposal.md`。  
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+用 Task，`subagent_type: generalPurpose`，**`model` 用已指定的 research**（见 rule「subagent 模型」；禁 `*-fast`）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/idea-kickoff/proposal.md`
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
 - 目标夹绝对路径
 - 只写 `proposal/` 或 fallback 的 `proposal.md`
 - 回报：`pdf` 或 `md`、路径、若 fallback 写明原因

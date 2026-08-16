@@ -22,13 +22,14 @@ description: >-
 - 只写 `temp/`：本 run 目录 + 通过 ingest 写的 `temp/papers/<slug>/`。
 - 禁止：改仓库代码/`config/`、训练/占 GPU、远端作业、往 `temp/ideas/` 写（正式开题由人确认后走 `idea-kickoff`）。亦禁止写 `temp/idea/`、`temp/auto-research/`。
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
+- 开 brainstorm / explore / ingest 时 **必须**把三类模型块写入该层 prompt（见 rule「subagent 模型」），禁止只给 README 路径。
 - 与当前仓库实现**解耦**：不要求 repo-novel；自由探索即可。
 
 ## 落盘
 
 ```text
 temp/research-scout/<run-slug>/
-  README.md       # 范围、非目标、kill、算力上限、N/K、停止原因
+  README.md       # 范围、非目标、kill、算力上限、subagent 模型、N/K、停止原因
   backlog.md      # 论文与查询队列
   brainstorm/R-{r}.md  # 各轮候选假设（尚未送审）
   ideas.md        # 索引：可行区按 潜力×确信 降序；文末 Deprecated
@@ -49,6 +50,7 @@ temp/research-scout/<run-slug>/
 | 非目标 | 明确不做（如不写综述、不训基础模型） |
 | Kill 条件 | 什么情况下整条 idea 直接丢（如必须冻结某 backbone） |
 | 算力上限 | 5090 卡时、A100 卡时（可只给一种；explore 超标则 fail） |
+| subagent 模型 | `research` / `research-high` / `ingest` 各用什么（见 rule「subagent 模型」；禁 fast、禁默填） |
 
 ```markdown
 # Scout run
@@ -56,6 +58,10 @@ temp/research-scout/<run-slug>/
 - 非目标: …
 - Kill 条件: …
 - 算力上限: 5090 … 卡时 / A100 … 卡时（未使用的写「无」）
+- subagent 模型:
+  - research: …
+  - research-high: …
+  - ingest: …
 - N / K: …
 - 停止原因: （结束时再填）
 ```
@@ -98,12 +104,13 @@ temp/research-scout/<run-slug>/
 ### 开 brainstorm subagent（强制，产候选）
 
 候选假设**必须**由 brainstorm 出，scout 主 agent **禁止**自己编一批再送审。  
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。  
+用 Task，`subagent_type: generalPurpose`，**`model` 用 README 已指定的 research**（见 rule「subagent 模型」；禁 `*-fast`）。  
 `run_in_background: false`（除非并行多路角度且能合并）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/brainstorm.md`
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」）
 - run 目录绝对路径、本轮 `r`、用户范围/种子
 - 已有可行与 Deprecated 的短标题（避免重复）
 - 可选本轮角度（如机制 / 目标 / 表征，便于并行发散）
@@ -115,15 +122,16 @@ Prompt 须包含：
 ### 开 idea-explore subagent（强制，送审时）
 
 轻量查重且多样性挑选后决定送审的假设**必须**交给 `idea-explore`，scout **不**自己写夹内长文。  
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。  
+用 Task，`subagent_type: generalPurpose`，**`model` 用 README 已指定的 research**（见 rule「subagent 模型」；禁 `*-fast`）。  
 `run_in_background: false`（除非并行多条且能合并结果）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/idea-explore.md`
+- **三类 subagent 模型块**（本 Task 类型=`research` + 三值原文；见 rule「subagent 模型」；内层 critic/ingest 必须再写入 prompt）
 - 目标目录：`temp/research-scout/<run-slug>/ideas/I-{n}/`（绝对路径）
 - 假设陈述 + 已做轻量查重摘要
-- run `README.md` 绝对路径（范围 / 非目标 / kill / 算力上限）
+- run `README.md` 绝对路径（范围 / 非目标 / kill / 算力上限 / **三类 subagent 模型**）
 - 本条 **新** ingest 上限与当前 `N_left`（本条默认上限 6，且不得超过 `N_left`；缓存命中不占）
 - 只写该夹与 `temp/papers/`；文稿不要写 `I-{n}` 字样
 - 回报：`keep` 或 `fail`、短标题、失败门、研究潜力、成功可能性 0～1、本条**新** ingest 数
@@ -138,12 +146,13 @@ Prompt 须包含：
 
 ### 开 paper-ingest subagent（强制）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（默认 `auto` / `composer-2.5`；主模型为 DeepSeek/Qwen 等时优先 `inherit`；禁 `*-fast`）。  
+用 Task，`subagent_type: generalPurpose`，**`model` 用 README 已指定的 ingest**（见 rule「subagent 模型」；禁 `*-fast`）。  
 `run_in_background: false`（除非并行多篇且你能合并结果）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/paper-ingest/SKILL.md`
+- **三类 subagent 模型块**（本 Task 类型=`ingest` + 三值原文；见 rule「subagent 模型」）
 - 目标 arXiv/URL/slug
 - 只写 `temp/papers/<slug>/`
 - 回报：INDEX 路径 + `new` 或 `cache` + 可跟线索 + related 种子（勿贴全文）

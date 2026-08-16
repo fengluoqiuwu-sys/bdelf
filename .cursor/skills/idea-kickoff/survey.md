@@ -11,7 +11,7 @@
 - 禁止写 `scope.md` / `claims.md` / `protocol.md` / `proposal*` / `stage.md` / `README.md`；禁止改拷贝来的 explore 文稿（含 `related.md` / `milestones.md`）。
 - 禁止把综述写成开题报告或论文 related work 章。
 - 文稿禁止出现 `I-{n}` / `D-{n}`。
-- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
+- 面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`）；嵌套 ingest 再原样传入（本 Task=`ingest`）。未收到完整块不准开更内层 Task。见 rule「subagent 模型」。
 - 对照 scout README：**非目标 / Kill** 命中 → **FAIL**。
 
 ## 预算（默认）
@@ -25,7 +25,7 @@
 ## 主循环
 
 ```
-父代理传入：目标夹、SOURCE / scout README 路径
+父代理传入：目标夹、SOURCE / scout README 路径、**三类 subagent 模型块**
   → 读 idea.md / related.md / base.md / novelty.md（以及已有 INDEX）
   → 脉络不够再 ingest（计 N）
   → 写 survey.md
@@ -35,7 +35,8 @@
 
 ### 开 paper-ingest subagent（强制，需全文时）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（默认 `auto` / `composer-2.5`；主模型为 DeepSeek/Qwen 等时优先 `inherit`；禁 `*-fast`）。只写 `temp/papers/<slug>/`。
+用 Task，`subagent_type: generalPurpose`，**`model` 用已指定的 ingest**（见 rule「subagent 模型」；禁 `*-fast`）。只写 `temp/papers/<slug>/`。  
+Prompt 须含 **三类 subagent 模型块**（本 Task 类型=`ingest` + 三值原文；未收到完整块则不准开 ingest）。
 
 ### `survey.md` 格式
 

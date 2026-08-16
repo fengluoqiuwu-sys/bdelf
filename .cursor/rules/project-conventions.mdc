@@ -40,7 +40,7 @@ cache/                     # gitignore
 - 注释主体用**中文**（专有名词可英文）；改到的英文注释顺手改中文。
 - 最小改动；复用 registry/config 加载；不主动加未要求的测试/文档。
 - AI 改代码默认在 **`master`** + 工作区锁；须向前兼容、不影响其他模型；破坏性改动二次确认（见 `auto-train` / 「本机计算约束」）。
-- Task / subagent 模型见 rule「subagent 模型」：原模型 `inherit` / `auto` / `composer-2.5`，禁 fast；`paper-ingest` 默认 `auto` / `composer-2.5`，主模型为 DeepSeek/Qwen 等时优先 `inherit`。
+- Task / subagent 模型见 rule「subagent 模型」：用户指定 `research` / `research-high` / `ingest` 三类；开 Task 必须把整块写入 prompt 并逐层原样传递；禁默认与 `*-fast`。
 
 ## Agent skills（按需读）
 
