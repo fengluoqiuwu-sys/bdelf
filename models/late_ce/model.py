@@ -3,7 +3,7 @@
 训练：per-example 混合 ELF 式 t=1 decode CE（``decoder_prob``）与 denoise
 MSE/x-pred（t~U(0,1) 可改）；denoise 行在晚段时间窗内额外叠加
 ``late_ce_weight`` 加权的轨迹 token CE。推理末步 unembed（decode mode）。
-见 ``temp/idea/late-ce/``。
+见 ``temp/ideas/late-ce/``。
 """
 
 from __future__ import annotations

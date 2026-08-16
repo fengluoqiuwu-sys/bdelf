@@ -61,13 +61,13 @@ train-ops / 远端 Slurm 规则）；`common` → `scripts/launch-train.sh --ser
   fork 任务分支或改完后 `git switch` 到别的实现分支。思路隔离靠 `temp/auto-research/<idea>/`，不靠 git 分支。
 - **改代码前须抢工作区锁**（见下节与 skill `train-ops`）；**generate 不占锁**，但应确认当前为 `master`
   （若被切走则 `git switch master`）。
-- **开改前重读**：动手实现 / 换向前，通读 `temp/idea/<idea>/`（若有）、`temp/auto-research/<idea>/`
+- **开改前重读**：动手实现 / 换向前，通读 `temp/ideas/<idea>/`（若有）、`temp/auto-research/<idea>/`
   与相关代码，确认理解后再改，避免叠错方向。
 - **记录粒度**：
   - 架构变体 / 调参 / 修 bug → 仍用同一 `temp/auto-research/<idea>/`，新增 `.md` 记改动与原因。
   - 全新想法 → **新建** `temp/auto-research/<newidea>/`；放弃原因写回旧 idea 目录。
 - 每个自动训练思路在 **本地 `temp/auto-research/<idea>/`** 下建目录记录：
-  - `README.md`：本轮自动研究目标/口径（可链到 `temp/idea/<idea>/README.md`）。
+  - `README.md`：本轮自动研究目标/口径（可链到 `temp/ideas/<idea>/README.md`）。
   - 每个调整/子实验一个 `.md`：写明改动内容、原因、父节点、结果数据。
   - `SUMMARY.md`（只在完成后写）：整个思路的结论与最终建议。
 - **换向/停止时的权重留存**：checkpoint 留在 `cache/checkpoints/{fast|full}/{model}/{hash}/`，
@@ -133,7 +133,7 @@ WHO="auto-train:<idea>"
 
 **1. 记录口径（不建 git 分支）**
 
-开改前通读 `temp/idea/<idea>/`（若有）与既有 `temp/auto-research/<idea>/`，写好 `README.md` 口径。
+开改前通读 `temp/ideas/<idea>/`（若有）与既有 `temp/auto-research/<idea>/`，写好 `README.md` 口径。
 
 **2. 实现思路**
 

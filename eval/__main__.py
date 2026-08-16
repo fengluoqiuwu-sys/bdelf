@@ -84,7 +84,7 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     )
     args.input = args.input or default_in
     args.out_dir = args.out_dir or (
-        root / "temp/idea/trifluency/baselines/elf-cfg-32"
+        root / "temp/ideas/trifluency/result/baselines/elf-cfg-32"
     )
     return cmd_score(args)
 
