@@ -741,6 +741,14 @@ def train_loop(
                 f"freeze_d={getattr(bb, 'attr_freeze_d', '?')}); "
                 "fast 变体跳过估 d；metrics: mse / ce / attr",
             )
+        elif cfg.model == "bdelf":
+            bb = unwrap_model(model).backbone
+            _train_log(
+                f"BDELF: DiT 只做当前块 FM；独立因果 decoder "
+                f"(λ={getattr(bb, 'lambda_dec', 1):g}, "
+                f"{getattr(bb, 'n_dec_layer', '?')}×{getattr(bb, 'n_dec_embd', '?')}) "
+                "读 stop-grad latent；metrics/plots 用 decoder CE",
+            )
         else:
             decoder_prob = float(
                 getattr(unwrap_model(model).backbone, "decoder_prob", 0.2)

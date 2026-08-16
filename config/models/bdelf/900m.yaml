@@ -1,4 +1,4 @@
-_doc: Block Diffusion + Flow LM ~870M（token emb latent，28×1536，block 16）
+_doc: Block Diffusion + Flow LM ~870M（冻 emb FM + 独立因果 decoder，28×1536，block 16）
 
 name: bdelf-900m                   # 配置名；与文件名一致
 tokenizer: gpt2                     # GPT-2 词表；配合 preprocess=default
@@ -13,7 +13,6 @@ dropout: 0.0                       # dropout（仅中段层启用）
 attn_backend: flex                 # 注意力后端：flex | sdpa
 num_time_tokens: 4                 # in-context 时间 token 数
 num_self_cond_cfg_tokens: 0        # SC-CFG scale token；0=关闭（保留普通 self-cond，少 1～2 次 forward）
-num_model_mode_tokens: 4           # decode/denoise mode token 数
 self_cond_prob: 0.5                # 训练时 self-cond 概率
 self_cond_cfg_min: 0.5             # SC-CFG 采样下界
 self_cond_cfg_max: 5.0             # SC-CFG 采样上界
@@ -22,10 +21,11 @@ latent_std: 0.2                    # emb 归一化标准差
 denoiser_p_mean: -1.5              # denoise t 的 logit-normal 均值
 denoiser_p_std: 0.8                # denoise t 的 logit-normal 标准差
 denoiser_noise_scale: 2.0          # denoise 噪声尺度
-decoder_prob: 0.5                  # mixed 中 decode 样本比例
-decoder_p_mean: 0.8                # decode λ 的 logit-normal 均值
-decoder_p_std: 0.8                 # decode λ 的 logit-normal 标准差
-decoder_noise_scale: 5.0           # decode 噪声尺度
+n_dec_layer: 4                     # 独立因果 decoder 层数
+n_dec_head: 6                      # decoder 注意力头数
+n_dec_embd: 384                    # decoder 隐层维
+dec_dropout: 0.1                   # decoder dropout
+lambda_dec: 1.0                    # decoder CE 相对 FM 的权重
 t_eps: 0.05                        # 1-t 下界，防除零
 time_schedule: logit_normal        # 训练时间调度
 fix_bos: true                      # 是否固定 BOS 位置为干净 latent

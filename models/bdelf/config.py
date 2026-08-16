@@ -27,17 +27,17 @@ class FL_BDELFConfig(PretrainedConfig):
             "dropout",
             "attn_backend",
             "num_time_tokens",
-            "num_model_mode_tokens",
             "self_cond_prob",
             "latent_mean",
             "latent_std",
             "denoiser_p_mean",
             "denoiser_p_std",
             "denoiser_noise_scale",
-            "decoder_prob",
-            "decoder_p_mean",
-            "decoder_p_std",
-            "decoder_noise_scale",
+            "n_dec_layer",
+            "n_dec_head",
+            "n_dec_embd",
+            "dec_dropout",
+            "lambda_dec",
             "t_eps",
             "time_schedule",
             "fix_bos",
@@ -66,7 +66,6 @@ class FL_BDELFConfig(PretrainedConfig):
         attn_backend: str = "flex",
         num_time_tokens: int = 4,
         num_self_cond_cfg_tokens: int = 0,
-        num_model_mode_tokens: int = 4,
         self_cond_prob: float = 0.5,
         self_cond_cfg_min: float = 0.5,
         self_cond_cfg_max: float = 5.0,
@@ -75,10 +74,11 @@ class FL_BDELFConfig(PretrainedConfig):
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         denoiser_noise_scale: float = 2.0,
-        decoder_prob: float = 0.5,
-        decoder_p_mean: float = 0.8,
-        decoder_p_std: float = 0.8,
-        decoder_noise_scale: float = 5.0,
+        n_dec_layer: int = 4,
+        n_dec_head: int = 6,
+        n_dec_embd: int = 384,
+        dec_dropout: float = 0.1,
+        lambda_dec: float = 1.0,
         t_eps: float = 0.05,
         time_schedule: str = "logit_normal",
         fix_bos: bool = True,
@@ -108,7 +108,6 @@ class FL_BDELFConfig(PretrainedConfig):
         self.attn_backend = attn_backend
         self.num_time_tokens = num_time_tokens
         self.num_self_cond_cfg_tokens = num_self_cond_cfg_tokens
-        self.num_model_mode_tokens = num_model_mode_tokens
         self.self_cond_prob = self_cond_prob
         self.self_cond_cfg_min = self_cond_cfg_min
         self.self_cond_cfg_max = self_cond_cfg_max
@@ -117,10 +116,11 @@ class FL_BDELFConfig(PretrainedConfig):
         self.denoiser_p_mean = denoiser_p_mean
         self.denoiser_p_std = denoiser_p_std
         self.denoiser_noise_scale = denoiser_noise_scale
-        self.decoder_prob = decoder_prob
-        self.decoder_p_mean = decoder_p_mean
-        self.decoder_p_std = decoder_p_std
-        self.decoder_noise_scale = decoder_noise_scale
+        self.n_dec_layer = n_dec_layer
+        self.n_dec_head = n_dec_head
+        self.n_dec_embd = n_dec_embd
+        self.dec_dropout = dec_dropout
+        self.lambda_dec = lambda_dec
         self.t_eps = t_eps
         self.time_schedule = time_schedule
         self.fix_bos = fix_bos
@@ -151,7 +151,6 @@ class FL_BDELFConfig(PretrainedConfig):
             "attn_backend": self.attn_backend,
             "num_time_tokens": self.num_time_tokens,
             "num_self_cond_cfg_tokens": self.num_self_cond_cfg_tokens,
-            "num_model_mode_tokens": self.num_model_mode_tokens,
             "self_cond_prob": self.self_cond_prob,
             "self_cond_cfg_min": self.self_cond_cfg_min,
             "self_cond_cfg_max": self.self_cond_cfg_max,
@@ -160,10 +159,11 @@ class FL_BDELFConfig(PretrainedConfig):
             "denoiser_p_mean": self.denoiser_p_mean,
             "denoiser_p_std": self.denoiser_p_std,
             "denoiser_noise_scale": self.denoiser_noise_scale,
-            "decoder_prob": self.decoder_prob,
-            "decoder_p_mean": self.decoder_p_mean,
-            "decoder_p_std": self.decoder_p_std,
-            "decoder_noise_scale": self.decoder_noise_scale,
+            "n_dec_layer": self.n_dec_layer,
+            "n_dec_head": self.n_dec_head,
+            "n_dec_embd": self.n_dec_embd,
+            "dec_dropout": self.dec_dropout,
+            "lambda_dec": self.lambda_dec,
             "t_eps": self.t_eps,
             "time_schedule": self.time_schedule,
             "fix_bos": self.fix_bos,

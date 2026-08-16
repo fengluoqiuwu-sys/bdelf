@@ -320,7 +320,7 @@ class BDELFInferState:
     sc_prev: torch.Tensor | None = None,
     self_cond_cfg_scale: torch.Tensor | None = None,
   ) -> torch.Tensor:
-    """返回当前块 z-half 的 hidden（n_embd），供 FinalLayer / unembed。"""
+    """返回当前块 z-half 的 hidden（n_embd），供 FinalLayer。"""
     win_len = (stride + 1) * self.db
     z_in = self.bb._apply_self_cond(z_block, sc_prev)
     suffix_pair = self._gather_suffix_pair(z_in)
@@ -378,17 +378,12 @@ class BDELFInferState:
     top_k: int | None = None,
     self_cond_cfg_scale: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    del self_cond_cfg_scale
     self.write_suffix(z_block, stride)
-    bsz = z_block.size(0)
-    t_batch = torch.ones(bsz, device=self.device, dtype=z_block.dtype)
-    hidden = self._suffix_forward(
-      z_block, stride, t_batch, decode=True,
-      sc_prev=None,
-      self_cond_cfg_scale=self_cond_cfg_scale,
-    )
-    logits = self.bb._decode_logits(hidden)
+    z_so_far = self.z_buf[:, : (stride + 1) * self.db]
+    logits = self.bb.latent_decoder(z_so_far)
     return sample_from_logits(
-      logits,
+      logits[:, -self.db:],
       temperature=temperature,
       top_k=top_k,
     )
