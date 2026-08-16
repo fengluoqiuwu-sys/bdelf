@@ -52,7 +52,7 @@ ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-eval.sh <name> --server <
 ## AI 作业登记（仅占 GPU；登记用了哪几张卡）
 
 路径：该机 `temp/agent/active/<id>.json` + `launched/<id>.json`；`<id>` 为 `pid<PID>`。  
-`scripts/launch-train.sh` **自动**写 active + launched + `logs/.../meta.json`。  
+`scripts/launch-train.sh` / `scripts/launch-eval.sh` **自动**写 active + launched + `logs/.../meta.json`。  
 **仅**占 GPU 需要登记；纯 CPU **不写** agent。**不**登记 `cpus`。
 
 ```json

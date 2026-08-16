@@ -4,7 +4,7 @@
 本机直接跑 ``scontrol show node -o``（轻量只读，不占 GPU）。
 按节点汇总：配置卡数 / 已分配 / 空闲 / 状态 / GPU 型号。
 
-脚本不发起 SSH。本机查远端时，先 push，再：
+脚本不发起 SSH。本机查远端时，先 push，再（工作目录见 servers.csv；本仓库通常 ``~/source/bdelf``）：
 
     ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/gpu_availability.py'
 

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # 本机工具（ovan-server / Slurm 专属）：一次 ssh 汇总远端 GPU / 队列 / agent 登记。
 # 远端作业操作（sbatch / scancel 等）之前必须先跑本脚本（见 rule「远端 Slurm 计算约束」）。
+#
 # 合计 GPU 额度现场读本机 scripts/servers.csv「最大使用显卡数量」，不写死。
+# 工作目录从 scripts/servers.csv 读取，勿写死旧仓库路径。
+# 可用 REMOTE_ROOT 覆盖工作目录。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

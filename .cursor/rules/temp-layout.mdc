@@ -10,9 +10,10 @@ alwaysApply: true
 | 路径 | 用途 |
 |------|------|
 | `temp/auto-research/<idea>/` | 自动训练/优化记录（见 skill `auto-train`；README 须含已确认的训练服务名） |
-| `temp/idea/<idea>/` | 人工认可后的想法/规格文稿 |
+| `temp/ideas/<name>/` | 人确认可行后的 idea 工作夹（后续阶段共用；**当前阶段只写 `stage.md`**。开题见 `idea-kickoff`；实验见 `idea-experiment`：专用代码 `source/`，数据与结果 `result/`；全局训练与 checkpoint 不放本夹） |
+| `temp/idea/<idea>/` | 人工认可后的旧规格文稿（新流程用 `temp/ideas/`） |
 | `temp/papers/<name>/` | 论文（`paper/` + `INDEX.md`）与可选 `sources/` |
-| `temp/research-scout/<run>/` | 自由探索找 idea 的 run 记录（见 skill `research-scout`）；交付物 `ideas.md` |
+| `temp/research-scout/<run>/` | 自由探索找 idea 的 run 记录（见 skill `research-scout`）；可行 `ideas/I-{n}/`，失败 `ideas/D-{n}/`（由 `idea-explore` 写入、scout 改名） |
 | `temp/vram-probe/` | `alloc.md`：model×batch→alloc_peak_GiB（见 skill `vram-probe`）；开训按当前卡+global_bs 查表 |
 | `temp/local-workspace.lock/` | **本机** AI 非 temp 改动互斥锁（用 `scripts/workspace_lock.py` 抢/释；见 skill `train-ops`） |
 | `temp/agent/`（本机） | 本机调试作业登记（`scheduler: "local"`；见「本机计算约束」、skill `train-ops`） |
@@ -22,6 +23,7 @@ alwaysApply: true
 另：`logs/<服务名>/<时间戳>/`（仓库根、gitignore）存放作业 `.out` / `.err` / `gpu-*.log`（Slurm 与 common 统一）。**pull 会拉取**；push 不上传且不因 `--delete` 清远端（见 skill `sync` / `train-ops`）。
 
 - `<idea>` / `<name>` / `<run>`：短横线小写 slug（如 `elf-cfg`、`2026-08-03-diff-lm`）。
-- `auto-research` / `idea` / `research-scout` 目录建议有 `README.md`。
-- scout 不写入 `temp/idea/`；人筛选后再搬入。
-- 勿把大 checkpoint 放进 `temp/`。
+- `auto-research` / `ideas` / `research-scout` 目录建议有 `README.md`。`temp/ideas/<name>/README.md` **只**写跨阶段身份（标题、陈述、来源）；当前阶段、闸、本阶段产物、下一步写 `stage.md`，不要写进 README。
+- scout / idea-explore **不写入** `temp/ideas/` 或 `temp/idea/`；人说某条可行后再走 `idea-kickoff` 拷贝进去。
+- 本题专用代码在 `temp/ideas/<name>/source/`，本题数据与结果在 `result/`。全局训练、共享数据、checkpoint **不要**放进 idea 夹。
+- 勿把大 checkpoint / 权重放进 `temp/`（含 `result/`）；全局 ckpt 保持全局，idea 夹只可引用路径或哈希。

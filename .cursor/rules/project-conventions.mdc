@@ -52,5 +52,8 @@ cache/                     # gitignore
 | `generate` | 本机 `generate.py` |
 | `sync` | `scripts/sync.sh`（`<服务名>` 见 `servers.csv`；登录用系统 `ssh <服务名>`） |
 | `auto-train` | 用户明确「自动执行」后的闭环优化；**须先确认训练服务名**（见「本机计算约束」） |
-| `research-scout` | 自由探索找未充分做过的 idea → `temp/research-scout/` |
-| `paper-ingest` | 下载论文并编 AI 用 INDEX（供 scout subagent；仅 auto） |
+| `research-scout` | 自由探索找未充分做过的 idea → `temp/research-scout/`（单条深化见同目录 `idea-explore.md`） |
+| `idea-kickoff` | 人确认某条可行后拷贝到 `temp/ideas/<name>/`；开题分综述→规格→报告（均 subagent） |
+| `idea-experiment` | 实验阶段规范：本题代码 `source/`、数据与结果 `result/`；全局训练/checkpoint 仍全局；不要求 AI 跑实验 |
+| `git-commit` | 人说才提交；Conventional 类型 + 中文说明；多逻辑先问再拆 |
+| `paper-ingest` | 下载论文并编 AI 用 INDEX（供 scout / idea-explore / idea-kickoff subagent；仅 auto） |

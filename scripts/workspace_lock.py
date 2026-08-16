@@ -8,6 +8,7 @@
 
     .venv/bin/python scripts/workspace_lock.py acquire --holder auto-train:elf-cfg --purpose "edit code"
     .venv/bin/python scripts/workspace_lock.py release --holder auto-train:elf-cfg
+    .venv/bin/python scripts/workspace_lock.py acquire --holder scout:topic --purpose "edit code"
     .venv/bin/python scripts/workspace_lock.py status
 """
 
@@ -134,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     ac = sub.add_parser("acquire", help="抢锁（失败 exit 1）")
-    ac.add_argument("--holder", required=True, help="持有者，如 auto-train:elf-cfg / human")
+    ac.add_argument("--holder", required=True, help="持有者，如 auto-train:elf-cfg / scout:topic / human")
     ac.add_argument("--purpose", default="edit", help="用途简述")
     ac.set_defaults(func=cmd_acquire)
 

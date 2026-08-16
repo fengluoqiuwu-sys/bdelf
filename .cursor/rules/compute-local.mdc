@@ -9,10 +9,10 @@ alwaysApply: true
 - **调度**：本机 ≠ Slurm、≠ common 远端；不入 `servers.csv`。正式 full 训练在远端（Slurm 或 common）。
 - **Python**：见 rule「Python 虚拟环境」。
 - **GPU 互斥**：同时只跑一个占 GPU 的进程；可停本会话拉起的作业，勿杀用户自启进程。
-- **分支**：AI 本机改代码 / generate 均在 **`master`** 上进行（`git branch --show-current` 须为 `master`；被切走则切回）。**禁止**为实验另开实现分支（见 skill `auto-train`）。
+- **分支**：AI 本机改代码 / generate 均在 **`master`** 上进行（`git branch --show-current` 须为 `master`；被切走则切回）。**禁止**为实验另开实现分支；思路隔离用 `temp/`（`auto-research` / `ideas`；见 skill `auto-train`）。
 - **工作区锁**：AI 对本机**非 temp** 文件的改动（generate 除外）须
   `.venv/bin/python scripts/workspace_lock.py acquire --holder …`；释锁用 `release`；
-  抢不到则睡 30min 再试（见 skill `train-ops`）。
+  抢不到则睡 30min 再试（见 skill `train-ops`）。只读或只动 `temp/` 不占锁。
 - **改动兼容性**：默认只做向前兼容、且不影响其他模型训练/推理的改动；破坏性 / 修实现错误会改旧数值等须向用户二次确认（见 `auto-train`「改动兼容性」、rule「Checkpoint 路径与配置哈希」）。
 - **推理/评测**：本机可直接 `eval.py` / `generate.py`；远端 TriFluency eval 须经 `slurm/sbatch-eval.sh`（Slurm）或 `scripts/launch-eval.sh`（common），默认卡数与 csv「单个ai任务最大使用显卡数量」相同；结果经 `sync pull`（含 `cache/eval/`）拉回查看。`generate.py` 交互式续写仍只在本机。
 - **自动训练目标机（强制）**：启动 `auto-train` / 远端 full 前，必须先与用户确认

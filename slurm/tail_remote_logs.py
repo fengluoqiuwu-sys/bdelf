@@ -8,7 +8,7 @@
 
 旧布局（兼容）:: ``slurm/logs/<job-name>-<job-id>.{out,err}``。
 
-脚本不发起 SSH。本机查远端日志时，先 push，再：
+脚本不发起 SSH。本机查远端日志时，先 push，再（工作目录见 servers.csv；本仓库通常 ``~/source/bdelf``）：
 
     ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py 1234567'
     ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345'

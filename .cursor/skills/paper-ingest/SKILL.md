@@ -3,20 +3,21 @@ name: paper-ingest
 description: >-
   Download a paper into temp/papers/<slug>/, build an AI-oriented INDEX.md
   (file map, mechanism sketch, limitations, related seeds, scout cues), and
-  return paths plus short cues. Use when research-scout (or the user) needs a
-  local retrievable paper asset. Cursor-only; intended for Task subagents on
-  auto only. Does not invent research ideas.
+  return paths plus short cues. Use when research-scout, idea-explore,
+  idea-kickoff (survey step), or the user needs a local retrievable paper asset.
+  Cursor-only; intended for Task subagents on auto only. Does not invent
+  research ideas.
 ---
 
 # paper-ingest
 
-把**一篇**论文变成主循环可检索的本地资产。由 `research-scout` 用 Task subagent 调用；也可在用户明确要求「下载并编索引」时单独用。
+把**一篇**论文变成主循环可检索的本地资产。由 `research-scout` / `idea-explore` / `idea-kickoff`（综述）用 Task subagent 调用；也可在用户明确要求「下载并编索引」时单独用。
 
 **硬边界**
 
 - 只写 `temp/papers/<slug>/`（及其中 `paper/`）。
-- 禁止改代码、开训、远端作业、clone GitHub/`sources/`（除非用户明示）。
-- **不产出完整 research idea**（那是 scout 的事）；INDEX 里只给「可跟线索」。
+- 禁止改代码、开训/占 GPU、远端作业、clone GitHub/`sources/`（除非用户明示）。
+- **不产出完整 research idea**（那是 scout / idea-explore 的事）；INDEX 里只给「可跟线索」。
 - 本 skill 面向 **subagent**：父代理须用 `model: auto` 启动；禁止 composer 或其它显式模型。
 
 ## 输入
@@ -32,7 +33,7 @@ description: >-
 ## 步骤
 
 1. **解析身份**：确定 title、arXiv id（若有）、目标 `temp/papers/<slug>/`。
-2. **跳过条件**：若 `paper/INDEX.md` 已存在且含「局限/未做」「可跟线索」「文件地图」等必备块 → **不重下**，直接回报路径 + 从 INDEX 抽出的线索（**不计** scout 的 N）。
+2. **跳过条件**：若 `paper/INDEX.md` 已存在且含「局限/未做」「可跟线索」「文件地图」等必备块 → **不重下**，直接回报路径 + `cache` + 从 INDEX 抽出的线索（**不计** 父代理的 N）。
 3. **下载**（优先可检索文本）：
    - 优先 arXiv HTML → 另存可读 `*.html` / 抽 `*.txt`
    - 有 source：可下 `e-print`（tar）并解开 tex；保留 `source.tar.gz` 可选
@@ -65,14 +66,14 @@ description: >-
 ## 4. 相关工作种子
 - arXiv:… — 为何可能相关
 
-## 5. 给 scout 的可跟线索
+## 5. 可跟线索（scout / idea-explore）
 - （5～10 条子弹级提示，不是完整 idea）
 ```
 
-5. **回报父代理**（短）：`slug`、INDEX 路径、线索列表、related 种子 id。勿贴全文。
+5. **回报父代理**（短）：`slug`、INDEX 路径、`new` 或 `cache`、线索列表、related 种子 id。勿贴全文。父代理只对 `new` 计 N。
 
 ## 禁止
 
-- 写 `temp/idea/`、`temp/research-scout/`、`temp/auto-research/`
+- 写 `temp/ideas/`、`temp/idea/`、`temp/research-scout/`、`temp/auto-research/`
 - 长篇「论文笔记」代替 INDEX 结构
 - 把 PDF 二进制内容读进对话（用 txt/html/tex）

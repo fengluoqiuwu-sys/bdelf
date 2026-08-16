@@ -1,0 +1,14 @@
+---
+description: 人说才提交；禁机密；多逻辑先问再拆。细则见 skill git-commit
+alwaysApply: true
+---
+
+# Git 提交约束
+
+- 用户没明确说提交 / commit / `git commit` → **不** `commit`、**不** `push`。
+- 禁止提交：`.env*`、`scripts/servers.csv`、`instances.csv`、`temp/`、`logs/`、`.venv/`、`cache/`、权重/checkpoint，以及 `.gitignore` 已忽略项。已 staged 则停并警告。
+- 一次一事。工作区有多段无关改动 → **先列出拟拆的 commit（标题 + 文件），等人同意再提**。
+- 说明：`type(scope): 中文主语`（无明确模块则省略 scope）；正文一两句写 **why**，不要文件清单。
+- 禁止：`--no-verify`、未要求的 `--amend` / `push --force` / `reset --hard`、`git add -A` / `git add .`。点名文件暂存。
+- 更新实例仓库走 skill `template-update` 的 `instance-git.sh`，不要用手写 commit 代替。
+- 流程见 skill `git-commit`。

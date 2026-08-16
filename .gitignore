@@ -70,3 +70,4 @@ cache
 
 # ---- 服务清单（含连接信息，不入库）----
 scripts/servers.csv
+instances.csv

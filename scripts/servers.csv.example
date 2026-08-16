@@ -1,0 +1,11 @@
+# 计算服务清单（复制为 scripts/servers.csv；该文件应 gitignore）
+# 【必须对照新项目重写】「工作目录」改为本仓库在远端的路径，勿沿用其它项目的目录。
+# 调度类型 slurm → rule「远端 Slurm 计算约束」（ovan：slurm/remote_status.sh）
+# 调度类型 common → rule「远端 common 计算约束」（占 GPU 才登记 agent，不登记 CPU；本机调试不入本表）
+# 「名字」即可系统 SSH（ssh <名字>）；工作目录供 sync / 远端命令 cd
+# 多种显卡用 | 分隔，与「单卡GB」一一对应（如 A6000|RTX4090 对 48|24）
+# 同步：bash scripts/sync.sh <名字> …；登录/执行：ssh <名字> …
+名字,调度类型,工作目录,最大使用显卡数量,单个ai任务最大使用显卡数量,显卡,单卡GB
+ovan-server,slurm,~/source/<repo>,4,4,A6000|RTX4090,48|24
+train-server-1,common,~/source/<repo>,4,4,RTX5090,32
+train-server-2,common,~/source/<repo>,4,4,RTX5090,32
