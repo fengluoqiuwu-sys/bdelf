@@ -8,7 +8,7 @@
 - 只写父代理给定夹内：`scope.md` / `claims.md` / `grounding.md` / `risk.md` / `protocol.md`。
 - 禁止写 `survey.md` / `proposal*` / `stage.md` / `README.md`；禁止改 `milestones.md`（路线权威是拷贝来的该文件，本步只对齐、不另写一套里程碑）。
 - 文稿禁止出现 `I-{n}` / `D-{n}`。
-- 面向 **subagent**：父代理须用 `model: auto`。
+- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 - 不 ingest（文献缺口应已在综述解决；仍缺则 **FAIL** 并说明，让父代理决定是否退回综述）。
 
 ## 主循环

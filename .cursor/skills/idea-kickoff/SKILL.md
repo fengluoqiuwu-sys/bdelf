@@ -100,7 +100,7 @@ cp -a <源夹绝对路径> temp/ideas/<name>
 ### 开 survey subagent（强制，综述）
 
 综述**必须**交给 survey，主 agent **禁止**自己写 `survey.md` 或把综述揉进开题报告。  
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 
 Prompt 须包含：
 
@@ -114,7 +114,7 @@ Prompt 须包含：
 ### 开 spec subagent（强制，仅综述 PASS 后）
 
 规格与实验协议**必须**交给 spec，主 agent **禁止**自己写 `scope.md` / `claims.md` / `protocol.md` 等。  
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 
 Prompt 须包含：
 
@@ -128,7 +128,7 @@ Prompt 须包含：
 ### 开 report subagent（强制，仅规格 PASS 后）
 
 开题报告**必须**交给 report，主 agent **禁止**自己写 `proposal.tex` / `proposal.md`。  
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 
 Prompt 须包含：
 

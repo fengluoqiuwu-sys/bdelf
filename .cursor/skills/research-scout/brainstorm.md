@@ -11,7 +11,7 @@
 - **默认不 ingest**。只做 WebSearch / arXiv 摘要级检索；要读机制留给 explore。
 - **尽量自主假设**；可参考 future work，但预估**连 B 档都难**的不要列入。
 - 禁止为凑条数灌水。宁缺，回报「本轮无合格候选」。
-- 面向 **subagent**：父代理须用 `model: auto`。
+- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 
 ## 落盘
 

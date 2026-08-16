@@ -1,0 +1,44 @@
+---
+description: Task/subagent 只用原模型（inherit / auto / composer-2.5），禁 fast；ingest 默认同此，主模型为 DeepSeek/Qwen 等时优先 inherit
+alwaysApply: true
+---
+
+# Subagent 模型
+
+凡 `Task` / subagent，**只能**用原模型，禁止一切 fast 变体与其它显式模型。
+
+## 允许（一般 subagent）
+
+| `model` | 含义 |
+|---------|------|
+| `inherit`（默认） | 与**主 agent 同一模型**；主 agent 本身是 fast 时**禁止** inherit |
+| `auto` | Cursor Auto（非 Fast） |
+| `composer-2.5` | Composer 2.5（非 Fast） |
+
+禁止：`composer-2.5-fast`、`auto-fast`、任何 `*-fast`；禁止显式点名 Claude / GPT / Grok 等（主 agent 是这些模型时只能靠 `inherit`）。  
+运行时若没有非 fast 的 `composer-2.5`，改用 `auto` 或 `inherit`，**禁止**退回 `*-fast`。
+
+## paper-ingest
+
+默认只允许 `auto` 或 `composer-2.5`。禁止把 Claude / GPT / Grok 等经 `inherit` 传给 ingest；禁止 `*-fast`。
+
+**例外（优先）**：主 agent 或当前父代理属于**中国便宜模型**（名称/slug 含 `deepseek`、`qwen`；同类如 `glm`、`kimi`、`minimax`）且非 fast 时，ingest **必须优先 `inherit`**，不要改用 auto / composer-2.5。
+
+```
+# 一般：OK
+Task(..., model="inherit")          # 主 agent 非 fast
+Task(..., model="auto")
+Task(..., model="composer-2.5")
+
+# ingest：主模型是 DeepSeek/Qwen 等 → 优先 inherit
+Task(..., model="inherit")
+
+# ingest：主模型不是上述族 → auto 或 composer-2.5
+Task(..., model="auto")
+Task(..., model="composer-2.5")
+
+# 禁止
+Task(..., model="composer-2.5-fast")
+Task(..., model="inherit")          # ingest 且将被继承的是 Grok/Claude/GPT 等
+Task(..., model="claude-opus-5-thinking-high")
+```

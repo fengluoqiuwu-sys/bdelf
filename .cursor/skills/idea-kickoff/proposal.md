@@ -9,7 +9,7 @@
 
 - 只写父代理给定夹内的 `proposal/`（tex + bib + pdf）或 fallback 的 `proposal.md`。
 - 禁止写 `survey.md` / `scope.md` / `stage.md` / `README.md`；禁止改 `milestones.md`。
-- 面向 **subagent**：父代理须用 `model: auto`。
+- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 - 进度节对齐 `milestones.md`；实验方案节对齐 `protocol.md`；相关工作节对齐 `survey.md`（短引，不要再写一篇综述）。
 
 ## 主循环

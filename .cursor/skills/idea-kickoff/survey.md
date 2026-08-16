@@ -11,7 +11,7 @@
 - 禁止写 `scope.md` / `claims.md` / `protocol.md` / `proposal*` / `stage.md` / `README.md`；禁止改拷贝来的 explore 文稿（含 `related.md` / `milestones.md`）。
 - 禁止把综述写成开题报告或论文 related work 章。
 - 文稿禁止出现 `I-{n}` / `D-{n}`。
-- 面向 **subagent**：父代理须用 `model: auto`。
+- 面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 - 对照 scout README：**非目标 / Kill** 命中 → **FAIL**。
 
 ## 预算（默认）
@@ -35,7 +35,7 @@
 
 ### 开 paper-ingest subagent（强制，需全文时）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。只写 `temp/papers/<slug>/`。
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（默认 `auto` / `composer-2.5`；主模型为 DeepSeek/Qwen 等时优先 `inherit`；禁 `*-fast`）。只写 `temp/papers/<slug>/`。
 
 ### `survey.md` 格式
 

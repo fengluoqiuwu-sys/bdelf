@@ -98,7 +98,7 @@ temp/research-scout/<run-slug>/
 ### 开 brainstorm subagent（强制，产候选）
 
 候选假设**必须**由 brainstorm 出，scout 主 agent **禁止**自己编一批再送审。  
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。  
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。  
 `run_in_background: false`（除非并行多路角度且能合并）。
 
 Prompt 须包含：
@@ -115,7 +115,7 @@ Prompt 须包含：
 ### 开 idea-explore subagent（强制，送审时）
 
 轻量查重且多样性挑选后决定送审的假设**必须**交给 `idea-explore`，scout **不**自己写夹内长文。  
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。  
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。  
 `run_in_background: false`（除非并行多条且能合并结果）。
 
 Prompt 须包含：
@@ -138,7 +138,7 @@ Prompt 须包含：
 
 ### 开 paper-ingest subagent（强制）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**（禁止 composer 或其它显式模型）。  
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（默认 `auto` / `composer-2.5`；主模型为 DeepSeek/Qwen 等时优先 `inherit`；禁 `*-fast`）。  
 `run_in_background: false`（除非并行多篇且你能合并结果）。
 
 Prompt 须包含：

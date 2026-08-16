@@ -14,7 +14,7 @@
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
 - **钉住本题**：变体只进本夹 `backlog.md`；不自行改题、不另开号。
 - **文稿禁止出现 `I-{n}` / `D-{n}` / 条目编号**（夹名可能被外部重排）。标题只用短标题。
-- 本流程面向 **subagent**：父代理须用 `model: auto`；禁止 composer 或其它显式模型。
+- 本流程面向 **subagent**：父代理须按 rule「subagent 模型」选 `model`（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 - 对照 scout 传入的 run `README.md`：**非目标 / Kill 条件** 命中 → **fail**；**算力上限** 里程碑合计超标 → **fail**。
 
 ## 落盘
@@ -68,7 +68,7 @@ scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、ru
 
 ### 开 paper-ingest subagent（强制）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。  
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（默认 `auto` / `composer-2.5`；主模型为 DeepSeek/Qwen 等时优先 `inherit`；禁 `*-fast`）。  
 `run_in_background: false`（除非并行多篇且能合并结果）。
 
 Prompt 须包含：
@@ -80,7 +80,7 @@ Prompt 须包含：
 
 ### 开 critic subagent（强制，数学写完后）
 
-用 Task，`subagent_type: generalPurpose`，**`model` 只能是 `auto`**。
+用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 
 Prompt 须包含：
 

@@ -5,8 +5,9 @@ description: >-
   (file map, mechanism sketch, limitations, related seeds, scout cues), and
   return paths plus short cues. Use when research-scout, idea-explore,
   idea-kickoff (survey step), or the user needs a local retrievable paper asset.
-  Cursor-only; intended for Task subagents on auto only. Does not invent
-  research ideas.
+  Cursor-only; Task subagents on auto / composer-2.5, or inherit when
+  the parent is a cheap Chinese model (DeepSeek/Qwen).
+  Does not invent research ideas.
 ---
 
 # paper-ingest
@@ -18,7 +19,7 @@ description: >-
 - 只写 `temp/papers/<slug>/`（及其中 `paper/`）。
 - 禁止改代码、开训/占 GPU、远端作业、clone GitHub/`sources/`（除非用户明示）。
 - **不产出完整 research idea**（那是 scout / idea-explore 的事）；INDEX 里只给「可跟线索」。
-- 本 skill 面向 **subagent**：父代理须用 `model: auto` 启动；禁止 composer 或其它显式模型。
+- 本 skill 面向 **subagent**：`model` 见 rule「subagent 模型」。默认 `auto` 或 `composer-2.5`；主/父代理是 DeepSeek、Qwen 等中国便宜模型（非 fast）时**优先 `inherit`**。禁止把 Grok/Claude/GPT 等经 inherit 传入，禁止 `*-fast`。
 
 ## 输入
 
