@@ -15,7 +15,7 @@ description: >-
 **不是**写论文综述；**不**交接 auto-train；**不**改代码、不占 GPU、不提交远端作业。
 
 配合 skill `paper-ingest`（读全文/编 INDEX）与本目录 [brainstorm.md](brainstorm.md)、[idea-explore.md](idea-explore.md)、[critic.md](critic.md)、[potential.md](potential.md)；均须 Task subagent。  
-**主 agent 不独自想 idea**：候选由 brainstorm 出；主循环只筛选、多样性、查重、送审。explore 先新颖性后可行性；数学由 critic 他评；**研究潜力在数学通过后由独立 potential 重评**。
+**主 agent 不独自想 idea**：候选由 brainstorm 出；主循环只筛选、多样性、查重、送审。explore 先新颖性后可行性（新颖性须主题网络搜索 + 相关论文查找，别人写过的不要 keep）；数学由 critic 他评；**研究潜力在数学通过后由独立 potential 重评**。
 
 ## 硬边界
 
@@ -91,7 +91,7 @@ temp/research-scout/<run-slug>/
        主 agent **只筛选**：
          丢掉连 B刊/B会都难的、与已有 I/D 重复的；
          **多样性**：按角度聚类（机制 / 目标 / 表征 / 数据 / 评测…），每簇最多送审 1 条；同质的记 log 不送
-         轻量检索查重
+         轻量检索查重（WebSearch / arXiv 摘要；明显已有同题则不送审。正式新颖性由 explore 再搜一遍）
        需要机制细节才 → Task(paper-ingest)（**仅新 ingest 计 N**；缓存命中不计）
        筛过值得送审 **且** `可行 I-* + 在飞 < K` → 分配 n，Task(idea-explore) 写入 ideas/I-{n}/（传入 README 约束；其**新** ingest 计入 N）
        接到 explore 返回：
@@ -117,7 +117,7 @@ Prompt 须包含：
 - 只写 `brainstorm/R-{r}.md`；默认不 ingest
 - 回报：候选条数、各条短标题 + 角度 + 预估档 + 成功可能性
 
-候选入池后由**主 agent**做轻量查重、滤档与**多样性挑选**，通过的才送 `idea-explore`。同簇不连送。brainstorm 回报 0 条算一轮「加不出新 idea」。
+候选入池后由**主 agent**做轻量查重（须实际 WebSearch / arXiv，禁止只凭记忆）、滤档与**多样性挑选**，通过的才送 `idea-explore`。同簇不连送。brainstorm 回报 0 条算一轮「加不出新 idea」。主循环这一步只挡明显撞车；**不能**代替 explore 的主题检索与论文查找。
 
 ### 开 idea-explore subagent（强制，送审时）
 
@@ -195,7 +195,7 @@ Prompt 须包含：
 | B+ / B / B- | **B刊 / B会** 的上 / 中 / 下 |
 | C | 普通论文（够写成一篇，够不上 A/B 刊会） |
 
-scout 主循环里轻量查重已撞车、尚未送审的假设：不必建夹，`log.md` 记一行即可。  
+scout 主循环里轻量查重已撞车、尚未送审的假设：不必建夹，`log.md` 记一行即可（写清搜过什么、撞到哪篇）。  
 送审后失败：只改名为 `D-{n}/`，不要删夹。
 
 ## 触发

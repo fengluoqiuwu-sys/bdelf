@@ -8,7 +8,7 @@
 ## 硬边界
 
 - 只写父代理给定的 run 目录下 `brainstorm/`（及可选追加 `backlog.md` 查询词）。禁止写 `ideas/`、`temp/ideas/`、`temp/papers/`。
-- **默认不 ingest**。只做 WebSearch / arXiv 摘要级检索；要读机制留给 explore。
+- **默认不 ingest**。只做 WebSearch / arXiv 摘要级检索；要读机制留给 explore。本轮检索只帮自己丢掉明显已有工作，**不**代替 explore 新颖性闸。
 - **尽量自主假设**；可参考 future work，但预估**连 B刊/B会都难**的不要列入。
 - 禁止为凑条数灌水。宁缺，回报「本轮无合格候选」。
 - 面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`；见 rule「subagent 模型」）。即使本步不 ingest 也要传齐，禁止只给 README 路径。

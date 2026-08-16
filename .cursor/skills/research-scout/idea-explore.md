@@ -16,6 +16,7 @@
 - **文稿禁止出现 `I-{n}` / `D-{n}` / 条目编号**（夹名可能被外部重排）。标题只用短标题。
 - 本流程面向 **subagent**：父代理须把 **三类模型块**写入 prompt（本 Task=`research`）。嵌套 critic / potential / ingest 时**原样再写入**其 prompt（只改本 Task 类型）。未收到完整块 → 不准开更内层 Task。见 rule「subagent 模型」。
 - **禁止自己给研究潜力定档**：critic 通过后必须 Task(potential)；`idea.md` / `SPEC.md` 只许**抄** `potential.md` 的档。
+- **新颖性必须实搜**：写 `novelty.md` 之前必须对本题做**主题网络搜索**和**相关论文查找**；禁止用训练记忆、scout 轻量摘要或「感觉没见过」代替。别人已经写过的同一题 / 同一机制增量 → **FAIL**，不要 keep。
 - 对照 scout 传入的 run `README.md`：**非目标 / Kill 条件** 命中 → **fail**；**算力上限** 里程碑合计超标 → **fail**。
 
 ## 落盘
@@ -25,9 +26,9 @@
 ```text
 ideas/I-{n}/
   idea.md         # 短条目；失败时在此标注
-  related.md      # 相关论文
+  related.md      # 相关论文（须含主题检索 + 论文查找记录）
   base.md         # base 做了什么 + 相对更改
-  novelty.md      # ★ 新颖性（先于可行性）
+  novelty.md      # ★ 新颖性（先于可行性；未实搜不得 PASS）
   reality.md      # 数据 / 指标 / 可复现（新颖性通过后）
   math.md         # 底层数学
   critic.md       # 数学他评（由 critic 子代理写）
@@ -52,9 +53,14 @@ ideas/I-{n}/
 scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、run README 路径（范围/非目标/kill/算力/**三类 subagent 模型**）
   → 建夹；idea.md 先钉住假设（状态: 探索中）
        违反 README 非目标或 Kill → idea.md 标 失败；回报 fail；结束
-  → 1. 查相关论文（ingest 仅新计 N）→ related.md
+  → 1. **强制检索**（本步未实搜 → 不得写 PASS）：
+       a. 主题网络搜索（WebSearch；多组查询：假设原句、机制关键词、问题+方法）
+       b. 相关论文查找（arXiv / 学术检索；命中写入 related.md）
+       摘要已显示同一 claim / 同一机制增量 → idea.md 标 失败（查重）；回报 fail；结束
+       近邻需机制细节才 ingest（仅新计 N）
        总结 base 做了什么、本题在 base 上改了什么 → base.md
-  → 2. 写 novelty.md：最近邻、residual delta、PASS/FAIL
+  → 2. 写 novelty.md：检索记录、最近邻、residual delta、PASS/FAIL
+       未检索、查询词/命中未落盘、或别人已写过 → FAIL
        FAIL → idea.md 标 失败（新颖性）；回报 fail；结束
   → 3. 写 reality.md：数据从哪来、主指标能否支撑 claim、能否公开复现
        FAIL → idea.md 标 失败（现实性）；回报 fail；结束
@@ -71,7 +77,8 @@ scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、ru
   → 9. idea.md 标 可行（潜力档抄 potential.md）；回报 keep；结束探索
 ```
 
-需要机制细节才 Task(paper-ingest)；**仅新 ingest 计 N**；缓存命中不计。
+需要机制细节才 Task(paper-ingest)；**仅新 ingest 计 N**；缓存命中不计。  
+新颖性检索本身用 WebSearch / arXiv 摘要即可；**不能不搜**。近邻摘要已够判强重叠时直接 FAIL，不必为了否决再 ingest。
 
 ### 开 paper-ingest subagent（强制）
 
@@ -123,7 +130,7 @@ Prompt 须包含：
 - 新颖性: PASS / FAIL
 - 陈述: …
 - 为何可能好: …
-- 查重: 搜过什么 → 未见 / 有近邻（链接） / 已有强重叠
+- 查重: 主题检索 + 论文查找（抄 novelty.md 检索节）→ 未见 / 有近邻（链接） / 已有强重叠
 - 依据: INDEX 锚点 或 纯假设+检索
 - 粗成本: 小 / 中 / 大
 - 研究潜力: 待独立重评 / A+ / A / A- / B+ / B / B- / C（**仅抄** potential.md；未评前写待独立重评）
@@ -142,20 +149,37 @@ Prompt 须包含：
 …
 ```
 
+### `related.md` 格式（检索之后立刻写；禁止凭记忆编近邻）
+
+```markdown
+# 相关工作
+## 检索
+- 主题网络搜索: 查询词 → 引擎/来源 → 关键命中（标题 + 链接；无则写「无命中」）
+- 相关论文查找: 查询词 → arXiv/学术检索 → 关键命中（标题 + 链接/arxiv id；无则写「无命中」）
+## 近邻
+- <论文> — 与本题差在哪（链 INDEX 或摘要）
+```
+
+至少两组**不同**查询词（主题陈述一组、机制/方法名一组）。scout 传入的轻量摘要只作线索，**不能**代替本表。
+
 ### `novelty.md` 格式
 
 ```markdown
 # 新颖性
+## 检索（强制）
+- 主题网络搜索: （查询词；命中或「无命中」；链 related.md）
+- 相关论文查找: （查询词；命中或「无命中」；链 related.md）
+- 结论: 未见同题 / 有近邻 / 已有强重叠
 ## 最近邻
-…（1～3 篇，链到 related.md）
+…（1～3 篇，必须来自上一节命中，链到 related.md；禁止无检索写近邻）
 ## 差在哪
 …（residual delta；禁止只写「我们更高效/更通用」）
 ## 判定
 PASS / FAIL：…
 ```
 
-**FAIL** 若：强重叠；或实质是把已有方法 A 换到问题 B、没有机制增量。  
-新颖性未过，**不要**写现实性、数学、卡时。
+**FAIL** 若：未做主题网络搜索或相关论文查找；检索节空白/伪造；强重叠（别人已写过同一假设或同一机制增量）；或实质是把已有方法 A 换到问题 B、没有机制增量。  
+未检索不得 PASS。新颖性未过，**不要**写现实性、数学、卡时。
 
 ### `reality.md` 格式（仅新颖性 PASS 后）
 
@@ -209,7 +233,7 @@ PASS / FAIL：…
 - 怎样算做成: （相对基准的可检验提升或定性门槛；禁止空泛「更好」）
 
 ## 查重
-搜过什么 → 未见 / 有近邻（链到 related.md） / 已有强重叠
+主题检索 + 论文查找（抄 novelty.md）→ 未见 / 有近邻（链到 related.md） / 已有强重叠
 
 ## 失败模式
 …
@@ -242,6 +266,6 @@ PASS / FAIL：…
 
 成功可能性（必填）：`[0,1]`，表示**本题能做成的确信程度**（与研究潜力档独立；失败条也可填，通常接近 0）。critic **FAIL** 后须下调，不得维持高分；**REVISE** 后可略降，最终须以最后一轮 PASS 为准。
 
-`related.md` 每条近邻一行：论文 + **与本题差在哪**。列出检索词。
+`related.md` 必须先有检索节（主题网络搜索 + 相关论文查找），再列近邻；每条近邻一行：论文 + **与本题差在哪**。
 
 回报 scout（短）：`keep` 或 `fail`、短标题、失败门（非目标/kill/新颖性/现实性/数学/超预算/查重，若有）、研究潜力、成功可能性 0～1、本条**新** ingest 数。勿贴全文、勿回报编号标签。
