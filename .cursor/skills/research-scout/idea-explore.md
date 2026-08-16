@@ -57,8 +57,12 @@ scout 传入：目标夹路径、假设陈述、轻量查重摘要、N_left、ru
   → 3. 写 reality.md：数据从哪来、主指标能否支撑 claim、能否公开复现
        FAIL → idea.md 标 失败（现实性）；回报 fail；结束
   → 4. 写 math.md：先 base 逻辑，再本题逻辑（细）
-  → 5. Task(critic) 写 critic.md；FAIL → idea.md 标 失败（数学）；回报 fail；结束
-       禁止自己给 math 判通过
+  → 5. Task(critic) 写/追加 critic.md（传入轮次 k=1；禁止自己给 math 判通过）
+       PASS → 继续
+       FAIL → idea.md 标 失败（数学）；回报 fail；结束
+       REVISE → 按反驳改 math.md（必要时同步 base.md 数学衔接；**禁止换题**；换题才能过 → 当作 FAIL）
+                 k ← k+1，再 Task(critic)；最多反驳 **2** 次（k=1、2 可 REVISE）
+                 第 3 次 critic（k=3）非 PASS → idea.md 标 失败（数学）；回报 fail；结束
   → 6. 细化机制 + 成功判据 → SPEC.md
   → 7. 写 milestones.md（M0 = 最便宜证伪；对照 README 算力；超标 fail）
   → 8. idea.md 标 可行；回报 keep；结束探索
@@ -78,15 +82,19 @@ Prompt 须包含：
 - 只写 `temp/papers/<slug>/`
 - 回报：INDEX 路径 + `new` 或 `cache` + 可跟线索 + related 种子（勿贴全文）
 
-### 开 critic subagent（强制，数学写完后）
+### 开 critic subagent（强制，数学写完或按反驳改完后）
 
 用 Task，`subagent_type: generalPurpose`，**`model` 见 rule「subagent 模型」**（`inherit` / `auto` / `composer-2.5`，禁 `*-fast`）。
 
 Prompt 须包含：
 
 - 读并遵循 `.cursor/skills/research-scout/critic.md`
-- 夹内绝对路径；只写 `critic.md`
-- 回报：`PASS` 或 `FAIL` + 一句原因
+- 夹内绝对路径；只追加 `critic.md` 本轮一节
+- 当前轮次 `k`（1 / 2 / 3）与已反驳次数（`k-1`）
+- `k=3` 时写明：禁止 `REVISE`，非 PASS 即 FAIL
+- 回报：`PASS` / `REVISE` / `FAIL` + 一句原因；`REVISE` 时加「改哪」
+
+接到 `REVISE`：`log.md` 记一轮；只改数学表述，不改 `idea.md` 陈述。已反驳 2 次仍接到 `REVISE` → 按 FAIL 处理。
 
 ### `idea.md` 格式
 
@@ -159,9 +167,9 @@ PASS / FAIL：…
 …（供 critic 攻击；本文件不得写「判定通过」）
 ```
 
-新逻辑必须**逻辑自洽**且**数学上可行、合理**。是否通过以 `critic.md` 为准。
+新逻辑必须**逻辑自洽**且**数学上可行、合理**。是否通过以 `critic.md` **最后一轮**为准（中间可以 REVISE，explore 改完再送审；禁止在本文件写「判定通过」）。
 
-### `SPEC.md` 格式（仅 critic PASS 后）
+### `SPEC.md` 格式（仅 critic **最后一轮 PASS** 后）
 
 ```markdown
 # <短标题>
@@ -189,7 +197,7 @@ PASS / FAIL：…
 …
 ```
 
-### `milestones.md` 格式（仅 critic PASS 后）
+### `milestones.md` 格式（仅 critic **最后一轮 PASS** 后）
 
 - **M0（强制）**：最便宜的证伪实验——怎样用最少卡时证明这题不成立。不要一上来完整训练。
 - 其后 M1… 才是逐步做正的路径。
@@ -220,7 +228,7 @@ PASS / FAIL：…
 | B+ / B / B- | B 档文章的上 / 中 / 下 |
 | C | 普通论文（够写成一篇，够不上 A/B 档） |
 
-成功可能性（必填）：`[0,1]`，表示**本题能做成的确信程度**（与研究潜力档独立；失败条也可填，通常接近 0）。critic FAIL 后须下调，不得维持高分。
+成功可能性（必填）：`[0,1]`，表示**本题能做成的确信程度**（与研究潜力档独立；失败条也可填，通常接近 0）。critic **FAIL** 后须下调，不得维持高分；**REVISE** 后可略降，最终须以最后一轮 PASS 为准。
 
 `related.md` 每条近邻一行：论文 + **与本题差在哪**。列出检索词。
 
