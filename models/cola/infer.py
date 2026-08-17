@@ -1,4 +1,4 @@
-"""Block-wise ODE sampling for Cola latent prior (CFG + clean condition)."""
+"""块级 ODE 采样：对齐官方 ``generate_task_repaint_inference`` 的积分与 CFG。"""
 
 from __future__ import annotations
 
@@ -15,61 +15,45 @@ def sample_block_ode(
     clean_prefix: torch.Tensor | None,
     num_steps: int,
     cfg_scale: float,
-    t_eps: float,
-    time_schedule: str,
-    p_mean: float,
-    p_std: float,
+    ode_T: float = 1000.0,
 ) -> torch.Tensor:
-    """Integrate one latent block from noise to clean.
+    """从噪声积分一块 latent 到干净。
 
-    ``predict_v(z_full, t_batch)`` returns velocity for the **current block**
-    slice (last ``block_len`` positions of the conditioned sequence).
-    ``z_full`` is ``cat(clean_prefix, z_block)`` with clean prefix held fixed
-    (clean condition repaint).
+    时间轴与官方一致：``linspace(T, 0, steps+1)``，
+    ``z ← z - v * (t_curr - t_next) / T``。
+    CFG 无条件支路 = **仅当前块**（空前缀），不是把前缀置零。
+    ``predict_v(z_full, t)`` 返回当前块速度；``t`` 为 ``(B,)`` 或 ``(B, L)``。
     """
-    device = z_init.device
     z = z_init
     block_len = z.size(1)
-    steps = _time_grid(
-        num_steps, device, time_schedule, p_mean, p_std,
-    )
-    for i in range(len(steps) - 1):
-        t = steps[i]
-        t_next = steps[i + 1]
-        t_batch = t.expand(z.size(0))
-        if clean_prefix is not None and clean_prefix.numel() > 0:
-            z_full = torch.cat([clean_prefix, z], dim=1)
-        else:
-            z_full = z
+    bsz = z.size(0)
+    device = z.device
+    dtype = z.dtype
+    t_grid = torch.linspace(float(ode_T), 0.0, num_steps + 1, device=device, dtype=torch.float32)
+    has_prefix = clean_prefix is not None and clean_prefix.numel() > 0
+    prefix_len = int(clean_prefix.size(1)) if has_prefix else 0
+    use_cfg = float(cfg_scale) != 1.0 and has_prefix
 
-        v_cond = predict_v(z_full, t_batch)
-        if cfg_scale != 1.0 and clean_prefix is not None and clean_prefix.numel() > 0:
-            # Uncond: zero prefix (drop condition) for CFG.
-            z_uncond = torch.cat([torch.zeros_like(clean_prefix), z], dim=1)
-            v_uncond = predict_v(z_uncond, t_batch)
+    for i in range(len(t_grid) - 1):
+        t_curr = t_grid[i]
+        t_next = t_grid[i + 1]
+        dt = (float(t_curr) - float(t_next)) / max(float(ode_T), 1.0)
+
+        if has_prefix:
+            z_full = torch.cat([clean_prefix, z], dim=1)
+            t_full = torch.zeros(bsz, prefix_len + block_len, device=device, dtype=dtype)
+            t_full[:, prefix_len:] = t_curr.to(dtype=dtype)
+            v_cond = predict_v(z_full, t_full)
+        else:
+            t_batch = t_curr.to(dtype=dtype).expand(bsz)
+            v_cond = predict_v(z, t_batch)
+
+        if use_cfg:
+            t_uncond = t_curr.to(dtype=dtype).expand(bsz)
+            v_uncond = predict_v(z, t_uncond)
             v = v_uncond + cfg_scale * (v_cond - v_uncond)
         else:
             v = v_cond
 
-        dt = t_next - t
-        z = z + dt * v
-        # Keep numerical stability near t→1
-        if float(t_next) >= 1.0 - t_eps:
-            break
+        z = z - v * dt
     return z
-
-
-def _time_grid(
-    num_steps: int,
-    device: torch.device,
-    schedule: str,
-    p_mean: float,
-    p_std: float,
-) -> torch.Tensor:
-    if schedule == "logit_normal" and num_steps > 1:
-        z = torch.randn(num_steps - 1, device=device) * p_std + p_mean
-        interior = torch.sigmoid(z).sort().values
-        return torch.cat(
-            [torch.zeros(1, device=device), interior, torch.ones(1, device=device)],
-        )
-    return torch.linspace(0.0, 1.0, num_steps + 1, device=device)

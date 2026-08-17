@@ -1,20 +1,27 @@
-_doc: >
-  Cola Text VAE ~30M (4+4 causal layers x 384 dim). Size tag is the experiment
-  tier matching DiT 100m; not the VAE parameter count.
+_doc: Cola Text VAE ~30M（4+4 × 384；档位对齐 DiT 100m，非 VAE 参数量）  # 文件说明，写入 extra
 
-name: cola_vae-100m
-tokenizer: gpt2
-max_seq_len: 1024
-n_layer_enc: 4
-n_layer_dec: 4
-n_head: 6
-n_embd: 384
-latent_dim: 16
-dropout: 0.1
-beta_kl: 0.1
-lambda_mask: 1.0
-mask_ratio: 0.15
-use_flash: true
+name: cola_vae-100m  # 配置名；非 prototype 时与文件名一致
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+max_seq_len: 1024  # 训练序列长度
+n_layer_enc: 4  # 编码器层数（官方 4，不随 100m 缩小）
+n_layer_dec: 4  # 解码器层数（官方 4）
+n_head: 6  # 注意力头数；官方 12，等比例缩小
+n_embd: 384  # 隐层宽度；官方 1536，等比例缩小
+latent_dim: 16  # 连续 latent 维 d（官方 16，不缩小）
+dropout: 0.0  # Dropout；官方 0
+beta_kl: 0.1  # Stage-1 KL(q‖N(0,I)) 权重
+lambda_mask: 1.0  # BERT-mask 损失权重
+mask_ratio: 0.15  # BERT-mask 比例
+use_flash: true  # CausalBlock（BDELF）是否 SDPA
+attn_backend: flex  # TextVAEBlock 注意力后端：flex | sdpa
+block_size: 16  # 块大小；块内双向、块间因果（与 DiT 一致）
+rope_theta: 500000  # VAE RoPE 基频（官方 500000）
+qk_norm: true  # Q/K 是否 LayerNorm
+post_norm: true  # 官方 TextVAEBlock 为 post-norm
+patch_size: 1  # token→latent 的 1D patch；1=不压缩长度
+ffn_mult: 4  # SwiGLU 上投影倍数（官方 ffn_dim=4×dim）
+scaling_factor: 1.0  # 交 DiT 前 latent 缩放
+shifting_factor: 0.0  # 交 DiT 前 latent 平移
 
 sampling:
-  temperature: 1.0
+  temperature: 1.0  # 采样温度；≤0 为 argmax

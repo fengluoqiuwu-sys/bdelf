@@ -1,7 +1,8 @@
-"""Causal Text VAE for Cola DLM Stage-1.
+"""Cola DLM Stage-1 Text VAE。
 
-Learns a stable text↔latent map with reconstruction, KL, and BERT-style mask loss.
-Encoder/decoder are strictly causal (paper Cola DLM).
+对齐官方 ``ColaTextVAEModel``（规模除外）：块因果、post-norm SwiGLU、
+QK-norm、rope_theta=500000、独立 lm_head、额外 mask token、patch Conv1d。
+论文 Stage-1 损失：重建 + β KL(q||N(0,I)) + λ_mask BERT-mask。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.cola_vae.config import FL_ColaVAEConfig
-from models.cola_vae.layers import CausalBlock
+from models.cola_vae.layers import TextVAEBlock
 from models.model import (
     FL_PreTrainedModel,
     ensure_token_layout,
@@ -23,8 +24,12 @@ from models.model import (
 from models.tokens import FL_TokenLayout, apply_token_layout_to_config, token_layout_from_cfg
 
 
+def _trunc_normal_(tensor: torch.Tensor, std: float, cutoff: float) -> None:
+    nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-cutoff * std, b=cutoff * std)
+
+
 class _ColaVAEBackbone(nn.Module):
-    """Causal Text VAE backbone used for Stage-1 pretraining."""
+    """官方风格 Text VAE；块因果 encoder/decoder。"""
 
     full_sequence_training = True
 
@@ -37,62 +42,103 @@ class _ColaVAEBackbone(nn.Module):
         n_head: int = 6,
         n_embd: int = 384,
         latent_dim: int = 16,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         beta_kl: float = 0.1,
         lambda_mask: float = 1.0,
         mask_ratio: float = 0.15,
         use_flash: bool = True,
+        attn_backend: str = "flex",
+        block_size: int = 16,
+        rope_theta: float = 500000.0,
+        qk_norm: bool = True,
+        post_norm: bool = True,
+        patch_size: int = 1,
+        ffn_mult: int = 4,
+        scaling_factor: float = 1.0,
+        shifting_factor: float = 0.0,
+        init_std: float = 0.02,
+        init_cutoff_factor: float = 3.0,
     ) -> None:
         super().__init__()
+        if max_seq_len % (patch_size * block_size) != 0:
+            raise ValueError(
+                f"max_seq_len={max_seq_len} 须能被 patch_size*block_size="
+                f"{patch_size * block_size} 整除"
+            )
         self.token_layout = token_layout
         self.vocab_size = token_layout.vocab_size
+        self.mask_token_id = self.vocab_size
         self.max_seq_len = max_seq_len
         self.n_embd = n_embd
         self.latent_dim = latent_dim
         self.beta_kl = beta_kl
         self.lambda_mask = lambda_mask
         self.mask_ratio = mask_ratio
+        self.block_size = block_size
+        self.patch_size = patch_size
+        self.scaling_factor = scaling_factor
+        self.shifting_factor = shifting_factor
 
-        self.wte = nn.Embedding(self.vocab_size, n_embd)
+        ffn_dim = int(ffn_mult) * n_embd
+        block_kwargs = dict(
+            n_embd=n_embd,
+            n_head=n_head,
+            dropout=dropout,
+            ffn_dim=ffn_dim,
+            block_size=block_size,
+            rope_theta=rope_theta,
+            qk_norm=qk_norm,
+            post_norm=post_norm,
+            use_flash=use_flash,
+            attn_backend=attn_backend,
+        )
+
+        # 官方 wte 多 1 行，专供 BERT mask，不进 lm_head。
+        self.wte = nn.Embedding(self.vocab_size + 1, n_embd)
+        self.patch_embedder = nn.Conv1d(
+            n_embd, n_embd, kernel_size=patch_size, stride=patch_size,
+        )
         self.drop = nn.Dropout(dropout)
         self.encoder = nn.ModuleList(
-            [
-                CausalBlock(n_embd, n_head, dropout, use_flash=use_flash)
-                for _ in range(n_layer_enc)
-            ]
+            [TextVAEBlock(**block_kwargs) for _ in range(n_layer_enc)]
         )
-        self.enc_ln = nn.LayerNorm(n_embd)
-        self.to_mu = nn.Linear(n_embd, latent_dim)
-        self.to_logvar = nn.Linear(n_embd, latent_dim)
+        self.to_posterior = nn.Linear(n_embd, latent_dim * 2, bias=True)
+        self.enc_latent_norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
 
-        self.from_latent = nn.Linear(latent_dim, n_embd)
+        self.from_latent = nn.Linear(latent_dim, n_embd, bias=True)
         self.decoder = nn.ModuleList(
-            [
-                CausalBlock(n_embd, n_head, dropout, use_flash=use_flash)
-                for _ in range(n_layer_dec)
-            ]
+            [TextVAEBlock(**block_kwargs) for _ in range(n_layer_dec)]
         )
+        self.unpatch_layer = nn.Linear(n_embd, patch_size * n_embd, bias=True)
         self.dec_ln = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, self.vocab_size, bias=False)
-        self.lm_head.weight = self.wte.weight
+        self.lm_head = nn.Linear(n_embd, self.vocab_size, bias=True)
 
         self.last_ce_loss = float("nan")
         self.last_kl_loss = float("nan")
         self.last_mask_loss = float("nan")
 
-        self.apply(self._init_weights)
+        self.apply(lambda m: self._init_weights(m, init_std, init_cutoff_factor))
 
     @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def _init_weights(module: nn.Module, std: float, cutoff: float) -> None:
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            _trunc_normal_(module.weight, std, cutoff)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            _trunc_normal_(module.weight, std, cutoff)
         elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+            if module.weight is not None:
+                nn.init.ones_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.wte(tokens)
+        x = x.transpose(1, 2)
+        x = self.patch_embedder(x)
+        x = x.transpose(1, 2)
+        return self.drop(x)
 
     def encode(
         self,
@@ -100,13 +146,14 @@ class _ColaVAEBackbone(nn.Module):
         *,
         sample: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(z0, mu, logvar)`` with shape ``(B, L, latent_dim)``."""
-        x = self.drop(self.wte(tokens))
+        """返回 ``(z0, mu, logvar)``，形状 ``(B, L/patch, latent_dim)``。"""
+        x = self._embed_tokens(tokens)
         for block in self.encoder:
             x = block(x)
-        x = self.enc_ln(x)
-        mu = self.to_mu(x)
-        logvar = self.to_logvar(x).clamp(-20.0, 20.0)
+        stats = self.to_posterior(x)
+        mu, logvar = stats.chunk(2, dim=-1)
+        mu = self.enc_latent_norm(mu)
+        logvar = logvar.clamp(-30.0, 20.0)
         if sample:
             std = torch.exp(0.5 * logvar)
             z0 = mu + torch.randn_like(std) * std
@@ -118,8 +165,34 @@ class _ColaVAEBackbone(nn.Module):
         x = self.drop(self.from_latent(z0))
         for block in self.decoder:
             x = block(x)
+        x = self.unpatch_layer(x)
+        if self.patch_size != 1:
+            bsz, n_lat, _ = x.shape
+            x = x.view(bsz, n_lat, self.patch_size, self.n_embd).reshape(
+                bsz, n_lat * self.patch_size, self.n_embd,
+            )
         x = self.dec_ln(x)
         return self.lm_head(x)
+
+    def bert_mask_loss(self, tokens: torch.Tensor) -> torch.Tensor:
+        """BERT-style：编码被 mask 的视图，只在 mask 位置算 CE。
+
+        固定形状（不用 ``logits[mask]`` / ``mask.any()``），以便 torch.compile。
+        """
+        mask = torch.rand(tokens.shape, device=tokens.device) < self.mask_ratio
+        mask[:, 0] = False
+        enc_masked = torch.where(
+            mask, torch.full_like(tokens, self.mask_token_id), tokens,
+        )
+        z_m, _, _ = self.encode(enc_masked, sample=True)
+        logits_m = self.decode_logits(z_m)
+        ignore = self.token_layout.ignore_index
+        targets = tokens.masked_fill(~mask, ignore)
+        return F.cross_entropy(
+            logits_m.reshape(-1, self.vocab_size),
+            targets.reshape(-1),
+            ignore_index=ignore,
+        )
 
     def forward(
         self,
@@ -129,7 +202,6 @@ class _ColaVAEBackbone(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del targets, kwargs
         tokens = idx
-        # Clean reconstruction CE + KL; BERT-mask is a separate auxiliary term.
         z0, mu, logvar = self.encode(tokens, sample=self.training)
         logits = self.decode_logits(z0)
 
@@ -138,34 +210,21 @@ class _ColaVAEBackbone(nn.Module):
             tokens.reshape(-1),
             ignore_index=self.token_layout.ignore_index,
         )
-        # KL(q(z|x) || N(0,I)) averaged over batch/seq/latent.
         kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).mean()
 
-        # BERT-style: encode a masked view; CE only on masked positions.
         mask_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         if self.training and self.lambda_mask > 0 and self.mask_ratio > 0:
-            mask = torch.rand(tokens.shape, device=tokens.device) < self.mask_ratio
-            mask[:, 0] = False
-            if mask.any():
-                enc_masked = tokens.clone()
-                enc_masked[mask] = self.token_layout.pad_token_id
-                z_m, _, _ = self.encode(enc_masked, sample=True)
-                logits_m = self.decode_logits(z_m)
-                mask_loss = F.cross_entropy(
-                    logits_m[mask],
-                    tokens[mask],
-                    ignore_index=self.token_layout.ignore_index,
-                )
+            mask_loss = self.bert_mask_loss(tokens)
 
-        self.last_ce_loss = float(ce.detach().item())
-        self.last_kl_loss = float(kl.detach().item())
-        self.last_mask_loss = float(mask_loss.detach().item())
-        # Eval: CE only so eval_ppl ≈ reconstruction perplexity.
+        self.last_ce_loss = ce.detach()
+        self.last_kl_loss = kl.detach()
+        self.last_mask_loss = mask_loss.detach()
         if not self.training:
             return logits, ce
         loss = ce + self.beta_kl * kl + self.lambda_mask * mask_loss
         return logits, loss
 
+    @torch.compiler.disable
     @torch.no_grad()
     def reconstruct(
         self,
@@ -178,6 +237,7 @@ class _ColaVAEBackbone(nn.Module):
         logits = self.decode_logits(z0)
         return sample_from_logits(logits, temperature=temperature, top_k=top_k)
 
+    @torch.compiler.disable
     @torch.no_grad()
     def generate(
         self,
@@ -190,10 +250,6 @@ class _ColaVAEBackbone(nn.Module):
         prefix_tokens: torch.Tensor | None = None,
         sampling_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, int]:
-        """Stage-1 has no latent prior; reconstruct from BOS/prefix via encode→decode.
-
-        For open-ended generation use the Stage-2 ``cola`` model.
-        """
         del sampling_cfg
         seqlen = int(seqlen or self.max_seq_len)
         device = next(self.parameters()).device
@@ -202,7 +258,6 @@ class _ColaVAEBackbone(nn.Module):
             idx = prefix_tokens.to(device=device, dtype=torch.long)
             if idx.size(0) != num_samples:
                 raise ValueError("prefix_tokens batch must match num_samples")
-            # Pad/truncate to seqlen then reconstruct.
             if idx.size(1) < seqlen:
                 pad = torch.full(
                     (num_samples, seqlen - idx.size(1)),

@@ -10,7 +10,7 @@ from models.tokens import FL_TokenLayout
 
 
 class FL_ColaVAEConfig(PretrainedConfig):
-    """Causal Text VAE: encoder/decoder + continuous latent sequence."""
+    """Causal-block Text VAE: encoder/decoder + continuous latent sequence."""
 
     model_type = "fl_cola_vae"
     _YAML_REQUIRED = frozenset(
@@ -26,6 +26,7 @@ class FL_ColaVAEConfig(PretrainedConfig):
             "beta_kl",
             "lambda_mask",
             "mask_ratio",
+            "attn_backend",
         }
     )
 
@@ -44,11 +45,20 @@ class FL_ColaVAEConfig(PretrainedConfig):
         n_head: int = 6,
         n_embd: int = 384,
         latent_dim: int = 16,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         beta_kl: float = 0.1,
         lambda_mask: float = 1.0,
         mask_ratio: float = 0.15,
         use_flash: bool = True,
+        attn_backend: str = "flex",
+        block_size: int = 16,
+        rope_theta: float = 500000.0,
+        qk_norm: bool = True,
+        post_norm: bool = True,
+        patch_size: int = 1,
+        ffn_mult: int = 4,
+        scaling_factor: float = 1.0,
+        shifting_factor: float = 0.0,
         sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -71,6 +81,15 @@ class FL_ColaVAEConfig(PretrainedConfig):
         self.lambda_mask = lambda_mask
         self.mask_ratio = mask_ratio
         self.use_flash = use_flash
+        self.attn_backend = attn_backend
+        self.block_size = block_size
+        self.rope_theta = rope_theta
+        self.qk_norm = qk_norm
+        self.post_norm = post_norm
+        self.patch_size = patch_size
+        self.ffn_mult = ffn_mult
+        self.scaling_factor = scaling_factor
+        self.shifting_factor = shifting_factor
         self.sampling = sampling or {}
 
     def token_layout(self) -> FL_TokenLayout:
@@ -96,6 +115,15 @@ class FL_ColaVAEConfig(PretrainedConfig):
             "lambda_mask": self.lambda_mask,
             "mask_ratio": self.mask_ratio,
             "use_flash": self.use_flash,
+            "attn_backend": self.attn_backend,
+            "block_size": self.block_size,
+            "rope_theta": self.rope_theta,
+            "qk_norm": self.qk_norm,
+            "post_norm": self.post_norm,
+            "patch_size": self.patch_size,
+            "ffn_mult": self.ffn_mult,
+            "scaling_factor": self.scaling_factor,
+            "shifting_factor": self.shifting_factor,
         }
 
 

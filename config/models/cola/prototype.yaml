@@ -1,33 +1,37 @@
-_doc: Cola DLM Stage-2 config template (DiT prior + Text VAE)
+_doc: Cola DLM Stage-2 配置模板（DiT prior + Text VAE）  # 文件说明，写入 extra
 
-name: prototype
-tokenizer: gpt2
-max_seq_len: 1024
-n_layer: 12
-n_head: 12
-n_embd: 768
-latent_dim: 16
-diffusion_block_size: 16
-dropout: 0.0
-denoiser_p_mean: 0.0
-denoiser_p_std: 1.0
-time_schedule: logit_normal
-schedule_loc: 1.0
-t_eps: 0.05
-vae_model: cola_vae
-vae_size: 100m
-# vae_run: null
-vae_lr_ratio: 1.0
-lambda_vae: 1.0
-lambda_fm: 1.0
-lambda_ref: 0.1
-beta_kl: 0.1
-lambda_mask: 1.0
-mask_ratio: 0.15
-freeze_vae: false
+name: prototype  # 配置名；prototype 不可实例化
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+max_seq_len: 1024  # 训练序列长度
+n_layer: 12  # DiT 层数；官方 24，等比例缩小
+n_head: 12  # 注意力头数；官方 16，按 100m 档
+n_embd: 768  # 隐层宽度；官方 2048，按 100m 档
+latent_dim: 16  # 连续 latent 维 d（官方 16，不缩小）
+diffusion_block_size: 16  # DiT 块大小（论文 RQ4 / 官方推理常用 16）
+dropout: 0.0  # Dropout
+denoiser_p_mean: 0.0  # logit-normal 均值偏移的基准
+denoiser_p_std: 1.0  # logit-normal 标准差
+time_schedule: logit_normal  # 训练时间采样：logit_normal（论文 loc=1）
+schedule_loc: 1.0  # logit-normal 位置参数 loc
+t_eps: 0.05  # 训练 t 截断，避免 0/1
+ode_T: 1000.0  # AdaLN / 推理时间轴上界（官方 T=1000）
+rope_dim: 48  # RoPE 每头通道；官方 96/128，按 head_dim=64 等比例 48
+qk_norm: true  # DiT Q/K LayerNorm
+expand_ratio: 4  # MLP 扩展比（官方 4，GELU tanh）
+attn_backend: flex  # 注意力后端：flex | sdpa
+vae_model: cola_vae  # Stage-1 VAE 模型名
+vae_size: 100m  # 加载的 VAE 档位
+vae_lr_ratio: 1.0  # VAE 相对 DiT 的学习率比（官方联合同 LR）
+lambda_vae: 1.0  # Stage-2 VAE 项权重
+lambda_fm: 1.0  # Flow Matching 权重
+lambda_ref: 0.1  # 参考编码器 KL 权重
+beta_kl: 0.1  # Stage-2 为 E[log q_φ] 的系数
+lambda_mask: 1.0  # BERT-mask 损失权重
+mask_ratio: 0.15  # BERT-mask 比例
+freeze_vae: false  # 是否冻 VAE（官方联合训练为 false）
 
 sampling:
-  num_ode_steps: 16
-  cfg_scale: 7.0
-  temperature: 1.0
-  time_schedule: logit_normal
+  num_ode_steps: 16  # ODE 积分步数（官方 timestep_num=16）
+  cfg_scale: 7.0  # Classifier-free guidance 缩放
+  temperature: 1.0  # 采样温度；≤0 为 argmax
+  ode_T: 1000.0  # 推理 linspace(T,0) 的 T

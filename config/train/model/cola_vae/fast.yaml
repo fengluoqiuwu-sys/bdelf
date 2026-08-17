@@ -1,7 +1,7 @@
 # =============================================================================
 # 模型训练配方（optimizer + batch；由 CLI --config 100m-{variant} 选择本文件）
 # =============================================================================
-_doc: Cola Stage-1 VAE · fast（约 30M）  # 文件说明，写入 extra
+_doc: Cola Stage-1 VAE · fast（约 30M；优化器对齐 ELF）  # 文件说明，写入 extra
 name: cola_vae  # 模型名；与目录名一致
 variant: fast  # 训练变体：fast | full
 
@@ -10,13 +10,13 @@ variant: fast  # 训练变体：fast | full
 # -----------------------------------------------------------------------------
 optimizer:
   dtype: bf16  # 训练精度：bf16 | fp16 | fp32
-  learning_rate: 0.001  # AdamW 学习率
-  weight_decay: 0.01  # AdamW weight decay
+  learning_rate: 0.002  # AdamW 学习率
+  weight_decay: 0  # AdamW weight decay
   beta1: 0.9  # AdamW β1
   beta2: 0.95  # AdamW β2
   grad_clip: 1  # 梯度裁剪阈值
-  muon_learning_rate: 0.001  # Muon 学习率
-  muon_weight_decay: 0.01  # Muon weight decay
+  muon_learning_rate: 0.002  # Muon 学习率
+  muon_weight_decay: 0  # Muon weight decay
   muon_momentum: 0.95  # Muon momentum
   muon_ns_steps: 5  # Muon Newton–Schulz 步数
   ema_decay: 0.9999  # EMA 衰减；0 表示关闭

@@ -23,6 +23,7 @@ class FL_ColaConfig(PretrainedConfig):
             "latent_dim",
             "diffusion_block_size",
             "dropout",
+            "attn_backend",
             "vae_model",
             "vae_size",
         }
@@ -44,13 +45,16 @@ class FL_ColaConfig(PretrainedConfig):
         latent_dim: int = 16,
         diffusion_block_size: int = 16,
         dropout: float = 0.0,
-        # Flow-matching / schedule
         denoiser_p_mean: float = 0.0,
         denoiser_p_std: float = 1.0,
         time_schedule: str = "logit_normal",
         schedule_loc: float = 1.0,
         t_eps: float = 0.05,
-        # Joint VAE
+        ode_T: float = 1000.0,
+        rope_dim: int | None = None,
+        qk_norm: bool = True,
+        expand_ratio: int = 4,
+        attn_backend: str = "flex",
         vae_model: str = "cola_vae",
         vae_size: str = "100m",
         vae_run: str | None = None,
@@ -85,6 +89,11 @@ class FL_ColaConfig(PretrainedConfig):
         self.time_schedule = time_schedule
         self.schedule_loc = schedule_loc
         self.t_eps = t_eps
+        self.ode_T = ode_T
+        self.rope_dim = rope_dim
+        self.qk_norm = qk_norm
+        self.expand_ratio = expand_ratio
+        self.attn_backend = attn_backend
         self.vae_model = vae_model
         self.vae_size = vae_size
         self.vae_run = vae_run
@@ -100,7 +109,7 @@ class FL_ColaConfig(PretrainedConfig):
             "num_ode_steps": 16,
             "cfg_scale": 7.0,
             "temperature": 1.0,
-            "time_schedule": "logit_normal",
+            "ode_T": 1000.0,
         }
 
     def token_layout(self) -> FL_TokenLayout:
