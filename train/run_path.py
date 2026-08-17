@@ -59,7 +59,7 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
 
 
 def dataclass_fingerprint(obj: Any) -> dict[str, Any]:
-    """``asdict`` 后合并 ``extra``（去掉 ``_`` 键与冗余 ``name``）。"""
+    """``asdict`` 后合并 ``extra``（去掉 ``_`` 键、冗余 ``name`` 与 ``_HASH_EXCLUDE``）。"""
     from dataclasses import asdict, is_dataclass
 
     if not is_dataclass(obj):
@@ -73,7 +73,24 @@ def dataclass_fingerprint(obj: Any) -> dict[str, Any]:
                 continue
             merged[key] = value
     merged.pop("name", None)
+    for key in getattr(type(obj), "_HASH_EXCLUDE", ()):
+        merged.pop(key, None)
     return _strip_meta(merged)
+
+
+def _fingerprint_overrides(
+    overrides: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """``--set`` 进指纹；``eval.skip`` 不进哈希，从 overrides 里剥掉。"""
+    ov = _strip_meta(dict(overrides or {}))
+    eval_ov = ov.get("eval")
+    if isinstance(eval_ov, dict):
+        eval_ov = {k: v for k, v in eval_ov.items() if k != "skip"}
+        if eval_ov:
+            ov["eval"] = eval_ov
+        else:
+            ov.pop("eval", None)
+    return ov
 
 
 def build_train_fingerprint(
@@ -120,7 +137,7 @@ def build_train_fingerprint(
         "dataset": dataset,
         "preprocess": preprocess,
         "generate": generate,
-        "overrides": _strip_meta(dict(overrides or {})),
+        "overrides": _fingerprint_overrides(overrides),
         "optimizer": dataclass_fingerprint(optimizer),
         "batch": dataclass_fingerprint(batch),
         "schedule": dataclass_fingerprint(schedule),

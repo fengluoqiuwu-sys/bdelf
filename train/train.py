@@ -119,6 +119,8 @@ class FL_EvalConfig:
             "eval_sample_seed",
         }
     )
+    # 不进指纹；YAML 省略视为 false（勿写入 default.yaml）
+    _HASH_EXCLUDE = frozenset({"skip"})
 
     name: str = "prototype"
     # Online eval subsample; None / omitted runs the full eval split
@@ -130,6 +132,7 @@ class FL_EvalConfig:
     gen_eval_model_device: str = "cuda"
     # Total sequences to generate+score per gen-PPL eval
     gen_eval_samples: int = 32
+    skip: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -187,6 +190,7 @@ class FL_TrainConfig:
     gen_eval_model_dtype: TrainDtype
     gen_eval_model_device: str
     gen_eval_samples: int
+    skip_eval: bool
     generate_sampling: Dict[str, Any]  # from config/generate/<model>/<name>.yaml
     use_muon: bool = True
     muon_learning_rate: float = 0.003
@@ -266,6 +270,7 @@ def parse_train_overrides(items: list[str] | None) -> dict[str, dict[str, Any]]:
     Allowed sections: optimizer, batch, schedule, eval, generate, model, extra.
     ``model.*`` 覆盖 ``config/models/<model>/<size>.yaml`` 键（进指纹）。
     ``extra.init_ckpt`` 为跨 run 初始化权重路径（进指纹；不恢复优化器）。
+    ``eval.skip`` 关闭在线 held-out / gen-eval（省略为 false；不进指纹）。
     """
     if not items:
         return {}
@@ -562,6 +567,9 @@ def compose_train_config(
     )
     schedule = _load_schedule(variant, overrides=ov.get("schedule"))
     eval_cfg = _load_eval(overrides=ov.get("eval"))
+    # cola_vae 默认跳过在线 eval（可用 --set eval.skip=false 打开）；不进哈希
+    if model == "cola_vae" and "skip" not in (ov.get("eval") or {}):
+        eval_cfg.skip = True
     generate_cfg = get_generate(model, generate, overrides=ov.get("generate"))
 
     run_label = f"{model}-{config_name}"
@@ -588,6 +596,10 @@ def compose_train_config(
         raise ValueError(
             f"{run_label}: eval_sample_count must be >= 1 when set, "
             f"got {eval_cfg.eval_sample_count}"
+        )
+    if not isinstance(eval_cfg.skip, bool):
+        raise ValueError(
+            f"{run_label}: eval.skip must be a bool, got {eval_cfg.skip!r}"
         )
     if eval_cfg.gen_eval_samples < 1:
         raise ValueError(
@@ -715,6 +727,7 @@ def compose_train_config(
         gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
         gen_eval_model_device=eval_cfg.gen_eval_model_device,
         gen_eval_samples=eval_cfg.gen_eval_samples,
+        skip_eval=bool(eval_cfg.skip),
         generate_sampling=generate_cfg.to_sampling_cfg(),
         use_muon=schedule.use_muon,
         muon_learning_rate=optimizer.muon_learning_rate,

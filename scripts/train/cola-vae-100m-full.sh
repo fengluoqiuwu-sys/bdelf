@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Cola Stage-1 VAE 100m full（含训练期 gen-eval）；经 slurm/sbatch-train.sh 提交或本地直接跑。
+# Cola Stage-1 VAE 100m full；默认跳过在线 eval（eval.skip，不进哈希）。
+# 经 slurm/sbatch-train.sh 提交或本地直接跑。
 # 两阶段连跑用 scripts/train/cola-seq-100m-full.sh。
-# Rank0 gen-eval 时 peer 会卡在短 all_reduce，拉长 NCCL 超时避免误杀。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
