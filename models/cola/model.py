@@ -354,8 +354,33 @@ class _ColaBackbone(nn.Module):
     def _dit_velocity_on_window(
         self, z_full: torch.Tensor, t_batch: torch.Tensor, block_len: int,
     ) -> torch.Tensor:
+        """生成时 DiT 前向固定为 ``max_seq_len``，避免 16、32、… 换形状。
+
+        真实 token 靠左、零 pad 在右。块因果下当前块看不到未来 pad，
+        因此只保留一套 Flex mask。返回真实序列末 ``block_len`` 的速度。
+        """
+        real_len = int(z_full.size(1))
+        if real_len < block_len:
+            raise ValueError(
+                f"DiT 窗口长度 {real_len} 短于 block_len={block_len}"
+            )
+        pad_to = int(self.max_seq_len)
+        if real_len > pad_to:
+            raise ValueError(
+                f"generate 窗口 {real_len} 超过 max_seq_len={pad_to}"
+            )
+        if real_len < pad_to:
+            bsz, _, dim = z_full.shape
+            pad_n = pad_to - real_len
+            z_full = torch.cat(
+                [z_full, z_full.new_zeros(bsz, pad_n, dim)], dim=1,
+            )
+            if t_batch.ndim == 2:
+                t_batch = torch.cat(
+                    [t_batch, t_batch.new_zeros(bsz, pad_n)], dim=1,
+                )
         v = self.dit(z_full, t_batch)
-        return v[:, -block_len:]
+        return v[:, real_len - block_len : real_len]
 
     @torch.compiler.disable
     @torch.no_grad()
@@ -410,6 +435,7 @@ class _ColaBackbone(nn.Module):
 
         n_blocks = seqlen // db
         nfe = 0
+        # DiT 在 _dit_velocity_on_window 内 pad 到 max_seq_len，整段 generate 共用一块 mask。
         for _b in range(start_block, n_blocks):
             z_block = torch.randn(
                 num_samples, db, self.latent_dim, device=device, dtype=dtype,
