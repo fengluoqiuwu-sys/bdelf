@@ -1,0 +1,47 @@
+_doc: JacEllipsoid-B ~105M (ELF copy; 12×768, frozen T5-small, QDA decode)
+
+name: jac_ellipsoid-100m
+tokenizer: t5-small
+max_seq_len: 1024
+encoder_model_name: t5-small
+text_encoder_dim: 512
+bottleneck_dim: 128
+n_layer: 12
+n_head: 12
+n_embd: 768
+dropout: 0.0
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+self_cond_prob: 0.5
+self_cond_cfg_min: 0.5
+self_cond_cfg_max: 5.0
+latent_mean: 0.0
+latent_std: 0.2
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+decoder_prob: 0.2
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+decoder_noise_scale: 5.0
+t_eps: 0.05
+time_schedule: logit_normal
+
+qda_mode: jacobian              # 读出：jacobian | isotropic | softmax | learned
+qda_top_m: 16                   # 每 token 竞争者数 M
+qda_rank: 16                    # G_k^{(0)} 秩截断 r≤M；isotropic 忽略
+qda_lambda_scale: 0.01          # λ = scale × median_k λ_max(G_k^{(0)})
+qda_prior: uniform              # 类先验：uniform
+qda_table_path: ""              # 预计算 tables.pt；空则现场从冻 T5 构造
+qda_decode_only: false          # true 则只训 decode CE（M0/M1 短训）
+freeze_dit: false               # true 则冻 DiT / text_proj，只训读出头
+qda_diag: false                 # true 则 G_k 取对角近似（M0 对角对照）
+
+sampling:
+  sampling_method: sde
+  num_sampling_steps: 32
+  sde_gamma: 1.5
+  time_schedule: logit_normal
+  temperature: 0.0
+  self_cond_cfg_scale: 3.0

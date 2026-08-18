@@ -29,10 +29,28 @@ TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
-_TRAIN_MODELS = (
-    "ar", "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "lexce", "odar", "posbeta", "trace", "cola_vae", "cola", "denoiser_chart",
+_MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|full)$")
+_ARCH_SIZE_RE = re.compile(r"^[0-9]+m$")
+_ARCH_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
+# 按整段 chunk 计 token 预算（非因果减 1）。
+_SEQ_FULL_CHUNK_MODELS = frozenset(
+    {
+        "ar1_5",
+        "ar2",
+        "bd3lm",
+        "bdelf",
+        "elf",
+        "late_ce",
+        "lexce",
+        "odar",
+        "posbeta",
+        "trace",
+        "cola_vae",
+        "cola",
+        "denoiser_chart",
+        "jac_ellipsoid",
+    }
 )
-_MODEL_CONFIG_RE = re.compile(r"^(100m)-(fast|full)$")
 # DataLoader workers per rank; world_size comes from visible GPU count at launch.
 DEFAULT_NUM_WORKERS = 8
 
@@ -202,9 +220,7 @@ class FL_TrainConfig:
     @property
     def seq_tokens(self) -> int:
         chunk = int(self.extra.get("chunk_length", 1024))
-        if self.model in (
-            "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "lexce", "odar", "posbeta", "trace", "cola_vae", "cola", "denoiser_chart",
-        ):
+        if self.model in _SEQ_FULL_CHUNK_MODELS:
             return chunk
         return max(1, chunk - 1)
 
@@ -240,13 +256,21 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
             )
         model, config_name = model.split("/", 1)
 
-    if model not in _TRAIN_MODELS:
+    known = list_train_models()
+    if model not in known:
         raise ValueError(
-            f"Unknown model {model!r}. Expected one of: {', '.join(_TRAIN_MODELS)}"
+            f"Unknown model {model!r}. Expected one of: {', '.join(known) or '<none>'}"
         )
     if not _MODEL_CONFIG_RE.fullmatch(config_name):
         raise ValueError(
-            f"Invalid config name {config_name!r}, expected 100m-{{fast,full}}"
+            f"Invalid config name {config_name!r}, expected {{size}}m-{{fast,full}} "
+            "(e.g. 100m-full, 300m-full)"
+        )
+    available = list_train_configs(model)
+    if config_name not in available:
+        raise ValueError(
+            f"Unknown train config {config_name!r} for {model}. Available: "
+            f"{', '.join(available) or '<none>'}"
         )
     return model, config_name
 
@@ -532,8 +556,9 @@ def compose_train_config(
 ) -> FL_TrainConfig:
     """Merge per-model recipe with global schedule/eval + generate.
 
-    ``config_name`` must be ``100m-{fast,full}`` and loads
-    ``config/train/model/<model>/{fast|full}.yaml``. Shared refs:
+    ``config_name`` must be ``{size}m-{fast,full}`` (e.g. ``100m-full``,
+    ``300m-full``) and loads ``config/train/model/<model>/{fast|full}.yaml``
+    plus architecture ``config/models/<model>/{size}.yaml``. Shared refs:
       - schedule ← ``schedule/<variant>.yaml``
       - eval ← ``eval/default.yaml``
       - generate ← ``config/generate/<model>/<generate>.yaml``
@@ -620,9 +645,7 @@ def compose_train_config(
         * resolved_world_size
         * (
             chunk_length
-            if model in (
-                "ar1_5", "ar2", "bd3lm", "bdelf", "elf", "late_ce", "lexce", "odar", "posbeta", "trace", "cola_vae", "cola", "denoiser_chart",
-            )
+            if model in _SEQ_FULL_CHUNK_MODELS
             else max(1, chunk_length - 1)
         )
     )
@@ -750,8 +773,20 @@ def list_train_models() -> List[str]:
     return names
 
 
+def _arch_sizes(model: str) -> List[str]:
+    """``config/models/<model>/{size}.yaml`` 中形如 ``100m`` / ``300m`` 的规格。"""
+    model_dir = _ARCH_CONFIG_DIR / model
+    if not model_dir.is_dir():
+        return []
+    return sorted(
+        path.stem
+        for path in model_dir.glob("*.yaml")
+        if path.stem != "prototype" and _ARCH_SIZE_RE.fullmatch(path.stem)
+    )
+
+
 def list_train_configs(model: str | None = None) -> List[str]:
-    """Return available ``100m-{fast,full}`` profiles for ``model`` (or all)."""
+    """Return available ``{size}m-{fast,full}`` profiles for ``model`` (or all)."""
     models = [model] if model is not None else list_train_models()
     names: List[str] = []
     for m in models:
@@ -760,9 +795,14 @@ def list_train_configs(model: str | None = None) -> List[str]:
         model_dir = MODEL_DIR / m
         if not model_dir.is_dir():
             continue
-        for variant in ("fast", "full"):
-            if (model_dir / f"{variant}.yaml").is_file():
-                name = f"100m-{variant}"
+        sizes = _arch_sizes(m)
+        if not sizes:
+            continue
+        for size in sizes:
+            for variant in ("fast", "full"):
+                if not (model_dir / f"{variant}.yaml").is_file():
+                    continue
+                name = f"{size}-{variant}"
                 if model is not None:
                     names.append(name)
                 else:

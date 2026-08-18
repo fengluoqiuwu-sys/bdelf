@@ -1273,7 +1273,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"Available models: {', '.join(models)}\n"
             f"Available datasets: {', '.join(datasets)}\n"
             f"Available preprocess configs: {', '.join(preprocess_names)}\n"
-            "Train configs: 100m-{fast,full}\n"
+            "Train configs: {size}m-{fast,full} (from config/models/<model>/)\n"
             "Generate configs: config/generate/<model>/<name>.yaml\n"
             "Overrides: --set section.key=value "
             "(sections: optimizer, batch, schedule, eval, generate, model, extra)"
@@ -1289,7 +1289,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         dest="train_config",
         metavar="CONFIG",
-        help="Train config name, e.g. 100m-fast / 100m-full",
+        help="Train config name, e.g. 100m-fast / 100m-full / 300m-full",
     )
     parser.add_argument(
         "--dataset",
@@ -1415,7 +1415,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         raise SystemExit(
             f"Unknown train config {args.train_config!r}. {args.model} available: "
             f"{', '.join(configs)}\n"
-            f"Naming format: 100m-{{fast,full}}"
+            f"Naming format: {{size}}m-{{fast,full}}"
         )
 
     size = args.train_config.rsplit("-", 1)[0]
