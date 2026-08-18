@@ -7,8 +7,9 @@
 #   - min_lr_ratio=1.0 → warmup 后 constant LR=0.002
 #   - target_tokens=45.2B（5 × ~9.04B OWT）
 #   - gen_eval_samples=32（控在线评测开销）
+# 微批 8、全局批 256（ELF 的一半；4 卡 accum 仍为 8）。
 # 预处理仍为 default（GPT-2），不用 elf（T5）。
-# fingerprint：resolve_checkpoint.py … 下列 --set → full/cola/d349aca8ed249f46
+# fingerprint：resolve_checkpoint.py … 下列 --set → full/cola/1a6f475e64aae3f4
 # Rank0 gen-eval 时 peer 会卡在短 all_reduce，拉长 NCCL 超时避免误杀。
 set -euo pipefail
 
