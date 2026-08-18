@@ -6,6 +6,7 @@ DataLoader / DDP / 采样聚合逻辑，并 re-export 常用符号以兼容旧�
 
 from __future__ import annotations
 
+import gc
 from typing import Any
 
 import torch
@@ -353,3 +354,22 @@ def eval_one_batch_gen_ppl(
         else:
             _train_log(summary)
     return gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac
+
+
+def release_eval_cuda_scratch(model: nn.Module, *, log: bool = False) -> None:
+    """丢掉在线 eval 留下的 GPU 缓存，把空闲块还给驱动。
+
+    gen-eval（尤其 Cola 变长 Flex mask）释放 tensor 后，CUDA caching allocator
+    仍预留峰值；不还池则后续训练步的 nvidia-smi 会钉在峰值。不卸载 gpt2、
+    权重、优化器或 EMA。各 rank 都要调用。
+    """
+    raw = unwrap_model(model)
+    for m in raw.modules():
+        cache = getattr(m, "_mask_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if log:
+        _train_log("released eval CUDA scratch (empty_cache)")

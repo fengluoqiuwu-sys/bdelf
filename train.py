@@ -67,6 +67,7 @@ from train.eval import (
     forward_loss,
     get_amp_dtype,
     load_gen_eval_baseline,
+    release_eval_cuda_scratch,
     uses_dual_branch_logging,
     uses_full_sequence,
 )
@@ -1075,6 +1076,10 @@ def train_loop(
                             is_distributed=is_distributed,
                             log=(rank == 0),
                         )
+                # EMA 权重已换回；丢掉 Flex mask / 采样临时块，避免池子钉在 gen 峰值。
+                release_eval_cuda_scratch(model, log=(rank == 0))
+                if is_distributed:
+                    dist.barrier()
                 if rank == 0:
                     eval_row = {
                         "step": step,
