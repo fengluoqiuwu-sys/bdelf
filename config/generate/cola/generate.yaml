@@ -5,5 +5,5 @@ _doc: Cola Stage-2 正式生成采样  # 文件说明，写入 extra
 name: generate  # 配置名；非 prototype 时与文件名一致
 num_ode_steps: 16  # ODE 积分步数（官方 timestep_num=16）
 cfg_scale: 7.0  # Classifier-free guidance 缩放
-temperature: 1.0  # 采样温度；≤0 为 argmax
+temperature: 0.0  # 采样温度；≤0 为 argmax
 ode_T: 1000.0  # 推理 linspace(T,0) 的 T

@@ -28,10 +28,10 @@ lambda_ref: 0.1  # 参考编码器 KL 权重
 beta_kl: 0.1  # Stage-2 为 E[log q_φ] 的系数
 lambda_mask: 1.0  # BERT-mask 损失权重
 mask_ratio: 0.15  # BERT-mask 比例
-freeze_vae: false  # 是否冻 VAE（官方联合训练为 false）
+freeze_vae: true  # 是否冻 VAE；开源 cola_pretrain 冻，论文联合为 false
 
 sampling:
   num_ode_steps: 16  # ODE 积分步数（官方 timestep_num=16）
   cfg_scale: 7.0  # Classifier-free guidance 缩放
-  temperature: 1.0  # 采样温度；≤0 为 argmax
+  temperature: 0.0  # 采样温度；≤0 为 argmax
   ode_T: 1000.0  # 推理 linspace(T,0) 的 T

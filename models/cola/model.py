@@ -432,7 +432,11 @@ class _ColaBackbone(nn.Module):
 
         z_all = self._from_dit_latent(clean[:, :seqlen])
         logits = self.vae.decode_logits(z_all)
-        tokens = sample_from_logits(logits, temperature=temperature, top_k=top_k)
+        # 官方任务评测默认 temperature=0 → argmax；≤0 走 argmax。
+        if temperature <= 0:
+            tokens = logits.argmax(dim=-1)
+        else:
+            tokens = sample_from_logits(logits, temperature=temperature, top_k=top_k)
         if prefix_len > 0:
             tokens = tokens.clone()
             tokens[:, :prefix_len] = prefix_tokens.to(tokens.device)

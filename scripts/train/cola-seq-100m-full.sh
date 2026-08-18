@@ -5,7 +5,7 @@
 #   bash slurm/sbatch-train.sh cola-seq-100m-full --time=4-00:00:00
 # 已有 Stage-1 权重时：export COLA_VAE_CHECKPOINT=.../checkpoint_latest.pt 可跳过 VAE。
 # "$@" 原样传给两段（含 --gpus / --set）。VAE 已跑满则 train.py 会立刻退出再进 Stage-2。
-# Stage-2 日程在 cola-100m-full.sh（对齐 elf-cfg）；Stage-1 VAE 仍用 cola-vae 默认 50B 日程。
+# Stage-2 日程在 cola-100m-full.sh（冻 VAE、AdamW 4e-4）；Stage-1 VAE 仍用 cola-vae 默认 50B 日程。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
