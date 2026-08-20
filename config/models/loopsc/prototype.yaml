@@ -1,0 +1,40 @@
+_doc: LoopSC config template (ELF 复制；训练展开闭环 SC；不可实例化)
+
+name: prototype
+tokenizer: t5-small
+max_seq_len: 1024
+encoder_model_name: t5-small
+text_encoder_dim: 512
+bottleneck_dim: 128
+n_layer: 12
+n_head: 12
+n_embd: 768
+dropout: 0.0
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+self_cond_prob: 0.5
+self_cond_cfg_min: 0.5
+self_cond_cfg_max: 5.0
+latent_mean: 0.0
+latent_std: 0.2
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+decoder_prob: 0.2
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+decoder_noise_scale: 5.0
+t_eps: 0.05
+time_schedule: logit_normal
+sc_unroll_steps: 2          # 训练展开采样 SC 步数；1=与 ELF 同构
+sc_unroll_bptt: true        # 反传穿过 SC 链（改 s(u) 的 Jacobian）
+sc_unroll_detach_z: true    # ODE 状态 detach，梯度只走 SC 半边
+
+sampling:
+  sampling_method: sde
+  num_sampling_steps: 32
+  sde_gamma: 1.5
+  time_schedule: logit_normal
+  temperature: 0.0
+  self_cond_cfg_scale: 3.0

@@ -832,6 +832,17 @@ def train_loop(
                 f"+ Posβ interpolant (κ={getattr(bb, 'pos_beta_kappa', '?')}); "
                 "κ=0 退回各向同性 ELF；metrics: mse / ce",
             )
+        elif cfg.model == "loopsc":
+            bb = unwrap_model(model).backbone
+            decoder_prob = float(getattr(bb, "decoder_prob", 0.2))
+            _train_log(
+                f"LOOPSC: per-example denoise:decode ≈ "
+                f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+                f"+ SC unroll (K={getattr(bb, 'sc_unroll_steps', '?')}, "
+                f"bptt={getattr(bb, 'sc_unroll_bptt', '?')}, "
+                f"detach_z={getattr(bb, 'sc_unroll_detach_z', '?')}); "
+                "metrics: mse / ce",
+            )
         elif cfg.model == "trace":
             bb = unwrap_model(model).backbone
             decoder_prob = float(getattr(bb, "decoder_prob", 0.2))

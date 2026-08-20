@@ -49,6 +49,8 @@ _SEQ_FULL_CHUNK_MODELS = frozenset(
         "cola",
         "denoiser_chart",
         "jac_ellipsoid",
+        "residw",
+        "loopsc",
     }
 )
 # DataLoader workers per rank; world_size comes from visible GPU count at launch.
