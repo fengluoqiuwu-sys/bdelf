@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # LoopSC 100m full（ELF 复制：训练展开 2 步闭环 SC，主损失仍对 x0）。
 # 日程与 elf-cfg-100m-full 对齐：warmup_ratio=0.1、min_lr_ratio=1.0（constant LR）、
-# target_tokens=45.2B、在线 gen-eval 32 samples；微批用 full.yaml 的 16。
+# target_tokens=45.2B、在线 gen-eval 32 samples。
+# 微批 8：K=2 BPTT 在 4090 上 batch=16 会 OOM（约 22GiB）；global_bs 仍 512。
 # 预处理仍用 elf（共享 T5 嵌入管线）。经 sbatch-train / launch-train；勿直接占远端 GPU。
 set -euo pipefail
 
@@ -30,4 +31,5 @@ exec "$PY" train.py \
   --set schedule.warmup_ratio=0.1 \
   --set schedule.min_lr_ratio=1.0 \
   --set schedule.target_tokens=45200000000 \
+  --set batch.batch_size=8 \
   "$@"
