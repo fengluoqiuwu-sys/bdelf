@@ -84,7 +84,7 @@ OWT 仅下载 HF `train` split；在** parquet 行号顺序**上做一次随机�
 
 入口：[`scripts/preprocess.py`](../../scripts/preprocess.py)。要求 raw parquet 已下载且体积 ≥ 1 GiB。
 
-并行：主进程顺序 `iter_parquet_rows`；`ProcessPoolExecutor`（spawn）按文档 `chunk_document`；`max_inflight ≈ 2×CPU workers`（上限 16）。
+并行：主进程顺序 `iter_parquet_rows`；`ProcessPoolExecutor`（spawn）按文档 `chunk_document`；worker 数 = 可见 CPU 数 − 1（`sched_getaffinity`，Slurm 作业内为分配核数）；`max_inflight ≈ 2×workers`。
 
 ## 缓存目录
 

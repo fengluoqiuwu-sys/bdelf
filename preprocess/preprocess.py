@@ -34,7 +34,6 @@ _MANIFEST_VERSION_OWT = 3
 _OVERFLOW_MODES = frozenset({"wrap", "discard", "pad_eos"})
 _DTYPE = np.int32
 _DOCS_PER_TASK = 512
-_MAX_TOKENIZE_WORKERS = 16
 # Split token/chunk storage into multiple files above this size (bytes).
 _SHARD_MAX_BYTES = 1 << 30
 
@@ -217,8 +216,18 @@ def _cache_dir(config: FL_PreprocessConfig, source: FL_Dataset) -> Path:
 
 
 
+def _available_cpu_count() -> int:
+    """可见 CPU 数（Slurm/cgroup 下为分配核数，而非整机逻辑核）。"""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def _worker_count() -> int:
-    return min(_MAX_TOKENIZE_WORKERS, max(1, os.cpu_count() or 1))
+    n = _available_cpu_count()
+    # 主进程顺序读 parquet + 协调；留 1 核避免与 worker 抢满 CPU
+    return max(1, n - 1) if n > 1 else 1
 
 
 def _log_preprocess(message: str) -> None:
