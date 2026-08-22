@@ -25,7 +25,6 @@ MODELS=(
   "ar1_5|default"
   "ar2|default"
   "bd3lm|default"
-  "bdelf|default"
   "elf|elf"
 )
 

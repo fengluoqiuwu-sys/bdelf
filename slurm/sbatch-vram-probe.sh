@@ -28,7 +28,7 @@ usage() {
    或: bash slurm/sbatch-vram-probe.sh [sbatch 选项...] --suite
 
   -n, --name JOB_NAME   Slurm --job-name（默认 vram-probe / vram-probe-suite）
-  --suite               跑 scripts/vram_probe_suite.sh（多模型依次测，跳过 bdelf）
+  --suite               跑 scripts/vram_probe_suite.sh（多模型依次测，跳过 cola 系）
   --nodelist=...        指定节点（推荐；模板不写死）
   --gpus-per-node=N     默认模板为 1；可覆盖
   其余以 - 开头的参数原样传给 sbatch
