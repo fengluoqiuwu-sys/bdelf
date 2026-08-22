@@ -36,7 +36,7 @@ from generate import (
     set_seed,
 )
 from hybrid_readout_elf import elf_decode_probe, elf_generate_latent
-from models.elf.t5_encoder import ensure_t5_encoder_cached
+from models.lm.elf.t5_encoder import ensure_t5_encoder_cached
 from tokenizer import get_tokenizer
 from train.ema import swap_ema_weights
 from train.generate_config import get_generate
@@ -245,7 +245,7 @@ def run_m0_shard(
     tokenizer = get_tokenizer(tokenizer_name)
     layout = tokenizer.get_token_layout()
     if model_meta["name"] == "elf":
-        from models.elf.ace import attach_ace_identity
+        from models.lm.elf.ace import attach_ace_identity
 
         attach_ace_identity(
             model,
@@ -619,7 +619,7 @@ def run_m2_shard(
     model, model_meta, step, train_cfg = load_model_from_checkpoint(ckpt, device)
     dtype = resolve_dtype(device, train_cfg)
     if model_meta["name"] == "elf":
-        from models.elf.ace import attach_ace_identity
+        from models.lm.elf.ace import attach_ace_identity
 
         attach_ace_identity(
             model,

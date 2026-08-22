@@ -10,7 +10,7 @@
         samples.txt / summary.*
 
 ``generate-hash`` = sha256(生成配置 + 样本参数含 seed；不含 step / name)[:16]。
-``model-hash`` 即训练 config-hash（与 ``cache/checkpoints/full/{model}/{hash}/`` 一致）。
+``model-hash`` 即训练 config-hash（与 ``cache/checkpoints/full/{lm|latent}/{model}/{hash}/`` 一致；旧 ``full/{model}/{hash}`` 仍可读）。
 ``results.*`` 浮点均保留四位小数；每次评测结束自动刷新。
 第一行/第一柱固定为 OWT eval 1024 参照（``owt-eval-1024``，见 ``eval/report.py``）。
 ``summary.json`` 缺 ``glue_token_pct`` 时，再次 ``eval.py`` **不跳过**：有 ``samples.txt`` 则只补 glue（不重新生成）；没有样本则整组重跑。
@@ -108,7 +108,10 @@ def parse_generate_sets(items: list[str] | None) -> dict[str, Any]:
 
 
 def parse_full_run(ckpt_path: Path) -> tuple[str, str]:
-    """从 checkpoint 路径解析 ``(model, model_hash)``；要求 variant=full。"""
+    """从 checkpoint 路径解析 ``(model, model_hash)``；要求 variant=full、kind=lm。"""
+    from models import kind_of
+    from train.run_path import parse_checkpoint_run_relpath
+
     root = _checkpoint_root().resolve()
     try:
         rel = ckpt_path.resolve().parent.relative_to(root)
@@ -117,15 +120,20 @@ def parse_full_run(ckpt_path: Path) -> tuple[str, str]:
             f"Checkpoint not under {root}: {ckpt_path}. "
             "eval.py only accepts full runs under cache/checkpoints/full/..."
         ) from exc
-    parts = rel.parts
-    if len(parts) != 3:
+    try:
+        variant, model, model_hash = parse_checkpoint_run_relpath(str(rel))
+    except ValueError as exc:
         raise ValueError(
-            f"Expected cache/checkpoints/{{variant}}/{{model}}/{{hash}}/, got {rel}"
-        )
-    variant, model, model_hash = parts
+            f"Invalid checkpoint run layout under {root}: {rel}. "
+            "Use full/{model}/{hash} or full/{lm|latent}/{model}/{hash}."
+        ) from exc
     if variant != "full":
         raise ValueError(
             f"eval.py only supports variant=full (got {variant!r} from {rel})"
+        )
+    if kind_of(model) != "lm":
+        raise ValueError(
+            f"eval.py only supports lm models (got {model!r} kind={kind_of(model)!r})"
         )
     return model, model_hash
 
@@ -583,7 +591,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--run",
-        help="Run relpath: full/{model}/{train-hash}",
+        help="Run relpath: full/lm/{model}/{hash} (legacy full/{model}/{hash})",
     )
     p.add_argument(
         "--name",
@@ -694,11 +702,16 @@ def main() -> None:
 
     if args.rescore_glue:
         if not args.run:
-            raise SystemExit("--rescore-glue requires --run full/{model}/{hash}")
-        parts = Path(str(args.run)).parts
-        if len(parts) < 3 or parts[0] != "full":
-            raise SystemExit(f"--run must be full/{{model}}/{{hash}}, got {args.run!r}")
-        model_name, model_hash = parts[1], parts[2]
+            raise SystemExit(
+                "--rescore-glue requires --run full/lm/{model}/{hash} "
+                "or legacy full/{model}/{hash}"
+            )
+        try:
+            from train.run_path import parse_checkpoint_run_relpath
+
+            _variant, model_name, model_hash = parse_checkpoint_run_relpath(str(args.run))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         step_dir = _latest_eval_step_dir(model_name, model_hash)
         if step_dir is None:
             raise SystemExit(
@@ -800,7 +813,7 @@ def main() -> None:
     tokenizer = get_tokenizer(tokenizer_name)
 
     if getattr(model, "ace_attachable", False):
-        from models.elf.ace import attach_ace_identity
+        from models.lm.elf.ace import attach_ace_identity
 
         attach_ace_identity(
             model, model_hash=model_hash, step=step, tokenizer=tokenizer_name,

@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 import hf_config  # noqa: F401
 from models import (
     build_model,
+    kind_of,
     list_model_configs,
     list_models,
     resolve_model_config_path,
@@ -101,6 +102,7 @@ def _spawn_worker(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     models = list_models() or ["<none>"]
+    model_help = ", ".join(f"{m} ({kind_of(m)})" for m in models) if models != ["<none>"] else "<none>"
     datasets = list_datasets() or ["<none>"]
     preprocess_names = list_preprocess() or ["<none>"]
     parser = argparse.ArgumentParser(
@@ -118,11 +120,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--dataset owt --preprocess elf --generate eval\n"
             "  python train.py --model elf --config 100m-full "
             "--dataset owt --preprocess elf --generate eval\n\n"
-            f"Available models: {', '.join(models)}\n"
+            f"Available models: {model_help}\n"
             f"Available datasets: {', '.join(datasets)}\n"
             f"Available preprocess configs: {', '.join(preprocess_names)}\n"
-            "Train configs: {size}m-{fast,full} (from config/models/<model>/)\n"
-            "Generate configs: config/generate/<model>/<name>.yaml\n"
+            "Train configs: {size}m-{fast,full} (from config/models/{kind}/<model>/)\n"
+            "Generate configs: config/generate/{kind}/<model>/<name>.yaml\n"
             "Overrides: --set section.key=value "
             "(sections: optimizer, batch, schedule, eval, generate, model, extra)"
         ),
@@ -130,7 +132,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         required=True,
-        help=f"Model family name; options: {', '.join(models)}",
+        help=f"Model family name; options: {model_help}",
     )
     parser.add_argument(
         "--config",
@@ -249,7 +251,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
     if args.model not in models:
         raise SystemExit(
             f"Unknown model {args.model!r}. Available: {', '.join(models) or '<none>'}\n"
-            f"Model config directory: config/models/<model>/"
+            f"Model config: config/models/{{lm|latent}}/<model>/"
         )
 
     train_models = list_train_models()
@@ -272,7 +274,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
     except FileNotFoundError as exc:
         available = ", ".join(list_model_configs(args.model)) or "<none>"
         raise SystemExit(
-            f"Model architecture config not found: config/models/{args.model}/{size}.yaml\n"
+            f"Model architecture config not found: "
+            f"config/models/{kind_of(args.model)}/{args.model}/{size}.yaml\n"
             f"Available: {available}\n{exc}"
         ) from exc
 

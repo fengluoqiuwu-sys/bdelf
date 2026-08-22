@@ -3,8 +3,8 @@
 
 Usage:
     python generate.py
-    python generate.py --run full/elf/<hash>
-    python generate.py --checkpoint cache/checkpoints/full/elf/<hash>/checkpoint_latest.pt
+    python generate.py --run full/lm/elf/<hash>
+    python generate.py --checkpoint cache/checkpoints/full/lm/elf/<hash>/checkpoint_latest.pt
     python generate.py --num-tokens 1024 --seed 42
     python generate.py --prompt "Once upon a time" --num-tokens 256
     python generate.py --prompt-file prompt.txt --run full/ar/<hash>
@@ -38,7 +38,10 @@ def _checkpoint_root() -> Path:
 
 
 def list_checkpoint_runs(root: Path | None = None) -> list[Path]:
-    """列出含 ``checkpoint_latest.pt`` 的 run 目录（``{variant}/{model}/{hash}``）。"""
+    """列出含 ``checkpoint_latest.pt`` 的 run 目录。
+
+    支持 ``{variant}/{model}/{hash}``（旧）与 ``{variant}/{kind}/{model}/{hash}``（新）。
+    """
     root = root or _checkpoint_root()
     if not root.is_dir():
         return []
@@ -46,9 +49,19 @@ def list_checkpoint_runs(root: Path | None = None) -> list[Path]:
     for variant_dir in sorted(root.iterdir()):
         if not variant_dir.is_dir() or variant_dir.name not in ("fast", "full"):
             continue
-        for model_dir in sorted(variant_dir.iterdir()):
-            if not model_dir.is_dir():
+        for child in sorted(variant_dir.iterdir()):
+            if not child.is_dir() or child.name == "artifacts":
                 continue
+            if child.name in ("lm", "latent"):
+                for model_dir in sorted(child.iterdir()):
+                    if not model_dir.is_dir():
+                        continue
+                    for hash_dir in sorted(model_dir.iterdir()):
+                        if hash_dir.is_dir() and (hash_dir / "checkpoint_latest.pt").is_file():
+                            runs.append(hash_dir)
+                continue
+            # legacy: variant/model/hash
+            model_dir = child
             for hash_dir in sorted(model_dir.iterdir()):
                 if hash_dir.is_dir() and (hash_dir / "checkpoint_latest.pt").is_file():
                     runs.append(hash_dir)
@@ -83,12 +96,13 @@ def resolve_checkpoint(
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         return path
     if run:
-        # 相对 checkpoint_root：fast/ar/<hash> 或旧扁平名（仅当目录仍存在）
+        # 相对 checkpoint_root：新 full/lm/elf/<hash> 或旧 full/elf/<hash>
         path = root / run / "checkpoint_latest.pt"
         if not path.is_file():
             raise FileNotFoundError(
                 f"Checkpoint not found: {path}\n"
-                "Use --run {fast|full}/{model}/{config-hash} "
+                "Use --run {fast|full}/{kind}/{model}/{config-hash} "
+                "or legacy {fast|full}/{model}/{config-hash} "
                 "(see scripts/resolve_checkpoint.py)."
             )
         return path
@@ -346,7 +360,7 @@ def main() -> None:
     tokenizer = get_tokenizer(tokenizer_name)
 
     if getattr(model, "ace_attachable", False):
-        from models.elf.ace import attach_ace_identity, model_hash_from_checkpoint
+        from models.lm.elf.ace import attach_ace_identity, model_hash_from_checkpoint
 
         ace_hash = model_hash_from_checkpoint(ckpt_path)
         if ace_hash:

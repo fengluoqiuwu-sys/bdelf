@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Literal, Optional, TypeVar
 import yaml
 
 from config_util import load_mapping_config
-from models import resolve_full_sequence_training
+from models import kind_of, resolve_full_sequence_training
+from models.kinds import resolve_train_model_dir
 from preprocess import get_preprocess
 from train.generate_config import get_generate
 from train.run_path import (
@@ -33,7 +34,6 @@ TSub = TypeVar("TSub")
 _MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|full)$")
 _ARCH_SIZE_RE = re.compile(r"^[0-9]+m$")
 _ARCH_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
-# DataLoader workers per rank; world_size comes from visible GPU count at launch.
 DEFAULT_NUM_WORKERS = 8
 
 
@@ -339,7 +339,7 @@ def _apply_mapping_overrides(
 
 
 def model_train_config_path(model: str, variant: TrainVariant) -> Path:
-    return MODEL_DIR / model / f"{variant}.yaml"
+    return resolve_train_model_dir(model) / f"{variant}.yaml"
 
 
 def _load_model_recipe(model: str, variant: TrainVariant) -> dict[str, Any]:
@@ -683,7 +683,7 @@ def compose_train_config(
             "config_hash": config_hash,
             "run_relpath": run_rel,
             "config_refs": {
-                "recipe": f"model/{model}/{variant}.yaml",
+                "recipe": f"model/{kind_of(model)}/{model}/{variant}.yaml",
                 "schedule": variant,
                 "eval": "default",
                 "generate": generate,
@@ -747,17 +747,22 @@ def list_train_models() -> List[str]:
     if not MODEL_DIR.is_dir():
         return []
     names: List[str] = []
-    for path in sorted(MODEL_DIR.iterdir()):
-        if not path.is_dir() or path.name == "prototype":
+    for kind_dir in sorted(MODEL_DIR.iterdir()):
+        if not kind_dir.is_dir() or kind_dir.name in ("prototype",):
             continue
-        if (path / "fast.yaml").is_file() or (path / "full.yaml").is_file():
-            names.append(path.name)
-    return names
+        if kind_dir.name not in ("lm", "latent"):
+            continue
+        for path in sorted(kind_dir.iterdir()):
+            if not path.is_dir():
+                continue
+            if (path / "fast.yaml").is_file() or (path / "full.yaml").is_file():
+                names.append(path.name)
+    return sorted(names)
 
 
 def _arch_sizes(model: str) -> List[str]:
-    """``config/models/<model>/{size}.yaml`` 中形如 ``100m`` / ``300m`` 的规格。"""
-    model_dir = _ARCH_CONFIG_DIR / model
+    """``config/models/<kind>/<model>/{size}.yaml`` 中形如 ``100m`` 的规格。"""
+    model_dir = _ARCH_CONFIG_DIR / kind_of(model) / model
     if not model_dir.is_dir():
         return []
     return sorted(
@@ -774,7 +779,7 @@ def list_train_configs(model: str | None = None) -> List[str]:
     for m in models:
         if m == "prototype":
             continue
-        model_dir = MODEL_DIR / m
+        model_dir = resolve_train_model_dir(m)
         if not model_dir.is_dir():
             continue
         sizes = _arch_sizes(m)

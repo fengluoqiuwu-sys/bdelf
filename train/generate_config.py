@@ -10,6 +10,8 @@ import yaml
 
 from config_util import load_mapping_config
 
+from models.kinds import resolve_generate_dir
+
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "generate"
 
 # 训练在线 gen-eval / 独立 generate.py 常用名
@@ -37,7 +39,7 @@ class FL_GenerateConfig:
             if not str(k).startswith("_")
         }
         ace = out.get("ace", False)
-        # 与 models.elf.ace.ace_is_enabled 对齐：未写 / false / 0 → 关
+        # 与 models.lm.elf.ace.ace_is_enabled 对齐：未写 / false / 0 → 关
         ace_off = (
             ace is False
             or ace is None
@@ -86,13 +88,13 @@ class FL_GenerateConfig:
 
 
 def generate_config_path(model: str, name: str) -> Path:
-    return CONFIG_DIR / model / f"{name}.yaml"
+    return resolve_generate_dir(model) / f"{name}.yaml"
 
 
 def list_generate(model: str | None = None) -> List[str]:
     """列出可用生成配置名（``model`` 给定时只列该模型；否则 ``model/name``）。"""
     if model is not None:
-        model_dir = CONFIG_DIR / model
+        model_dir = resolve_generate_dir(model)
         if not model_dir.is_dir():
             return []
         return sorted(
@@ -104,13 +106,16 @@ def list_generate(model: str | None = None) -> List[str]:
     names: List[str] = []
     if not CONFIG_DIR.is_dir():
         return names
-    for model_dir in sorted(CONFIG_DIR.iterdir()):
-        if not model_dir.is_dir():
+    for kind_dir in sorted(CONFIG_DIR.iterdir()):
+        if not kind_dir.is_dir() or kind_dir.name not in ("lm", "latent"):
             continue
-        for path in sorted(model_dir.glob("*.yaml")):
-            if path.stem == "prototype":
+        for model_dir in sorted(kind_dir.iterdir()):
+            if not model_dir.is_dir():
                 continue
-            names.append(f"{model_dir.name}/{path.stem}")
+            for path in sorted(model_dir.glob("*.yaml")):
+                if path.stem == "prototype":
+                    continue
+                names.append(f"{model_dir.name}/{path.stem}")
     return names
 
 

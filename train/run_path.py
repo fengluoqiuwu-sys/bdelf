@@ -1,8 +1,9 @@
-"""Checkpoint run identity: config hash → ``cache/checkpoints/{variant}/{model}/{hash}/``.
+"""Checkpoint run identity: config hash → ``cache/checkpoints/{variant}/{kind}/{model}/{hash}/``.
 
 不允许别名 / 软链；路径唯一由训练入参与所解析 YAML 内容决定。
 ``world_size`` / 派生 accum / 微步间隔 / GPU 硬件规格不进指纹
 （硬件另行写入 run 目录 ``hardware.json`` 并在续跑时校验）。
+旧布局 ``{variant}/{model}/{hash}/`` 仍可读（generate / 续训兼容）。
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from models import resolve_model_config_path
+from models import kind_of, resolve_model_config_path
 
 CHECKPOINT_ROOT = "cache/checkpoints"
 CONFIG_HASH_LEN = 16
@@ -160,18 +161,77 @@ def run_dir_for(
     model: str,
     config_hash: str,
     checkpoint_root: str | Path = CHECKPOINT_ROOT,
+    kind: str | None = None,
 ) -> Path:
-    """``{root}/{fast|full}/{model}/{hash}/``；禁止别名。"""
+    """``{root}/{fast|full}/{kind}/{model}/{hash}/``；禁止别名。"""
     if variant not in ("fast", "full"):
         raise ValueError(f"variant must be fast|full, got {variant!r}")
     if not config_hash or any(c in config_hash for c in "/\\"):
         raise ValueError(f"invalid config_hash: {config_hash!r}")
-    return Path(checkpoint_root) / variant / model / config_hash
+    model_kind = kind or kind_of(model)
+    return Path(checkpoint_root) / variant / model_kind / model / config_hash
 
 
 def run_relpath(*, variant: str, model: str, config_hash: str) -> str:
     """相对 ``checkpoint_root`` 的路径字符串（generate ``--run`` 用）。"""
-    return f"{variant}/{model}/{config_hash}"
+    return f"{variant}/{kind_of(model)}/{model}/{config_hash}"
+
+
+def legacy_run_dir_for(
+    *,
+    variant: str,
+    model: str,
+    config_hash: str,
+    checkpoint_root: str | Path = CHECKPOINT_ROOT,
+) -> Path:
+    """旧布局 ``{variant}/{model}/{hash}/``（只读兼容）。"""
+    return Path(checkpoint_root) / variant / model / config_hash
+
+
+def resolve_run_dir(
+    *,
+    variant: str,
+    model: str,
+    config_hash: str,
+    checkpoint_root: str | Path = CHECKPOINT_ROOT,
+) -> Path:
+    """优先新布局；不存在时回退旧布局。"""
+    root = Path(checkpoint_root)
+    primary = run_dir_for(
+        variant=variant,
+        model=model,
+        config_hash=config_hash,
+        checkpoint_root=root,
+    )
+    if primary.is_dir():
+        return primary
+    legacy = legacy_run_dir_for(
+        variant=variant,
+        model=model,
+        config_hash=config_hash,
+        checkpoint_root=root,
+    )
+    if legacy.is_dir():
+        return legacy
+    return primary
+
+
+def parse_checkpoint_run_relpath(run: str) -> tuple[str, str, str]:
+    """Parse ``--run`` into ``(variant, model, config_hash)``.
+
+    Accepts legacy ``{variant}/{model}/{hash}`` and
+    ``{variant}/{kind}/{model}/{hash}``.
+    """
+    parts = Path(run).parts
+    if len(parts) == 3 and parts[0] in ("fast", "full"):
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 4 and parts[0] in ("fast", "full") and parts[1] in ("lm", "latent"):
+        return parts[0], parts[2], parts[3]
+    raise ValueError(
+        f"invalid run relpath {run!r}; expected "
+        "{{fast|full}}/{{model}}/{{hash}} or "
+        "{{fast|full}}/{{lm|latent}}/{{model}}/{{hash}}"
+    )
 
 
 def checkpoint_run_dir(
@@ -191,7 +251,7 @@ def checkpoint_run_dir(
 
 def checkpoint_run_dir_from_cfg(cfg: Any) -> Path:
     """从 ``FL_TrainConfig`` 得到 run 目录（``cfg.name`` 即 config hash）。"""
-    return run_dir_for(
+    return resolve_run_dir(
         variant=cfg.variant,
         model=cfg.model,
         config_hash=cfg.name,

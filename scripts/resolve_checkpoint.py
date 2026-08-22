@@ -31,7 +31,7 @@ from train import (
     list_train_models,
     parse_train_overrides,
 )
-from train.run_path import checkpoint_run_dir_from_cfg
+from train.run_path import checkpoint_run_dir_from_cfg, run_relpath
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -41,8 +41,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Resolve train launch args to "
-            "cache/checkpoints/{fast|full}/{model}/{config-hash}/ "
-            "(same CLI rules as train.py; no aliases)"
+            "cache/checkpoints/{fast|full}/{lm|latent}/{model}/{config-hash}/ "
+            "(legacy {variant}/{model}/{hash} still readable; same CLI as train.py)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -177,7 +177,9 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     cfg = _validate_and_load(args)
     run_dir = checkpoint_run_dir_from_cfg(cfg)
-    rel = cfg.extra.get("run_relpath") or f"{cfg.variant}/{cfg.model}/{cfg.name}"
+    rel = cfg.extra.get("run_relpath") or run_relpath(
+        variant=cfg.variant, model=cfg.model, config_hash=cfg.name,
+    )
 
     if args.hash_only:
         print(cfg.name)

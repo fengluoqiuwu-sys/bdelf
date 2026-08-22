@@ -15,6 +15,13 @@ import yaml
 import hf_config  # noqa: F401
 from transformers import PretrainedConfig, PreTrainedModel
 
+from models.kinds import (
+    ModelKind,
+    import_family_module,
+    kind_of,
+    list_models as _list_models_by_kind,
+    resolve_model_config_dir,
+)
 from models.tokens import apply_token_layout_to_config, token_layout_from_cfg
 
 
@@ -75,25 +82,17 @@ def merge_sampling_cfg(
         merged["use_fast_infer"] = use_fast_infer_override
     return merged
 
-CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
-
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
 
-def list_models() -> List[str]:
-    """Return model family names discovered from ``config/models/*/``."""
-    if not CONFIG_DIR.exists():
-        return []
-    return sorted(
-        path.name
-        for path in CONFIG_DIR.iterdir()
-        if path.is_dir() and path.name != "prototype"
-    )
+def list_models(*, kind: ModelKind | None = None) -> List[str]:
+    """Return model family names under ``config/models/{lm,latent}/``."""
+    return _list_models_by_kind(kind=kind)
 
 
 def list_model_configs(model: str) -> List[str]:
-    """Return config names for a model family (yaml stems under ``config/models/<model>/``)."""
-    model_dir = CONFIG_DIR / model
+    """Return config names for a model family (yaml stems under kind dir)."""
+    model_dir = resolve_model_config_dir(model)
     if not model_dir.is_dir():
         return []
     return sorted(
@@ -108,7 +107,7 @@ def resolve_model_config_path(model: str, config_arg: str) -> Path:
     as_path = Path(config_arg)
     if as_path.suffix in (".yaml", ".yml") and as_path.is_file():
         return as_path
-    path = CONFIG_DIR / model / f"{config_arg}.yaml"
+    path = resolve_model_config_dir(model) / f"{config_arg}.yaml"
     if not path.is_file():
         available = ", ".join(list_model_configs(model)) or "<none>"
         raise FileNotFoundError(
@@ -300,14 +299,16 @@ class FL_PreTrainedModel(PreTrainedModel):
 def resolve_full_sequence_training(model_name: str) -> bool:
     """Whether ``model_name`` counts the full chunk toward the token budget.
 
-    Imports ``models.<name>.model`` and reads the first ``nn.Module`` subclass
-    that defines class attribute ``full_sequence_training`` (typically the
-    backbone). Used at config-compose time before the model is built.
+    Imports ``models.<kind>.<name>.model`` and reads the first ``nn.Module``
+    subclass that defines class attribute ``full_sequence_training``.
+  Used at config-compose time before the model is built.
     """
     try:
-        module = importlib.import_module(f"models.{model_name}.model")
-    except ModuleNotFoundError as exc:
-        raise ValueError(f"Model package not found: models/{model_name}/") from exc
+        module = importlib.import_module(f"{import_family_module(model_name).__name__}.model")
+    except (ModuleNotFoundError, KeyError) as exc:
+        raise ValueError(
+            f"Model package not found: models/{kind_of(model_name)}/{model_name}/"
+        ) from exc
 
     for value in vars(module).values():
         if not isinstance(value, type):
@@ -331,25 +332,31 @@ def resolve_full_sequence_training(model_name: str) -> bool:
 def build_model(model_name: str, model_cfg: dict) -> FL_PreTrainedModel:
     """Build a model by family name and config dict."""
     try:
-        module = importlib.import_module(f"models.{model_name}")
-    except ModuleNotFoundError as exc:
-        raise ValueError(f"Model package not found: models/{model_name}/") from exc
+        module = import_family_module(model_name)
+    except (ModuleNotFoundError, KeyError) as exc:
+        raise ValueError(
+            f"Model package not found: models/{kind_of(model_name)}/{model_name}/"
+        ) from exc
 
     if not hasattr(module, "build_model"):
-        raise ValueError(f"models/{model_name}/ is missing build_model(cfg)")
+        raise ValueError(
+            f"models/{kind_of(model_name)}/{model_name}/ is missing build_model(cfg)"
+        )
     return module.build_model(model_cfg)
 
 
 def get_model(model: str, config_name: str) -> FL_PreTrainedModel:
-    """Load ``config/models/<model>/<config_name>.yaml`` and instantiate the model."""
+    """Load ``config/models/<kind>/<model>/<config_name>.yaml`` and instantiate."""
     path = resolve_model_config_path(model, config_name)
     try:
-        module = importlib.import_module(f"models.{model}")
-    except ModuleNotFoundError as exc:
-        raise ValueError(f"Model package not found: models/{model}/") from exc
+        module = import_family_module(model)
+    except (ModuleNotFoundError, KeyError) as exc:
+        raise ValueError(
+            f"Model package not found: models/{kind_of(model)}/{model}/"
+        ) from exc
 
     if not hasattr(module, "CONFIG_CLS"):
-        raise ValueError(f"models/{model}/ is missing CONFIG_CLS")
+        raise ValueError(f"models/{kind_of(model)}/{model}/ is missing CONFIG_CLS")
     config = config_from_yaml(module.CONFIG_CLS, path)
     ensure_token_layout(config)
     return module.build_model_from_config(config)

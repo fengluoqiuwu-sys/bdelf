@@ -1,6 +1,6 @@
 """给人看的 checkpoint 哈希指引 CSV（``cache/checkpoints/hash_guide.csv``）。
 
-列：model, config, dataset, Preprocess, generate, hash, set
+列：kind, model, config, dataset, Preprocess, generate, hash, set
 按前六列字典序排序；``set`` 为 overrides 的单行 JSON。
 仅收录 ``full`` 变体；``fast`` 冒烟不写入。
 本文件仅本地维护，不随 sync push/pull。
@@ -13,10 +13,12 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from models import kind_of
 from train.train import CHECKPOINT_ROOT
 
 HASH_GUIDE_FILENAME = "hash_guide.csv"
 COLUMNS = (
+    "kind",
     "model",
     "config",
     "dataset",
@@ -44,6 +46,7 @@ def row_from_train(train: Mapping[str, Any]) -> dict[str, str]:
     refs = dict(extra.get("config_refs") or {})
     cfg_hash = str(extra.get("config_hash") or train.get("name") or "")
     return {
+        "kind": kind_of(str(train["model"])),
         "model": str(train["model"]),
         "config": f"{train['model_config']}-{train['variant']}",
         "dataset": str(train["dataset"]),
@@ -67,7 +70,13 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
         for raw in reader:
             if not raw:
                 continue
-            rows.append({c: str(raw.get(c) or "") for c in COLUMNS})
+            row = {c: str(raw.get(c) or "") for c in COLUMNS}
+            if not row.get("kind") and row.get("model"):
+                try:
+                    row["kind"] = kind_of(row["model"])
+                except KeyError:
+                    row["kind"] = ""
+            rows.append(row)
         return rows
 
 
@@ -103,19 +112,29 @@ def rebuild_hash_guide(*, root: Path | None = None) -> Path:
     """扫描 ``full/{model}/{hash}/config.json`` 重建指引表（不含 fast）。"""
     root = Path(root or CHECKPOINT_ROOT)
     rows: list[dict[str, str]] = []
-    for cfg_path in sorted(root.glob("full/*/*/config.json")):
-        try:
-            payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        train = payload.get("train")
-        if not isinstance(train, dict):
-            continue
-        if not train.get("model") or not train.get("model_config"):
-            continue
-        if not _is_full_train(train):
-            continue
-        rows.append(row_from_train(train))
+    patterns = (
+        "full/*/*/config.json",
+        "full/lm/*/*/config.json",
+        "full/latent/*/*/config.json",
+    )
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for cfg_path in sorted(root.glob(pattern)):
+            if cfg_path in seen:
+                continue
+            seen.add(cfg_path)
+            try:
+                payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            train = payload.get("train")
+            if not isinstance(train, dict):
+                continue
+            if not train.get("model") or not train.get("model_config"):
+                continue
+            if not _is_full_train(train):
+                continue
+            rows.append(row_from_train(train))
     # 同 hash 去重（后写覆盖）
     by_hash: dict[str, dict[str, str]] = {}
     for row in rows:

@@ -10,7 +10,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from models.elf.ace import (
+from models.lm.elf.ace import (
     ace_step_active,
     apply_ace_steer,
     parse_ace_step_range,

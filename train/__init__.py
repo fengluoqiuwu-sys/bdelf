@@ -22,6 +22,7 @@ from .generate_config import (
 from .run_path import (
     checkpoint_run_dir_from_cfg,
     config_hash_from_fingerprint,
+    parse_checkpoint_run_relpath,
     run_dir_for,
     run_relpath,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "list_train_models",
     "model_train_config_path",
     "parse_train_overrides",
+    "parse_checkpoint_run_relpath",
     "resolve_train_config_path",
     "run_dir_for",
     "run_relpath",
