@@ -1005,7 +1005,7 @@ def _split_needs_shuffle(
                 return None
         elif status in ("built", "shuffling"):
             meta = _split_meta_from_manifest(prior)
-            if _verify_split_cache(
+            if meta.count > 0 and _verify_split_cache(
                 cache_dir, split, meta, chunk_length=chunk_length
             ):
                 return meta
@@ -1013,8 +1013,12 @@ def _split_needs_shuffle(
     inferred = _infer_split_meta_from_disk(
         cache_dir, split, chunk_length=chunk_length
     )
-    if inferred and _verify_split_cache(
-        cache_dir, split, inferred, chunk_length=chunk_length
+    if (
+        inferred
+        and inferred.count > 0
+        and _verify_split_cache(
+            cache_dir, split, inferred, chunk_length=chunk_length
+        )
     ):
         return inferred
     return None
@@ -1104,6 +1108,9 @@ def _build_cache(
                 cache_dir=cache_dir,
                 config=config,
             )
+            from preprocess.owt_segment_build import assert_owt_segment_metas_nonempty
+
+            assert_owt_segment_metas_nonempty(metas, splits=metas.keys())
         else:
             metas = _stream_preprocess_parquet(
                 source,
@@ -1152,6 +1159,9 @@ def _build_cache(
                     cache_dir=cache_dir,
                     config=config,
                 )
+                from preprocess.owt_segment_build import assert_owt_segment_metas_nonempty
+
+                assert_owt_segment_metas_nonempty({split: meta}, splits=[split])
             else:
                 meta = _stream_preprocess_split_dataset(
                     hf_dataset,
@@ -1183,6 +1193,14 @@ def _build_cache(
                     split_counts,
                     write_partial=_write_partial,
                 )
+
+    if config.strategy == "owt_segment":
+        train_count = int(split_counts.get("train", 0))
+        if train_count <= 0:
+            raise RuntimeError(
+                "OWT 句段预处理 train split 为 0 chunks，拒绝写入 complete manifest；"
+                "请删除缓存目录后重跑。"
+            )
 
     _write_manifest(
         cache_dir,
@@ -1230,7 +1248,9 @@ def _ensure_cache(
                     )
                     for name, meta in splits.items()
                 ):
-                    return dict(manifest.get("split_counts", {})), splits
+                    split_counts = dict(manifest.get("split_counts", {}))
+                    if split_counts and all(int(v) > 0 for v in split_counts.values()):
+                        return split_counts, splits
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     _log_preprocess(

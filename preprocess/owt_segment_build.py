@@ -9,7 +9,7 @@ from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Set
+from typing import Callable, Dict, Iterator, Iterable, List, Set
 
 import numpy as np
 from tqdm import tqdm
@@ -95,6 +95,13 @@ def _pad_chunk_ids(chunk: List[int], pad_id: int) -> tuple[List[int], int]:
     return pad_to(chunk, pad_len, pad_id), valid_len
 
 
+def _storage_row(padded: List[int], pad_id: int) -> np.ndarray:
+    """桶 pad 后再对齐到 memmap 行宽（chunk_length），便于 batch stack。"""
+    if len(padded) < _WORKER_FIXED_PAD:
+        padded = pad_to(padded, _WORKER_FIXED_PAD, pad_id)
+    return np.asarray(padded, dtype=_DTYPE)
+
+
 def _process_owt_batch(batch: _TaggedDocBatch) -> tuple[str, int, np.ndarray, np.ndarray]:
     if _WORKER_TOKENIZER is None:
         raise RuntimeError("OWT worker tokenizer is not initialized.")
@@ -113,7 +120,7 @@ def _process_owt_batch(batch: _TaggedDocBatch) -> tuple[str, int, np.ndarray, np
             padded, valid = _pad_chunk_ids(chunk, _WORKER_PAD)
             if not padded:
                 continue
-            rows.append(np.asarray(padded, dtype=_DTYPE))
+            rows.append(_storage_row(padded, _WORKER_PAD))
             lengths.append(valid)
     if not rows:
         empty = np.empty((0, _WORKER_FIXED_PAD), dtype=_DTYPE)
@@ -373,6 +380,7 @@ def _run_owt_segment_loop(
         )
 
     ctx = multiprocessing.get_context("spawn")
+    metas: Dict[str, _SplitCacheMeta] = {}
     try:
         with ProcessPoolExecutor(
             max_workers=workers,
@@ -391,7 +399,6 @@ def _run_owt_segment_loop(
                     chunks=f"{writers[split]._total:,}", refresh=False
                 )
     finally:
-        metas: Dict[str, _SplitCacheMeta] = {}
         for split, writer in writers.items():
             progress[split].close()
             metas[split] = writer.finalize()
@@ -399,7 +406,22 @@ def _run_owt_segment_loop(
                 f"[preprocess] split={split!r}: built, {metas[split].count:,} chunks "
                 f"(shuffle pending)"
             )
-        return metas
+    return metas
+
+
+def assert_owt_segment_metas_nonempty(
+    metas: Dict[str, _SplitCacheMeta],
+    *,
+    splits: Iterable[str],
+) -> None:
+    """切分阶段不得产出空 split（避免中断后被标成 complete）。"""
+    for split in splits:
+        meta = metas.get(split)
+        if meta is None or meta.count <= 0:
+            raise RuntimeError(
+                f"OWT 句段预处理 split={split!r} 产出 0 chunks；"
+                "若人为中断请删缓存目录后重跑。"
+            )
 
 
 def build_owt_segment_splits(

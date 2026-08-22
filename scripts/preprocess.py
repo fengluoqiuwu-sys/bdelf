@@ -76,6 +76,11 @@ def validate_manifest(dataset: str, preprocess: str) -> Path:
     if status != "complete":
         raise SystemExit(f"manifest status={status!r}, expected 'complete'")
 
+    if not split_counts or all(int(v) == 0 for v in split_counts.values()):
+        raise SystemExit(
+            "split_counts 全为 0，缓存无效；请删除 cache 目录后重跑 preprocess"
+        )
+
     expected_splits = set(get_dataset(dataset).get_splits())
     if set(split_counts) != expected_splits:
         raise SystemExit(
