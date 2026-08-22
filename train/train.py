@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Literal, Optional, TypeVar
 import yaml
 
 from config_util import load_mapping_config
+from models import resolve_full_sequence_training
 from preprocess import get_preprocess
 from train.generate_config import get_generate
 from train.run_path import (
@@ -32,27 +33,6 @@ TSub = TypeVar("TSub")
 _MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|full)$")
 _ARCH_SIZE_RE = re.compile(r"^[0-9]+m$")
 _ARCH_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
-# 按整段 chunk 计 token 预算（非因果减 1）。
-_SEQ_FULL_CHUNK_MODELS = frozenset(
-    {
-        "ar1_5",
-        "ar2",
-        "bd3lm",
-        "bdelf",
-        "elf",
-        "late_ce",
-        "lexce",
-        "odar",
-        "posbeta",
-        "trace",
-        "cola_vae",
-        "cola",
-        "denoiser_chart",
-        "jac_ellipsoid",
-        "residw",
-        "loopsc",
-    }
-)
 # DataLoader workers per rank; world_size comes from visible GPU count at launch.
 DEFAULT_NUM_WORKERS = 8
 
@@ -222,7 +202,7 @@ class FL_TrainConfig:
     @property
     def seq_tokens(self) -> int:
         chunk = int(self.extra.get("chunk_length", 1024))
-        if self.model in _SEQ_FULL_CHUNK_MODELS:
+        if resolve_full_sequence_training(self.model):
             return chunk
         return max(1, chunk - 1)
 
@@ -647,7 +627,7 @@ def compose_train_config(
         * resolved_world_size
         * (
             chunk_length
-            if model in _SEQ_FULL_CHUNK_MODELS
+            if resolve_full_sequence_training(model)
             else max(1, chunk_length - 1)
         )
     )

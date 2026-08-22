@@ -3,17 +3,16 @@
 
 Usage:
     python generate.py
-    python generate.py --run bdelf-100m-full-muon
-    python generate.py --checkpoint cache/checkpoints/bdelf-100m-full-muon/checkpoint_latest.pt
+    python generate.py --run full/elf/<hash>
+    python generate.py --checkpoint cache/checkpoints/full/elf/<hash>/checkpoint_latest.pt
     python generate.py --num-tokens 1024 --seed 42
     python generate.py --prompt "Once upon a time" --num-tokens 256
-    python generate.py --prompt-file prompt.txt --run ar-100m-full-muon
+    python generate.py --prompt-file prompt.txt --run full/ar/<hash>
 """
 
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import sys
 from pathlib import Path
@@ -195,8 +194,8 @@ def encode_prefix_tokens(
 
 
 def model_supports_prefix(model: torch.nn.Module) -> bool:
-    backbone = getattr(model, "backbone", model)
-    return "prefix_tokens" in inspect.signature(backbone.generate).parameters
+    """Whether ``--prompt`` / prefix completion is allowed for this model."""
+    return bool(getattr(model, "supports_prefix", True))
 
 
 def generate_tokens(
@@ -292,7 +291,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Override sampling temperature; omit to use --generate config "
-            "(ELF: 0=argmax; AR/BDELF: typically 1.0)"
+            "(ELF: 0=argmax; AR: typically 1.0)"
         ),
     )
     parser.add_argument(
@@ -346,10 +345,7 @@ def main() -> None:
         raise ValueError("Model config is missing tokenizer name")
     tokenizer = get_tokenizer(tokenizer_name)
 
-    if model_meta["name"] in (
-        "elf", "odar", "lexce", "posbeta", "trace", "denoiser_chart",
-        "residw", "loopsc",
-    ):
+    if getattr(model, "ace_attachable", False):
         from models.elf.ace import attach_ace_identity, model_hash_from_checkpoint
 
         ace_hash = model_hash_from_checkpoint(ckpt_path)
@@ -362,10 +358,7 @@ def main() -> None:
     prefix_tokens = None
     prefix_len = 0
     if prompt_text is not None:
-        if model_meta["name"] in (
-            "elf", "late_ce", "odar", "lexce", "posbeta", "trace",
-            "denoiser_chart", "residw", "loopsc",
-        ):
+        if not model_supports_prefix(model):
             raise ValueError(
                 f"{model_meta['name']} generation is unconditional; "
                 "--prompt is not supported"

@@ -514,13 +514,15 @@ def build_train_row(
     *,
     dual_branch: bool,
     loss_branch: str = "",
-    denoise_mse: float | None = None,
-    decode_ce: float | None = None,
-    late_ce: float | None = None,
-    lex_ce: float | None = None,
-    attr: float | None = None,
-    chart_ce: float | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    metrics = metrics or {}
+    denoise_mse = metrics.get("denoise_mse")
+    decode_ce = metrics.get("decode_ce")
+    late_ce = metrics.get("late_ce")
+    lex_ce = metrics.get("lex_ce")
+    attr = metrics.get("attr")
+    chart_ce = metrics.get("chart_ce")
     row: dict[str, Any] = {
         "step": step,
         "tokens": tokens,
@@ -561,7 +563,7 @@ def build_train_row(
             if chart_v is not None:
                 row["chart_ce"] = round(chart_v, 6)
         elif loss_branch == "denoise":
-            # MSE is not a CE; leave train_ppl empty (same as BDELF).
+            # MSE is not a CE; leave train_ppl empty.
             row["denoise_mse"] = round(train_loss, 6) if train_loss == train_loss else ""
             if lce is not None:
                 row["late_ce"] = round(lce, 6)

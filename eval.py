@@ -705,7 +705,7 @@ def main() -> None:
                 f"no eval step dir under {EVAL_ROOT / model_name / model_hash}"
             )
         tok_name = "t5-small"
-        if model_name in ("ar", "ar2", "ar1_5", "bd3lm", "bdelf", "cola", "cola_vae"):
+        if model_name in ("ar", "ar2", "ar1_5", "bd3lm", "cola", "cola_vae"):
             tok_name = "gpt2"
         from eval.glue import rescore_glue_step_dir, summary_has_glue
 
@@ -799,10 +799,7 @@ def main() -> None:
         raise ValueError("Model config missing tokenizer")
     tokenizer = get_tokenizer(tokenizer_name)
 
-    if model_name in (
-        "elf", "odar", "lexce", "posbeta", "trace", "denoiser_chart",
-        "residw", "loopsc",
-    ):
+    if getattr(model, "ace_attachable", False):
         from models.elf.ace import attach_ace_identity
 
         attach_ace_identity(

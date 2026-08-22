@@ -176,7 +176,3 @@ def score_texts(
         loss_to_ppl(loss_sum / token_sum) if token_sum > 0 else float("nan")
     )
     return per_ppl, per_ent, corpus_ppl
-
-
-# 兼容旧名
-score_samples = score_texts

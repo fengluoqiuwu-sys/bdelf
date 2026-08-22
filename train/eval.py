@@ -1,7 +1,7 @@
 """训练环内 held-out PPL 与在线 gen-eval 胶水。
 
-Gen.PPL 重分词 / 打分原语已上收至 ``eval.gen_ppl``；本模块仅保留
-DataLoader / DDP / 采样聚合逻辑，并 re-export 常用符号以兼容旧导入。
+Gen.PPL 重分词 / 打分原语在 ``eval.gen_ppl``；本模块保留
+DataLoader / DDP / 采样聚合逻辑。
 """
 
 from __future__ import annotations
@@ -15,10 +15,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from eval.gen_ppl import (  # noqa: F401 — re-export
+from eval.gen_ppl import (
     get_gpt2_tokenizer as _get_gpt2_tokenizer,
     get_src_tokenizer as _get_src_tokenizer,
-    prepare_gpt2_eval_batch,
     prepare_gpt2_eval_texts,
 )
 from models import get_hf_model
