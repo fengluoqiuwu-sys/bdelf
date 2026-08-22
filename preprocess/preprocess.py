@@ -11,7 +11,7 @@ from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Set, Union
+from typing import Any, Callable, Dict, Iterator, List, Literal, Set, Union
 
 import numpy as np
 import torch
@@ -740,6 +740,39 @@ def _cleanup_split(cache_dir: Path, split: str) -> None:
     (cache_dir / f"{split}.len").unlink(missing_ok=True)
 
 
+def _cleanup_shuffle_tmp(cache_dir: Path, split: str) -> None:
+    tmp_dir = cache_dir / f".shuffle_{split}"
+    if not tmp_dir.exists():
+        return
+    for child in tmp_dir.iterdir():
+        child.unlink(missing_ok=True)
+    tmp_dir.rmdir()
+
+
+def _infer_split_meta_from_disk(
+    cache_dir: Path,
+    split: str,
+    *,
+    chunk_length: int,
+) -> _SplitCacheMeta | None:
+    """无 manifest 时从磁盘推断 split 元数据（用于切分已完成、shuffle 未完成）。"""
+    shards: List[_SplitShardMeta] = []
+    row_bytes = chunk_length * np.dtype(_DTYPE).itemsize
+    for path in sorted(cache_dir.glob(f"{split}.*.bin")):
+        size = path.stat().st_size
+        if size <= 0 or size % row_bytes != 0:
+            return None
+        shards.append(_SplitShardMeta(file=path.name, count=size // row_bytes))
+    if not shards:
+        return None
+    count = sum(shard.count for shard in shards)
+    len_path = cache_dir / f"{split}.len"
+    has_lengths = (
+        len_path.exists() and len_path.stat().st_size == count * np.dtype(_DTYPE).itemsize
+    )
+    return _SplitCacheMeta(count=count, shards=shards, has_lengths=has_lengths)
+
+
 def _split_meta_from_manifest(raw: Dict[str, Any]) -> _SplitCacheMeta:
     shards = [
         _SplitShardMeta(file=item["file"], count=int(item["count"]))
@@ -793,6 +826,8 @@ def _manifest_payload_base(
                 "pad_mode": config.pad_mode,
                 "bucket_lengths": list(config.bucket_lengths),
                 "shuffle_seed": config.shuffle_seed,
+                "shuffle_mode": "block",
+                "shuffle_block_rows": 65536,
             }
         )
     return payload
@@ -906,6 +941,85 @@ def _owt_segment_preprocess_split_dataset(
     return metas[split]
 
 
+def _owt_shuffle_splits(
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+    split_names: List[str],
+    split_entries: Dict[str, Any],
+    split_counts: Dict[str, int],
+    *,
+    write_partial: Callable[[], None],
+) -> None:
+    from preprocess.owt_segment_build import _ShuffleHooks, shuffle_owt_splits
+
+    metas = {
+        split: _split_meta_from_manifest(split_entries[split]) for split in split_names
+    }
+
+    def _on_start(split: str, meta: _SplitCacheMeta) -> None:
+        split_entries[split] = {
+            "status": "shuffling",
+            "shuffle_rows": 0,
+            **_split_meta_to_manifest(meta),
+        }
+        write_partial()
+
+    def _on_progress(split: str, rows_done: int, total: int) -> None:
+        entry = split_entries.get(split, {})
+        entry["status"] = "shuffling"
+        entry["shuffle_rows"] = rows_done
+        split_entries[split] = entry
+        write_partial()
+
+    def _on_complete(split: str, meta: _SplitCacheMeta) -> None:
+        split_entries[split] = {
+            "status": "complete",
+            **_split_meta_to_manifest(meta),
+        }
+        split_counts[split] = meta.count
+        write_partial()
+
+    hooks = _ShuffleHooks(
+        on_start=_on_start,
+        on_progress=_on_progress,
+        on_complete=_on_complete,
+    )
+    shuffle_owt_splits(cache_dir, config, metas, hooks=hooks)
+
+
+def _split_needs_shuffle(
+    cache_dir: Path,
+    split: str,
+    prior: Dict[str, Any] | None,
+    *,
+    chunk_length: int,
+) -> _SplitCacheMeta | None:
+    """若 split 已切分未 shuffle（或 shuffle 中断），返回可验证的 meta。"""
+    if prior:
+        status = prior.get("status")
+        if status == "complete":
+            meta = _split_meta_from_manifest(prior)
+            if _verify_split_cache(
+                cache_dir, split, meta, chunk_length=chunk_length
+            ):
+                return None
+        elif status in ("built", "shuffling"):
+            meta = _split_meta_from_manifest(prior)
+            if _verify_split_cache(
+                cache_dir, split, meta, chunk_length=chunk_length
+            ):
+                return meta
+
+    inferred = _infer_split_meta_from_disk(
+        cache_dir, split, chunk_length=chunk_length
+    )
+    if inferred and _verify_split_cache(
+        cache_dir, split, inferred, chunk_length=chunk_length
+    ):
+        return inferred
+    return None
+
+
 def _build_cache(
     config: FL_PreprocessConfig,
     source: FL_Dataset,
@@ -925,6 +1039,7 @@ def _build_cache(
     split_entries: Dict[str, Any] = dict(existing.get("splits", {}))
     split_counts: Dict[str, int] = {}
     splits_to_build: List[str] = []
+    splits_to_shuffle: List[str] = []
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for split in source.get_splits():
@@ -936,7 +1051,24 @@ def _build_cache(
             ):
                 split_counts[split] = meta.count
                 continue
+
+        shuffle_meta = _split_needs_shuffle(
+            cache_dir,
+            split,
+            prior,
+            chunk_length=config.chunk_length,
+        )
+        if shuffle_meta is not None:
+            split_entries[split] = {
+                "status": "built",
+                **_split_meta_to_manifest(shuffle_meta),
+            }
+            split_counts[split] = shuffle_meta.count
+            splits_to_shuffle.append(split)
+            continue
+
         _cleanup_split(cache_dir, split)
+        _cleanup_shuffle_tmp(cache_dir, split)
         splits_to_build.append(split)
 
     def _write_partial() -> None:
@@ -949,6 +1081,19 @@ def _build_cache(
                 split_counts=dict(split_counts),
                 splits=split_entries,
             ),
+        )
+
+    if splits_to_shuffle and config.strategy == "owt_segment":
+        _log_preprocess(
+            f"Skipping tokenize; resuming shuffle for splits={splits_to_shuffle}"
+        )
+        _owt_shuffle_splits(
+            cache_dir,
+            config,
+            splits_to_shuffle,
+            split_entries,
+            split_counts,
+            write_partial=_write_partial,
         )
 
     if splits_to_build and source.can_stream_parquet():
@@ -969,13 +1114,29 @@ def _build_cache(
                 workers=workers,
             )
         for split, meta in metas.items():
-            split_entries[split] = {
-                "status": "complete",
-                **_split_meta_to_manifest(meta),
-            }
+            if config.strategy == "owt_segment":
+                split_entries[split] = {
+                    "status": "built",
+                    **_split_meta_to_manifest(meta),
+                }
+            else:
+                split_entries[split] = {
+                    "status": "complete",
+                    **_split_meta_to_manifest(meta),
+                }
             split_counts[split] = meta.count
             _write_partial()
-    else:
+
+        if config.strategy == "owt_segment":
+            _owt_shuffle_splits(
+                cache_dir,
+                config,
+                list(metas.keys()),
+                split_entries,
+                split_counts,
+                write_partial=_write_partial,
+            )
+    elif splits_to_build:
         for split in splits_to_build:
             _log_preprocess(f"Loading split={split!r} ...")
             load_started = time.time()
@@ -1000,12 +1161,28 @@ def _build_cache(
                     special=special,
                     workers=workers,
                 )
-            split_entries[split] = {
-                "status": "complete",
-                **_split_meta_to_manifest(meta),
-            }
+            if config.strategy == "owt_segment":
+                split_entries[split] = {
+                    "status": "built",
+                    **_split_meta_to_manifest(meta),
+                }
+            else:
+                split_entries[split] = {
+                    "status": "complete",
+                    **_split_meta_to_manifest(meta),
+                }
             split_counts[split] = meta.count
             _write_partial()
+
+            if config.strategy == "owt_segment":
+                _owt_shuffle_splits(
+                    cache_dir,
+                    config,
+                    [split],
+                    split_entries,
+                    split_counts,
+                    write_partial=_write_partial,
+                )
 
     _write_manifest(
         cache_dir,

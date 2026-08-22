@@ -1,14 +1,15 @@
-"""OWT 句段预处理构建：按文档切分、pad、shuffle、写 shard。"""
+"""OWT 句段预处理构建：按文档切分、pad、block shuffle、写 shard。"""
 
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 import os
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Set
+from typing import Callable, Dict, Iterator, List, Set
 
 import numpy as np
 from tqdm import tqdm
@@ -26,10 +27,14 @@ from preprocess.preprocess import (
     _ShardWriter,
     _SplitCacheMeta,
     _TaggedDocBatch,
+    _cleanup_shuffle_tmp,
     _cleanup_split,
     _worker_count,
 )
 from tokenizer import FL_Tokenizer, get_token_layout, get_tokenizer
+
+# 块 shuffle：每块连续读盘，块顺序随机；train 约 40GB 时通常比逐条随机读快一个数量级。
+_SHUFFLE_BLOCK_ROWS = 65536
 
 _WORKER_TOKENIZER: FL_Tokenizer | None = None
 _WORKER_BOS: int = 0
@@ -51,6 +56,15 @@ class _OwtWorkerConfig:
     min_chunk_len: int
     pad_mode: str
     fixed_pad_len: int
+
+
+@dataclass(frozen=True)
+class _ShuffleHooks:
+    """shuffle 生命周期回调（由 preprocess 写 manifest）。"""
+
+    on_start: Callable[[str, _SplitCacheMeta], None] | None = None
+    on_progress: Callable[[str, int, int], None] | None = None
+    on_complete: Callable[[str, _SplitCacheMeta], None] | None = None
 
 
 def _init_owt_worker(cfg: _OwtWorkerConfig) -> None:
@@ -130,38 +144,64 @@ def _iter_owt_pipelined(
         yield inflight.popleft().result()
 
 
-def _read_split_row(
+def _read_split_range(
     cache_dir: Path,
     split: str,
     meta: _SplitCacheMeta,
     chunk_length: int,
-    global_index: int,
+    start: int,
+    end: int,
     *,
     shard_starts: np.ndarray,
     maps: List[np.memmap | None],
-) -> tuple[np.ndarray, int | None]:
-    shard_idx = int(np.searchsorted(shard_starts, global_index, side="right") - 1)
-    local_idx = global_index - int(shard_starts[shard_idx])
-    mmap = maps[shard_idx]
-    if mmap is None:
+    len_mmap: np.memmap | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """读取 split 内全局行号 [start, end)（源顺序连续段，可跨 shard）。"""
+    if start >= end:
+        empty = np.empty((0, chunk_length), dtype=_DTYPE)
+        return empty, np.empty(0, dtype=_DTYPE) if len_mmap is not None else None
+
+    row_parts: List[np.ndarray] = []
+    len_parts: List[np.ndarray] = []
+    pos = start
+    while pos < end:
+        shard_idx = int(np.searchsorted(shard_starts, pos, side="right") - 1)
         shard = meta.shards[shard_idx]
-        mmap = np.memmap(
-            cache_dir / shard.file,
-            dtype=_DTYPE,
-            mode="r",
-            shape=(shard.count, chunk_length),
+        shard_global_end = int(shard_starts[shard_idx]) + shard.count
+        chunk_end = min(end, shard_global_end)
+        local_start = pos - int(shard_starts[shard_idx])
+        local_end = chunk_end - int(shard_starts[shard_idx])
+
+        mmap = maps[shard_idx]
+        if mmap is None:
+            mmap = np.memmap(
+                cache_dir / shard.file,
+                dtype=_DTYPE,
+                mode="r",
+                shape=(shard.count, chunk_length),
+            )
+            maps[shard_idx] = mmap
+        row_parts.append(np.asarray(mmap[local_start:local_end]))
+        if len_mmap is not None:
+            len_parts.append(np.asarray(len_mmap[pos:chunk_end]))
+        pos = chunk_end
+
+    rows = row_parts[0] if len(row_parts) == 1 else np.concatenate(row_parts, axis=0)
+    lengths = None
+    if len_mmap is not None:
+        lengths = (
+            len_parts[0] if len(len_parts) == 1 else np.concatenate(len_parts, axis=0)
         )
-        maps[shard_idx] = mmap
-    row = np.array(mmap[local_idx], copy=True)
-    length: int | None = None
-    len_path = cache_dir / f"{split}.len"
-    if meta.has_lengths and len_path.exists():
-        len_mmap = np.memmap(len_path, dtype=_DTYPE, mode="r", shape=(meta.count,))
-        length = int(len_mmap[global_index])
-    return row, length
+    return rows, lengths
 
 
-def _shuffle_split_cache(
+def _split_shuffle_seed(config: FL_PreprocessConfig, split: str) -> int:
+    raw = f"{config.shuffle_seed}:{split}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
+def _shuffle_split_cache_block(
     cache_dir: Path,
     split: str,
     meta: _SplitCacheMeta,
@@ -169,18 +209,32 @@ def _shuffle_split_cache(
     chunk_length: int,
     shuffle_seed: int,
     bucket_lengths: List[int],
+    hooks: _ShuffleHooks | None = None,
 ) -> _SplitCacheMeta:
+    """块级 shuffle：打乱固定大小块顺序，块内保持源顺序（I/O 友好）。"""
     if meta.count <= 1:
         return meta
 
     rng = np.random.default_rng(shuffle_seed)
-    perm = rng.permutation(meta.count)
+    block_size = _SHUFFLE_BLOCK_ROWS
+    n_blocks = (meta.count + block_size - 1) // block_size
+    block_perm = rng.permutation(n_blocks)
 
     shard_counts = np.asarray([s.count for s in meta.shards], dtype=np.int64)
     shard_starts = np.concatenate(([0], np.cumsum(shard_counts[:-1])))
     src_maps: List[np.memmap | None] = [None] * len(meta.shards)
+    len_mmap: np.memmap | None = None
+    if meta.has_lengths:
+        len_path = cache_dir / f"{split}.len"
+        len_mmap = np.memmap(
+            len_path,
+            dtype=_DTYPE,
+            mode="r",
+            shape=(meta.count,),
+        )
 
     tmp_dir = cache_dir / f".shuffle_{split}"
+    _cleanup_shuffle_tmp(cache_dir, split)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     writer = _ShardWriter(
         tmp_dir,
@@ -189,28 +243,48 @@ def _shuffle_split_cache(
         record_lengths=meta.has_lengths,
     )
 
-    batch_size = 4096
-    for start in range(0, meta.count, batch_size):
-        end = min(start + batch_size, meta.count)
-        batch_indices = perm[start:end]
-        rows_list: List[np.ndarray] = []
-        len_list: List[int] = []
-        for global_idx in batch_indices:
-            row, length = _read_split_row(
+    if hooks and hooks.on_start:
+        hooks.on_start(split, meta)
+
+    progress = tqdm(
+        total=meta.count,
+        desc=f"[preprocess] shuffle {split}",
+        unit="chunk",
+        dynamic_ncols=True,
+    )
+    progress_rows = 0
+    manifest_rows = 0
+    manifest_stride = 1_048_576
+
+    try:
+        for block_id in block_perm:
+            src_start = int(block_id) * block_size
+            src_end = min(src_start + block_size, meta.count)
+            rows, lengths = _read_split_range(
                 cache_dir,
                 split,
                 meta,
                 chunk_length,
-                int(global_idx),
+                src_start,
+                src_end,
                 shard_starts=shard_starts,
                 maps=src_maps,
+                len_mmap=len_mmap,
             )
-            rows_list.append(row)
-            if length is not None:
-                len_list.append(length)
-        rows = np.stack(rows_list, axis=0)
-        lengths_arr = np.asarray(len_list, dtype=_DTYPE) if len_list else None
-        writer.append(rows, lengths_arr)
+            writer.append(rows, lengths)
+            block_rows = src_end - src_start
+            progress.update(block_rows)
+            progress_rows += block_rows
+
+            if (
+                hooks
+                and hooks.on_progress
+                and progress_rows - manifest_rows >= manifest_stride
+            ):
+                hooks.on_progress(split, progress_rows, meta.count)
+                manifest_rows = progress_rows
+    finally:
+        progress.close()
 
     new_meta = writer.finalize()
     _cleanup_split(cache_dir, split)
@@ -219,20 +293,55 @@ def _shuffle_split_cache(
     tmp_dir.rmdir()
 
     if bucket_lengths and new_meta.has_lengths:
-        len_mmap = np.memmap(
+        out_len = np.memmap(
             cache_dir / f"{split}.len",
             dtype=_DTYPE,
             mode="r",
             shape=(new_meta.count,),
         )
         new_meta.bucket_counts = bucket_counts_from_lengths(
-            len_mmap.tolist(), bucket_lengths
+            out_len.tolist(), bucket_lengths
         )
+
+    if hooks and hooks.on_complete:
+        hooks.on_complete(split, new_meta)
+
     return new_meta
 
 
-def _split_shuffle_seed(config: FL_PreprocessConfig, split: str) -> int:
-    return int(config.shuffle_seed) + (hash(split) & 0xFFFFFFFF)
+def shuffle_owt_splits(
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+    metas: Dict[str, _SplitCacheMeta],
+    *,
+    hooks: _ShuffleHooks | None = None,
+) -> Dict[str, _SplitCacheMeta]:
+    """对已切分（未 shuffle 或 shuffle 中断）的 split 做 block shuffle。"""
+    out: Dict[str, _SplitCacheMeta] = {}
+    for split in sorted(metas):
+        meta = metas[split]
+        if meta.count <= 1:
+            out[split] = meta
+            if hooks and hooks.on_complete:
+                hooks.on_complete(split, meta)
+            continue
+        tqdm.write(
+            f"[preprocess] block shuffle split={split!r}: "
+            f"{meta.count:,} chunks, block={_SHUFFLE_BLOCK_ROWS:,}"
+        )
+        out[split] = _shuffle_split_cache_block(
+            cache_dir,
+            split,
+            meta,
+            chunk_length=config.chunk_length,
+            shuffle_seed=_split_shuffle_seed(config, split),
+            bucket_lengths=list(config.bucket_lengths),
+            hooks=hooks,
+        )
+        tqdm.write(
+            f"[preprocess] split={split!r}: done, {out[split].count:,} chunks"
+        )
+    return out
 
 
 def _run_owt_segment_loop(
@@ -285,18 +394,10 @@ def _run_owt_segment_loop(
         metas: Dict[str, _SplitCacheMeta] = {}
         for split, writer in writers.items():
             progress[split].close()
-            meta = writer.finalize()
-            meta = _shuffle_split_cache(
-                cache_dir,
-                split,
-                meta,
-                chunk_length=config.chunk_length,
-                shuffle_seed=_split_shuffle_seed(config, split),
-                bucket_lengths=list(config.bucket_lengths),
-            )
-            metas[split] = meta
+            metas[split] = writer.finalize()
             tqdm.write(
-                f"[preprocess] split={split!r}: done, {meta.count:,} chunks"
+                f"[preprocess] split={split!r}: built, {metas[split].count:,} chunks "
+                f"(shuffle pending)"
             )
         return metas
 

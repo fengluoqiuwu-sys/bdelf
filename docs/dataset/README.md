@@ -45,7 +45,8 @@ OWT 仅下载 HF `train` split；在** parquet 行号顺序**上做一次随机�
 - `tokenizer: gpt2`；encode `add_special_tokens=False`；BOS/EOS 由 [`preprocess/owt_split.py`](../../preprocess/owt_split.py) `wrap_chunk` 手动添加。
 - 特殊 token ID：[`config/tokenizers/gpt2.yaml`](../../config/tokenizers/gpt2.yaml) 的 `<|bos|>` / `<|eos|>` / `<|pad|>`。
 - `min_chunk_len: 128`：包装后（含 BOS/EOS）长度 ≤ 128 的段丢弃。
-- `shuffle_seed: 42`：每个 split 内 chunk 写盘前 shuffle（seed 与 split 名混合）。
+- `shuffle_seed: 42`：每个 split 内 chunk 写盘前 **块 shuffle**（seed 与 split 名混合；块大小 65536 行，块内保持源顺序）。
+- 切分完成后写 `manifest`（split `status: built`）；**block shuffle** 带进度条 `[preprocess] shuffle {split}`；完成后 `status: complete`。切分已完成但 shuffle 未做/中断时，重跑同命令会**跳过 tokenize、只 shuffle**（无 manifest 时从磁盘推断 `built`）。
 
 ### 旧：流式切块（`strategy: stream`）
 
@@ -60,7 +61,7 @@ OWT 仅下载 HF `train` split；在** parquet 行号顺序**上做一次随机�
 | 模块 | 职责 |
 |---|---|
 | [`preprocess/owt_split.py`](../../preprocess/owt_split.py) | 分隔符检测、`split_token_ranges`、`chunk_document`、`bucket_pad_length` |
-| [`preprocess/owt_segment_build.py`](../../preprocess/owt_segment_build.py) | 多进程按文档切分、pad、split 内 shuffle、写 shard |
+| [`preprocess/owt_segment_build.py`](../../preprocess/owt_segment_build.py) | 多进程按文档切分、pad、block shuffle、写 shard |
 | [`preprocess/preprocess.py`](../../preprocess/preprocess.py) | `get_preprocess` / `get_preprocessed`、指纹、`manifest`、stream / owt_segment 分支 |
 
 切分要点（实现细节）：
