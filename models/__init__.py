@@ -16,6 +16,7 @@ from .model import (
     list_model_configs,
     list_models,
     load_model_yaml,
+    resolve_full_sequence_training,
     resolve_model_config_path,
 )
 
@@ -32,6 +33,7 @@ __all__ = [
     "list_model_configs",
     "list_models",
     "load_model_yaml",
+    "resolve_full_sequence_training",
     "resolve_hf_model_cache_path",
     "resolve_model_config_path",
 ]

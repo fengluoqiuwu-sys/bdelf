@@ -53,6 +53,8 @@ class _DenoiserChartBackbone(nn.Module):
     dual_branch_logging = True
     # Official train_step: one forward mixes per-example denoise/decode rows.
     mixed_branch_training = True
+    ace_attachable = True
+    supports_prefix = False
 
     def __init__(
         self,
@@ -1007,6 +1009,27 @@ class _DenoiserChartBackbone(nn.Module):
             pad_token_id=self.token_layout.pad_token_id,
         )
         return tokens, nfe
+
+    def train_metrics(self) -> dict[str, float]:
+        return {
+            "denoise_mse": self.last_l2_loss,
+            "decode_ce": self.last_ce_loss,
+            "chart_ce": self.last_chart_ce_loss,
+        }
+
+    def describe_training(self) -> str:
+        decoder_prob = float(self.decoder_prob)
+        return (
+            f"DENOISER_CHART: per-example denoise:decode ≈ "
+            f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+            f"+ W_t(warp={self.chart_warp_enabled}, "
+            f"leak={self.chart_leak_decode}) "
+            f"+ L_chart(w={self.chart_weight}, "
+            f"t∈[{self.chart_t_min},"
+            f"{self.chart_t_max}]); "
+            f"freeze_U={self.freeze_unembed}; "
+            "metrics: mse / ce / chart_ce"
+        )
 
 
 class FL_DenoiserChartModel(FL_PreTrainedModel):

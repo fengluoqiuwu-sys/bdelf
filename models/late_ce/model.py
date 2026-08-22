@@ -47,6 +47,7 @@ class _LateCEBackbone(nn.Module):
     dual_branch_logging = True
     # 复用 train.py mixed 日志路径：记 mse / late_ce（无 decode_ce）
     mixed_branch_training = True
+    supports_prefix = False
 
     def __init__(
         self,
@@ -953,6 +954,26 @@ class _LateCEBackbone(nn.Module):
             pad_token_id=self.token_layout.pad_token_id,
         )
         return tokens, nfe
+
+    def train_metrics(self) -> dict[str, float]:
+        return {
+            "denoise_mse": self.last_l2_loss,
+            "decode_ce": self.last_ce_loss,
+            "late_ce": self.last_late_ce_loss,
+        }
+
+    def describe_training(self) -> str:
+        decoder_prob = float(self.decoder_prob)
+        return (
+            f"LATE_CE 变体 B: per-example denoise:decode ≈ "
+            f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+            f"+ 晚窗轨迹 CE (mode={self.late_ce_mode}, "
+            f"delta={self.late_ce_delta}, "
+            f"weight={self.late_ce_weight}, "
+            f"region={self.late_ce_region}, "
+            f"t={self.time_schedule}); "
+            "metrics: mse / ce / late_ce"
+        )
 
 
 class FL_LateCEModel(FL_PreTrainedModel):

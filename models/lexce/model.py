@@ -57,6 +57,8 @@ class _LexCEBackbone(nn.Module):
     dual_branch_logging = True
     # Official train_step: one forward mixes per-example denoise/decode rows.
     mixed_branch_training = True
+    ace_attachable = True
+    supports_prefix = False
 
     def __init__(
         self,
@@ -1004,6 +1006,28 @@ class _LexCEBackbone(nn.Module):
             pad_token_id=self.token_layout.pad_token_id,
         )
         return tokens, nfe
+
+    def train_metrics(self) -> dict[str, float]:
+        return {
+            "denoise_mse": self.last_l2_loss,
+            "decode_ce": self.last_ce_loss,
+            "lex_ce": self.last_lex_ce_loss,
+        }
+
+    def describe_training(self) -> str:
+        decoder_prob = float(self.decoder_prob)
+        t0 = self._lex_ce_threshold()
+        return (
+            f"LEXCE: per-example denoise:decode ≈ "
+            f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+            f"+ 分位晚窗 CE (mode={self.lex_ce_mode}, "
+            f"delta={self.lex_ce_delta}, "
+            f"weight={self.lex_ce_weight}, "
+            f"region={self.lex_ce_region}, "
+            f"t={self.time_schedule}, "
+            f"t0≈{t0:.3f}); "
+            "metrics: mse / ce / lex_ce"
+        )
 
 
 class FL_LexCEModel(FL_PreTrainedModel):

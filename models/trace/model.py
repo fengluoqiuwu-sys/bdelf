@@ -13,7 +13,7 @@ References:
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -53,6 +53,8 @@ class _TrACEBackbone(nn.Module):
     dual_branch_logging = True
     # Official train_step: one forward mixes per-example denoise/decode rows.
     mixed_branch_training = True
+    ace_attachable = True
+    supports_prefix = False
 
     def __init__(
         self,
@@ -998,6 +1000,45 @@ class _TrACEBackbone(nn.Module):
             pad_token_id=self.token_layout.pad_token_id,
         )
         return tokens, nfe
+
+    def on_optimizer_step(self, **ctx: Any) -> None:
+        """长训慢跟踪 ``attr_d``（Alg.1）；须传入外层 ``model``（含 DDP/EMA）。"""
+        from models.trace.track import maybe_refresh_attr_d
+
+        model = ctx.get("model")
+        if model is None:
+            return
+        maybe_refresh_attr_d(
+            model,
+            ema_state=ctx.get("ema_state"),
+            opt_step=int(ctx.get("opt_step", 0)),
+            variant=str(ctx.get("variant", "full")),
+            generate_sampling=ctx.get("generate_sampling") or {},
+            rank=int(ctx.get("rank", 0)),
+            world_size=int(ctx.get("world_size", 1)),
+            is_distributed=bool(ctx.get("is_distributed", False)),
+            device=ctx["device"],
+            log=ctx.get("log"),
+        )
+
+    def train_metrics(self) -> dict[str, float]:
+        return {
+            "denoise_mse": self.last_l2_loss,
+            "decode_ce": self.last_ce_loss,
+            "attr": self.last_attr_loss,
+        }
+
+    def describe_training(self) -> str:
+        decoder_prob = float(self.decoder_prob)
+        return (
+            f"TRACE: per-example denoise:decode ≈ "
+            f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+            f"+ L_attr (w={self.attr_weight}, "
+            f"warmup_opt={self.attr_warmup_steps}, "
+            f"d_every={self.attr_d_every}, "
+            f"freeze_d={self.attr_freeze_d}); "
+            "fast 变体跳过估 d；metrics: mse / ce / attr"
+        )
 
 
 class FL_TrACEModel(FL_PreTrainedModel):

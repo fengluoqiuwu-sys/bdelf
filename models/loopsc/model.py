@@ -58,6 +58,8 @@ class _LoopSCBackbone(nn.Module):
     dual_branch_logging = True
     # Official train_step: one forward mixes per-example denoise/decode rows.
     mixed_branch_training = True
+    ace_attachable = True
+    supports_prefix = False
 
     def __init__(
         self,
@@ -991,6 +993,23 @@ class _LoopSCBackbone(nn.Module):
             pad_token_id=self.token_layout.pad_token_id,
         )
         return tokens, nfe
+
+    def train_metrics(self) -> dict[str, float]:
+        return {
+            "denoise_mse": self.last_l2_loss,
+            "decode_ce": self.last_ce_loss,
+        }
+
+    def describe_training(self) -> str:
+        decoder_prob = float(self.decoder_prob)
+        return (
+            f"LOOPSC: per-example denoise:decode ≈ "
+            f"{max(0.0, 1.0 - decoder_prob):g}:{decoder_prob:g} "
+            f"+ SC unroll (K={self.sc_unroll_steps}, "
+            f"bptt={self.sc_unroll_bptt}, "
+            f"detach_z={self.sc_unroll_detach_z}); "
+            "metrics: mse / ce"
+        )
 
 
 class FL_LoopSCModel(FL_PreTrainedModel):

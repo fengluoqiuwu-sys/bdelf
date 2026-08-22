@@ -60,6 +60,8 @@ class _ELFBackbone(nn.Module):
     dual_branch_logging = True
     # Official train_step: one forward mixes per-example denoise/decode rows.
     mixed_branch_training = True
+    ace_attachable = True
+    supports_prefix = False
 
     def __init__(
         self,
@@ -387,12 +389,59 @@ class _ELFBackbone(nn.Module):
         t_exp = t.reshape(-1, 1, 1)
         return (x_pred - z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
 
+    def _denoise_path(
+        self,
+        x0: torch.Tensor,
+        t: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """构造 denoise 行的 ``z_t`` 与速度目标 ``v*``。
+
+        变体可覆盖（如 Posβ 位置相关 β）；默认各向同性 ``z=t x+(1-t)ε``。
+        """
+        t_exp = t.reshape(-1, 1, 1)
+        z = t_exp * x0 + (1.0 - t_exp) * noise
+        v_target = (x0 - z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
+        return z, v_target
+
+    def _sde_z_back(
+        self,
+        z: torch.Tensor,
+        alpha: float,
+        eps: torch.Tensor,
+        t_back: float,
+    ) -> torch.Tensor:
+        """SDE 回噪声一步的 ``z_back``；变体可按位置缩放剩余噪声预算。"""
+        del t_back
+        return alpha * z + (1.0 - alpha) * eps
+
     def _masked_mean(
         self, per_token: torch.Tensor, mask: torch.Tensor,
     ) -> torch.Tensor:
         """Mean of ``per_token`` (B, S) over positions where ``mask`` (B, S) > 0."""
         mask_f = mask.to(dtype=per_token.dtype)
         return (per_token * mask_f).sum() / torch.clamp(mask_f.sum(), min=1.0)
+
+    def _sc_cfg_velocity_delta(
+        self,
+        v_cond: torch.Tensor,
+        v_uncond: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """训练期 SC-CFG 残差 ``Δv``；默认 ``v_cond - v_uncond``。
+
+        变体可覆盖（如 ResidW 对长度维高通），避免整份拷贝 ``_mixed_branch_loss``。
+        ``loss_mask`` 为 (B, L)，供按有效位聚合的变体使用。
+        """
+        del loss_mask  # 默认路径不按 mask 改 Δv
+        return v_cond - v_uncond
+
+    def train_metrics(self) -> dict[str, float]:
+        """CSV 对齐：denoise MSE / decode CE。"""
+        return {
+            "denoise_mse": self.last_l2_loss,
+            "decode_ce": self.last_ce_loss,
+        }
 
     def _denoise_loss(
         self,
@@ -404,9 +453,7 @@ class _ELFBackbone(nn.Module):
         device = x0.device
         t = self._sample_train_t(bsz, device).to(dtype=x0.dtype)
         noise = torch.randn_like(x0) * self.denoiser_noise_scale
-        t_exp = t.reshape(-1, 1, 1)
-        z = t_exp * x0 + (1.0 - t_exp) * noise
-        v_target = (x0 - z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
+        z, v_target = self._denoise_path(x0, t, noise)
 
         # Per-example self-conditioning (official), not a single batch coin flip.
         if self.self_cond_prob > 0:
@@ -481,9 +528,7 @@ class _ELFBackbone(nn.Module):
 
         t = self._sample_train_t(bsz, device).to(dtype=dtype)
         noise = torch.randn_like(x0) * self.denoiser_noise_scale
-        t_exp = t.reshape(-1, 1, 1)
-        denoiser_z = t_exp * x0 + (1.0 - t_exp) * noise
-        v_target = (x0 - denoiser_z) / torch.clamp(1.0 - t_exp, min=self.t_eps)
+        denoiser_z, v_target = self._denoise_path(x0, t, noise)
 
         decoder_step_active = torch.bernoulli(
             torch.full((bsz,), self.decoder_prob, dtype=torch.float32, device=device),
@@ -531,9 +576,12 @@ class _ELFBackbone(nn.Module):
                 )
             v_cond = self._x_to_v(x_cond, denoiser_z, t)
 
-            # v + (1 - 1/w) * (v_cond - v_uncond), masked to self-cond rows.
+            # v + (1 - 1/w) * Δv, masked to self-cond rows.
+            # Δv 默认 v_cond - v_uncond；变体可覆盖 _sc_cfg_velocity_delta。
             sc_w = self_cond_cfg.reshape(-1, 1, 1)
-            sc_guidance = (1.0 - 1.0 / sc_w) * (v_cond - v_uncond)
+            sc_guidance = (1.0 - 1.0 / sc_w) * self._sc_cfg_velocity_delta(
+                v_cond, v_uncond, loss_mask,
+            )
             sc_guidance = torch.where(
                 use_sc.bool(), sc_guidance, torch.zeros_like(sc_guidance),
             )
@@ -776,7 +824,7 @@ class _ELFBackbone(nn.Module):
         alpha = max(0.0, min(1.0, 1.0 - gamma * h))
         t_back = alpha * float(t)
         eps = torch.randn_like(z) * self.denoiser_noise_scale
-        z_back = alpha * z + (1.0 - alpha) * eps
+        z_back = self._sde_z_back(z, alpha, eps, t_back)
         v, x_pred = self._forward_sample(
             z_back, t_back, x_pred_prev, self_cond_cfg_scale=self_cond_cfg_scale,
         )

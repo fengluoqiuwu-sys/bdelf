@@ -194,36 +194,54 @@ class FL_PreTrainedModel(PreTrainedModel):
         return getattr(self.backbone, "last_loss_branch", "")
 
     @property
-    def last_l2_loss(self) -> float:
-        return _metric_to_float(getattr(self.backbone, "last_l2_loss", float("nan")))
+    def ace_attachable(self) -> bool:
+        """Whether ``attach_ace_identity`` should run for this checkpoint."""
+        return bool(getattr(self.backbone, "ace_attachable", False))
 
     @property
-    def last_ce_loss(self) -> float:
-        return _metric_to_float(getattr(self.backbone, "last_ce_loss", float("nan")))
+    def supports_prefix(self) -> bool:
+        """Whether generate accepts a prompt prefix (AR-style)."""
+        return bool(getattr(self.backbone, "supports_prefix", True))
 
-    @property
-    def last_late_ce_loss(self) -> float:
-        return _metric_to_float(
-            getattr(self.backbone, "last_late_ce_loss", float("nan"))
-        )
+    def train_metrics(self) -> Dict[str, float]:
+        """Branch metrics for CSV logging; keys align with ``TRAIN_CSV_FIELDS``.
 
-    @property
-    def last_lex_ce_loss(self) -> float:
-        return _metric_to_float(
-            getattr(self.backbone, "last_lex_ce_loss", float("nan"))
-        )
+        Backbone may override ``train_metrics()``; otherwise collect from
+        ``last_*_loss`` fields written during the forward.
+        """
+        bb = self.backbone
+        fn = getattr(bb, "train_metrics", None)
+        if callable(fn):
+            raw = fn()
+            if isinstance(raw, dict):
+                return {str(k): _metric_to_float(v) for k, v in raw.items()}
 
-    @property
-    def last_attr_loss(self) -> float:
-        return _metric_to_float(
-            getattr(self.backbone, "last_attr_loss", float("nan"))
-        )
+        out: Dict[str, float] = {}
+        for attr, key in (
+            ("last_l2_loss", "denoise_mse"),
+            ("last_ce_loss", "decode_ce"),
+            ("last_late_ce_loss", "late_ce"),
+            ("last_lex_ce_loss", "lex_ce"),
+            ("last_attr_loss", "attr"),
+            ("last_chart_ce_loss", "chart_ce"),
+        ):
+            if hasattr(bb, attr):
+                out[key] = _metric_to_float(getattr(bb, attr))
+        return out
 
-    @property
-    def last_chart_ce_loss(self) -> float:
-        return _metric_to_float(
-            getattr(self.backbone, "last_chart_ce_loss", float("nan"))
-        )
+    def describe_training(self) -> str | None:
+        """One-line startup description; ``None`` → trainer uses a generic line."""
+        fn = getattr(self.backbone, "describe_training", None)
+        if callable(fn):
+            msg = fn()
+            return None if msg is None else str(msg)
+        return None
+
+    def on_optimizer_step(self, **ctx: Any) -> None:
+        """Hook after optimizer.step (+ EMA); default no-op."""
+        fn = getattr(self.backbone, "on_optimizer_step", None)
+        if callable(fn):
+            fn(**ctx)
 
     def generate(
         self,
@@ -262,6 +280,37 @@ class FL_PreTrainedModel(PreTrainedModel):
             scale, unit = 1.0, ""
         human = f"{n / scale:.2f}{unit}" if unit else str(n)
         print(f"[model] Total parameters: {n:,} ({human})")
+
+
+def resolve_full_sequence_training(model_name: str) -> bool:
+    """Whether ``model_name`` counts the full chunk toward the token budget.
+
+    Imports ``models.<name>.model`` and reads the first ``nn.Module`` subclass
+    that defines class attribute ``full_sequence_training`` (typically the
+    backbone). Used at config-compose time before the model is built.
+    """
+    try:
+        module = importlib.import_module(f"models.{model_name}.model")
+    except ModuleNotFoundError as exc:
+        raise ValueError(f"Model package not found: models/{model_name}/") from exc
+
+    for value in vars(module).values():
+        if not isinstance(value, type):
+            continue
+        try:
+            if not issubclass(value, nn.Module):
+                continue
+        except TypeError:
+            continue
+        # 跳过 FL_PreTrainedModel：其 full_sequence_training 是实例 property，
+        # bool(property) 恒为 True，会把 ar 等误判进 full-chunk。
+        raw = getattr(value, "full_sequence_training", None)
+        if isinstance(raw, property):
+            continue
+        # 含继承（如 residw ← _ELFBackbone）；只要是类上的 bool 标志即采纳。
+        if isinstance(raw, bool):
+            return raw
+    return False
 
 
 def build_model(model_name: str, model_cfg: dict) -> FL_PreTrainedModel:
