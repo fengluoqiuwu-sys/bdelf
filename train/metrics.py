@@ -10,8 +10,10 @@ from typing import Any
 
 from tqdm import tqdm
 
-# 主表：仅核心列
-TRAIN_CSV_FIELDS = [
+from models import kind_of
+
+# lm 主表：仅核心列
+TRAIN_CSV_FIELDS_LM = [
     "step",
     "tokens",
     "train_loss",
@@ -19,16 +21,39 @@ TRAIN_CSV_FIELDS = [
     "lr",
     "tokens_per_sec",
 ]
-EVAL_CSV_FIELDS = [
+TRAIN_CSV_FIELDS_LATENT = [
+    "step",
+    "tokens",
+    "train_loss",
+    "lr",
+    "tokens_per_sec",
+    "recon_ce",
+    "kl",
+    "mask",
+    "token_acc",
+    "mask_acc",
+    "beta_kl",
+    "lambda_mask",
+]
+TRAIN_CSV_FIELDS = TRAIN_CSV_FIELDS_LM
+
+EVAL_CSV_FIELDS_LM = [
     "step",
     "tokens",
     "lr",
     "eval_loss",
     "eval_ppl",
 ]
+EVAL_CSV_FIELDS_LATENT = [
+    "step",
+    "tokens",
+    "lr",
+    "eval_loss",
+]
+EVAL_CSV_FIELDS = EVAL_CSV_FIELDS_LM
 
-# Train 官方卫星表（对齐键仅 step）
-TRAIN_OFFICIAL_FIELDS = [
+# lm 官方卫星表（对齐键仅 step；不含 VAE 列）
+TRAIN_OFFICIAL_FIELDS_LM = [
     "step",
     "loss_branch",
     "denoise_mse",
@@ -39,9 +64,8 @@ TRAIN_OFFICIAL_FIELDS = [
     "attr_rho",
     "chart_ce",
     "commit",
-    "kl",
-    "mask",
 ]
+TRAIN_OFFICIAL_FIELDS = TRAIN_OFFICIAL_FIELDS_LM
 
 # Eval 官方卫星表
 EVAL_OFFICIAL_FIELDS = [
@@ -63,6 +87,24 @@ EVAL_SAMPLE_BASE_FIELDS = [
 ]
 
 _TRAIN_LOG = "[train]"
+
+
+def train_csv_fields(model: str) -> list[str]:
+    if kind_of(model) == "latent":
+        return list(TRAIN_CSV_FIELDS_LATENT)
+    return list(TRAIN_CSV_FIELDS_LM)
+
+
+def eval_csv_fields(model: str) -> list[str]:
+    if kind_of(model) == "latent":
+        return list(EVAL_CSV_FIELDS_LATENT)
+    return list(EVAL_CSV_FIELDS_LM)
+
+
+def train_official_fields(model: str) -> list[str]:
+    if kind_of(model) == "latent":
+        return []
+    return list(TRAIN_OFFICIAL_FIELDS_LM)
 
 
 def _train_log(msg: str, *, file: Any = None) -> None:
@@ -234,6 +276,43 @@ def build_train_core_row(
     return row
 
 
+def build_latent_train_row(
+    step: int,
+    tokens: int,
+    train_loss: float,
+    lr: float,
+    tokens_per_sec: float,
+    *,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """latent 宽主表行（无 train_ppl / official 卫星）。"""
+    metrics = dict(metrics or {})
+    row: dict[str, Any] = {
+        "step": step,
+        "tokens": tokens,
+        "train_loss": round(train_loss, 6) if train_loss == train_loss else "",
+        "lr": lr,
+        "tokens_per_sec": round(tokens_per_sec, 2),
+    }
+    for key in (
+        "recon_ce",
+        "kl",
+        "mask",
+        "token_acc",
+        "mask_acc",
+        "beta_kl",
+        "lambda_mask",
+    ):
+        val = _as_optional_float(metrics.get(key))
+        if val is None:
+            row[key] = ""
+        elif key in ("token_acc", "mask_acc"):
+            row[key] = round(val, 4)
+        else:
+            row[key] = round(val, 6)
+    return row
+
+
 def build_train_official_row(
     step: int,
     *,
@@ -244,7 +323,7 @@ def build_train_official_row(
 ) -> dict[str, Any] | None:
     """官方卫星行；无任何扩展时返回 None（不写）。"""
     metrics = dict(metrics or {})
-    row: dict[str, Any] = {k: "" for k in TRAIN_OFFICIAL_FIELDS}
+    row: dict[str, Any] = {k: "" for k in TRAIN_OFFICIAL_FIELDS_LM}
     row["step"] = step
 
     has_any = False
@@ -273,8 +352,6 @@ def build_train_official_row(
         "attr_rho",
         "chart_ce",
         "commit",
-        "kl",
-        "mask",
         "denoise_mse",
         "decode_ce",
     ):

@@ -20,6 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from models import kind_of
 from train.train import FL_TrainConfig
 from train.batching import (
     TokenChunkDataset,
@@ -40,15 +41,16 @@ from train.eval import (
 )
 from train.eval_pipeline import run_online_eval
 from train.metrics import (
-    TRAIN_CSV_FIELDS,
-    TRAIN_OFFICIAL_FIELDS,
+    TRAIN_OFFICIAL_FIELDS_LM,
     _rank0_log,
     _train_log,
     append_csv_row,
+    build_latent_train_row,
     build_train_core_row,
     build_train_official_row,
     format_interval_summary,
     loss_to_ppl,
+    train_csv_fields,
 )
 from train.run_logs import prepare_run_logs, train_official_csv
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
@@ -257,6 +259,8 @@ def train_loop(
     from train.run_path import checkpoint_run_dir_from_cfg
 
     run_dir = checkpoint_run_dir_from_cfg(cfg)
+    is_latent = kind_of(cfg.model) == "latent"
+    train_fields = train_csv_fields(cfg.model)
 
     # 硬件锁定（不进 hash）：探测可见 GPU，首次写入 hardware.json，续跑必须一致。
     hw_err = ""
@@ -336,7 +340,7 @@ def train_loop(
 
     train_csv = run_dir / "train_log.csv"
     if rank == 0:
-        prepare_run_logs(run_dir, start_step=None)
+        prepare_run_logs(run_dir, model=cfg.model, start_step=None)
     # Absolute path: relative cache/ can race under BeeGFS when ranks disagree
     # on cwd visibility right after a cross-node resume.
     latest_ckpt = (run_dir / "checkpoint_latest.pt").resolve()
@@ -396,7 +400,7 @@ def train_loop(
                 )
                 ema_state = init_ema(model)
         if rank == 0:
-            kept = prepare_run_logs(run_dir, start_step=step)
+            kept = prepare_run_logs(run_dir, model=cfg.model, start_step=step)
             _train_log(
                 f"Resuming from checkpoint: step {step} "
                 f"(train_log {kept.get('train_log', 0)} rows, "
@@ -610,27 +614,39 @@ def train_loop(
             )
             tokens_per_sec = (seq_tokens * max(1, world_size)) / max(elapsed, 1e-6)
 
-            core_row = build_train_core_row(
-                step,
-                cfg.tokens_seen_after_step(step),
-                train_loss,
-                lr,
-                tokens_per_sec,
-                dual_branch=dual_branch,
-                loss_branch=loss_branch,
-                metrics=metrics,
-            )
-            official_row = build_train_official_row(
-                step,
-                dual_branch=dual_branch,
-                loss_branch=loss_branch,
-                train_loss=train_loss,
-                metrics=metrics,
-            )
+            if is_latent:
+                train_row = build_latent_train_row(
+                    step,
+                    cfg.tokens_seen_after_step(step),
+                    train_loss,
+                    lr,
+                    tokens_per_sec,
+                    metrics=metrics,
+                )
+                core_row = train_row
+                official_row = None
+            else:
+                core_row = build_train_core_row(
+                    step,
+                    cfg.tokens_seen_after_step(step),
+                    train_loss,
+                    lr,
+                    tokens_per_sec,
+                    dual_branch=dual_branch,
+                    loss_branch=loss_branch,
+                    metrics=metrics,
+                )
+                official_row = build_train_official_row(
+                    step,
+                    dual_branch=dual_branch,
+                    loss_branch=loss_branch,
+                    train_loss=train_loss,
+                    metrics=metrics,
+                )
+                train_row = core_row
 
             do_eval = (
-                (not cfg.skip_eval)
-                and (step + 1) % cfg.eval_step == 0
+                (step + 1) % cfg.eval_step == 0
                 and eval_loader is not None
             )
             if do_eval:
@@ -654,7 +670,19 @@ def train_loop(
 
             if rank == 0:
                 m = metrics or {}
-                if mixed_branch:
+                if is_latent:
+                    postfix = {
+                        "loss": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
+                    recon_ce = m.get("recon_ce", float("nan"))
+                    token_acc = m.get("token_acc", float("nan"))
+                    if recon_ce == recon_ce:
+                        postfix["recon"] = f"{recon_ce:.3f}"
+                    if token_acc == token_acc:
+                        postfix["acc"] = f"{token_acc:.3f}"
+                elif mixed_branch:
                     decode_ce = m.get("decode_ce", float("nan"))
                     denoise_mse = m.get("denoise_mse", float("nan"))
                     late_ce = m.get("late_ce")
@@ -699,11 +727,11 @@ def train_loop(
                         "tok_s": f"{tokens_per_sec:.0f}",
                     }
                 pbar.set_postfix(**postfix)
-                append_csv_row(train_csv, TRAIN_CSV_FIELDS, core_row)
+                append_csv_row(train_csv, train_fields, train_row)
                 if official_row is not None:
                     append_csv_row(
                         train_official_csv(run_dir),
-                        TRAIN_OFFICIAL_FIELDS,
+                        TRAIN_OFFICIAL_FIELDS_LM,
                         official_row,
                     )
 

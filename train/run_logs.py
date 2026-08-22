@@ -9,15 +9,17 @@ from pathlib import Path
 from typing import Any
 
 from train.metrics import (
-    EVAL_CSV_FIELDS,
     EVAL_OFFICIAL_FIELDS,
-    TRAIN_CSV_FIELDS,
-    TRAIN_OFFICIAL_FIELDS,
+    TRAIN_CSV_FIELDS_LM,
+    TRAIN_OFFICIAL_FIELDS_LM,
     _train_log,
     ensure_csv_schema,
+    eval_csv_fields,
     init_csv_header,
+    train_csv_fields,
     truncate_csv_for_resume,
 )
+from models import kind_of
 
 # 旧宽表扩展列 → 拆出目标
 _OLD_TRAIN_EXT = {
@@ -111,8 +113,10 @@ def _is_old_eval_wide(fields: list[str]) -> bool:
     return bool(set(fields) & _OLD_EVAL_EXT)
 
 
-def migrate_run_logs(run_dir: Path) -> None:
-    """若仍为旧宽表则拆成主表 + 官方卫星；备份为 ``*.pre_split``。"""
+def migrate_run_logs(run_dir: Path, *, model: str) -> None:
+    """若仍为旧宽表则拆成主表 + 官方卫星；备份为 ``*.pre_split``（仅 lm）。"""
+    if kind_of(model) == "latent":
+        return
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
 
@@ -123,17 +127,17 @@ def migrate_run_logs(run_dir: Path) -> None:
             core_rows = []
             off_rows = []
             for row in rows:
-                core = {k: row.get(k, "") for k in TRAIN_CSV_FIELDS}
+                core = {k: row.get(k, "") for k in TRAIN_CSV_FIELDS_LM}
                 core_rows.append(core)
                 if any(row.get(k) not in (None, "") for k in _OLD_TRAIN_EXT):
-                    off = {k: row.get(k, "") for k in TRAIN_OFFICIAL_FIELDS}
+                    off = {k: row.get(k, "") for k in TRAIN_OFFICIAL_FIELDS_LM}
                     off["step"] = row.get("step", "")
                     off_rows.append(off)
-            _write_rows(train_csv, TRAIN_CSV_FIELDS, core_rows)
+            _write_rows(train_csv, TRAIN_CSV_FIELDS_LM, core_rows)
             if off_rows:
                 out = train_official_csv(run_dir)
                 if not out.exists():
-                    _write_rows(out, TRAIN_OFFICIAL_FIELDS, off_rows)
+                    _write_rows(out, TRAIN_OFFICIAL_FIELDS_LM, off_rows)
             _train_log(
                 f"Migrated train_log.csv → core + train_metrics/official.csv "
                 f"({len(core_rows)} rows)"
@@ -146,7 +150,7 @@ def migrate_run_logs(run_dir: Path) -> None:
             core_rows = []
             off_rows = []
             for row in rows:
-                core = {k: row.get(k, "") for k in EVAL_CSV_FIELDS}
+                core = {k: row.get(k, "") for k in EVAL_CSV_FIELDS_LM}
                 # 旧表可能无 lr
                 core_rows.append(core)
                 if any(row.get(k) not in (None, "") for k in _OLD_EVAL_EXT):
@@ -160,7 +164,7 @@ def migrate_run_logs(run_dir: Path) -> None:
                         else:
                             off[k] = row.get(k, "")
                     off_rows.append(off)
-            _write_rows(eval_csv, EVAL_CSV_FIELDS, core_rows)
+            _write_rows(eval_csv, EVAL_CSV_FIELDS_LM, core_rows)
             if off_rows:
                 out = eval_official_csv(run_dir)
                 if not out.exists():
@@ -171,17 +175,21 @@ def migrate_run_logs(run_dir: Path) -> None:
             )
 
 
-def align_run_log_schemas(run_dir: Path) -> None:
+def align_run_log_schemas(run_dir: Path, *, model: str) -> None:
     """已是新布局时：主表/官方表加列留空。"""
+    train_fields = train_csv_fields(model)
+    eval_fields = eval_csv_fields(model)
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
     if train_csv.exists():
-        ensure_csv_schema(train_csv, TRAIN_CSV_FIELDS)
+        ensure_csv_schema(train_csv, train_fields)
     if eval_csv.exists():
-        ensure_csv_schema(eval_csv, EVAL_CSV_FIELDS)
+        ensure_csv_schema(eval_csv, eval_fields)
+    if kind_of(model) != "lm":
+        return
     toff = train_official_csv(run_dir)
     if toff.exists():
-        ensure_csv_schema(toff, TRAIN_OFFICIAL_FIELDS)
+        ensure_csv_schema(toff, TRAIN_OFFICIAL_FIELDS_LM)
     eoff = eval_official_csv(run_dir)
     if eoff.exists():
         ensure_csv_schema(eoff, EVAL_OFFICIAL_FIELDS)
@@ -206,49 +214,56 @@ def truncate_eval_samples(run_dir: Path, start_step: int) -> int:
     return removed
 
 
-def prepare_run_logs(run_dir: Path, *, start_step: int | None = None) -> dict[str, int]:
+def prepare_run_logs(
+    run_dir: Path,
+    *,
+    model: str,
+    start_step: int | None = None,
+) -> dict[str, int]:
     """迁移 → schema 对齐 →（可选）按 step 截断。返回 kept 计数。"""
-    migrate_run_logs(run_dir)
-    align_run_log_schemas(run_dir)
+    migrate_run_logs(run_dir, model=model)
+    align_run_log_schemas(run_dir, model=model)
 
+    train_fields = train_csv_fields(model)
+    eval_fields = eval_csv_fields(model)
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
-    init_csv_header(train_csv, TRAIN_CSV_FIELDS)
-    init_csv_header(eval_csv, EVAL_CSV_FIELDS)
+    init_csv_header(train_csv, train_fields)
+    init_csv_header(eval_csv, eval_fields)
 
     kept: dict[str, int] = {}
     if start_step is None:
         return kept
 
     kept["train_log"] = truncate_csv_for_resume(
-        train_csv, start_step, TRAIN_CSV_FIELDS,
+        train_csv, start_step, train_fields,
     )
     kept["eval_log"] = truncate_csv_for_resume(
-        eval_csv, start_step, EVAL_CSV_FIELDS,
+        eval_csv, start_step, eval_fields,
     )
-    toff = train_official_csv(run_dir)
-    if toff.exists() or start_step is not None:
-        if toff.exists():
-            kept["train_official"] = truncate_csv_for_resume(
-                toff, start_step, TRAIN_OFFICIAL_FIELDS,
+    if kind_of(model) == "lm":
+        toff = train_official_csv(run_dir)
+        if toff.exists() or start_step is not None:
+            if toff.exists():
+                kept["train_official"] = truncate_csv_for_resume(
+                    toff, start_step, TRAIN_OFFICIAL_FIELDS_LM,
+                )
+        eoff = eval_official_csv(run_dir)
+        if eoff.exists():
+            kept["eval_official"] = truncate_csv_for_resume(
+                eoff, start_step, EVAL_OFFICIAL_FIELDS,
             )
-    eoff = eval_official_csv(run_dir)
-    if eoff.exists():
-        kept["eval_official"] = truncate_csv_for_resume(
-            eoff, start_step, EVAL_OFFICIAL_FIELDS,
-        )
-    # 外部表：截断时保留其现有表头
-    for label, path in (
-        ("train_external", train_external_csv(run_dir)),
-        ("eval_external", eval_external_csv(run_dir)),
-    ):
-        if not path.exists():
-            continue
-        fields, _ = _read_rows(path)
-        if not fields:
-            fields = ["step"]
-        kept[label] = truncate_csv_for_resume(path, start_step, fields)
-    kept["eval_samples_dirs"] = truncate_eval_samples(run_dir, start_step)
+        for label, path in (
+            ("train_external", train_external_csv(run_dir)),
+            ("eval_external", eval_external_csv(run_dir)),
+        ):
+            if not path.exists():
+                continue
+            fields, _ = _read_rows(path)
+            if not fields:
+                fields = ["step"]
+            kept[label] = truncate_csv_for_resume(path, start_step, fields)
+        kept["eval_samples_dirs"] = truncate_eval_samples(run_dir, start_step)
     return kept
 
 

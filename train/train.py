@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypeVar
@@ -132,6 +133,7 @@ class FL_EvalConfig:
     gen_eval_model_device: str = "cuda"
     # Total sequences to generate+score per gen-PPL eval
     gen_eval_samples: int = 32
+    # DEPRECATED：不再使用；加载后恒为 False
     skip: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -427,24 +429,43 @@ def _load_schedule(
     )
 
 
-def _load_eval(overrides: dict[str, Any] | None = None) -> FL_EvalConfig:
-    path = CONFIG_DIR / "eval" / "default.yaml"
+def _load_eval(
+    model: str,
+    overrides: dict[str, Any] | None = None,
+) -> FL_EvalConfig:
+    path = CONFIG_DIR / "eval" / kind_of(model) / "default.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"Eval config {path} does not exist.")
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: YAML root must be a mapping")
+    if "skip" in raw:
+        warnings.warn(
+            "eval.skip in YAML is deprecated and ignored",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        raw = {k: v for k, v in raw.items() if k != "skip"}
     raw = _apply_mapping_overrides(raw, overrides, label=str(path))
+    eval_ov = overrides or {}
+    if isinstance(eval_ov, dict) and "skip" in eval_ov:
+        warnings.warn(
+            "eval.skip override is deprecated and ignored",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     for removed in ("use_fast_infer", "eval_gen_steps"):
         if removed in raw:
             raise ValueError(
                 f"{path}: {removed} moved to config/generate/<model>/; "
                 f"pass --generate <name> and/or --set generate.*"
             )
-    return load_mapping_config(
+    cfg = load_mapping_config(
         FL_EvalConfig, raw, required=FL_EvalConfig._YAML_REQUIRED, label=str(path),
     )
+    cfg.skip = False
+    return cfg
 
 
 def _merge_extra(*parts: Dict[str, Any]) -> Dict[str, Any]:
@@ -542,7 +563,7 @@ def compose_train_config(
     ``300m-full``) and loads ``config/train/model/<model>/{fast|full}.yaml``
     plus architecture ``config/models/<model>/{size}.yaml``. Shared refs:
       - schedule ← ``schedule/<variant>.yaml``
-      - eval ← ``eval/default.yaml``
+      - eval ← ``eval/{lm|latent}/default.yaml``
       - generate ← ``config/generate/<model>/<generate>.yaml``
 
     ``overrides`` may contain ``optimizer`` / ``batch`` / ``schedule`` /
@@ -573,10 +594,7 @@ def compose_train_config(
         overrides=ov.get("batch"),
     )
     schedule = _load_schedule(variant, overrides=ov.get("schedule"))
-    eval_cfg = _load_eval(overrides=ov.get("eval"))
-    # cola_vae 默认跳过在线 eval（可用 --set eval.skip=false 打开）；不进哈希
-    if model == "cola_vae" and "skip" not in (ov.get("eval") or {}):
-        eval_cfg.skip = True
+    eval_cfg = _load_eval(model, overrides=ov.get("eval"))
     generate_cfg = get_generate(model, generate, overrides=ov.get("generate"))
 
     run_label = f"{model}-{config_name}"
@@ -608,7 +626,7 @@ def compose_train_config(
         raise ValueError(
             f"{run_label}: eval.skip must be a bool, got {eval_cfg.skip!r}"
         )
-    if eval_cfg.gen_eval_samples < 1:
+    if kind_of(model) == "lm" and eval_cfg.gen_eval_samples < 1:
         raise ValueError(
             f"{run_label}: gen_eval_samples must be >= 1, "
             f"got {eval_cfg.gen_eval_samples}"
@@ -685,7 +703,7 @@ def compose_train_config(
             "config_refs": {
                 "recipe": f"model/{kind_of(model)}/{model}/{variant}.yaml",
                 "schedule": variant,
-                "eval": "default",
+                "eval": f"{kind_of(model)}/default",
                 "generate": generate,
                 "batch_profile": variant,
                 "dataset": dataset,
@@ -732,7 +750,7 @@ def compose_train_config(
         gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
         gen_eval_model_device=eval_cfg.gen_eval_model_device,
         gen_eval_samples=eval_cfg.gen_eval_samples,
-        skip_eval=bool(eval_cfg.skip),
+        skip_eval=False,
         generate_sampling=generate_cfg.to_sampling_cfg(),
         use_muon=schedule.use_muon,
         muon_learning_rate=optimizer.muon_learning_rate,

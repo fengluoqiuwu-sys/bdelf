@@ -1,7 +1,7 @@
 # =============================================================================
-# 在线评测（held-out PPL + 生成式 PPL）
+# 在线评测（held-out PPL + 生成式 PPL）— lm
 # =============================================================================
-_doc: 默认在线评测（held-out + gpt2-large 打分）  # 文件说明，写入 extra
+_doc: lm 默认在线评测（held-out + gpt2-large 打分）  # 文件说明，写入 extra
 name: default  # 配置名；非 prototype 时与文件名一致
 eval_sample_count: 1024  # held-out 子采样条数；null 表示全量
 eval_sample_seed: 42  # held-out 子采样随机种子

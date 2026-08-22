@@ -401,31 +401,29 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     eval_ds_full = None
     eval_run_size = 0
     gpt2_model: nn.Module | None = None
-    if cfg.skip_eval:
+    model_kind = kind_of(model_name)
+    eval_ds_full = TokenChunkDataset(preprocessed.load_split("eval"))
+    eval_ds, eval_run_size = build_eval_subset(
+        eval_ds_full,
+        cfg.eval_sample_count,
+        cfg.eval_sample_seed,
+    )
+    if len(eval_ds) == 0:
         if rank == 0:
-            _train_log("eval skipped (eval.skip=true)")
+            _train_log("WARNING: eval dataset is empty; eval will be skipped")
     else:
-        eval_ds_full = TokenChunkDataset(preprocessed.load_split("eval"))
-        eval_ds, eval_run_size = build_eval_subset(
-            eval_ds_full,
-            cfg.eval_sample_count,
-            cfg.eval_sample_seed,
+        eval_ds_local = shard_eval_dataset(
+            eval_ds, rank=rank, world_size=world_size,
         )
-        if len(eval_ds) == 0:
-            if rank == 0:
-                _train_log("WARNING: eval dataset is empty; eval will be skipped")
-        else:
-            eval_ds_local = shard_eval_dataset(
-                eval_ds, rank=rank, world_size=world_size,
-            )
-            eval_loader = DataLoader(
-                eval_ds_local,
-                batch_size=cfg.batch_size,
-                shuffle=False,
-                num_workers=cfg.num_workers,
-                pin_memory=torch.cuda.is_available(),
-                collate_fn=collate_input_ids,
-            )
+        eval_loader = DataLoader(
+            eval_ds_local,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=collate_input_ids,
+        )
+    if model_kind == "lm":
         if is_distributed:
             if rank == 0:
                 gpt2_model = load_gen_eval_baseline(cfg)
@@ -492,7 +490,7 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 f"eval sharded across {world_size} ranks "
                 f"(~{eval_run_size // world_size} samples/rank)",
             )
-        if not cfg.skip_eval:
+        if model_kind == "lm" and eval_loader is not None:
             _train_log(
                 f"gen. ppl: {cfg.gen_eval_samples} samples / eval via "
                 f"{cfg.gen_eval_model} "

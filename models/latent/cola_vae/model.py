@@ -116,6 +116,8 @@ class _ColaVAEBackbone(nn.Module):
         self.last_ce_loss = float("nan")
         self.last_kl_loss = float("nan")
         self.last_mask_loss = float("nan")
+        self.last_token_acc = float("nan")
+        self.last_mask_acc = float("nan")
 
         self.apply(lambda m: self._init_weights(m, init_std, init_cutoff_factor))
 
@@ -188,11 +190,23 @@ class _ColaVAEBackbone(nn.Module):
         logits_m = self.decode_logits(z_m)
         ignore = self.token_layout.ignore_index
         targets = tokens.masked_fill(~mask, ignore)
-        return F.cross_entropy(
-            logits_m.reshape(-1, self.vocab_size),
+        logits_flat = logits_m.reshape(-1, self.vocab_size)
+        mask_loss = F.cross_entropy(
+            logits_flat,
             targets.reshape(-1),
             ignore_index=ignore,
         )
+        with torch.no_grad():
+            if mask.any():
+                pred_m = logits_m.argmax(dim=-1)
+                self.last_mask_acc = (
+                    (pred_m[mask] == tokens[mask]).float().mean().detach()
+                )
+            else:
+                self.last_mask_acc = torch.tensor(
+                    float("nan"), device=tokens.device,
+                )
+        return mask_loss
 
     def forward(
         self,
@@ -219,10 +233,53 @@ class _ColaVAEBackbone(nn.Module):
         self.last_ce_loss = ce.detach()
         self.last_kl_loss = kl.detach()
         self.last_mask_loss = mask_loss.detach()
+        with torch.no_grad():
+            ignore = self.token_layout.ignore_index
+            valid = tokens != ignore
+            if valid.any():
+                pred = logits.argmax(dim=-1)
+                self.last_token_acc = (
+                    (pred[valid] == tokens[valid]).float().mean().detach()
+                )
+            else:
+                self.last_token_acc = torch.tensor(
+                    float("nan"), device=tokens.device,
+                )
+            if not (self.training and self.lambda_mask > 0 and self.mask_ratio > 0):
+                self.last_mask_acc = torch.tensor(
+                    float("nan"), device=tokens.device,
+                )
         if not self.training:
             return logits, ce
         loss = ce + self.beta_kl * kl + self.lambda_mask * mask_loss
         return logits, loss
+
+    def train_metrics(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for attr, key in (
+            ("last_ce_loss", "recon_ce"),
+            ("last_kl_loss", "kl"),
+            ("last_mask_loss", "mask"),
+            ("last_token_acc", "token_acc"),
+            ("last_mask_acc", "mask_acc"),
+        ):
+            val = getattr(self, attr, None)
+            if val is None:
+                continue
+            if hasattr(val, "item"):
+                val = val.item()
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            if fval == fval:
+                out[key] = fval
+        out["beta_kl"] = float(self.beta_kl)
+        out["lambda_mask"] = float(self.lambda_mask)
+        return out
+
+    def online_eval_components(self) -> list:
+        return []
 
     @torch.compiler.disable
     @torch.no_grad()

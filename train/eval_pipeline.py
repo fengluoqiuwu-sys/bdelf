@@ -19,6 +19,7 @@ from eval.gen_ppl import (
     score_texts,
 )
 from preprocess import get_preprocess
+from models import kind_of
 from train import FL_TrainConfig
 from train.checkpoint import unwrap_model
 from train.eval import (
@@ -29,12 +30,12 @@ from train.eval import (
     release_eval_cuda_scratch,
 )
 from train.metrics import (
-    EVAL_CSV_FIELDS,
     EVAL_OFFICIAL_FIELDS,
     EVAL_SAMPLE_BASE_FIELDS,
     _TRAIN_LOG,
     _train_log,
     append_csv_row,
+    eval_csv_fields,
     loss_to_ppl,
 )
 from train.run_logs import (
@@ -378,10 +379,12 @@ def run_online_eval(
     swap_ema_weights: Callable[..., Any],
 ) -> None:
     """HeldOut 永写主表；按 tick 跑到期组件；共享生成至多一次。"""
+    is_latent = kind_of(cfg.model) == "latent"
+    eval_fields = eval_csv_fields(cfg.model)
     tick = load_eval_tick(run_dir) + 1
     components = resolve_online_eval_components(model)
     due = [c for c in components if _component_due(c, tick)]
-    need_samples = any(c.needs_samples for c in due)
+    need_samples = not is_latent and any(c.needs_samples for c in due)
 
     with swap_ema_weights(model, ema_state):
         eval_loss, eval_ppl = eval_model_ppl(
@@ -433,74 +436,80 @@ def run_online_eval(
         dist.barrier()
 
     if rank == 0:
-        eval_row = {
+        eval_row: dict[str, Any] = {
             "step": step,
             "tokens": cfg.tokens_seen_after_step(step),
             "lr": lr,
             "eval_loss": round(eval_loss, 6) if eval_loss == eval_loss else "",
-            "eval_ppl": round(eval_ppl, 4) if eval_ppl == eval_ppl else "",
         }
-        append_csv_row(run_dir / "eval_log.csv", EVAL_CSV_FIELDS, eval_row)
-
-        due_names = {c.name for c in due if c.official}
-        off: dict[str, Any] = {k: "" for k in EVAL_OFFICIAL_FIELDS}
-        off["step"] = step
-        wrote_official = False
-
-        if batch is not None and scores is not None:
-            n = len(batch.texts)
-            nonempty = sum(
-                1 for t in batch.texts if isinstance(t, str) and t.strip()
+        if not is_latent:
+            eval_row["eval_ppl"] = (
+                round(eval_ppl, 4) if eval_ppl == eval_ppl else ""
             )
-            uniq_mean = (
-                float(sum(batch.uniq_counts) / max(n, 1))
-                if batch.uniq_counts
-                else float("nan")
-            )
-            nonempty_frac = nonempty / max(n, 1)
+        append_csv_row(run_dir / "eval_log.csv", eval_fields, eval_row)
 
-            if "gen_ppl" in due_names:
-                if scores.gen_loss_corpus == scores.gen_loss_corpus:
-                    off["gen_loss"] = round(scores.gen_loss_corpus, 6)
-                if scores.gen_ppl_corpus == scores.gen_ppl_corpus:
-                    off["gen_ppl"] = round(scores.gen_ppl_corpus, 4)
-                if uniq_mean == uniq_mean:
-                    off["gen_uniq_mean"] = round(uniq_mean, 2)
-                off["gen_nonempty_frac"] = round(nonempty_frac, 4)
-                wrote_official = True
-            if "entropy" in due_names:
-                ment = _mean_finite(scores.entropy)
-                if ment == ment:
-                    off["entropy"] = round(ment, 6)
+        if is_latent:
+            save_eval_tick(run_dir, tick)
+        else:
+            due_names = {c.name for c in due if c.official}
+            off: dict[str, Any] = {k: "" for k in EVAL_OFFICIAL_FIELDS}
+            off["step"] = step
+            wrote_official = False
+
+            if batch is not None and scores is not None:
+                n = len(batch.texts)
+                nonempty = sum(
+                    1 for t in batch.texts if isinstance(t, str) and t.strip()
+                )
+                uniq_mean = (
+                    float(sum(batch.uniq_counts) / max(n, 1))
+                    if batch.uniq_counts
+                    else float("nan")
+                )
+                nonempty_frac = nonempty / max(n, 1)
+
+                if "gen_ppl" in due_names:
+                    if scores.gen_loss_corpus == scores.gen_loss_corpus:
+                        off["gen_loss"] = round(scores.gen_loss_corpus, 6)
+                    if scores.gen_ppl_corpus == scores.gen_ppl_corpus:
+                        off["gen_ppl"] = round(scores.gen_ppl_corpus, 4)
+                    if uniq_mean == uniq_mean:
+                        off["gen_uniq_mean"] = round(uniq_mean, 2)
+                    off["gen_nonempty_frac"] = round(nonempty_frac, 4)
                     wrote_official = True
-            if "dist1" in due_names:
-                d1 = _corpus_dist1(batch.texts, batch.seqlen)
-                if d1 == d1:
-                    off["dist1"] = round(d1, 6)
-                    wrote_official = True
+                if "entropy" in due_names:
+                    ment = _mean_finite(scores.entropy)
+                    if ment == ment:
+                        off["entropy"] = round(ment, 6)
+                        wrote_official = True
+                if "dist1" in due_names:
+                    d1 = _corpus_dist1(batch.texts, batch.seqlen)
+                    if d1 == d1:
+                        off["dist1"] = round(d1, 6)
+                        wrote_official = True
 
-            write_sample_dir(
-                run_dir, step, batch, scores,
-                meta_extra={"eval_tick": tick, "due": sorted(due_names)},
-            )
-            summary_bits = []
-            if off.get("gen_ppl") != "":
-                summary_bits.append(f"gen_ppl {off['gen_ppl']}")
-            if off.get("entropy") != "":
-                summary_bits.append(f"entropy {off['entropy']}")
-            if off.get("dist1") != "":
-                summary_bits.append(f"dist1 {off['dist1']}")
-            if summary_bits:
-                msg = "eval/official: " + " ".join(summary_bits)
-                if pbar_parent is not None:
-                    tqdm.write(f"{_TRAIN_LOG} {msg}")
-                else:
-                    _train_log(msg)
+                write_sample_dir(
+                    run_dir, step, batch, scores,
+                    meta_extra={"eval_tick": tick, "due": sorted(due_names)},
+                )
+                summary_bits = []
+                if off.get("gen_ppl") != "":
+                    summary_bits.append(f"gen_ppl {off['gen_ppl']}")
+                if off.get("entropy") != "":
+                    summary_bits.append(f"entropy {off['entropy']}")
+                if off.get("dist1") != "":
+                    summary_bits.append(f"dist1 {off['dist1']}")
+                if summary_bits:
+                    msg = "eval/official: " + " ".join(summary_bits)
+                    if pbar_parent is not None:
+                        tqdm.write(f"{_TRAIN_LOG} {msg}")
+                    else:
+                        _train_log(msg)
 
-        if wrote_official:
-            append_csv_row(eval_official_csv(run_dir), EVAL_OFFICIAL_FIELDS, off)
+            if wrote_official:
+                append_csv_row(eval_official_csv(run_dir), EVAL_OFFICIAL_FIELDS, off)
 
-        save_eval_tick(run_dir, tick)
+            save_eval_tick(run_dir, tick)
 
     if is_distributed:
         dist.barrier()
