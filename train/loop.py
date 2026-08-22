@@ -33,27 +33,24 @@ from train.checkpoint import (
 )
 from train.ema import ema_update, init_ema, swap_ema_weights
 from train.eval import (
-    eval_model_ppl,
-    eval_one_batch_gen_ppl,
     forward_loss,
     get_amp_dtype,
-    release_eval_cuda_scratch,
     uses_dual_branch_logging,
     uses_full_sequence,
 )
+from train.eval_pipeline import run_online_eval
 from train.metrics import (
-    EVAL_CSV_FIELDS,
     TRAIN_CSV_FIELDS,
+    TRAIN_OFFICIAL_FIELDS,
     _rank0_log,
     _train_log,
     append_csv_row,
-    build_train_row,
+    build_train_core_row,
+    build_train_official_row,
     format_interval_summary,
-    init_csv_header,
     loss_to_ppl,
-    truncate_csv_for_resume,
-    update_ppl_plots,
 )
+from train.run_logs import prepare_run_logs, train_official_csv
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
 from train.scratch import (
     _preload_frozen_encoders,
@@ -251,8 +248,6 @@ def train_loop(
     device: torch.device,
     is_distributed: bool,
 ) -> None:
-    # 暂时断开训练环内在线 eval 与指标 log（csv / plot / last_*_loss / gen-eval）。
-    # 下列 ``if False:`` 块保留原逻辑，后续有安排再接回；重构模型时不必维护这些路径。
     amp_dtype = get_amp_dtype(cfg.dtype)
     from train.hardware import (
         HardwareMismatchError,
@@ -340,12 +335,8 @@ def train_loop(
     optimizer = build_optimizer(raw, cfg)
 
     train_csv = run_dir / "train_log.csv"
-    eval_csv = run_dir / "eval_log.csv"
-    # 暂时断开指标 log：不预建 csv 表头。
-    if False:
-        if rank == 0:
-            init_csv_header(train_csv, TRAIN_CSV_FIELDS)
-            init_csv_header(eval_csv, EVAL_CSV_FIELDS)
+    if rank == 0:
+        prepare_run_logs(run_dir, start_step=None)
     # Absolute path: relative cache/ can race under BeeGFS when ranks disagree
     # on cwd visibility right after a cross-node resume.
     latest_ckpt = (run_dir / "checkpoint_latest.pt").resolve()
@@ -405,21 +396,13 @@ def train_loop(
                 )
                 ema_state = init_ema(model)
         if rank == 0:
-            # 暂时断开指标 log：续训不裁 csv、不重画 ppl 图。
-            if False:
-                kept_train = truncate_csv_for_resume(train_csv, step)
-                kept_eval = truncate_csv_for_resume(eval_csv, step)
-                update_ppl_plots(
-                    train_csv,
-                    eval_csv,
-                    run_dir,
-                    tokens_per_micro_step=cfg.tokens_per_micro_step,
-                )
-                _train_log(
-                    f"Resuming from checkpoint: step {step} "
-                    f"(train_log {kept_train} rows, eval_log {kept_eval} rows)",
-                )
-            _train_log(f"Resuming from checkpoint: step {step}")
+            kept = prepare_run_logs(run_dir, start_step=step)
+            _train_log(
+                f"Resuming from checkpoint: step {step} "
+                f"(train_log {kept.get('train_log', 0)} rows, "
+                f"eval_log {kept.get('eval_log', 0)} rows, "
+                f"samples_dirs_removed {kept.get('eval_samples_dirs', 0)})",
+            )
         if step >= cfg.max_steps:
             if rank == 0:
                 _train_log(
@@ -484,30 +467,28 @@ def train_loop(
 
     dual_branch = uses_dual_branch_logging(model)
     mixed_branch = bool(getattr(unwrap_model(model), "mixed_branch_training", False))
-    # 暂时断开指标 log：不打印各变体 denoise/decode 配比与 metrics 说明。
-    if False:
-        if rank == 0 and dual_branch:
-            raw = unwrap_model(model)
-            msg = raw.describe_training()
-            if msg:
-                _train_log(msg)
-            else:
-                decoder_prob = float(
-                    getattr(raw.backbone, "decoder_prob", 0.2)
+    if rank == 0 and dual_branch:
+        raw = unwrap_model(model)
+        msg = raw.describe_training()
+        if msg:
+            _train_log(msg)
+        else:
+            decoder_prob = float(
+                getattr(raw.backbone, "decoder_prob", 0.2)
+            )
+            denoise_prob = max(0.0, 1.0 - decoder_prob)
+            if mixed_branch:
+                _train_log(
+                    f"{cfg.model.upper()} dual-branch: per-example mix "
+                    f"denoise:decode ≈ {denoise_prob:g}:{decoder_prob:g} "
+                    "(official ELF train_step); train_ppl uses decode CE",
                 )
-                denoise_prob = max(0.0, 1.0 - decoder_prob)
-                if mixed_branch:
-                    _train_log(
-                        f"{cfg.model.upper()} dual-branch: per-example mix "
-                        f"denoise:decode ≈ {denoise_prob:g}:{decoder_prob:g} "
-                        "(official ELF train_step); metrics/plots use decode CE",
-                    )
-                else:
-                    _train_log(
-                        f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
-                        f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
-                        "metrics/plots use decode CE",
-                    )
+            else:
+                _train_log(
+                    f"{cfg.model.upper()} dual-branch: denoise:decode ≈ "
+                    f"{denoise_prob:g}:{decoder_prob:g} loss mix; "
+                    "train_ppl uses decode CE",
+                )
 
     model.train()
     t0 = time.time()
@@ -610,174 +591,130 @@ def train_loop(
                     )
                 optimizer.zero_grad(set_to_none=True)
 
-            # 暂时断开训练期指标 log 与在线 eval（读 last_*_loss / csv / plot / gen-eval）。
-            # 接回时：恢复上方 import，并将本段 if False 改回原逻辑。
-            if False:
-                train_loss = micro_loss.item() if loss_ok else float("nan")
-                # Prefer the sampled branch over model.last_loss_branch so logging
-                # stays correct under torch.compile / DDP wrappers.
-                # ELF mixed path reads branch metrics from the backbone.
-                raw_for_log = unwrap_model(model)
+            # 训练指标主表 + 官方卫星；在线 eval（HeldOut 永开 + 共享样本组件）。
+            train_loss = micro_loss.item() if loss_ok else float("nan")
+            raw_for_log = unwrap_model(model)
+            if mixed_branch:
+                loss_branch = "mixed"
+                metrics = raw_for_log.train_metrics()
+            elif dual_branch:
+                loss_branch = train_branch if train_branch else ""
+                metrics = raw_for_log.train_metrics()
+            else:
+                loss_branch = ""
+                metrics = raw_for_log.train_metrics()
+            elapsed = time.time() - t0
+            # 每微批消耗一整份数据 batch；tok/s 为全卡合计。
+            seq_tokens = batch.size(0) * (
+                batch.size(1) if uses_full_sequence(model) else batch.size(1) - 1
+            )
+            tokens_per_sec = (seq_tokens * max(1, world_size)) / max(elapsed, 1e-6)
+
+            core_row = build_train_core_row(
+                step,
+                cfg.tokens_seen_after_step(step),
+                train_loss,
+                lr,
+                tokens_per_sec,
+                dual_branch=dual_branch,
+                loss_branch=loss_branch,
+                metrics=metrics,
+            )
+            official_row = build_train_official_row(
+                step,
+                dual_branch=dual_branch,
+                loss_branch=loss_branch,
+                train_loss=train_loss,
+                metrics=metrics,
+            )
+
+            do_eval = (
+                (not cfg.skip_eval)
+                and (step + 1) % cfg.eval_step == 0
+                and eval_loader is not None
+            )
+            if do_eval:
+                run_online_eval(
+                    model,
+                    cfg=cfg,
+                    run_dir=run_dir,
+                    step=step,
+                    lr=lr,
+                    eval_loader=eval_loader,
+                    gpt2_model=gpt2_model,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    rank=rank,
+                    world_size=world_size,
+                    is_distributed=is_distributed,
+                    pbar_parent=pbar,
+                    ema_state=ema_state,
+                    swap_ema_weights=swap_ema_weights,
+                )
+
+            if rank == 0:
+                m = metrics or {}
                 if mixed_branch:
-                    loss_branch = "mixed"
-                    metrics = raw_for_log.train_metrics()
+                    decode_ce = m.get("decode_ce", float("nan"))
+                    denoise_mse = m.get("denoise_mse", float("nan"))
+                    late_ce = m.get("late_ce")
+                    lex_ce = m.get("lex_ce")
+                    attr_loss = m.get("attr")
+                    chart_ce = m.get("chart_ce")
+                    postfix = {
+                        "loss": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
+                    if decode_ce == decode_ce:
+                        postfix["ce"] = f"{decode_ce:.3f}"
+                        postfix["ppl"] = f"{loss_to_ppl(decode_ce):.1f}"
+                    if denoise_mse == denoise_mse:
+                        postfix["mse"] = f"{denoise_mse:.3f}"
+                    if late_ce is not None and late_ce == late_ce:
+                        postfix["late_ce"] = f"{late_ce:.3f}"
+                    if lex_ce is not None and lex_ce == lex_ce:
+                        postfix["lex_ce"] = f"{lex_ce:.3f}"
+                    if attr_loss is not None and attr_loss == attr_loss:
+                        postfix["attr"] = f"{attr_loss:.3f}"
+                    if chart_ce is not None and chart_ce == chart_ce:
+                        postfix["chart_ce"] = f"{chart_ce:.3f}"
+                elif dual_branch and loss_branch == "decode":
+                    postfix = {
+                        "ce": f"{train_loss:.3f}",
+                        "ppl": f"{loss_to_ppl(train_loss):.1f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
                 elif dual_branch:
-                    loss_branch = train_branch if train_branch else ""
-                    metrics = None
+                    postfix = {
+                        "mse": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
                 else:
-                    loss_branch = ""
-                    metrics = None
-                elapsed = time.time() - t0
-                # 每微批消耗一整份数据 batch（与是否 denoise/decode 混合无关）。
-                seq_tokens = batch.size(0) * (
-                    batch.size(1) if uses_full_sequence(model) else batch.size(1) - 1
-                )
-                tokens_per_sec = seq_tokens / max(elapsed, 1e-6)
-
-                row = build_train_row(
-                    step,
-                    cfg.tokens_seen_after_step(step),
-                    train_loss,
-                    lr,
-                    tokens_per_sec,
-                    dual_branch=dual_branch,
-                    loss_branch=loss_branch,
-                    metrics=metrics,
-                )
-
-                # 在线 eval 在各卡均摊（held-out 分片 + gen 分担）；写盘仍仅 rank0。
-                do_eval = (
-                    (not cfg.skip_eval)
-                    and (step + 1) % cfg.eval_step == 0
-                    and eval_loader is not None
-                )
-                if do_eval:
-                    with swap_ema_weights(model, ema_state):
-                        eval_loss, eval_ppl = eval_model_ppl(
-                            unwrap_model(model),
-                            eval_loader,
-                            device,
-                            amp_dtype,
-                            pbar_parent=pbar,
-                            is_distributed=is_distributed,
-                            log=(rank == 0),
-                        )
-                        gen_loss: float | None = None
-                        gen_ppl: float | None = None
-                        gen_uniq_mean: float | None = None
-                        gen_nonempty_frac: float | None = None
-                        if gpt2_model is not None:
-                            (
-                                gen_loss,
-                                gen_ppl,
-                                gen_uniq_mean,
-                                gen_nonempty_frac,
-                            ) = eval_one_batch_gen_ppl(
-                                model,
-                                gpt2_model,
-                                cfg=cfg,
-                                train_device=device,
-                                train_amp_dtype=amp_dtype,
-                                seed=cfg.seed + step,
-                                pbar_parent=pbar,
-                                rank=rank,
-                                world_size=world_size,
-                                is_distributed=is_distributed,
-                                log=(rank == 0),
-                            )
-                    # EMA 权重已换回；丢掉 Flex mask / 采样临时块，避免池子钉在 gen 峰值。
-                    release_eval_cuda_scratch(model, log=(rank == 0))
-                    if is_distributed:
-                        dist.barrier()
-                    if rank == 0:
-                        eval_row = {
-                            "step": step,
-                            "tokens": cfg.tokens_seen_after_step(step),
-                            "eval_loss": round(eval_loss, 6),
-                            "eval_ppl": round(eval_ppl, 4),
-                            "gen_loss": (
-                                round(gen_loss, 6) if gen_loss is not None else ""
-                            ),
-                            "gen_ppl": (
-                                round(gen_ppl, 4) if gen_ppl is not None else ""
-                            ),
-                            "gen_uniq_mean": (
-                                round(gen_uniq_mean, 2)
-                                if gen_uniq_mean is not None
-                                else ""
-                            ),
-                            "gen_nonempty_frac": (
-                                round(gen_nonempty_frac, 4)
-                                if gen_nonempty_frac is not None
-                                else ""
-                            ),
-                            "lr": lr,
-                        }
-                        append_csv_row(eval_csv, EVAL_CSV_FIELDS, eval_row)
-
-                if rank == 0:
-                    if mixed_branch:
-                        m = metrics or {}
-                        decode_ce = m.get("decode_ce", float("nan"))
-                        denoise_mse = m.get("denoise_mse", float("nan"))
-                        late_ce = m.get("late_ce")
-                        lex_ce = m.get("lex_ce")
-                        attr_loss = m.get("attr")
-                        chart_ce = m.get("chart_ce")
-                        postfix = {
-                            "loss": f"{train_loss:.3f}",
-                            "lr": f"{lr:.2e}",
-                            "tok_s": f"{tokens_per_sec:.0f}",
-                        }
-                        if decode_ce == decode_ce:
-                            postfix["ce"] = f"{decode_ce:.3f}"
-                            postfix["ppl"] = f"{loss_to_ppl(decode_ce):.1f}"
-                        if denoise_mse == denoise_mse:
-                            postfix["mse"] = f"{denoise_mse:.3f}"
-                        if late_ce is not None and late_ce == late_ce:
-                            postfix["late_ce"] = f"{late_ce:.3f}"
-                        if lex_ce is not None and lex_ce == lex_ce:
-                            postfix["lex_ce"] = f"{lex_ce:.3f}"
-                        if attr_loss is not None and attr_loss == attr_loss:
-                            postfix["attr"] = f"{attr_loss:.3f}"
-                        if chart_ce is not None and chart_ce == chart_ce:
-                            postfix["chart_ce"] = f"{chart_ce:.3f}"
-                    elif dual_branch and loss_branch == "decode":
-                        postfix = {
-                            "ce": f"{train_loss:.3f}",
-                            "ppl": f"{loss_to_ppl(train_loss):.1f}",
-                            "lr": f"{lr:.2e}",
-                            "tok_s": f"{tokens_per_sec:.0f}",
-                        }
-                    elif dual_branch:
-                        postfix = {
-                            "mse": f"{train_loss:.3f}",
-                            "lr": f"{lr:.2e}",
-                            "tok_s": f"{tokens_per_sec:.0f}",
-                        }
-                    else:
-                        postfix = {
-                            "loss": f"{train_loss:.3f}",
-                            "lr": f"{lr:.2e}",
-                            "tok_s": f"{tokens_per_sec:.0f}",
-                        }
-                    pbar.set_postfix(**postfix)
-                    append_csv_row(train_csv, TRAIN_CSV_FIELDS, row)
-
-                    interval_done = (
-                        (step + 1) % cfg.eval_step == 0 or (step + 1) >= cfg.max_steps
+                    postfix = {
+                        "loss": f"{train_loss:.3f}",
+                        "lr": f"{lr:.2e}",
+                        "tok_s": f"{tokens_per_sec:.0f}",
+                    }
+                pbar.set_postfix(**postfix)
+                append_csv_row(train_csv, TRAIN_CSV_FIELDS, core_row)
+                if official_row is not None:
+                    append_csv_row(
+                        train_official_csv(run_dir),
+                        TRAIN_OFFICIAL_FIELDS,
+                        official_row,
                     )
-                    if interval_done:
-                        for line in format_interval_summary(step, cfg.max_steps, row):
-                            _rank0_log(line, pbar)
 
-                    if (step + 1) % cfg.log_plot_step == 0:
-                        update_ppl_plots(
-                            train_csv,
-                            eval_csv,
-                            run_dir,
-                            tokens_per_micro_step=cfg.tokens_per_micro_step,
-                        )
+                interval_done = (
+                    (step + 1) % cfg.eval_step == 0 or (step + 1) >= cfg.max_steps
+                )
+                if interval_done:
+                    for line in format_interval_summary(
+                        step, cfg.max_steps, core_row, official_row,
+                    ):
+                        _rank0_log(line, pbar)
 
             rank0_sync = False
             if rank == 0:
@@ -824,14 +761,6 @@ def train_loop(
                 latest_ckpt, model, optimizer, next_step, cfg, model_meta,
                 ema_state=ema_state,
             )
-            # 暂时断开指标 log：中断时不重画 ppl 图。
-            if False:
-                update_ppl_plots(
-                    train_csv,
-                    eval_csv,
-                    run_dir,
-                    tokens_per_micro_step=cfg.tokens_per_micro_step,
-                )
             _train_log(f"Saved; resume from step {next_step} on next run")
         if is_distributed:
             dist.barrier()
@@ -852,14 +781,6 @@ def train_loop(
             final_snapshot, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,
         )
-        # 暂时断开指标 log：结束时不重画 ppl 图。
-        if False:
-            update_ppl_plots(
-                train_csv,
-                eval_csv,
-                run_dir,
-                tokens_per_micro_step=cfg.tokens_per_micro_step,
-            )
         _train_log(
             f"Training finished after {step} steps; "
             f"saved {latest_ckpt.name} and {final_snapshot.name} in {run_dir}"

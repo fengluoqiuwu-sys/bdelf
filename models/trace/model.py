@@ -1026,6 +1026,7 @@ class _TrACEBackbone(nn.Module):
             "denoise_mse": self.last_l2_loss,
             "decode_ce": self.last_ce_loss,
             "attr": self.last_attr_loss,
+            "attr_rho": self.last_attr_rho,
         }
 
     def describe_training(self) -> str:

@@ -204,10 +204,9 @@ class FL_PreTrainedModel(PreTrainedModel):
         return bool(getattr(self.backbone, "supports_prefix", True))
 
     def train_metrics(self) -> Dict[str, float]:
-        """Branch metrics for CSV logging; keys align with ``TRAIN_CSV_FIELDS``.
+        """Train 官方卫星表指标；键对齐 ``TRAIN_OFFICIAL_FIELDS``。
 
-        Backbone may override ``train_metrics()``; otherwise collect from
-        ``last_*_loss`` fields written during the forward.
+        Backbone 可覆写 ``train_metrics()``；否则从 ``last_*`` 回退收集。
         """
         bb = self.backbone
         fn = getattr(bb, "train_metrics", None)
@@ -223,11 +222,27 @@ class FL_PreTrainedModel(PreTrainedModel):
             ("last_late_ce_loss", "late_ce"),
             ("last_lex_ce_loss", "lex_ce"),
             ("last_attr_loss", "attr"),
+            ("last_attr_rho", "attr_rho"),
             ("last_chart_ce_loss", "chart_ce"),
+            ("last_commit_loss", "commit"),
+            ("last_kl_loss", "kl"),
+            ("last_mask_loss", "mask"),
         ):
             if hasattr(bb, attr):
                 out[key] = _metric_to_float(getattr(bb, attr))
         return out
+
+    def online_eval_components(self) -> Any:
+        """在线 eval 组件清单（不含 HeldOut）。
+
+        返回 ``None`` → 使用默认 GenPpl/Entropy/Dist1；
+        返回 list[EvalComponentSpec|dict] → 以该清单为准（不再自动追加默认项）。
+        写在模型代码中；无 YAML 配置。
+        """
+        fn = getattr(self.backbone, "online_eval_components", None)
+        if callable(fn):
+            return fn()
+        return None
 
     def describe_training(self) -> str | None:
         """One-line startup description; ``None`` → trainer uses a generic line."""

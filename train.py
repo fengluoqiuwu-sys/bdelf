@@ -398,48 +398,45 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     eval_ds_full = None
     eval_run_size = 0
     gpt2_model: nn.Module | None = None
-    # 暂时断开训练期 eval：不加载 held-out / gpt2 gen-eval 基线。
-    if False:
-        if cfg.skip_eval:
+    if cfg.skip_eval:
+        if rank == 0:
+            _train_log("eval skipped (eval.skip=true)")
+    else:
+        eval_ds_full = TokenChunkDataset(preprocessed.load_split("eval"))
+        eval_ds, eval_run_size = build_eval_subset(
+            eval_ds_full,
+            cfg.eval_sample_count,
+            cfg.eval_sample_seed,
+        )
+        if len(eval_ds) == 0:
             if rank == 0:
-                _train_log("eval skipped (eval.skip=true)")
+                _train_log("WARNING: eval dataset is empty; eval will be skipped")
         else:
-            eval_ds_full = TokenChunkDataset(preprocessed.load_split("eval"))
-            eval_ds, eval_run_size = build_eval_subset(
-                eval_ds_full,
-                cfg.eval_sample_count,
-                cfg.eval_sample_seed,
+            eval_ds_local = shard_eval_dataset(
+                eval_ds, rank=rank, world_size=world_size,
             )
-            if len(eval_ds) == 0:
-                if rank == 0:
-                    _train_log("WARNING: eval dataset is empty; eval will be skipped")
-            else:
-                eval_ds_local = shard_eval_dataset(
-                    eval_ds, rank=rank, world_size=world_size,
-                )
-                eval_loader = DataLoader(
-                    eval_ds_local,
-                    batch_size=cfg.batch_size,
-                    shuffle=False,
-                    num_workers=cfg.num_workers,
-                    pin_memory=torch.cuda.is_available(),
-                    collate_fn=collate_input_ids,
-                )
-        if not cfg.skip_eval:
-            if is_distributed:
-                if rank == 0:
-                    gpt2_model = load_gen_eval_baseline(cfg)
-                    dist.barrier()
-                else:
-                    dist.barrier()
-                    gpt2_model = load_gen_eval_baseline(cfg)
-            else:
-                gpt2_model = load_gen_eval_baseline(cfg)
+            eval_loader = DataLoader(
+                eval_ds_local,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=cfg.num_workers,
+                pin_memory=torch.cuda.is_available(),
+                collate_fn=collate_input_ids,
+            )
+        if is_distributed:
             if rank == 0:
-                _train_log(
-                    f"Loaded gen-eval baseline {cfg.gen_eval_model} "
-                    f"on {cfg.gen_eval_model_device} (all {world_size} ranks)",
-                )
+                gpt2_model = load_gen_eval_baseline(cfg)
+                dist.barrier()
+            else:
+                dist.barrier()
+                gpt2_model = load_gen_eval_baseline(cfg)
+        else:
+            gpt2_model = load_gen_eval_baseline(cfg)
+        if rank == 0:
+            _train_log(
+                f"Loaded gen-eval baseline {cfg.gen_eval_model} "
+                f"on {cfg.gen_eval_model_device} (all {world_size} ranks)",
+            )
 
     model_cfg_path = resolve_model_config_path(model_name, model_size)
     import yaml
@@ -474,35 +471,32 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     if rank == 0:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         _train_log(f"Train model parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
-        _train_log(f"train split: {len(train_ds):,} samples")
-        # 暂时断开训练期 eval：不打印 eval 子集 / gen.ppl 基线信息。
-        if False:
+        _train_log(
+            f"train split: {len(train_ds):,} samples"
+            + (
+                f", eval split: {len(eval_ds_full):,} samples"
+                if eval_ds_full is not None
+                else ""
+            ),
+        )
+        if eval_ds_full is not None and eval_run_size < len(eval_ds_full):
             _train_log(
-                f"train split: {len(train_ds):,} samples"
-                + (
-                    f", eval split: {len(eval_ds_full):,} samples"
-                    if eval_ds_full is not None
-                    else ""
-                ),
+                f"eval subsample: {eval_run_size:,} / {len(eval_ds_full):,} "
+                f"(seed={cfg.eval_sample_seed})",
             )
-            if eval_ds_full is not None and eval_run_size < len(eval_ds_full):
-                _train_log(
-                    f"eval subsample: {eval_run_size:,} / {len(eval_ds_full):,} "
-                    f"(seed={cfg.eval_sample_seed})",
-                )
-            if world_size > 1 and eval_loader is not None:
-                _train_log(
-                    f"eval sharded across {world_size} ranks "
-                    f"(~{eval_run_size // world_size} samples/rank)",
-                )
-            if not cfg.skip_eval:
-                _train_log(
-                    f"gen. ppl: {cfg.gen_eval_samples} samples / eval via "
-                    f"{cfg.gen_eval_model} "
-                    f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device}"
-                    + (f", sharded×{world_size}" if world_size > 1 else "")
-                    + ")",
-                )
+        if world_size > 1 and eval_loader is not None:
+            _train_log(
+                f"eval sharded across {world_size} ranks "
+                f"(~{eval_run_size // world_size} samples/rank)",
+            )
+        if not cfg.skip_eval:
+            _train_log(
+                f"gen. ppl: {cfg.gen_eval_samples} samples / eval via "
+                f"{cfg.gen_eval_model} "
+                f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device}"
+                + (f", sharded×{world_size}" if world_size > 1 else "")
+                + ")",
+            )
 
     train_loop(
         model,
