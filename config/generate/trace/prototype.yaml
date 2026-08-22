@@ -10,4 +10,4 @@ time_schedule: logit_normal  # 时间调度：logit_normal 等
 temperature: 0.0  # 采样温度；0 为 argmax（论文 decode）
 self_cond_cfg_scale: 3.0  # Self-cond CFG 缩放
 ace: false  # TrACE 默认关推理 ACE；true≡λ=2；正数=λ
-ace_direction: null  # 显式方向 .pt；null 则用 full/ace/{hash}/{step}/（缺则现算）
+ace_direction: null  # 显式方向 .pt；null 则用 artifacts/ace/{hash}/{step}/（缺则现算）

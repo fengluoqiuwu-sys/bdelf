@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cola 两阶段顺序 full：先 cola_vae（Stage-1），再 cola（Stage-2，加载 VAE latest）。
+# Cola 两阶段顺序 full：先 cola_vae（Stage-1），再 cola（Stage-2，加载 artifacts VAE（或 COLA_VAE_CHECKPOINT））。
 # 经 slurm/sbatch-train.sh 或 launch-train.sh 提交；本脚本不直接占远端 GPU。
 # 同一作业内连续跑两段；Slurm 默认 --time=2-00:00:00 可能不够，提交时可追加例如
 #   bash slurm/sbatch-train.sh cola-seq-100m-full --time=4-00:00:00

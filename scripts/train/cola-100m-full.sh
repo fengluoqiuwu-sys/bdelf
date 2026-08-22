@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cola Stage-2 100m full（含训练期 gen-eval）；经 slurm/sbatch-train.sh 提交或本地直接跑。
-# 需已有 Stage-1 VAE checkpoint：COLA_VAE_CHECKPOINT 或 --set 指向 full/cola_vae/<hash>。
+# 需已有 Stage-1 VAE checkpoint：COLA_VAE_CHECKPOINT 或 --set 指向 artifacts/cola_vae/<tag> 或 COLA_VAE_CHECKPOINT。
 # 两阶段连跑用 scripts/train/cola-seq-100m-full.sh。
 # Stage-2：峰值/衰减按 100m·45.2B 缩放的官方 AdamW；warmup 与 elf-cfg 相同：
 #   - 峰值 lr=4e-4：官方 1.5e-4 是 ~2B、宽 2048、~721B token 的；100m 宽 768

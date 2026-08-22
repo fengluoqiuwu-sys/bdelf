@@ -8,15 +8,27 @@ alwaysApply: true
 ## 布局（唯一身份）
 
 ```
-cache/checkpoints/{fast|full}/{model}/{config-hash}/
+cache/checkpoints/{fast|full}/{model}/{config-hash}/   # 训练 run
+cache/checkpoints/artifacts/<kind>/…                     # 非训练选用产物
 ```
 
-- 权威相对路径：`{variant}/{model}/{config-hash}`（`FL_TrainConfig.extra.run_relpath`）。
-- **禁止**软链、人类别名目录、`--run-name` 覆盖路径。
+- 训练权威相对路径：`{variant}/{model}/{config-hash}`（`FL_TrainConfig.extra.run_relpath`）。
+- **禁止**软链、人类别名目录、`--run-name` 覆盖训练路径。
 - `config-hash`：训练入参 + 进入指纹的 YAML **内容** → 16 hex；`--set` 会改变哈希。
 - **不进哈希**：`world_size`、GPU 硬件规格。
 - 进入指纹的 YAML：recipe / schedule / eval / generate / model arch / dataset / preprocess。
 - 实现：`train/run_path.py`；定位 CLI 见 skill `train`（`scripts/resolve_checkpoint.py`）。
+
+### artifacts（非训练）
+
+供下游固定引用，**不**与 `fast|full` 训练目录混放：
+
+| 种类 | 路径 | 说明 |
+|---|---|---|
+| ACE direction | `artifacts/ace/{model-hash}/{step}/` | 自动估计/缓存（仅 ACE 用 hash/step） |
+| 选用 VAE 等 | `artifacts/<name>/<tag>/` | 人手从训练 run 拷贝；按 **tag** 选用 |
+
+Cola Stage-2 默认只认 `artifacts/cola_vae/<tag>/`（或 `COLA_VAE_CHECKPOINT` / `COLA_VAE_TAG` / `vae_run`）；**不**再按 mtime 扫 `full/cola_vae` 的 latest。`cola_vae` **训练**仍写 `fast|full/cola_vae/<hash>/`。
 
 本地 `cache/checkpoints/hash_guide.csv` 给人看（**仅 full** 训练时自动 upsert；fast 不写入）；**不随 sync 推送/拉取**。
 

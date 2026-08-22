@@ -4,8 +4,9 @@
 ``x_pred ← x_pred - λ · d``（``d`` 广播到长度维）。``ace`` 未写 / false / 0 时关闭。
 
 方向 ``d`` 默认缓存在
-``cache/checkpoints/full/ace/{model-hash}/{step}/direction.pt``：
+``cache/checkpoints/artifacts/ace/{model-hash}/{step}/direction.pt``：
 有则加载，换 hash/step（缓存未命中）时用当前权重现算并写入。
+（非训练产物；与 ``fast|full/<model>/<hash>/`` 训练 run 分离。）
 
 估计轨迹兼容 ELF（``_sde/_ode_step`` → ``(z, x_pred)``）与 ODAR
 （``(z, x_pred, logits)``；有 ``_apply_dma`` 时按采样路径做 DMA-H 再收集 SC）。
@@ -38,8 +39,8 @@ META_FILENAME = "meta.json"
 
 
 def ace_cache_root() -> Path:
-    """``cache/checkpoints/full/ace``。"""
-    return Path(CHECKPOINT_ROOT) / "full" / "ace"
+    """``cache/checkpoints/artifacts/ace``（自动按 hash/step 落盘）。"""
+    return Path(CHECKPOINT_ROOT) / "artifacts" / "ace"
 
 
 def ace_cache_dir(model_hash: str, step: int) -> Path:
@@ -515,7 +516,7 @@ def get_or_estimate_ace_direction(
     dtype: torch.dtype,
     expected_dim: int,
 ) -> tuple[torch.Tensor, Path]:
-    """磁盘缓存命中则加载，否则现算并写入 ``full/ace/{hash}/{step}/``。
+    """磁盘缓存命中则加载，否则现算并写入 ``artifacts/ace/{hash}/{step}/``。
 
     同一 backbone 上对同一路径只从磁盘读一次（micro-batch 复用内存中的 ``d``）。
     """
@@ -576,7 +577,7 @@ def resolve_ace_steering(
 ) -> tuple[float, torch.Tensor | None]:
     """从 sampling_cfg 解析 ``(λ, d)``；关闭时 ``(0.0, None)``。
 
-    未给显式 ``ace_direction`` / 路径时：按 ``full/ace/{hash}/{step}/`` 加载或现算。
+    未给显式 ``ace_direction`` / 路径时：按 ``artifacts/ace/{hash}/{step}/`` 加载或现算。
     """
     ace = cfg.get("ace", False)
     lam = parse_ace_lambda(ace)
@@ -599,7 +600,7 @@ def resolve_ace_steering(
     if backbone is None:
         raise ValueError(
             "ace is enabled without ace_direction; need backbone to auto "
-            "load/estimate under cache/checkpoints/full/ace/{hash}/{step}/"
+            "load/estimate under cache/checkpoints/artifacts/ace/{hash}/{step}/"
         )
     model_hash, step = _ace_identity(cfg, backbone)
     if not model_hash or step is None:

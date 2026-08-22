@@ -29,7 +29,8 @@ else
 fi
 
 # 可选：模型专属环境变量（例）
-# export COLA_VAE_CHECKPOINT=cache/checkpoints/full/cola_vae/<hash>/checkpoint_latest.pt
+# export COLA_VAE_CHECKPOINT=cache/checkpoints/artifacts/cola_vae/<tag>/checkpoint_latest.pt
+# 或: export COLA_VAE_TAG=<tag>  （从 full/cola_vae/<hash> 拷贝到 artifacts）
 # export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
 # export NCCL_TIMEOUT=3600
 
