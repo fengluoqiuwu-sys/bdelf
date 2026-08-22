@@ -92,7 +92,7 @@ done
 
 job_log_alloc "$SERVER_NAME" "$PROJECT"
 PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
-ARGS_FILE="$PENDING_DIR/preprocess-args.pending"
+ARGS_FILE="$PENDING_DIR/preprocess-args-${JOB_NAME}.pending"
 printf '%s\n' --dataset "$DATASET" --preprocess "$PREPROCESS" > "$ARGS_FILE"
 
 SBATCH_OUT="$(sbatch \

@@ -2,7 +2,7 @@
 # =============================================================================
 # 通用预处理作业（勿在文件名里写死 dataset/preprocess）
 # 提交：bash slurm/sbatch-preprocess.sh --dataset owt --preprocess default
-# 参数文件：logs/ovan-server/pending/preprocess-args.pending（包装器写入；本脚本消费后删除）
+# 参数文件：logs/ovan-server/pending/preprocess-args-<job-name>.pending（包装器写入；本脚本消费后删除）
 # =============================================================================
 #SBATCH --job-name=preprocess
 #SBATCH --partition=cls1
@@ -21,14 +21,20 @@ SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 cd "$PROJECT"
 source .venv/bin/activate
 
-ARGS_FILE="$PROJECT/logs/${SERVER_NAME}/pending/preprocess-args.pending"
+ARGS_FILE="$PROJECT/logs/${SERVER_NAME}/pending/preprocess-args-${SLURM_JOB_NAME}.pending"
 if [[ ! -f "$ARGS_FILE" ]]; then
-  ARGS_LEGACY="$PROJECT/slurm/logs/preprocess-args.pending"
+  ARGS_LEGACY="$PROJECT/slurm/logs/preprocess-args-${SLURM_JOB_NAME}.pending"
   if [[ -f "$ARGS_LEGACY" ]]; then
     ARGS_FILE="$ARGS_LEGACY"
   else
-    echo "缺少 $ARGS_FILE；请用: bash slurm/sbatch-preprocess.sh --dataset … --preprocess …" >&2
-    exit 1
+    # 兼容旧单文件 pending（仅单作业提交时有效）
+    ARGS_SINGLE="$PROJECT/logs/${SERVER_NAME}/pending/preprocess-args.pending"
+    if [[ -f "$ARGS_SINGLE" ]]; then
+      ARGS_FILE="$ARGS_SINGLE"
+    else
+      echo "缺少 $ARGS_FILE；请用: bash slurm/sbatch-preprocess.sh --dataset … --preprocess …" >&2
+      exit 1
+    fi
   fi
 fi
 mapfile -t PRE_ARGV < "$ARGS_FILE"
