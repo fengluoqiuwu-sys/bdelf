@@ -55,6 +55,8 @@ def build_cache(dataset: str, preprocess: str) -> None:
 
 
 def validate_manifest(dataset: str, preprocess: str) -> Path:
+    from dataset import get_dataset
+
     cache_root = PROJECT / "cache" / "preprocessed_datasets"
     pattern = f"{dataset}_{preprocess}_*"
     dirs = sorted(cache_root.glob(pattern))
@@ -73,6 +75,12 @@ def validate_manifest(dataset: str, preprocess: str) -> Path:
     split_counts = manifest.get("split_counts", {})
     if status != "complete":
         raise SystemExit(f"manifest status={status!r}, expected 'complete'")
+
+    expected_splits = set(get_dataset(dataset).get_splits())
+    if set(split_counts) != expected_splits:
+        raise SystemExit(
+            f"split_counts keys {set(split_counts)} != expected {expected_splits}"
+        )
 
     print(f"cache_dir={cache_dir}")
     print(f"status={status}")

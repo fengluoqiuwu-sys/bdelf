@@ -1,0 +1,174 @@
+% XeLaTeX + ctex；在 docs/dataset/latex/ 下编译：
+%   latexmk -xelatex -interaction=nonstopmode -halt-on-error owt-preprocess.tex
+
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage[backend=biber,style=numeric,sorting=none]{biblatex}
+\addbibresource{refs.bib}
+
+\geometry{margin=2.5cm}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{OpenWebText 句段预处理：设计动机、算法与文献背景}
+\author{bdelf 数据集文档}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文档说明 bdelf 仓库中 OpenWebText（OWT）从「跨文档流式定长切块」迁移到「按文档句段切分 + 可选长度分桶」的动机与算法细节。
+工程配置、路径与构建命令见同目录上级 \texttt{README.md}。
+\end{abstract}
+
+\section{背景与数据}
+
+OpenWebText 是从 Reddit 外链爬取的网页文本集合，规模与领域接近 GPT-2 训练所用的 WebText，常作为语言模型预训练与生成质量评测的基准语料~\cite{openwebtext,radford2019language}。
+在本仓库中，原始数据以 parquet 形式存放在 \texttt{cache/datasets/owt/}，逻辑上仅使用 Hugging Face 的 \texttt{train} split。
+
+\section{为何要改预处理}
+
+\subsection{旧方案：跨文档流式切块（\texttt{strategy: stream}）}
+
+历史配置（如 \texttt{default}、\texttt{default-old}）的流程为：
+\begin{enumerate}
+  \item 对多篇文档分别做 BPE，将 token 序列\textbf{首尾相接}成一条长流；
+  \item 按固定长度 $L$（如 1024）切块，每块行首插入一个 BOS，尾部不足则按 \texttt{overflow\_mode} 丢弃或填充。
+\end{enumerate}
+
+该方案对自回归语言模型预训练简单有效~\cite{radford2019language}，但存在明显结构问题：
+\begin{itemize}
+  \item \textbf{样本边界与语义单元不一致}：一个 chunk 可包含多篇短文的尾部与下一篇的开头，模型看到的「序列」并非单一网页或段落。
+  \item \textbf{不利于序列级目标}：变长编解码（VAE、全文重建）、按文档评估、或需要文档级 holdout 的任务会被跨篇拼接污染。
+  \item \textbf{与「在自然边界切分」的常见实践不一致}：许多工作在长文档上先在句/段边界切分，再定长或分桶~\cite{raffel2020t5}。
+\end{itemize}
+
+因此新预处理冻结旧行为于 \texttt{*-old}，并引入 \texttt{owt-seg512} / \texttt{owt-bucket}（\texttt{strategy: owt\_segment}），在\textbf{单篇文档内}完成切分，且显式加入 BOS/EOS。
+
+\subsection{新方案概览}
+
+两篇文档独立处理，token 流\textbf{不跨文档拼接}。对每篇文档：
+\begin{enumerate}
+  \item GPT-2 BPE 编码（\texttt{add\_special\_tokens=False}）；
+  \item 按长度上限 $d$ 与分隔符规则切成若干 \emph{content} 段；
+  \item 每段包装为 $[\mathrm{BOS}, content, \mathrm{EOS}]$，总长 $\le d$；
+  \item 过滤过短段（有效长度 $\le 128$），再 pad 到定长或分桶长度；
+  \item 在 train/dev/test 各 split 内 shuffle 后写入缓存。
+\end{enumerate}
+
+\section{分隔符与切点选择}
+
+\subsection{分隔符集合}
+
+在\textbf{原文字符}上匹配分隔符，再映射到 token 边界（见第~\ref{sec:offset} 节）。优先级（数字越小越优先）为：
+\begin{description}
+  \item[P0] 连续空行（段落）；
+  \item[P1] 单个换行；
+  \item[P2] 句末：省略号、中文/英文句末标点 \texttt{.!?。！？}，及可选闭合引号、括号与尾随换行；
+  \item[P3] 分号（默认关闭，避免过碎切分）。
+\end{description}
+
+在长度接近上限时，优先在\textbf{语义更完整}的边界切分，而非任意 token 位置硬切，这与神经机器翻译中按子词单元切分 rare word 的思路不同~\cite{sennrich2016neural}：此处关注的是\textbf{文档结构}而非词表稀疏性。
+
+\subsection{Lookback 硬切回退}
+
+设单次处理上限为 $d$，内容上限 $c = d - 2$（预留 BOS、EOS）。
+对当前段起点 $s$，若剩余 token 数 $> c$，令 $t = s + c$。
+在区间 $(\max(s, t - \ell), t]$ 内选切点，其中 $\ell = \min(256, \lfloor d/8 \rfloor)$（例如 $d=512 \Rightarrow \ell=64$，$d=2048 \Rightarrow \ell=256$）。
+
+在该窗口内：
+\begin{itemize}
+  \item 仅考虑分隔符结束位置对应的 token 边界；
+  \item 先按 P0 $>$ P1 $>$ P2 选档位；同档取\textbf{最靠右}（最接近 $t$）的切点；
+  \item 若无分隔符，在 $t$ 处\textbf{硬切}，下一段从 $t$ 继续（不跳到下一分隔符之后，避免丢 token）。
+\end{itemize}
+
+若整篇 content 长度 $\le c$，则一篇一段。该设计在「尊重边界」与「严格长度上限」之间折中：硬切不可避免时仍保持流式扫描，不二次全文搜索。
+
+\section{词表、BOS/EOS 与 offset 映射}
+\label{sec:offset}
+
+采用 GPT-2 byte-level BPE~\cite{radford2019language}。
+特殊符号使用仓库扩展的 \texttt{<|bos|>}、\texttt{<|eos|>}、\texttt{<|pad|>}，而非依赖 HF 默认特殊 token，以便与下游 \texttt{FL\_TokenLayout} 一致。
+
+\textbf{为何必须用 Fast tokenizer 的 \texttt{offset\_mapping}？}
+GPT-2 对 CJK 等字符常拆成多个 byte token，多个 token 可共享同一字符区间。
+若在 token 串上 decode 再搜标点，会与原文对齐失败。
+因此在 UTF-8 原文上用正则找分隔符，再用 \texttt{offset\_mapping} 将字符结束位置映射为「包含该字符的最后一个 token 之后」的下标。
+
+这与 SentencePiece 等「先归一化再切分」的流程不同~\cite{kudo2018sentencepiece}，但目标相同：切点落在人类可读的边界上。
+
+\section{两套产物：定长与分桶}
+
+\subsection{\texttt{owt-seg512}（$d=512$，定长 pad）}
+
+\begin{itemize}
+  \item 每段包装后 pad 到 512，右侧 \texttt{<|pad|>}；
+  \item \texttt{.len} 记录有效长度（含 BOS/EOS），供训练时 mask padding；
+  \item 适用于固定 $L=512$ 的训练图（如单形状 \texttt{torch.compile}）。
+\end{itemize}
+
+\subsection{\texttt{owt-bucket}（$d=2048$，长度分桶）}
+
+切分上限提高到 2048，再按\textbf{有效长度}映射到 pad 桶：
+\[
+(128,256] \to 256,\quad (256,512] \to 512,\quad (512,1024] \to 1024,\quad (1024,2048] \to 2048.
+\]
+
+动机：
+\begin{itemize}
+  \item OWT 文档长度分布跨度大，统一 pad 到最大长度浪费算力；
+  \item T5 等模型在固定张量长度下通过 packing / 多长度训练兼顾效率与覆盖~\cite{raffel2020t5}；
+  \item 分桶使同一 batch 内序列等长，便于注意力实现；manifest 记录 \texttt{bucket\_counts} 供后续采样。
+\end{itemize}
+
+更长序列的外推仍是开放问题（ALiBi、Longformer 等~\cite{press2022trainshort,beltagy2020longformer}）；本预处理将 $d=2048$ 作为\textbf{切分上限}而非声称模型外推能力。
+
+\section{数据划分：train / dev / test}
+
+在 parquet \textbf{行号}上做一次随机划分（\texttt{holdout\_seed=42}）：
+先 1024 行 $\to$ \texttt{test}，再 1024 行 $\to$ \texttt{dev}，其余 $\to$ \texttt{train}。
+与旧版 \texttt{eval\_count=10000} 的 holdout \textbf{无继承关系}，指纹亦不同。
+
+设计意图：
+\begin{itemize}
+  \item \texttt{dev}：调参与训练中验证（待训练脚本接线）；
+  \item \texttt{test}：仅离线评测，避免反复调参污染；
+  \item 行级 holdout 保证同一网页不会同时出现在 train 与 dev/test。
+\end{itemize}
+
+\section{打乱与可复现性}
+
+每个 split 内全部 chunk 生成后，用 \texttt{shuffle\_seed}（与 split 名混合）生成置换，再写入 shard。
+预处理 shuffle 与训练时按 step 的 epoch shuffle \textbf{独立}：前者固定磁盘样本顺序，后者仍可在训练循环中随机化。
+
+配置与数据集字段进入 SHA-256 指纹（16 hex），缓存目录名 \texttt{owt\_\{preprocess\}\_\{hex\}}。
+改 holdout、改 $d$、改 pad 策略均会生成新目录；\textbf{不}对旧缓存做软链别名。
+
+\section{与 BERT 式句对切分的对比}
+
+BERT 等使用「下一句预测」时在句边界拼接~\cite{devlin2019bert}，但预训练 chunk 仍常为固定 512。
+本方案更接近「每段是带明确起止的文档片段」，并显式 EOS，适合生成式目标与全文重建类模型，而非仅句对分类。
+
+\section{局限与后续工作}
+
+\begin{itemize}
+  \item 分隔符基于英文网页标点与换行启发式，对列表、代码块、表格等结构可能切分不理想；
+  \item P3 分号默认关闭；开启会增加切分粒度；
+  \item 训练侧尚未实现变长分桶采样与 \texttt{dev} 验证接线；
+  \item ELF 等 T5 词表仍使用 \texttt{elf-old} 流式预处理，未迁移到 \texttt{owt\_segment}。
+\end{itemize}
+
+\section{小结}
+
+新 OWT 预处理的核心是：\textbf{文档内、边界感知、上限为 $d$ 的句段切分}，配合 BOS/EOS 与可选长度分桶，并在行级三分数据上构建可复现缓存。
+旧流式方案通过 \texttt{*-old} 保持可续训，两者通过配置名与指纹隔离，避免 silent 行为变更。
+
+\printbibliography
+
+\end{document}

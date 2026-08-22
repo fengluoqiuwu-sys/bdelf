@@ -1,6 +1,6 @@
-_doc: ELF preprocessing (T5-small tokenizer, 1024-token chunks; matches paper L=1024)
+_doc: 冻结旧流式预处理（T5-small，跨文档拼流）；需重建缓存
 
-name: elf
+name: elf-old
 tokenizer: t5-small
 strategy: stream
 chunk_length: 1024

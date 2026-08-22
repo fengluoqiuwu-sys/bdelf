@@ -1,0 +1,44 @@
+# LaTeX / XeLaTeX / latexmk 编译中间产物（保留 .tex / .bib；PDF 需入库可 git add -f）
+
+# 辅助与索引
+*.aux
+*.lof
+*.lot
+*.toc
+*.out
+*.nav
+*.snm
+*.vrb
+*.idx
+*.ilg
+*.ind
+
+# 参考文献（biblatex / biber）
+*.bbl
+*.blg
+*.bcf
+*-blx.bib
+*.run.xml
+
+# 日志与 latexmk 追踪
+*.log
+*.fdb_latexmk
+*.fls
+missfont.log
+*.latexmk
+
+# SyncTeX / 驱动中间件
+*.synctex
+*.synctex.gz
+*.synctex.gz(busy)
+*.xdv
+*.dvi
+*.ps
+
+# minted / pygments 等
+*.pyg
+*-minted/
+_minted*/
+
+# 其它临时
+*.bcf-SAVE-ERR

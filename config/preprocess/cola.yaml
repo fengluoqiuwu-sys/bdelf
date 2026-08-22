@@ -4,6 +4,7 @@ _doc: >
 
 name: cola
 tokenizer: gpt2
+strategy: stream
 chunk_length: 1024
 overflow_mode: discard
 seed: 42

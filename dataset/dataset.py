@@ -82,6 +82,8 @@ class FL_DatasetConfig:
     _YAML_REQUIRED = frozenset(
         {"name", "repo_id", "revision", "download_split", "download_path", "split"}
     )
+    # 三向 holdout（owt）：dev_count + test_count + holdout_seed。
+    # 二向 holdout（arxiv 等）：eval_count + eval_seed。
 
     name: str = "prototype"
     repo_id: str = ""
@@ -94,10 +96,14 @@ class FL_DatasetConfig:
     split: str = "train"
     # Local download path. Leave empty to use the HuggingFace Hub default cache.
     download_path: Optional[str] = None
-    # Random eval holdout size (arxiv / owt): sample this many rows as eval.
+    # Random eval holdout size (arxiv 等): sample this many rows as eval.
     eval_count: Optional[int] = None
-    # Random seed for eval holdout sampling (arxiv / owt).
+    # Random seed for eval holdout sampling (arxiv 等).
     eval_seed: Optional[int] = None
+    # 三向 holdout：dev / test 行数与 seed（owt）。
+    dev_count: Optional[int] = None
+    test_count: Optional[int] = None
+    holdout_seed: Optional[int] = None
     # YAML keys that are not config attributes (e.g. _doc).
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -196,6 +202,8 @@ class FL_Dataset(Dataset):
 
     def _build_split(self, split: str):
         """Build a logical split. Subclasses may override for custom mapping."""
+        if self.config.dev_count is not None and self.config.test_count is not None:
+            return self._build_tri_holdout_split(split)
         if self.config.eval_count is not None:
             return self._build_random_holdout_split(split)
         raise NotImplementedError(
@@ -221,6 +229,30 @@ class FL_Dataset(Dataset):
             return parts["test"]
         raise ValueError(f"Unknown split '{split}'.")
 
+    def _build_tri_holdout_split(self, split: str):
+        """Sample ``test_count`` then ``dev_count`` rows; the rest become train."""
+        if self.config.holdout_seed is None:
+            raise ValueError(
+                f"{self.config.name}: holdout_seed is required for tri holdout."
+            )
+        if self.config.dev_count is None or self.config.test_count is None:
+            raise ValueError(
+                f"{self.config.name}: dev_count and test_count are required."
+            )
+        if self.config.dev_count < 0 or self.config.test_count < 0:
+            raise ValueError(
+                f"{self.config.name}: dev_count and test_count must be non-negative."
+            )
+
+        parts = self._get_tri_holdout_parts()
+        if split == "train":
+            return parts["train"]
+        if split == "dev":
+            return parts["dev"]
+        if split == "test":
+            return parts["test"]
+        raise ValueError(f"Unknown split '{split}'.")
+
     def _get_holdout_parts(self):
         """Return cached train/test split from the raw train split."""
         cached = getattr(self, "_holdout_parts", None)
@@ -239,6 +271,61 @@ class FL_Dataset(Dataset):
             )
         self._holdout_parts = parts
         return parts
+
+    def _get_tri_holdout_sets(self) -> dict[str, frozenset[int]]:
+        """Return test/dev row-index sets (parquet order, holdout_seed 重抽)."""
+        cached = getattr(self, "_tri_holdout_sets", None)
+        if cached is not None:
+            return cached
+
+        total = self.count_raw_rows("train")
+        test_count = min(self.config.test_count, total)
+        remaining = total - test_count
+        dev_count = min(self.config.dev_count, remaining)
+
+        rng = random.Random(self.config.holdout_seed)
+        indices = list(range(total))
+        rng.shuffle(indices)
+        test_set = frozenset(indices[:test_count])
+        dev_set = frozenset(indices[test_count : test_count + dev_count])
+        sets = {"test": test_set, "dev": dev_set}
+        self._tri_holdout_sets = sets
+        return sets
+
+    def _get_tri_holdout_parts(self):
+        """Return cached train/dev/test splits from the raw train split."""
+        cached = getattr(self, "_tri_holdout_parts", None)
+        if cached is not None:
+            return cached
+
+        full = self._load_raw_split("train")
+        sets = self._get_tri_holdout_sets()
+        all_indices = set(range(len(full)))
+        test_indices = sorted(sets["test"])
+        dev_indices = sorted(sets["dev"])
+        train_indices = sorted(
+            all_indices - sets["test"] - sets["dev"]
+        )
+        parts = {
+            "train": full.select(train_indices),
+            "dev": full.select(dev_indices),
+            "test": full.select(test_indices),
+        }
+        self._tri_holdout_parts = parts
+        return parts
+
+    def holdout_row_split(self, row_index: int) -> str:
+        """Map a parquet row index to logical split name."""
+        if self.config.dev_count is not None and self.config.test_count is not None:
+            sets = self._get_tri_holdout_sets()
+            if row_index in sets["test"]:
+                return "test"
+            if row_index in sets["dev"]:
+                return "dev"
+            return "train"
+        if row_index in self.holdout_eval_indices():
+            return "eval"
+        return "train"
 
     def _local_parquet_files(self, data_root: Path, hf_split: str) -> List[Path]:
         plain_text = data_root / "plain_text"
@@ -355,21 +442,13 @@ class FL_Dataset(Dataset):
         hf_split: str = "train",
     ) -> Iterator[str]:
         """Sequentially read texts from local parquet files for one logical split."""
-        eval_indices = self.holdout_eval_indices()
         for row_index, text in self.iter_parquet_rows(
             text_column=text_column,
             read_row_batch=read_row_batch,
             hf_split=hf_split,
         ):
-            in_eval = row_index in eval_indices
-            if split == "eval":
-                if not in_eval:
-                    continue
-            elif split == "train":
-                if in_eval:
-                    continue
-            else:
-                raise ValueError(f"Unknown split '{split}'.")
+            if self.holdout_row_split(row_index) != split:
+                continue
             if text:
                 yield text
 

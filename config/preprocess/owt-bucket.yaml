@@ -1,0 +1,14 @@
+_doc: OWT 句段切分 + 变长分桶 pad（256/512/1024/2048）
+
+name: owt-bucket
+tokenizer: gpt2
+strategy: owt_segment
+process_d: 2048
+min_chunk_len: 128
+pad_mode: bucket
+bucket_lengths: [256, 512, 1024, 2048]
+shuffle_seed: 42
+chunk_length: 2048
+overflow_mode: discard
+seed: 42
+text_column: text

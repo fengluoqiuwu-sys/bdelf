@@ -1,0 +1,13 @@
+_doc: OWT 句段切分 + 定长 pad512（GPT-2 BPE，手动 BOS/EOS）
+
+name: owt-seg512
+tokenizer: gpt2
+strategy: owt_segment
+process_d: 512
+min_chunk_len: 128
+pad_mode: fixed
+shuffle_seed: 42
+chunk_length: 512
+overflow_mode: discard
+seed: 42
+text_column: text

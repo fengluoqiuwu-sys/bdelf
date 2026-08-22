@@ -27,7 +27,10 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "preprocess"
 CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "preprocessed_datasets"
 
 OverflowMode = Literal["wrap", "discard", "pad_eos"]
-_MANIFEST_VERSION = 2
+PadMode = Literal["fixed", "bucket"]
+Strategy = Literal["stream", "owt_segment"]
+_MANIFEST_VERSION_STREAM = 2
+_MANIFEST_VERSION_OWT = 3
 _OVERFLOW_MODES = frozenset({"wrap", "discard", "pad_eos"})
 _DTYPE = np.int32
 _DOCS_PER_TASK = 512
@@ -68,10 +71,16 @@ class FL_PreprocessConfig:
 
     name: str = "prototype"
     tokenizer: str = "gpt2"
+    strategy: Strategy = "stream"
     chunk_length: int = 1024
     overflow_mode: OverflowMode = "discard"
     seed: int = 42
     text_column: str = "text"
+    process_d: int = 0
+    min_chunk_len: int = 128
+    pad_mode: PadMode = "fixed"
+    bucket_lengths: List[int] = field(default_factory=list)
+    shuffle_seed: int = 42
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -84,7 +93,26 @@ class FL_PreprocessConfig:
             )
         if config.chunk_length < 2:
             raise ValueError(f"{path}: chunk_length must be >= 2")
+        if config.strategy not in ("stream", "owt_segment"):
+            raise ValueError(
+                f"{path}: strategy must be 'stream' or 'owt_segment', "
+                f"got {config.strategy!r}"
+            )
+        if config.strategy == "owt_segment":
+            if config.process_d < 512:
+                raise ValueError(f"{path}: process_d must be >= 512")
+            if config.pad_mode not in ("fixed", "bucket"):
+                raise ValueError(f"{path}: pad_mode must be 'fixed' or 'bucket'")
+            if config.pad_mode == "bucket" and not config.bucket_lengths:
+                config.bucket_lengths = [256, 512, 1024, 2048]
         return config
+
+    def manifest_version(self) -> int:
+        return (
+            _MANIFEST_VERSION_OWT
+            if self.strategy == "owt_segment"
+            else _MANIFEST_VERSION_STREAM
+        )
 
 
 @dataclass(frozen=True)
@@ -98,6 +126,7 @@ class _SplitCacheMeta:
     count: int
     shards: List[_SplitShardMeta]
     has_lengths: bool = False
+    bucket_counts: Dict[int, int] = field(default_factory=dict)
 
 
 def list_preprocess() -> List[str]:
@@ -131,26 +160,53 @@ def get_preprocessed(
     return FL_PreprocessedDataset(get_preprocess(preprocess_name), source)
 
 
+def _dataset_fingerprint_payload(dc) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "name": dc.name,
+        "repo_id": dc.repo_id,
+        "revision": dc.revision,
+        "subset": dc.subset,
+        "split": dc.split,
+    }
+    if dc.dev_count is not None and dc.test_count is not None:
+        payload["dev_count"] = dc.dev_count
+        payload["test_count"] = dc.test_count
+        payload["holdout_seed"] = dc.holdout_seed
+    else:
+        payload["eval_count"] = dc.eval_count
+        payload["eval_seed"] = dc.eval_seed
+    return payload
+
+
+def _preprocess_fingerprint_payload(config: FL_PreprocessConfig) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "name": config.name,
+        "tokenizer": config.tokenizer,
+        "strategy": config.strategy,
+        "chunk_length": config.chunk_length,
+        "seed": config.seed,
+        "text_column": config.text_column,
+    }
+    if config.strategy == "stream":
+        payload["overflow_mode"] = config.overflow_mode
+    else:
+        payload.update(
+            {
+                "process_d": config.process_d,
+                "min_chunk_len": config.min_chunk_len,
+                "pad_mode": config.pad_mode,
+                "bucket_lengths": list(config.bucket_lengths),
+                "shuffle_seed": config.shuffle_seed,
+            }
+        )
+    return payload
+
+
 def _fingerprint(config: FL_PreprocessConfig, source: FL_Dataset) -> str:
     dc = source.config
     payload = {
-        "preprocess": {
-            "name": config.name,
-            "tokenizer": config.tokenizer,
-            "chunk_length": config.chunk_length,
-            "overflow_mode": config.overflow_mode,
-            "seed": config.seed,
-            "text_column": config.text_column,
-        },
-        "dataset": {
-            "name": dc.name,
-            "repo_id": dc.repo_id,
-            "revision": dc.revision,
-            "subset": dc.subset,
-            "split": dc.split,
-            "eval_count": dc.eval_count,
-            "eval_seed": dc.eval_seed,
-        },
+        "preprocess": _preprocess_fingerprint_payload(config),
+        "dataset": _dataset_fingerprint_payload(dc),
     }
     raw = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
@@ -241,7 +297,6 @@ def _iter_tagged_doc_batches(
     text_column: str,
     total_rows: int,
 ) -> Iterator[_TaggedDocBatch]:
-    eval_indices = source.holdout_eval_indices()
     pending: Dict[str, List[str]] = {split: [] for split in splits}
 
     with tqdm(
@@ -254,7 +309,7 @@ def _iter_tagged_doc_batches(
             row_progress.update(1)
             if text is None:
                 continue
-            split = "eval" if row_index in eval_indices else "train"
+            split = source.holdout_row_split(row_index)
             if split not in splits:
                 continue
             pending[split].append(text)
@@ -294,6 +349,15 @@ def _iter_token_streams_pipelined(
 
 def _split_doc_total(source: FL_Dataset, split: str) -> int:
     total = source.count_raw_rows()
+    if source.config.dev_count is not None and source.config.test_count is not None:
+        sets = source._get_tri_holdout_sets()
+        if split == "train":
+            return total - len(sets["test"]) - len(sets["dev"])
+        if split == "dev":
+            return len(sets["dev"])
+        if split == "test":
+            return len(sets["test"])
+        raise ValueError(f"Unknown split '{split}'.")
     eval_count = len(source.holdout_eval_indices())
     if split == "train":
         return total - eval_count
@@ -672,19 +736,57 @@ def _split_meta_from_manifest(raw: Dict[str, Any]) -> _SplitCacheMeta:
         _SplitShardMeta(file=item["file"], count=int(item["count"]))
         for item in raw.get("shards", [])
     ]
+    bucket_raw = raw.get("bucket_counts") or {}
+    bucket_counts = {int(k): int(v) for k, v in bucket_raw.items()}
     return _SplitCacheMeta(
         count=int(raw.get("count", 0)),
         shards=shards,
         has_lengths=bool(raw.get("has_lengths", False)),
+        bucket_counts=bucket_counts,
     )
 
 
 def _split_meta_to_manifest(meta: _SplitCacheMeta) -> Dict[str, Any]:
-    return {
+    out: Dict[str, Any] = {
         "count": meta.count,
         "has_lengths": meta.has_lengths,
         "shards": [{"file": s.file, "count": s.count} for s in meta.shards],
     }
+    if meta.bucket_counts:
+        out["bucket_counts"] = dict(meta.bucket_counts)
+    return out
+
+
+def _manifest_payload_base(
+    config: FL_PreprocessConfig,
+    fingerprint: str,
+    *,
+    status: str,
+    split_counts: Dict[str, int],
+    splits: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "version": config.manifest_version(),
+        "status": status,
+        "fingerprint": fingerprint,
+        "strategy": config.strategy,
+        "chunk_length": config.chunk_length,
+        "split_counts": split_counts,
+        "splits": splits,
+    }
+    if config.strategy == "stream":
+        payload["overflow_mode"] = config.overflow_mode
+    else:
+        payload.update(
+            {
+                "process_d": config.process_d,
+                "min_chunk_len": config.min_chunk_len,
+                "pad_mode": config.pad_mode,
+                "bucket_lengths": list(config.bucket_lengths),
+                "shuffle_seed": config.shuffle_seed,
+            }
+        )
+    return payload
 
 
 def _verify_split_cache(
@@ -737,6 +839,62 @@ def _cleanup_cache_dir(cache_dir: Path) -> None:
     for path in cache_dir.iterdir():
         if path.is_file():
             path.unlink()
+        elif path.is_dir() and path.name.startswith(".shuffle_"):
+            for child in path.iterdir():
+                child.unlink(missing_ok=True)
+            path.rmdir()
+
+
+def _owt_segment_preprocess_parquet(
+    source: FL_Dataset,
+    *,
+    splits: Set[str],
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+) -> Dict[str, _SplitCacheMeta]:
+    from preprocess.owt_segment_build import build_owt_segment_splits
+
+    total_rows = source.count_raw_rows()
+    doc_totals = {
+        split: _split_doc_total(source, split) for split in sorted(splits)
+    }
+    tagged_batches = _iter_tagged_doc_batches(
+        source, splits, text_column=config.text_column, total_rows=total_rows
+    )
+    return build_owt_segment_splits(
+        source,
+        splits=splits,
+        cache_dir=cache_dir,
+        config=config,
+        tagged_batches=tagged_batches,
+        doc_totals=doc_totals,
+    )
+
+
+def _owt_segment_preprocess_split_dataset(
+    hf_dataset,
+    *,
+    split: str,
+    cache_dir: Path,
+    config: FL_PreprocessConfig,
+) -> _SplitCacheMeta:
+    from preprocess.owt_segment_build import build_owt_segment_splits
+
+    total = len(hf_dataset)
+
+    def _tagged() -> Iterator[_TaggedDocBatch]:
+        for texts in _iter_doc_batches_from_dataset(hf_dataset, config.text_column):
+            yield _TaggedDocBatch(split, texts)
+
+    metas = build_owt_segment_splits(
+        None,
+        splits={split},
+        cache_dir=cache_dir,
+        config=config,
+        tagged_batches=_tagged(),
+        doc_totals={split: total},
+    )
+    return metas[split]
 
 
 def _build_cache(
@@ -747,10 +905,11 @@ def _build_cache(
     special = get_token_layout(config.tokenizer)
     workers = _worker_count()
     fingerprint = _fingerprint(config, source)
+    expected_version = config.manifest_version()
     manifest = _load_manifest(cache_dir)
     if manifest and manifest.get("fingerprint") != fingerprint:
         _cleanup_cache_dir(cache_dir)
-    elif manifest and manifest.get("version") != _MANIFEST_VERSION:
+    elif manifest and manifest.get("version") != expected_version:
         _cleanup_cache_dir(cache_dir)
 
     existing = _load_manifest(cache_dir) or {}
@@ -771,33 +930,42 @@ def _build_cache(
         _cleanup_split(cache_dir, split)
         splits_to_build.append(split)
 
-    if splits_to_build and source.can_stream_parquet():
-        metas = _stream_preprocess_parquet(
-            source,
-            splits=set(splits_to_build),
-            cache_dir=cache_dir,
-            config=config,
-            special=special,
-            workers=workers,
+    def _write_partial() -> None:
+        _write_manifest(
+            cache_dir,
+            _manifest_payload_base(
+                config,
+                fingerprint,
+                status="partial",
+                split_counts=dict(split_counts),
+                splits=split_entries,
+            ),
         )
+
+    if splits_to_build and source.can_stream_parquet():
+        if config.strategy == "owt_segment":
+            metas = _owt_segment_preprocess_parquet(
+                source,
+                splits=set(splits_to_build),
+                cache_dir=cache_dir,
+                config=config,
+            )
+        else:
+            metas = _stream_preprocess_parquet(
+                source,
+                splits=set(splits_to_build),
+                cache_dir=cache_dir,
+                config=config,
+                special=special,
+                workers=workers,
+            )
         for split, meta in metas.items():
             split_entries[split] = {
                 "status": "complete",
                 **_split_meta_to_manifest(meta),
             }
             split_counts[split] = meta.count
-            _write_manifest(
-                cache_dir,
-                {
-                    "version": _MANIFEST_VERSION,
-                    "status": "partial",
-                    "fingerprint": fingerprint,
-                    "chunk_length": config.chunk_length,
-                    "overflow_mode": config.overflow_mode,
-                    "split_counts": dict(split_counts),
-                    "splits": split_entries,
-                },
-            )
+            _write_partial()
     else:
         for split in splits_to_build:
             _log_preprocess(f"Loading split={split!r} ...")
@@ -807,43 +975,38 @@ def _build_cache(
                 f"[preprocess] split={split!r} loaded {len(hf_dataset):,} rows "
                 f"({time.time() - load_started:.1f}s)"
             )
-            meta = _stream_preprocess_split_dataset(
-                hf_dataset,
-                split=split,
-                cache_dir=cache_dir,
-                config=config,
-                special=special,
-                workers=workers,
-            )
+            if config.strategy == "owt_segment":
+                meta = _owt_segment_preprocess_split_dataset(
+                    hf_dataset,
+                    split=split,
+                    cache_dir=cache_dir,
+                    config=config,
+                )
+            else:
+                meta = _stream_preprocess_split_dataset(
+                    hf_dataset,
+                    split=split,
+                    cache_dir=cache_dir,
+                    config=config,
+                    special=special,
+                    workers=workers,
+                )
             split_entries[split] = {
                 "status": "complete",
                 **_split_meta_to_manifest(meta),
             }
             split_counts[split] = meta.count
-            _write_manifest(
-                cache_dir,
-                {
-                    "version": _MANIFEST_VERSION,
-                    "status": "partial",
-                    "fingerprint": fingerprint,
-                    "chunk_length": config.chunk_length,
-                    "overflow_mode": config.overflow_mode,
-                    "split_counts": dict(split_counts),
-                    "splits": split_entries,
-                },
-            )
+            _write_partial()
 
     _write_manifest(
         cache_dir,
-        {
-            "version": _MANIFEST_VERSION,
-            "status": "complete",
-            "fingerprint": fingerprint,
-            "chunk_length": config.chunk_length,
-            "overflow_mode": config.overflow_mode,
-            "split_counts": split_counts,
-            "splits": split_entries,
-        },
+        _manifest_payload_base(
+            config,
+            fingerprint,
+            status="complete",
+            split_counts=split_counts,
+            splits=split_entries,
+        ),
     )
     return split_counts
 
@@ -864,7 +1027,8 @@ def _ensure_cache(
     fingerprint = _fingerprint(config, source)
     manifest = _load_manifest(cache_dir)
     if manifest and manifest.get("fingerprint") == fingerprint:
-        if manifest.get("status") == "complete" and manifest.get("version") == _MANIFEST_VERSION:
+        expected_version = config.manifest_version()
+        if manifest.get("status") == "complete" and manifest.get("version") == expected_version:
             split_names = set(source.get_splits())
             if set(manifest.get("splits", {})) == split_names:
                 splits = {

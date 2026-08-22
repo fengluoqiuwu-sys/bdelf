@@ -1,6 +1,6 @@
-_doc: Default preprocessing config (GPT-2 tokenizer, 1024-token chunks)
+_doc: 冻结旧流式预处理（与 default-old 参数相同，独立缓存名）
 
-name: default
+name: cola-old
 tokenizer: gpt2
 strategy: stream
 chunk_length: 1024
