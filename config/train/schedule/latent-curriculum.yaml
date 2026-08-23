@@ -1,0 +1,21 @@
+# =============================================================================
+# latent 长度课程日程（10B 有效 token + WSD）
+# =============================================================================
+_doc: latent 长度课程：WSD 优化器，有效 token 预算 10B  # 文件说明，写入 extra
+name: latent-curriculum  # 配置名；非 prototype 时与文件名一致
+variant: full  # checkpoint 变体目录仍用 full
+target_tokens: 12000000000  # 含 pad 上界（推导 max_steps 安全余量）
+warmup_ratio: 0.005  # 非 WSD 时回退；WSD 以 wsd_warmup_tokens 为准
+min_lr_ratio: 0.1  # 退火终点 = 峰值 × 0.1
+eval_step: 500  # 评测间隔（优化器步）
+save_step: 1000  # 保存 checkpoint 间隔（优化器步）
+snapshot_step: 5000  # 快照间隔（优化器步）
+log_plot_step: 100  # 曲线日志间隔（优化器步）
+resume: true  # 若存在 checkpoint_latest 则续训
+seed: 42  # 全局随机种子
+use_muon: true  # 隐藏层 Linear 用 Muon，其余 AdamW
+compile: true  # 是否启用 torch.compile(Inductor)
+lr_schedule: wsd  # warmup–stable–decay（按有效 token 计）
+wsd_warmup_tokens: 150000000  # 仅 S1 开头一次
+wsd_decay_tokens: 800000000  # 仅 S4 末段 cosine
+curriculum_effective_tokens: 10000000000  # 与 curriculum YAML 一致

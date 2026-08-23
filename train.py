@@ -265,10 +265,13 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         raise SystemExit(
             f"Unknown train config {args.train_config!r}. {args.model} available: "
             f"{', '.join(configs)}\n"
-            f"Naming format: {{size}}m-{{fast,full}}"
+            f"Naming format: {{size}}m-{{fast,full,curriculum}}"
         )
 
-    size = args.train_config.rsplit("-", 1)[0]
+    if args.train_config.endswith("-curriculum"):
+        size = args.train_config
+    else:
+        size = args.train_config.rsplit("-", 1)[0]
     try:
         resolve_model_config_path(args.model, size)
     except FileNotFoundError as exc:
@@ -372,42 +375,98 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 f"({cfg.max_steps:,} data micro-steps, accum={cfg.grad_accum_steps})",
             )
 
-    try:
-        # On a cache miss only rank 0 downloads/builds; the other ranks wait
-        # and then attach to the finished cache. Concurrent builds would write
-        # the same shard/manifest files and corrupt the cache.
+    curriculum_sampler = None
+    curriculum_eval_ctx = None
+    train_ds: TokenChunkDataset | None = None
+    eval_ds_full = None
+    latent_probe_pool = None
+    latent_pad_token_id: int | None = None
+
+    if cfg.preprocess == "latent-curriculum":
+        from train.latent_curriculum import (
+            LatentCurriculumSampler,
+            load_curriculum_spec,
+            resolve_curriculum_spec_name,
+        )
+        from train.eval_split import resolve_eval_split
+        from train.latent_eval import LatentCurriculumEvalContext
+        from models.tokens import get_token_layout
+
         if is_distributed and rank != 0:
             dist.barrier()
-        preprocessed = get_preprocessed(cfg.preprocess, cfg.dataset)
+        cur_spec = load_curriculum_spec(resolve_curriculum_spec_name(cfg.preprocess))
+        layout = get_token_layout("gpt2")
+        latent_pad_token_id = layout.pad_token_id
+        curriculum_sampler = LatentCurriculumSampler.build(
+            cur_spec,
+            dataset=cfg.dataset,
+            pad_token_id=layout.pad_token_id,
+            seed=cfg.seed,
+            world_size=world_size,
+            batch_size=cfg.batch_size,
+        )
+        seg512 = get_preprocessed(cur_spec.seg512_preprocess, cfg.dataset)
+        get_preprocessed(cur_spec.bucket_preprocess, cfg.dataset)
+        eval_split = resolve_eval_split(seg512, cfg.eval_split)
         if is_distributed and rank == 0:
             dist.barrier()
-    except FileNotFoundError as exc:
-        msg = (
-            f"Preprocessed data unavailable: {exc}\n"
-            f"Check that dataset={cfg.dataset}, preprocess={cfg.preprocess} "
-            f"are configured correctly (first run will download the dataset "
-            f"and build the preprocess cache automatically)"
+        curriculum_eval_ctx = LatentCurriculumEvalContext.build(
+            cur_spec,
+            dataset=cfg.dataset,
+            pad_token_id=layout.pad_token_id,
+            batch_size=cfg.batch_size,
+            eval_sample_count=cfg.eval_sample_count,
+            eval_sample_seed=cfg.eval_sample_seed,
+            eval_split=eval_split,
+            rank=rank,
+            world_size=world_size,
         )
-        if rank == 0:
-            _train_log(msg, file=sys.stderr)
-        raise SystemExit(msg) from exc
+        latent_probe_pool = curriculum_eval_ctx.seg512_probe_pool
+        eval_ds_full = TokenChunkDataset(seg512.load_split(eval_split))
+    else:
+        try:
+            # On a cache miss only rank 0 downloads/builds; the other ranks wait
+            # and then attach to the finished cache. Concurrent builds would write
+            # the same shard/manifest files and corrupt the cache.
+            if is_distributed and rank != 0:
+                dist.barrier()
+            preprocessed = get_preprocessed(cfg.preprocess, cfg.dataset)
+            if is_distributed and rank == 0:
+                dist.barrier()
+        except FileNotFoundError as exc:
+            msg = (
+                f"Preprocessed data unavailable: {exc}\n"
+                f"Check that dataset={cfg.dataset}, preprocess={cfg.preprocess} "
+                f"are configured correctly (first run will download the dataset "
+                f"and build the preprocess cache automatically)"
+            )
+            if rank == 0:
+                _train_log(msg, file=sys.stderr)
+            raise SystemExit(msg) from exc
 
-    splits = preprocessed.get_splits()
-    if "train" not in splits or "eval" not in splits:
-        raise SystemExit(f"Dataset is missing train/eval splits; current splits: {splits}")
+        from train.eval_split import require_train_and_holdout, resolve_eval_split
 
-    train_ds = TokenChunkDataset(preprocessed.load_split("train"))
+        splits = preprocessed.get_splits()
+        require_train_and_holdout(splits)
+        eval_split = resolve_eval_split(preprocessed, cfg.eval_split)
+
+        train_ds = TokenChunkDataset(preprocessed.load_split("train"))
+        eval_ds_full = TokenChunkDataset(preprocessed.load_split(eval_split))
+
     eval_loader: DataLoader | None = None
-    eval_ds_full = None
     eval_run_size = 0
     gpt2_model: nn.Module | None = None
     model_kind = kind_of(model_name)
-    eval_ds_full = TokenChunkDataset(preprocessed.load_split("eval"))
     eval_ds, eval_run_size = build_eval_subset(
         eval_ds_full,
         cfg.eval_sample_count,
         cfg.eval_sample_seed,
     )
+    if model_kind == "latent" and latent_probe_pool is None:
+        from models.tokens import get_token_layout
+
+        latent_pad_token_id = get_token_layout("gpt2").pad_token_id
+        latent_probe_pool = eval_ds
     if len(eval_ds) == 0:
         if rank == 0:
             _train_log("WARNING: eval dataset is empty; eval will be skipped")
@@ -472,14 +531,23 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     if rank == 0:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         _train_log(f"Train model parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
-        _train_log(
-            f"train split: {len(train_ds):,} samples"
-            + (
-                f", eval split: {len(eval_ds_full):,} samples"
-                if eval_ds_full is not None
-                else ""
-            ),
-        )
+        if curriculum_sampler is not None:
+            st = curriculum_sampler.curriculum_state()
+            _train_log(
+                f"curriculum: {st['stage']} graph_l={st['graph_l']} "
+                f"target={st['target_effective_tokens']:,} effective tokens"
+            )
+        elif train_ds is not None:
+            _train_log(
+                f"train split: {len(train_ds):,} samples"
+                + (
+                    f", eval split: {len(eval_ds_full):,} samples"
+                    if eval_ds_full is not None
+                    else ""
+                ),
+            )
+        elif eval_ds_full is not None:
+            _train_log(f"eval split: {len(eval_ds_full):,} samples")
         if eval_ds_full is not None and eval_run_size < len(eval_ds_full):
             _train_log(
                 f"eval subsample: {eval_run_size:,} / {len(eval_ds_full):,} "
@@ -498,6 +566,11 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
                 + (f", sharded×{world_size}" if world_size > 1 else "")
                 + ")",
             )
+        if model_kind == "latent" and cfg.vae_probe_samples > 0:
+            _train_log(
+                f"vae probe: {cfg.vae_probe_samples} samples / eval "
+                f"(seed={cfg.eval_sample_seed}+step)",
+            )
 
     train_loop(
         model,
@@ -510,6 +583,10 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         world_size=world_size,
         device=device,
         is_distributed=is_distributed,
+        curriculum_sampler=curriculum_sampler,
+        curriculum_eval_ctx=curriculum_eval_ctx,
+        latent_probe_pool=latent_probe_pool,
+        latent_pad_token_id=latent_pad_token_id,
     )
 
     if is_distributed:
@@ -546,7 +623,19 @@ def main() -> None:
         # a warm cache; a cold build inside a worker could exceed the NCCL
         # barrier timeout that the other ranks wait on.
         try:
-            get_preprocessed(cfg.preprocess, cfg.dataset)
+            if cfg.preprocess == "latent-curriculum":
+                from train.latent_curriculum import (
+                    load_curriculum_spec,
+                    resolve_curriculum_spec_name,
+                )
+
+                spec = load_curriculum_spec(
+                    resolve_curriculum_spec_name(cfg.preprocess),
+                )
+                get_preprocessed(spec.seg512_preprocess, cfg.dataset)
+                get_preprocessed(spec.bucket_preprocess, cfg.dataset)
+            else:
+                get_preprocessed(cfg.preprocess, cfg.dataset)
         except FileNotFoundError as exc:
             raise SystemExit(f"Preprocessed data unavailable: {exc}") from exc
 

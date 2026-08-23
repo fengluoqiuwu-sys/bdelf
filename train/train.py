@@ -32,8 +32,8 @@ TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
-_MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|full)$")
-_ARCH_SIZE_RE = re.compile(r"^[0-9]+m$")
+_MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|full|curriculum)$")
+_ARCH_SIZE_RE = re.compile(r"^[0-9]+m(?:-curriculum)?$")
 _ARCH_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
 DEFAULT_NUM_WORKERS = 8
 
@@ -127,6 +127,10 @@ class FL_EvalConfig:
     # Online eval subsample; None / omitted runs the full eval split
     eval_sample_count: Optional[int] = None
     eval_sample_seed: int = 42
+    # Held-out split: dev (owt) or eval (arxiv 等)；省略则自动解析
+    eval_split: Optional[str] = None
+    # latent VAE probe：每次 eval 从 held-out 抽样的序列数（0=关闭）
+    vae_probe_samples: int = 16
     # Generative PPL: train model samples → scored by HF causal LM
     gen_eval_model: str = "gpt2-large"
     gen_eval_model_dtype: TrainDtype = "bf16"
@@ -188,6 +192,8 @@ class FL_TrainConfig:
     seed: int
     eval_sample_count: Optional[int]
     eval_sample_seed: int
+    eval_split: Optional[str]
+    vae_probe_samples: int
     gen_eval_model: str
     gen_eval_model_dtype: TrainDtype
     gen_eval_model_device: str
@@ -247,8 +253,8 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
         )
     if not _MODEL_CONFIG_RE.fullmatch(config_name):
         raise ValueError(
-            f"Invalid config name {config_name!r}, expected {{size}}m-{{fast,full}} "
-            "(e.g. 100m-full, 300m-full)"
+            f"Invalid config name {config_name!r}, expected {{size}}m-{{fast,full,curriculum}} "
+            "(e.g. 100m-full, 100m-curriculum)"
         )
     available = list_train_configs(model)
     if config_name not in available:
@@ -263,7 +269,18 @@ def _parse_model_config_variant(config_name: str) -> tuple[str, TrainVariant]:
     match = _MODEL_CONFIG_RE.fullmatch(config_name)
     if match is None:
         raise ValueError(f"Invalid config name {config_name!r}")
-    return match.group(1), match.group(2)  # type: ignore[return-value]
+    size, suffix = match.group(1), match.group(2)
+    if suffix == "curriculum":
+        return f"{size}-curriculum", "full"
+    return size, suffix  # type: ignore[return-value]
+
+
+def _recipe_variant(config_name: str) -> str:
+    match = _MODEL_CONFIG_RE.fullmatch(config_name)
+    if match is None:
+        raise ValueError(f"Invalid config name {config_name!r}")
+    suffix = match.group(2)
+    return "curriculum" if suffix == "curriculum" else suffix
 
 
 _OVERRIDE_SECTIONS = frozenset(
@@ -412,8 +429,10 @@ def _load_batch_from_recipe(
 def _load_schedule(
     variant: TrainVariant,
     overrides: dict[str, Any] | None = None,
+    *,
+    schedule_name: str | None = None,
 ) -> FL_ScheduleConfig:
-    path = CONFIG_DIR / "schedule" / f"{variant}.yaml"
+    path = CONFIG_DIR / "schedule" / f"{schedule_name or variant}.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"Schedule config {path} does not exist.")
     with open(path, encoding="utf-8") as f:
@@ -577,10 +596,11 @@ def compose_train_config(
     """
     model, config_name = _parse_train_ref(model, config_name)
     model_config, variant = _parse_model_config_variant(config_name)
+    recipe_variant = _recipe_variant(config_name)
     ov = overrides or {}
 
-    recipe_path = model_train_config_path(model, variant)
-    recipe = _load_model_recipe(model, variant)
+    recipe_path = model_train_config_path(model, recipe_variant)  # type: ignore[arg-type]
+    recipe = _load_model_recipe(model, recipe_variant)  # type: ignore[arg-type]
     optimizer = _load_optimizer_from_recipe(
         recipe,
         path=recipe_path,
@@ -593,7 +613,12 @@ def compose_train_config(
         config_name=config_name,
         overrides=ov.get("batch"),
     )
-    schedule = _load_schedule(variant, overrides=ov.get("schedule"))
+    schedule_name: str | None = None
+    if recipe_variant == "curriculum" or preprocess == "latent-curriculum":
+        schedule_name = "latent-curriculum"
+    schedule = _load_schedule(
+        variant, overrides=ov.get("schedule"), schedule_name=schedule_name,
+    )
     eval_cfg = _load_eval(model, overrides=ov.get("eval"))
     generate_cfg = get_generate(model, generate, overrides=ov.get("generate"))
 
@@ -601,6 +626,25 @@ def compose_train_config(
     if schedule.use_muon:
         run_label = f"{run_label}-muon"
     chunk_length = get_preprocess(preprocess).chunk_length
+    is_curriculum = preprocess == "latent-curriculum" or recipe_variant == "curriculum"
+    curriculum_extra: dict[str, Any] = {}
+    if is_curriculum:
+        from train.latent_curriculum import (
+            curriculum_fingerprint_piece,
+            load_curriculum_spec,
+            resolve_curriculum_spec_name,
+        )
+
+        cur_name = resolve_curriculum_spec_name(preprocess)
+        cur_spec = load_curriculum_spec(cur_name)
+        curriculum_extra = {
+            "curriculum": cur_name,
+            "curriculum_spec": curriculum_fingerprint_piece(cur_spec),
+            "curriculum_effective_tokens": cur_spec.effective_target_tokens,
+            "lr_schedule": schedule.extra.get("lr_schedule", "wsd"),
+            "wsd_warmup_tokens": schedule.extra.get("wsd_warmup_tokens"),
+            "wsd_decay_tokens": schedule.extra.get("wsd_decay_tokens"),
+        }
 
     resolved_world_size = 1 if world_size is None else world_size
     accum, global_batch = _resolve_grad_accum(
@@ -636,19 +680,45 @@ def compose_train_config(
             f"{run_label}: gen_eval_model_device must be 'cuda' or 'cpu', "
             f"got {eval_cfg.gen_eval_model_device!r}"
         )
+    if eval_cfg.eval_split is not None and eval_cfg.eval_split not in ("dev", "eval"):
+        raise ValueError(
+            f"{run_label}: eval_split must be 'dev' or 'eval' when set, "
+            f"got {eval_cfg.eval_split!r}"
+        )
+    if kind_of(model) == "latent" and eval_cfg.vae_probe_samples < 0:
+        raise ValueError(
+            f"{run_label}: vae_probe_samples must be >= 0, "
+            f"got {eval_cfg.vae_probe_samples}"
+        )
 
     # 数据 token / 优化器步：global_batch × 每序列计入预算的 token 数。
     # denoise/decode 混合只影响 loss，不改变数据消耗与日程推导。
-    tokens_per_step = (
-        batch.batch_size
-        * accum
-        * resolved_world_size
-        * (
-            chunk_length
-            if resolve_full_sequence_training(model)
-            else max(1, chunk_length - 1)
+    if is_curriculum:
+        from train.latent_curriculum import stage_grad_accum
+
+        max_stage_graph = max(s.graph_l for s in cur_spec.stages)  # type: ignore[possibly-undefined]
+        min_global_seq = min(s.global_seq_batch for s in cur_spec.stages)  # type: ignore[possibly-undefined]
+        tokens_per_step = min_global_seq * max_stage_graph
+        curriculum_max_accum = max(
+            stage_grad_accum(
+                s,
+                batch_size=batch.batch_size,
+                world_size=resolved_world_size,
+            )
+            for s in cur_spec.stages  # type: ignore[possibly-undefined]
         )
-    )
+        curriculum_extra["curriculum_max_accum"] = curriculum_max_accum
+    else:
+        tokens_per_step = (
+            batch.batch_size
+            * accum
+            * resolved_world_size
+            * (
+                chunk_length
+                if resolve_full_sequence_training(model)
+                else max(1, chunk_length - 1)
+            )
+        )
     resolved = _resolve_schedule(
         schedule,
         run_name=run_label,
@@ -663,12 +733,26 @@ def compose_train_config(
     save_step = resolved.save_step
     snapshot_step = resolved.snapshot_step
 
-    max_steps = max_optimizer_steps * accum
-    warmup_steps = resolved.warmup_steps * accum
-    log_plot_step = max(1, log_plot_step * accum)
-    eval_step = max(1, eval_step * accum)
-    save_step = max(1, save_step * accum)
-    snapshot_step = max(1, snapshot_step * accum)
+    micro_accum = accum
+    if is_curriculum:
+        min_eff_per_opt = min_global_seq * 128  # type: ignore[possibly-undefined]
+        eff_opt_steps = max(
+            1,
+            math.ceil(cur_spec.effective_target_tokens / min_eff_per_opt),  # type: ignore[possibly-undefined]
+        )
+        max_optimizer_steps = max(max_optimizer_steps, eff_opt_steps)
+        target_tokens = max(
+            target_tokens,
+            cur_spec.effective_target_tokens,  # type: ignore[possibly-undefined]
+        )
+        micro_accum = curriculum_max_accum  # type: ignore[possibly-undefined]
+
+    max_steps = max_optimizer_steps * micro_accum
+    warmup_steps = resolved.warmup_steps * micro_accum
+    log_plot_step = max(1, log_plot_step * micro_accum)
+    eval_step = max(1, eval_step * micro_accum)
+    save_step = max(1, save_step * micro_accum)
+    snapshot_step = max(1, snapshot_step * micro_accum)
 
     fingerprint = build_train_fingerprint(
         model=model,
@@ -712,6 +796,7 @@ def compose_train_config(
             },
             "use_muon": schedule.use_muon,
             "compile": bool(schedule.extra.get("compile", False)),
+            **curriculum_extra,
         },
     )
 
@@ -746,6 +831,8 @@ def compose_train_config(
         seed=schedule.seed,
         eval_sample_count=eval_cfg.eval_sample_count,
         eval_sample_seed=eval_cfg.eval_sample_seed,
+        eval_split=eval_cfg.eval_split,
+        vae_probe_samples=eval_cfg.vae_probe_samples,
         gen_eval_model=eval_cfg.gen_eval_model,
         gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
         gen_eval_model_device=eval_cfg.gen_eval_model_device,
@@ -773,7 +860,7 @@ def list_train_models() -> List[str]:
         for path in sorted(kind_dir.iterdir()):
             if not path.is_dir():
                 continue
-            if (path / "fast.yaml").is_file() or (path / "full.yaml").is_file():
+            if (path / "fast.yaml").is_file() or (path / "full.yaml").is_file() or (path / "curriculum.yaml").is_file():
                 names.append(path.name)
     return sorted(names)
 
@@ -804,6 +891,8 @@ def list_train_configs(model: str | None = None) -> List[str]:
         if not sizes:
             continue
         for size in sizes:
+            if size.endswith("-curriculum"):
+                continue
             for variant in ("fast", "full"):
                 if not (model_dir / f"{variant}.yaml").is_file():
                     continue
@@ -812,6 +901,14 @@ def list_train_configs(model: str | None = None) -> List[str]:
                     names.append(name)
                 else:
                     names.append(f"{m}/{name}")
+        if (model_dir / "curriculum.yaml").is_file():
+            for size in sizes:
+                if size.endswith("-curriculum"):
+                    name = size
+                    if model is not None:
+                        names.append(name)
+                    else:
+                        names.append(f"{m}/{name}")
     return names
 
 

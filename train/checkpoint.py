@@ -40,6 +40,7 @@ def save_checkpoint(
     model_meta: dict[str, Any],
     *,
     ema_state: dict[str, torch.Tensor] | None = None,
+    curriculum_state: dict[str, Any] | None = None,
 ) -> None:
     """Atomically write a checkpoint (tmp file + ``os.replace``).
 
@@ -67,6 +68,8 @@ def save_checkpoint(
     }
     if ema_state:
         payload["ema"] = {k: v.detach().cpu() for k, v in ema_state.items()}
+    if curriculum_state:
+        payload["curriculum"] = dict(curriculum_state)
     if torch.cuda.is_available():
         payload["rng"]["cuda"] = torch.cuda.get_rng_state_all()
     tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -101,7 +104,7 @@ def load_checkpoint(
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
     restore_rng: bool = True,
-) -> tuple[int, dict[str, torch.Tensor] | None]:
+) -> tuple[int, dict[str, torch.Tensor] | None, dict[str, Any] | None]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     saved_cfg = ck.get("train_config") or {}
     if saved_cfg.get("name") and saved_cfg["name"] != cfg.name:
@@ -157,7 +160,7 @@ def load_checkpoint(
         np.random.set_state(rng["numpy"])
         if "cuda" in rng and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(rng["cuda"])
-    return int(ck["step"]), ema_state
+    return int(ck["step"]), ema_state, ck.get("curriculum")
 
 
 def load_init_weights(

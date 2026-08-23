@@ -1,0 +1,22 @@
+_doc: T5-small 维数 Text VAE ~60M；长度课程 max_seq_len=2048  # 文件说明，写入 extra
+
+name: latent_vae-100m-curriculum
+tokenizer: gpt2
+max_seq_len: 2048
+n_layer_enc: 6
+n_layer_dec: 6
+n_head: 8
+n_embd: 512
+d_kv: 64
+d_ff: 2048
+latent_dim: 64
+dropout: 0.0
+beta_kl: 0.1
+lambda_mask: 1.0
+mask_ratio: 0.15
+use_flash: true
+attn_backend: sdpa
+block_size: 1
+
+sampling:
+  temperature: 1.0

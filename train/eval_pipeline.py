@@ -11,6 +11,7 @@ from typing import Any, Callable, Sequence
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from eval.gen_ppl import (
@@ -377,139 +378,210 @@ def run_online_eval(
     pbar_parent: tqdm | None,
     ema_state: Any,
     swap_ema_weights: Callable[..., Any],
+    curriculum_eval_ctx: Any | None = None,
+    curriculum_sampler: Any | None = None,
+    eval_tokens: int | None = None,
+    latent_probe_pool: Dataset | None = None,
+    latent_pad_token_id: int | None = None,
 ) -> None:
     """HeldOut 永写主表；按 tick 跑到期组件；共享生成至多一次。"""
     is_latent = kind_of(cfg.model) == "latent"
-    eval_fields = eval_csv_fields(cfg.model)
+    eval_fields = eval_csv_fields(cfg.model, cfg)
     tick = load_eval_tick(run_dir) + 1
     components = resolve_online_eval_components(model)
     due = [c for c in components if _component_due(c, tick)]
     need_samples = not is_latent and any(c.needs_samples for c in due)
+    data_tokens = (
+        int(eval_tokens)
+        if eval_tokens is not None
+        else cfg.tokens_seen_after_step(step)
+    )
+
+    curriculum_eval_row: dict[str, Any] | None = None
+    eval_loss = float("nan")
+    eval_ppl = float("nan")
+    batch: SharedGenBatch | None = None
+    scores: SampleScoreSheet | None = None
 
     with swap_ema_weights(model, ema_state):
-        eval_loss, eval_ppl = eval_model_ppl(
-            unwrap_model(model),
-            eval_loader,
-            device,
-            amp_dtype,
-            pbar_parent=pbar_parent,
-            is_distributed=is_distributed,
-            log=(rank == 0),
-        )
+        if (
+            is_latent
+            and cfg.extra.get("curriculum")
+            and curriculum_eval_ctx is not None
+            and curriculum_sampler is not None
+        ):
+            from train.latent_eval import run_latent_curriculum_eval
 
-        batch: SharedGenBatch | None = None
-        scores: SampleScoreSheet | None = None
-        if need_samples and gpt2_model is not None:
-            try:
-                batch = generate_shared_samples(
-                    model,
-                    cfg=cfg,
-                    train_device=device,
-                    train_amp_dtype=amp_dtype,
-                    seed=cfg.seed + step,
-                    rank=rank,
-                    world_size=world_size,
-                    is_distributed=is_distributed,
-                    pbar_parent=pbar_parent,
-                    log=(rank == 0),
-                )
-                if rank == 0:
-                    gpt2_amp = get_amp_dtype(cfg.gen_eval_model_dtype)
-                    scores = score_shared_samples(
-                        batch, gpt2_model, cfg=cfg, amp_dtype=gpt2_amp,
+            curriculum_eval_row = run_latent_curriculum_eval(
+                model,
+                ctx=curriculum_eval_ctx,
+                sampler=curriculum_sampler,
+                step=step,
+                tokens=data_tokens,
+                lr=lr,
+                device=device,
+                amp_dtype=amp_dtype,
+                eval_sample_seed=cfg.eval_sample_seed,
+                rank=rank,
+                world_size=world_size,
+                is_distributed=is_distributed,
+                pbar_parent=pbar_parent,
+                log=(rank == 0),
+            )
+            release_eval_cuda_scratch(model, log=(rank == 0))
+        else:
+            eval_loss, eval_ppl = eval_model_ppl(
+                unwrap_model(model),
+                eval_loader,
+                device,
+                amp_dtype,
+                pbar_parent=pbar_parent,
+                is_distributed=is_distributed,
+                log=(rank == 0),
+            )
+
+            if need_samples and gpt2_model is not None:
+                try:
+                    batch = generate_shared_samples(
+                        model,
+                        cfg=cfg,
+                        train_device=device,
+                        train_amp_dtype=amp_dtype,
+                        seed=cfg.seed + step,
+                        rank=rank,
+                        world_size=world_size,
+                        is_distributed=is_distributed,
+                        pbar_parent=pbar_parent,
+                        log=(rank == 0),
                     )
-                if is_distributed:
-                    payload: list[Any] = [scores]
-                    dist.broadcast_object_list(payload, src=0)
-                    scores = payload[0]
-            except Exception as exc:  # noqa: BLE001 — 组件失败不中断训练
-                if rank == 0:
-                    _train_log(f"eval/gen failed (skip samples): {exc}")
-                batch = None
-                scores = None
-        elif need_samples and gpt2_model is None and rank == 0:
-            _train_log("eval/gen skipped: no gpt2 baseline")
+                    if rank == 0:
+                        gpt2_amp = get_amp_dtype(cfg.gen_eval_model_dtype)
+                        scores = score_shared_samples(
+                            batch, gpt2_model, cfg=cfg, amp_dtype=gpt2_amp,
+                        )
+                    if is_distributed:
+                        payload: list[Any] = [scores]
+                        dist.broadcast_object_list(payload, src=0)
+                        scores = payload[0]
+                except Exception as exc:  # noqa: BLE001 — 组件失败不中断训练
+                    if rank == 0:
+                        _train_log(f"eval/gen failed (skip samples): {exc}")
+                    batch = None
+                    scores = None
+            elif need_samples and gpt2_model is None and rank == 0:
+                _train_log("eval/gen skipped: no gpt2 baseline")
 
-        release_eval_cuda_scratch(model, log=(rank == 0))
+            release_eval_cuda_scratch(model, log=(rank == 0))
 
     if is_distributed:
         dist.barrier()
 
     if rank == 0:
-        eval_row: dict[str, Any] = {
-            "step": step,
-            "tokens": cfg.tokens_seen_after_step(step),
-            "lr": lr,
-            "eval_loss": round(eval_loss, 6) if eval_loss == eval_loss else "",
-        }
-        if not is_latent:
-            eval_row["eval_ppl"] = (
-                round(eval_ppl, 4) if eval_ppl == eval_ppl else ""
-            )
-        append_csv_row(run_dir / "eval_log.csv", eval_fields, eval_row)
-
-        if is_latent:
+        if curriculum_eval_row is not None:
+            append_csv_row(run_dir / "eval_log.csv", eval_fields, curriculum_eval_row)
             save_eval_tick(run_dir, tick)
         else:
-            due_names = {c.name for c in due if c.official}
-            off: dict[str, Any] = {k: "" for k in EVAL_OFFICIAL_FIELDS}
-            off["step"] = step
-            wrote_official = False
-
-            if batch is not None and scores is not None:
-                n = len(batch.texts)
-                nonempty = sum(
-                    1 for t in batch.texts if isinstance(t, str) and t.strip()
+            eval_row: dict[str, Any] = {
+                "step": step,
+                "tokens": data_tokens,
+                "lr": lr,
+                "eval_loss": round(eval_loss, 6) if eval_loss == eval_loss else "",
+            }
+            if not is_latent:
+                eval_row["eval_ppl"] = (
+                    round(eval_ppl, 4) if eval_ppl == eval_ppl else ""
                 )
-                uniq_mean = (
-                    float(sum(batch.uniq_counts) / max(n, 1))
-                    if batch.uniq_counts
-                    else float("nan")
-                )
-                nonempty_frac = nonempty / max(n, 1)
+            append_csv_row(run_dir / "eval_log.csv", eval_fields, eval_row)
 
-                if "gen_ppl" in due_names:
-                    if scores.gen_loss_corpus == scores.gen_loss_corpus:
-                        off["gen_loss"] = round(scores.gen_loss_corpus, 6)
-                    if scores.gen_ppl_corpus == scores.gen_ppl_corpus:
-                        off["gen_ppl"] = round(scores.gen_ppl_corpus, 4)
-                    if uniq_mean == uniq_mean:
-                        off["gen_uniq_mean"] = round(uniq_mean, 2)
-                    off["gen_nonempty_frac"] = round(nonempty_frac, 4)
-                    wrote_official = True
-                if "entropy" in due_names:
-                    ment = _mean_finite(scores.entropy)
-                    if ment == ment:
-                        off["entropy"] = round(ment, 6)
+            if is_latent:
+                save_eval_tick(run_dir, tick)
+            else:
+                due_names = {c.name for c in due if c.official}
+                off: dict[str, Any] = {k: "" for k in EVAL_OFFICIAL_FIELDS}
+                off["step"] = step
+                wrote_official = False
+
+                if batch is not None and scores is not None:
+                    n = len(batch.texts)
+                    nonempty = sum(
+                        1 for t in batch.texts if isinstance(t, str) and t.strip()
+                    )
+                    uniq_mean = (
+                        float(sum(batch.uniq_counts) / max(n, 1))
+                        if batch.uniq_counts
+                        else float("nan")
+                    )
+                    nonempty_frac = nonempty / max(n, 1)
+
+                    if "gen_ppl" in due_names:
+                        if scores.gen_loss_corpus == scores.gen_loss_corpus:
+                            off["gen_loss"] = round(scores.gen_loss_corpus, 6)
+                        if scores.gen_ppl_corpus == scores.gen_ppl_corpus:
+                            off["gen_ppl"] = round(scores.gen_ppl_corpus, 4)
+                        if uniq_mean == uniq_mean:
+                            off["gen_uniq_mean"] = round(uniq_mean, 2)
+                        off["gen_nonempty_frac"] = round(nonempty_frac, 4)
                         wrote_official = True
-                if "dist1" in due_names:
-                    d1 = _corpus_dist1(batch.texts, batch.seqlen)
-                    if d1 == d1:
-                        off["dist1"] = round(d1, 6)
-                        wrote_official = True
+                    if "entropy" in due_names:
+                        ment = _mean_finite(scores.entropy)
+                        if ment == ment:
+                            off["entropy"] = round(ment, 6)
+                            wrote_official = True
+                    if "dist1" in due_names:
+                        d1 = _corpus_dist1(batch.texts, batch.seqlen)
+                        if d1 == d1:
+                            off["dist1"] = round(d1, 6)
+                            wrote_official = True
 
-                write_sample_dir(
-                    run_dir, step, batch, scores,
-                    meta_extra={"eval_tick": tick, "due": sorted(due_names)},
+                    write_sample_dir(
+                        run_dir, step, batch, scores,
+                        meta_extra={"eval_tick": tick, "due": sorted(due_names)},
+                    )
+                    summary_bits = []
+                    if off.get("gen_ppl") != "":
+                        summary_bits.append(f"gen_ppl {off['gen_ppl']}")
+                    if off.get("entropy") != "":
+                        summary_bits.append(f"entropy {off['entropy']}")
+                    if off.get("dist1") != "":
+                        summary_bits.append(f"dist1 {off['dist1']}")
+                    if summary_bits:
+                        msg = "eval/official: " + " ".join(summary_bits)
+                        if pbar_parent is not None:
+                            tqdm.write(f"{_TRAIN_LOG} {msg}")
+                        else:
+                            _train_log(msg)
+
+                if wrote_official:
+                    append_csv_row(eval_official_csv(run_dir), EVAL_OFFICIAL_FIELDS, off)
+
+                save_eval_tick(run_dir, tick)
+
+        if is_latent and cfg.vae_probe_samples > 0 and latent_probe_pool is not None:
+            from models.tokens import get_token_layout
+            from train.vae_probe import maybe_write_vae_probe
+
+            pad_id = latent_pad_token_id
+            if pad_id is None:
+                pad_id = get_token_layout("gpt2").pad_token_id
+            probe_meta: dict[str, Any] = {"eval_tick": tick}
+            if curriculum_eval_ctx is not None:
+                probe_meta["eval_split"] = getattr(
+                    curriculum_eval_ctx, "eval_split", "",
                 )
-                summary_bits = []
-                if off.get("gen_ppl") != "":
-                    summary_bits.append(f"gen_ppl {off['gen_ppl']}")
-                if off.get("entropy") != "":
-                    summary_bits.append(f"entropy {off['entropy']}")
-                if off.get("dist1") != "":
-                    summary_bits.append(f"dist1 {off['dist1']}")
-                if summary_bits:
-                    msg = "eval/official: " + " ".join(summary_bits)
-                    if pbar_parent is not None:
-                        tqdm.write(f"{_TRAIN_LOG} {msg}")
-                    else:
-                        _train_log(msg)
-
-            if wrote_official:
-                append_csv_row(eval_official_csv(run_dir), EVAL_OFFICIAL_FIELDS, off)
-
-            save_eval_tick(run_dir, tick)
+            if curriculum_sampler is not None:
+                probe_meta["curriculum_stage"] = curriculum_sampler.current_stage.name
+            maybe_write_vae_probe(
+                run_dir,
+                step,
+                model,
+                latent_probe_pool,
+                pad_token_id=pad_id,
+                device=device,
+                amp_dtype=amp_dtype,
+                probe_samples=cfg.vae_probe_samples,
+                probe_seed=cfg.eval_sample_seed + step,
+                meta_extra=probe_meta,
+            )
 
     if is_distributed:
         dist.barrier()

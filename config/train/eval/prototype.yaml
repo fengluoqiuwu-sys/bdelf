@@ -5,4 +5,6 @@ _doc: 评测配置模板（不可实例化）  # 文件说明，写入 extra
 name: prototype  # 配置名；非 prototype 时与文件名一致
 eval_sample_count: null  # held-out 子采样条数；null 表示全量
 eval_sample_seed: 42  # held-out 子采样随机种子
+# eval_split: dev  # 省略则自动：owt 用 dev，arxiv 等用 eval
+vae_probe_samples: 16  # latent VAE probe 抽样数（0=关闭）
 gen_eval_samples: 256  # 每次 gen-PPL 生成并打分的序列数

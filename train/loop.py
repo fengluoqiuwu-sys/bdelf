@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from models import kind_of
@@ -52,6 +52,8 @@ from train.metrics import (
     loss_to_ppl,
     train_csv_fields,
 )
+from train.latent_curriculum import LatentCurriculumSampler
+from train.latent_eval import LatentCurriculumEvalContext, curriculum_in_observation_window
 from train.run_logs import prepare_run_logs, train_official_csv
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
 from train.scratch import (
@@ -61,8 +63,24 @@ from train.scratch import (
 )
 
 
-def get_lr(step: int, cfg: FL_TrainConfig) -> float:
-    return scaled_lr(step, cfg, cfg.learning_rate)
+def get_lr(
+    step: int,
+    cfg: FL_TrainConfig,
+    *,
+    effective_tokens: int | None = None,
+) -> float:
+    return scaled_lr(
+        step, cfg, cfg.learning_rate, effective_tokens=effective_tokens,
+    )
+
+
+def _grad_accum_steps(
+    cfg: FL_TrainConfig,
+    curriculum_sampler: LatentCurriculumSampler | None,
+) -> int:
+    if curriculum_sampler is not None:
+        return curriculum_sampler.grad_accum_steps
+    return cfg.grad_accum_steps
 
 
 def _all_ranks_true(local_ok: bool, device: torch.device, is_distributed: bool) -> bool:
@@ -241,7 +259,7 @@ def train_loop(
     model: nn.Module,
     cfg: FL_TrainConfig,
     model_meta: dict[str, Any],
-    train_ds: TokenChunkDataset,
+    train_ds: TokenChunkDataset | None,
     eval_loader: DataLoader | None,
     gpt2_model: nn.Module | None,
     *,
@@ -249,6 +267,10 @@ def train_loop(
     world_size: int,
     device: torch.device,
     is_distributed: bool,
+    curriculum_sampler: LatentCurriculumSampler | None = None,
+    curriculum_eval_ctx: LatentCurriculumEvalContext | None = None,
+    latent_probe_pool: Dataset | None = None,
+    latent_pad_token_id: int | None = None,
 ) -> None:
     amp_dtype = get_amp_dtype(cfg.dtype)
     from train.hardware import (
@@ -260,7 +282,7 @@ def train_loop(
 
     run_dir = checkpoint_run_dir_from_cfg(cfg)
     is_latent = kind_of(cfg.model) == "latent"
-    train_fields = train_csv_fields(cfg.model)
+    train_fields = train_csv_fields(cfg.model, cfg)
 
     # 硬件锁定（不进 hash）：探测可见 GPU，首次写入 hardware.json，续跑必须一致。
     hw_err = ""
@@ -340,7 +362,7 @@ def train_loop(
 
     train_csv = run_dir / "train_log.csv"
     if rank == 0:
-        prepare_run_logs(run_dir, model=cfg.model, start_step=None)
+        prepare_run_logs(run_dir, model=cfg.model, start_step=None, cfg=cfg)
     # Absolute path: relative cache/ can race under BeeGFS when ranks disagree
     # on cwd visibility right after a cross-node resume.
     latest_ckpt = (run_dir / "checkpoint_latest.pt").resolve()
@@ -353,6 +375,15 @@ def train_loop(
     )
     if rank == 0 and ema_state is not None:
         _train_log(f"EMA enabled: decay={ema_decay:g}")
+
+    def _curriculum_ckpt() -> dict[str, Any] | None:
+        if curriculum_sampler is None:
+            return None
+        return curriculum_sampler.curriculum_state()
+
+    curriculum_stage_idx = (
+        curriculum_sampler._stage_idx if curriculum_sampler is not None else -1
+    )
 
     # Rank0 picks an *openable* ckpt (BeeGFS ghosts: is_file ok, open fails).
     resume_src: Path | None = None
@@ -382,10 +413,17 @@ def train_loop(
         resume_path = _stage_ckpt_to_local(
             resume_src, rank=rank, is_distributed=is_distributed,
         )
-        step, loaded_ema = load_checkpoint(
+        step, loaded_ema, loaded_curriculum = load_checkpoint(
             resume_path, model, optimizer, device,
             cfg=cfg, model_meta=model_meta, restore_rng=(rank == 0),
         )
+        if curriculum_sampler is not None and loaded_curriculum:
+            curriculum_sampler.effective_tokens_global = int(
+                loaded_curriculum.get("effective_tokens_global", 0)
+            )
+            curriculum_sampler._stage_idx = int(loaded_curriculum.get("stage_idx", 0))
+            curriculum_sampler.sync_stage()
+            curriculum_stage_idx = curriculum_sampler._stage_idx
         _release_staged_ckpt(
             resume_path, rank=rank, is_distributed=is_distributed,
         )
@@ -400,7 +438,7 @@ def train_loop(
                 )
                 ema_state = init_ema(model)
         if rank == 0:
-            kept = prepare_run_logs(run_dir, model=cfg.model, start_step=step)
+            kept = prepare_run_logs(run_dir, model=cfg.model, start_step=step, cfg=cfg)
             _train_log(
                 f"Resuming from checkpoint: step {step} "
                 f"(train_log {kept.get('train_log', 0)} rows, "
@@ -509,17 +547,54 @@ def train_loop(
 
     try:
         while step < cfg.max_steps:
-            batch = fetch_train_batch(
-                train_ds, step, cfg.batch_size, world_size, rank, cfg.seed,
-            )
+            if curriculum_sampler is not None and curriculum_sampler.is_complete():
+                if rank == 0:
+                    _train_log(
+                        "Reached curriculum effective token budget; stopping training",
+                    )
+                break
+
+            if curriculum_sampler is not None:
+                batch, eff_rank = curriculum_sampler.fetch_batch(step, rank)
+            else:
+                assert train_ds is not None
+                batch = fetch_train_batch(
+                    train_ds, step, cfg.batch_size, world_size, rank, cfg.seed,
+                )
+                eff_rank = 0
             batch = batch.to(device, non_blocking=True)
 
-            lr = scaled_lr(step, cfg, cfg.learning_rate)
+            if curriculum_sampler is not None:
+                eff_t = torch.tensor([eff_rank], device=device, dtype=torch.int64)
+                if is_distributed:
+                    dist.all_reduce(eff_t, op=dist.ReduceOp.SUM)
+                curriculum_sampler.add_effective_tokens(int(eff_t.item()))
+                if curriculum_sampler._stage_idx != curriculum_stage_idx:
+                    optimizer.zero_grad(set_to_none=True)
+                    if rank == 0:
+                        _train_log(
+                            f"Curriculum stage -> {curriculum_sampler.current_stage.name}; "
+                            "reset grad accum",
+                        )
+                    curriculum_stage_idx = curriculum_sampler._stage_idx
+
+            accum = _grad_accum_steps(cfg, curriculum_sampler)
+            eff_tokens_lr = (
+                curriculum_sampler.effective_tokens_global
+                if curriculum_sampler is not None
+                else None
+            )
+            lr = get_lr(step, cfg, effective_tokens=eff_tokens_lr)
             if cfg.use_muon:
                 schedule_optimizer_lrs(
                     optimizer,
                     adam_lr=lr,
-                    muon_lr=scaled_lr(step, cfg, cfg.muon_learning_rate),
+                    muon_lr=scaled_lr(
+                        step,
+                        cfg,
+                        cfg.muon_learning_rate,
+                        effective_tokens=eff_tokens_lr,
+                    ),
                 )
             else:
                 for group in optimizer.param_groups:
@@ -546,11 +621,11 @@ def train_loop(
                 # window; math is unchanged, communication drops ~accum×.
                 sync_ctx = (
                     model.no_sync()
-                    if is_distributed and (step + 1) % cfg.grad_accum_steps != 0
+                    if is_distributed and (step + 1) % accum != 0
                     else nullcontext()
                 )
                 with sync_ctx:
-                    (micro_loss / cfg.grad_accum_steps).backward()
+                    (micro_loss / accum).backward()
                 step_backward_done = True
             elif rank == 0:
                 if not _params_are_finite(raw):
@@ -566,7 +641,7 @@ def train_loop(
                     "resume from an earlier checkpoint",
                 )
 
-            if (step + 1) % cfg.grad_accum_steps == 0:
+            if (step + 1) % accum == 0:
                 grads_ok = _all_ranks_true(
                     _grads_are_finite(model),
                     device,
@@ -580,7 +655,7 @@ def train_loop(
                     unwrap_model(model).on_optimizer_step(
                         model=model,
                         ema_state=ema_state,
-                        opt_step=(step + 1) // cfg.grad_accum_steps,
+                        opt_step=(step + 1) // accum,
                         variant=cfg.variant,
                         generate_sampling=cfg.generate_sampling,
                         rank=rank,
@@ -614,14 +689,29 @@ def train_loop(
             )
             tokens_per_sec = (seq_tokens * max(1, world_size)) / max(elapsed, 1e-6)
 
+            log_tokens = (
+                curriculum_sampler.effective_tokens_global
+                if curriculum_sampler is not None
+                else cfg.tokens_seen_after_step(step)
+            )
             if is_latent:
                 train_row = build_latent_train_row(
                     step,
-                    cfg.tokens_seen_after_step(step),
+                    log_tokens,
                     train_loss,
                     lr,
                     tokens_per_sec,
                     metrics=metrics,
+                    curriculum_stage=(
+                        curriculum_sampler.current_stage.name
+                        if curriculum_sampler is not None
+                        else ""
+                    ),
+                    observation_window=(
+                        curriculum_in_observation_window(curriculum_sampler)
+                        if curriculum_sampler is not None
+                        else None
+                    ),
                 )
                 core_row = train_row
                 official_row = None
@@ -645,9 +735,8 @@ def train_loop(
                 )
                 train_row = core_row
 
-            do_eval = (
-                (step + 1) % cfg.eval_step == 0
-                and eval_loader is not None
+            do_eval = (step + 1) % cfg.eval_step == 0 and (
+                eval_loader is not None or curriculum_eval_ctx is not None
             )
             if do_eval:
                 run_online_eval(
@@ -666,6 +755,11 @@ def train_loop(
                     pbar_parent=pbar,
                     ema_state=ema_state,
                     swap_ema_weights=swap_ema_weights,
+                    curriculum_eval_ctx=curriculum_eval_ctx,
+                    curriculum_sampler=curriculum_sampler,
+                    eval_tokens=log_tokens if is_latent else None,
+                    latent_probe_pool=latent_probe_pool,
+                    latent_pad_token_id=latent_pad_token_id,
                 )
 
             if rank == 0:
@@ -759,12 +853,14 @@ def train_loop(
                     save_checkpoint(
                         latest_ckpt, model, optimizer, next_step, cfg, model_meta,
                         ema_state=ema_state,
+                        curriculum_state=_curriculum_ckpt(),
                     )
                     if do_snapshot:
                         save_checkpoint(
                             run_dir / f"checkpoint_step_{next_step:07d}.pt",
                             model, optimizer, next_step, cfg, model_meta,
                             ema_state=ema_state,
+                            curriculum_state=_curriculum_ckpt(),
                         )
                     _rank0_log(f"  [ckpt] saved at step {next_step}", pbar)
                     rank0_sync = True
@@ -788,6 +884,7 @@ def train_loop(
             save_checkpoint(
                 latest_ckpt, model, optimizer, next_step, cfg, model_meta,
                 ema_state=ema_state,
+                curriculum_state=_curriculum_ckpt(),
             )
             _train_log(f"Saved; resume from step {next_step} on next run")
         if is_distributed:
@@ -803,11 +900,13 @@ def train_loop(
         save_checkpoint(
             latest_ckpt, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,
+            curriculum_state=_curriculum_ckpt(),
         )
         final_snapshot = run_dir / f"checkpoint_step_{step:07d}.pt"
         save_checkpoint(
             final_snapshot, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,
+            curriculum_state=_curriculum_ckpt(),
         )
         _train_log(
             f"Training finished after {step} steps; "

@@ -1,0 +1,22 @@
+_doc: T5-small 维数 Text VAE 配置模板（encoder 禁止双向；无 bidirectional 键）  # 文件说明，写入 extra
+
+name: prototype  # 配置名；prototype 不可实例化
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+max_seq_len: 1024  # 训练序列长度
+n_layer_enc: 6  # 编码器层数（T5-small）
+n_layer_dec: 6  # 解码器层数（T5-small）
+n_head: 8  # 注意力头数（512/64）
+n_embd: 512  # 隐层宽度 E（T5-small d_model）
+d_kv: 64  # 每头 K/V 维（T5-small）
+d_ff: 2048  # FFN 中间维（T5-small）
+latent_dim: 64  # 瓶颈维 B
+dropout: 0.0  # Dropout
+beta_kl: 0.1  # KL(q‖N(0,I)) 权重
+lambda_mask: 1.0  # BERT-mask 损失权重
+mask_ratio: 0.15  # BERT-mask 比例
+use_flash: true  # 是否 SDPA
+attn_backend: sdpa  # 块因果后端：sdpa | flex
+block_size: 1  # 块大小；1=逐 token 因果（不走块 mask）；>1 为块内双向、块间因果
+
+sampling:
+  temperature: 1.0  # 采样温度；≤0 为 argmax

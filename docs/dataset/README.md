@@ -108,10 +108,11 @@ OWT 仅下载 HF `train` split；在** parquet 行号顺序**上做一次随机�
 
 指纹：[`_fingerprint`](../../preprocess/preprocess.py) — 预处理 YAML 字段 + 数据集 holdout 字段（`dev_count` / `test_count` / `holdout_seed`）的 JSON 哈希前 16 hex。改名或改参数会**新目录**，不软链旧缓存。
 
-## 消费侧（当前状态）
+## 消费侧
 
-- `get_preprocessed("owt-seg512", "owt")` → `load_split("train"|"dev"|"test")` 返回 `input_ids` + 可选 `length`。
-- **训练脚本尚未接线** `dev`/`test` 与变长分桶 batching；续训旧 run 仍用 `--preprocess default` / `elf` 等 stream 配置。
+- `get_preprocessed("owt-seg512", "owt")` / `get_preprocessed("owt-bucket", "owt")` → `load_split("train"|"dev"|"test")` 返回 `input_ids` + 可选 `length`。
+- **长度课程**（`latent_t5` / `latent_vae`）：`--preprocess latent-curriculum` + `--config 100m-curriculum`；训练采样见 `train/latent_curriculum.py`，在线评测见 `train/latent_eval.py`（seg512 dev + S2 起分桶 dev）。
+- 续训旧 stream run 仍用 `--preprocess default` / `elf` 等。
 
 ## 与历史缓存的关系
 

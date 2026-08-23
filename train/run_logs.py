@@ -175,10 +175,10 @@ def migrate_run_logs(run_dir: Path, *, model: str) -> None:
             )
 
 
-def align_run_log_schemas(run_dir: Path, *, model: str) -> None:
+def align_run_log_schemas(run_dir: Path, *, model: str, cfg: Any | None = None) -> None:
     """已是新布局时：主表/官方表加列留空。"""
-    train_fields = train_csv_fields(model)
-    eval_fields = eval_csv_fields(model)
+    train_fields = train_csv_fields(model, cfg)
+    eval_fields = eval_csv_fields(model, cfg)
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
     if train_csv.exists():
@@ -219,13 +219,14 @@ def prepare_run_logs(
     *,
     model: str,
     start_step: int | None = None,
+    cfg: Any | None = None,
 ) -> dict[str, int]:
     """迁移 → schema 对齐 →（可选）按 step 截断。返回 kept 计数。"""
     migrate_run_logs(run_dir, model=model)
-    align_run_log_schemas(run_dir, model=model)
+    align_run_log_schemas(run_dir, model=model, cfg=cfg)
 
-    train_fields = train_csv_fields(model)
-    eval_fields = eval_csv_fields(model)
+    train_fields = train_csv_fields(model, cfg)
+    eval_fields = eval_csv_fields(model, cfg)
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
     init_csv_header(train_csv, train_fields)

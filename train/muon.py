@@ -296,7 +296,35 @@ def schedule_optimizer_lrs(
             group["lr"] = adam_lr * scale
 
 
-def scaled_lr(step: int, cfg: FL_TrainConfig, base_lr: float) -> float:
+def scaled_lr(
+    step: int,
+    cfg: FL_TrainConfig,
+    base_lr: float,
+    *,
+    effective_tokens: int | None = None,
+) -> float:
+    if cfg.extra.get("lr_schedule") == "wsd" and effective_tokens is not None:
+        warmup = int(cfg.extra.get("wsd_warmup_tokens", 0))
+        decay = int(cfg.extra.get("wsd_decay_tokens", 0))
+        total = int(
+            cfg.extra.get("curriculum_effective_tokens")
+            or cfg.target_tokens
+            or 0
+        )
+        if total < 1:
+            raise ValueError("WSD schedule requires curriculum_effective_tokens or target_tokens")
+        stable_end = max(warmup, total - decay)
+        tok = max(0, int(effective_tokens))
+        if tok < warmup:
+            return base_lr * tok / max(1, warmup)
+        if tok >= total:
+            return base_lr * cfg.min_lr_ratio
+        if tok >= stable_end:
+            progress = (tok - stable_end) / max(1, total - stable_end)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return base_lr * (cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * cosine)
+        return base_lr
+
     if step < cfg.warmup_steps:
         return base_lr * step / max(1, cfg.warmup_steps)
     if step >= cfg.max_steps:

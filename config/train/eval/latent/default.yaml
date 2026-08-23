@@ -5,4 +5,6 @@ _doc: latent 默认在线评测（仅 held-out 重建 CE；gen 字段占位以�
 name: default  # 配置名；非 prototype 时与文件名一致
 eval_sample_count: 1024  # held-out 子采样条数；null 表示全量
 eval_sample_seed: 42  # held-out 子采样随机种子
+# eval_split: dev  # 省略则自动：owt 用 dev，arxiv 等用 eval
+vae_probe_samples: 16  # 每次 eval 的 VAE probe 图数量（0=关闭）
 gen_eval_samples: 256  # 占位（latent 不跑 gen-eval；与 lm 同值以保持 config-hash）

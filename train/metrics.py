@@ -89,15 +89,25 @@ EVAL_SAMPLE_BASE_FIELDS = [
 _TRAIN_LOG = "[train]"
 
 
-def train_csv_fields(model: str) -> list[str]:
+def train_csv_fields(model: str, cfg: Any | None = None) -> list[str]:
     if kind_of(model) == "latent":
-        return list(TRAIN_CSV_FIELDS_LATENT)
+        fields = list(TRAIN_CSV_FIELDS_LATENT)
+        if cfg is not None and cfg.extra.get("curriculum"):
+            fields.extend(["curriculum_stage", "observation_window"])
+        return fields
     return list(TRAIN_CSV_FIELDS_LM)
 
 
-def eval_csv_fields(model: str) -> list[str]:
+def eval_csv_fields(model: str, cfg: Any | None = None) -> list[str]:
     if kind_of(model) == "latent":
-        return list(EVAL_CSV_FIELDS_LATENT)
+        fields = list(EVAL_CSV_FIELDS_LATENT)
+        if cfg is not None and cfg.extra.get("curriculum"):
+            from train.latent_eval import latent_curriculum_eval_fields
+
+            for name in latent_curriculum_eval_fields():
+                if name not in fields:
+                    fields.append(name)
+        return fields
     return list(EVAL_CSV_FIELDS_LM)
 
 
@@ -284,6 +294,8 @@ def build_latent_train_row(
     tokens_per_sec: float,
     *,
     metrics: dict[str, Any] | None = None,
+    curriculum_stage: str = "",
+    observation_window: bool | None = None,
 ) -> dict[str, Any]:
     """latent 宽主表行（无 train_ppl / official 卫星）。"""
     metrics = dict(metrics or {})
@@ -294,6 +306,10 @@ def build_latent_train_row(
         "lr": lr,
         "tokens_per_sec": round(tokens_per_sec, 2),
     }
+    if curriculum_stage:
+        row["curriculum_stage"] = curriculum_stage
+    if observation_window is not None:
+        row["observation_window"] = int(observation_window)
     for key in (
         "recon_ce",
         "kl",

@@ -1,0 +1,23 @@
+# =============================================================================
+# latent_vae · 长度课程（10B 有效 token；schedule=latent-curriculum）
+# =============================================================================
+_doc: latent_vae · curriculum（T5-small 维数；owt-seg512→bucket 四阶段）  # 文件说明，写入 extra
+name: latent_vae  # 模型名；与目录名一致
+variant: full  # checkpoint 目录仍用 full
+
+optimizer:
+  dtype: bf16
+  learning_rate: 0.002
+  weight_decay: 0
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1
+  muon_learning_rate: 0.002
+  muon_weight_decay: 0
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  ema_decay: 0.9999
+
+batch:
+  batch_size: 16
+  global_batch_size: 128

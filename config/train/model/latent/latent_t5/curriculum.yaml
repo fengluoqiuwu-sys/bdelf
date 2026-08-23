@@ -1,0 +1,29 @@
+# =============================================================================
+# latent_t5 · 长度课程（10B 有效 token；schedule=latent-curriculum）
+# =============================================================================
+_doc: latent_t5 · curriculum（T5-small 维数；owt-seg512→bucket 四阶段）  # 文件说明，写入 extra
+name: latent_t5  # 模型名；与目录名一致
+variant: full  # checkpoint 目录仍用 full
+
+# -----------------------------------------------------------------------------
+# 优化器（Muon + AdamW 混合）
+# -----------------------------------------------------------------------------
+optimizer:
+  dtype: bf16  # 训练精度：bf16 | fp16 | fp32
+  learning_rate: 0.002  # AdamW 学习率（WSD 峰值）
+  weight_decay: 0  # AdamW weight decay
+  beta1: 0.9  # AdamW β1
+  beta2: 0.95  # AdamW β2
+  grad_clip: 1  # 梯度裁剪阈值
+  muon_learning_rate: 0.002  # Muon 学习率（WSD 峰值）
+  muon_weight_decay: 0  # Muon weight decay
+  muon_momentum: 0.95  # Muon momentum
+  muon_ns_steps: 5  # Muon Newton–Schulz 步数
+  ema_decay: 0.9999  # EMA 衰减；0 表示关闭
+
+# -----------------------------------------------------------------------------
+# Batch（每 GPU 16；阶段内 global_seq_batch 由课程切换 accum）
+# -----------------------------------------------------------------------------
+batch:
+  batch_size: 16  # 每 GPU 微批大小
+  global_batch_size: 128  # 与 S4 global_seq_batch 对齐（最小阶段全局条数）
