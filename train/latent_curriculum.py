@@ -206,6 +206,7 @@ class LatentCurriculumSampler:
     batch_size: int
     stage_batch_sizes: Dict[int, int] = field(default_factory=dict)
     effective_tokens_global: int = 0
+    stage_micro_step: int = 0
     _stage_idx: int = 0
     _last_bucket: int = 0
     _last_batch_l: int = 0
@@ -280,9 +281,27 @@ class LatentCurriculumSampler:
     def _stage_end_tokens(self, stage_idx: int) -> int:
         return sum(s.effective_budget for s in self.spec.stages[: stage_idx + 1])
 
+    def stage_start_tokens(self, stage_idx: int | None = None) -> int:
+        idx = self._stage_idx if stage_idx is None else int(stage_idx)
+        if idx <= 0:
+            return 0
+        return self._stage_end_tokens(idx - 1)
+
+    def tokens_in_stage(self, stage_idx: int | None = None) -> tuple[int, int]:
+        """指定阶段已消耗的有效 token 与该阶段预算（用于进度条）。"""
+        idx = self._stage_idx if stage_idx is None else int(stage_idx)
+        start = self.stage_start_tokens(idx)
+        budget = int(self.spec.stages[idx].effective_budget)
+        done = int(self.effective_tokens_global) - start
+        if done < 0:
+            done = 0
+        if done > budget:
+            done = budget
+        return done, budget
+
     def sync_stage(self) -> None:
         while (
-            self._stage_idx < len(self._stages) - 1
+            self._stage_idx < len(self.spec.stages) - 1
             and self.effective_tokens_global >= self._stage_end_tokens(self._stage_idx)
         ):
             self._stage_idx += 1
@@ -390,6 +409,7 @@ class LatentCurriculumSampler:
             "batch_size": self.current_batch_size,
             "grad_accum_steps": self.grad_accum_steps,
             "effective_tokens_global": self.effective_tokens_global,
+            "stage_micro_step": self.stage_micro_step,
             "target_effective_tokens": self.spec.effective_target_tokens,
         }
 

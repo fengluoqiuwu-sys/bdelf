@@ -22,6 +22,7 @@ TRAIN_CSV_FIELDS_LM = [
     "tokens_per_sec",
 ]
 TRAIN_CSV_FIELDS_LATENT = [
+    "curriculum_stage",
     "step",
     "tokens",
     "train_loss",
@@ -45,6 +46,7 @@ EVAL_CSV_FIELDS_LM = [
     "eval_ppl",
 ]
 EVAL_CSV_FIELDS_LATENT = [
+    "curriculum_stage",
     "step",
     "tokens",
     "lr",
@@ -93,7 +95,8 @@ def train_csv_fields(model: str, cfg: Any | None = None) -> list[str]:
     if kind_of(model) == "latent":
         fields = list(TRAIN_CSV_FIELDS_LATENT)
         if cfg is not None and cfg.extra.get("curriculum"):
-            fields.extend(["curriculum_stage", "observation_window"])
+            if "observation_window" not in fields:
+                fields.append("observation_window")
         return fields
     return list(TRAIN_CSV_FIELDS_LM)
 
@@ -211,6 +214,44 @@ def truncate_csv_for_resume(csv_path: Path, start_step: int, fields: list[str]) 
     return len(rows)
 
 
+def _curriculum_stage_rank(name: str) -> int:
+    raw = (name or "").strip().lower()
+    if len(raw) >= 2 and raw[0] == "s" and raw[1:].isdigit():
+        return int(raw[1:])
+    return 0
+
+
+def truncate_csv_for_curriculum_resume(
+    csv_path: Path,
+    *,
+    resume_stage: str,
+    resume_step: int,
+    fields: list[str],
+) -> int:
+    """保留 (curriculum_stage, step) 严格早于 resume 点的行（step 为阶段内计数）。"""
+    if not csv_path.exists():
+        return 0
+    resume_key = (_curriculum_stage_rank(resume_stage), int(resume_step))
+    kept_rows: list[dict[str, str]] = []
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            stage = str(row.get("curriculum_stage") or "")
+            try:
+                step = int(row.get("step") or 0)
+            except ValueError:
+                continue
+            if (_curriculum_stage_rank(stage), step) < resume_key:
+                kept_rows.append(row)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in kept_rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+    return len(kept_rows)
+
+
 def _as_optional_float(raw: Any) -> float | None:
     if raw is None:
         return None
@@ -300,14 +341,13 @@ def build_latent_train_row(
     """latent 宽主表行（无 train_ppl / official 卫星）。"""
     metrics = dict(metrics or {})
     row: dict[str, Any] = {
+        "curriculum_stage": curriculum_stage,
         "step": step,
         "tokens": tokens,
         "train_loss": round(train_loss, 6) if train_loss == train_loss else "",
         "lr": lr,
         "tokens_per_sec": round(tokens_per_sec, 2),
     }
-    if curriculum_stage:
-        row["curriculum_stage"] = curriculum_stage
     if observation_window is not None:
         row["observation_window"] = int(observation_window)
     for key in (

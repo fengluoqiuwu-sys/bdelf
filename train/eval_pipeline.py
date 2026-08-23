@@ -383,10 +383,14 @@ def run_online_eval(
     eval_tokens: int | None = None,
     latent_probe_pool: Dataset | None = None,
     latent_pad_token_id: int | None = None,
+    log_step: int | None = None,
+    log_stage: str | None = None,
 ) -> None:
     """HeldOut 永写主表；按 tick 跑到期组件；共享生成至多一次。"""
     is_latent = kind_of(cfg.model) == "latent"
     eval_fields = eval_csv_fields(cfg.model, cfg)
+    csv_step = step if log_step is None else int(log_step)
+    csv_stage = "" if log_stage is None else str(log_stage)
     tick = load_eval_tick(run_dir) + 1
     components = resolve_online_eval_components(model)
     due = [c for c in components if _component_due(c, tick)]
@@ -416,7 +420,7 @@ def run_online_eval(
                 model,
                 ctx=curriculum_eval_ctx,
                 sampler=curriculum_sampler,
-                step=step,
+                step=csv_step,
                 tokens=data_tokens,
                 lr=lr,
                 device=device,
@@ -429,6 +433,8 @@ def run_online_eval(
                 log=(rank == 0),
             )
             release_eval_cuda_scratch(model, log=(rank == 0))
+            if csv_stage:
+                curriculum_eval_row["curriculum_stage"] = csv_stage
         else:
             eval_loss, eval_ppl = eval_model_ppl(
                 unwrap_model(model),
@@ -482,11 +488,13 @@ def run_online_eval(
             save_eval_tick(run_dir, tick)
         else:
             eval_row: dict[str, Any] = {
-                "step": step,
+                "step": csv_step,
                 "tokens": data_tokens,
                 "lr": lr,
                 "eval_loss": round(eval_loss, 6) if eval_loss == eval_loss else "",
             }
+            if is_latent:
+                eval_row["curriculum_stage"] = csv_stage
             if not is_latent:
                 eval_row["eval_ppl"] = (
                     round(eval_ppl, 4) if eval_ppl == eval_ppl else ""

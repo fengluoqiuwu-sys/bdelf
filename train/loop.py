@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -83,6 +84,71 @@ def _grad_accum_steps(
     return cfg.grad_accum_steps
 
 
+def _curriculum_run_desc(cfg: FL_TrainConfig) -> str:
+    """进度条前缀：模型名 + --set 的 readout / 方向 / B / D，便于多 run 串跑区分。"""
+    refs = cfg.extra.get("config_refs") or {}
+    ov = refs.get("overrides") or {}
+    mo = ov.get("model") or {}
+    parts = [str(cfg.model)]
+    bi = mo.get("bidirectional")
+    if bi is True:
+        parts.append("bi")
+    elif bi is False:
+        parts.append("uni")
+    readout = mo.get("readout")
+    if readout is not None:
+        parts.append(str(readout))
+    if "latent_dim" in mo:
+        parts.append(f"B={mo['latent_dim']}")
+    if "block_size" in mo:
+        parts.append(f"D={mo['block_size']}")
+    return " ".join(parts)
+
+
+def _fmt_hms(seconds: float) -> str:
+    if seconds != seconds or seconds == float("inf") or seconds < 0:
+        return "?"
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _open_curriculum_stage_pbar(
+    sampler: LatentCurriculumSampler,
+    *,
+    run_desc: str,
+) -> tqdm:
+    done, budget = sampler.tokens_in_stage()
+    stage = sampler.current_stage
+    return tqdm(
+        total=budget,
+        initial=done,
+        unit="tok",
+        unit_scale=True,
+        unit_divisor=1000,
+        dynamic_ncols=True,
+        leave=True,
+        smoothing=0.0,
+        desc=f"{run_desc} | {stage.name}",
+        bar_format=(
+            "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+            "[{elapsed}]{postfix}"
+        ),
+    )
+
+
+def _close_stage_pbar(pbar: tqdm | None) -> None:
+    if pbar is None:
+        return
+    if pbar.total:
+        pbar.n = pbar.total
+        pbar.refresh()
+    pbar.close()
+
+
 def _all_ranks_true(local_ok: bool, device: torch.device, is_distributed: bool) -> bool:
     """Return True only if every rank reports ``local_ok``."""
     if not is_distributed:
@@ -121,16 +187,45 @@ def _try_open_ckpt(path: Path, *, timeout_s: float = 2.0) -> Path | None:
         return None
 
 
+_STAGE_SNAP_RE = re.compile(r"^(s\d+)-checkpoint_step_(\d+)\.pt$", re.I)
+_OLD_SNAP_RE = re.compile(r"^checkpoint_step_(\d+)\.pt$")
+
+
+def _snapshot_sort_key(path: Path) -> tuple[int, int]:
+    """课程快照按 (阶段号, 阶段内 step)；旧 ``checkpoint_step_*`` 视为阶段 0。"""
+    m = _STAGE_SNAP_RE.match(path.name)
+    if m:
+        stage = m.group(1).lower()
+        rank = int(stage[1:]) if stage[1:].isdigit() else 0
+        return (rank, int(m.group(2)))
+    m2 = _OLD_SNAP_RE.match(path.name)
+    if m2:
+        return (0, int(m2.group(1)))
+    return (0, 0)
+
+
+def _snapshot_ckpt_path(
+    run_dir: Path,
+    *,
+    global_step: int,
+    sampler: LatentCurriculumSampler | None,
+) -> Path:
+    if sampler is None:
+        return run_dir / f"checkpoint_step_{global_step:07d}.pt"
+    return run_dir / (
+        f"{sampler.current_stage.name}-checkpoint_step_"
+        f"{sampler.stage_micro_step:07d}.pt"
+    )
+
+
 def _pick_resume_ckpt(run_dir: Path) -> Path | None:
     """Prefer latest, then explicit resume_*, then newest step_* that can open."""
     candidates: list[Path] = [run_dir / "checkpoint_latest.pt"]
     candidates.extend(sorted(run_dir.glob("checkpoint_resume_*.pt"), reverse=True))
-    step_ckpts = sorted(
-        run_dir.glob("checkpoint_step_*.pt"),
-        key=lambda p: p.name,
-        reverse=True,
-    )
-    candidates.extend(step_ckpts)
+    snaps = list(run_dir.glob("checkpoint_step_*.pt"))
+    snaps.extend(run_dir.glob("s*-checkpoint_step_*.pt"))
+    snaps = sorted(snaps, key=_snapshot_sort_key, reverse=True)
+    candidates.extend(snaps)
     seen: set[Path] = set()
     for cand in candidates:
         try:
@@ -422,8 +517,15 @@ def train_loop(
                 loaded_curriculum.get("effective_tokens_global", 0)
             )
             curriculum_sampler._stage_idx = int(loaded_curriculum.get("stage_idx", 0))
+            has_stage_micro = "stage_micro_step" in loaded_curriculum
+            if has_stage_micro:
+                curriculum_sampler.stage_micro_step = int(
+                    loaded_curriculum["stage_micro_step"]
+                )
             curriculum_sampler.sync_stage()
             curriculum_stage_idx = curriculum_sampler._stage_idx
+        else:
+            has_stage_micro = False
         _release_staged_ckpt(
             resume_path, rank=rank, is_distributed=is_distributed,
         )
@@ -438,7 +540,19 @@ def train_loop(
                 )
                 ema_state = init_ema(model)
         if rank == 0:
-            kept = prepare_run_logs(run_dir, model=cfg.model, start_step=step, cfg=cfg)
+            curr_resume = None
+            if curriculum_sampler is not None and has_stage_micro:
+                curr_resume = (
+                    curriculum_sampler.current_stage.name,
+                    curriculum_sampler.stage_micro_step,
+                )
+            kept = prepare_run_logs(
+                run_dir,
+                model=cfg.model,
+                start_step=step,
+                cfg=cfg,
+                curriculum_resume=curr_resume,
+            )
             _train_log(
                 f"Resuming from checkpoint: step {step} "
                 f"(train_log {kept.get('train_log', 0)} rows, "
@@ -536,14 +650,27 @@ def train_loop(
     t0 = time.time()
     step_backward_done = False
     pbar: tqdm | None = None
+    pbar_stage_idx = -1
+    pbar_rate_t0: float | None = None
+    pbar_rate_n0 = 0
+    run_desc = _curriculum_run_desc(cfg)
     if rank == 0:
-        pbar = tqdm(
-            total=cfg.max_steps,
-            initial=step,
-            unit="step",
-            dynamic_ncols=True,
-            leave=True,
-        )
+        if curriculum_sampler is not None:
+            pbar = _open_curriculum_stage_pbar(
+                curriculum_sampler, run_desc=run_desc,
+            )
+            pbar_stage_idx = curriculum_sampler._stage_idx
+            done0, _ = curriculum_sampler.tokens_in_stage()
+            pbar_rate_t0 = None
+            pbar_rate_n0 = done0
+        else:
+            pbar = tqdm(
+                total=cfg.max_steps,
+                initial=step,
+                unit="step",
+                dynamic_ncols=True,
+                leave=True,
+            )
 
     try:
         while step < cfg.max_steps:
@@ -554,8 +681,14 @@ def train_loop(
                     )
                 break
 
+            log_stage_idx = -1
+            log_stage_name = ""
+            log_csv_step = step
             if curriculum_sampler is not None:
                 batch, eff_rank = curriculum_sampler.fetch_batch(step, rank)
+                log_stage_idx = curriculum_sampler._stage_idx
+                log_stage_name = curriculum_sampler.current_stage.name
+                log_csv_step = curriculum_sampler.stage_micro_step
             else:
                 assert train_ds is not None
                 batch = fetch_train_batch(
@@ -699,16 +832,14 @@ def train_loop(
             )
             if is_latent:
                 train_row = build_latent_train_row(
-                    step,
+                    log_csv_step,
                     log_tokens,
                     train_loss,
                     lr,
                     tokens_per_sec,
                     metrics=metrics,
                     curriculum_stage=(
-                        curriculum_sampler.current_stage.name
-                        if curriculum_sampler is not None
-                        else ""
+                        log_stage_name if curriculum_sampler is not None else ""
                     ),
                     observation_window=(
                         curriculum_in_observation_window(curriculum_sampler)
@@ -763,6 +894,8 @@ def train_loop(
                     eval_tokens=log_tokens if is_latent else None,
                     latent_probe_pool=latent_probe_pool,
                     latent_pad_token_id=latent_pad_token_id,
+                    log_step=log_csv_step if curriculum_sampler is not None else None,
+                    log_stage=log_stage_name or None,
                 )
 
             if rank == 0:
@@ -823,7 +956,41 @@ def train_loop(
                         "lr": f"{lr:.2e}",
                         "tok_s": f"{tokens_per_sec:.0f}",
                     }
-                pbar.set_postfix(**postfix)
+                if (
+                    curriculum_sampler is not None
+                    and pbar is not None
+                ):
+                    if curriculum_sampler._stage_idx != pbar_stage_idx:
+                        _close_stage_pbar(pbar)
+                        pbar = _open_curriculum_stage_pbar(
+                            curriculum_sampler, run_desc=run_desc,
+                        )
+                        pbar_stage_idx = curriculum_sampler._stage_idx
+                        pbar_rate_t0 = None
+                        pbar_rate_n0, _ = curriculum_sampler.tokens_in_stage()
+                    done, budget = curriculum_sampler.tokens_in_stage()
+                    now = time.perf_counter()
+                    if pbar_rate_t0 is None:
+                        # 本阶段第一微批（常含 compile）只推进进度；速度从下一拍起算
+                        pbar_rate_t0 = now
+                        pbar_rate_n0 = done
+                        postfix["tok/s"] = "?"
+                        postfix["eta"] = "?"
+                    else:
+                        gained = max(0, done - pbar_rate_n0)
+                        elapsed_sn = max(now - pbar_rate_t0, 1e-9)
+                        tok_s_sn = gained / elapsed_sn
+                        remain = max(0, budget - done)
+                        postfix["tok/s"] = f"{tok_s_sn:.0f}"
+                        postfix["eta"] = _fmt_hms(
+                            remain / tok_s_sn if tok_s_sn > 0 else float("inf")
+                        )
+                    postfix.pop("tok_s", None)
+                    pbar.n = done
+                    pbar.set_postfix(**postfix)
+                    pbar.refresh()
+                elif pbar is not None:
+                    pbar.set_postfix(**postfix)
                 append_csv_row(train_csv, train_fields, train_row)
                 if official_row is not None:
                     append_csv_row(
@@ -841,9 +1008,14 @@ def train_loop(
                     ):
                         _rank0_log(line, pbar)
 
+            if curriculum_sampler is not None:
+                curriculum_sampler.stage_micro_step += 1
+                if curriculum_sampler._stage_idx != log_stage_idx:
+                    curriculum_sampler.stage_micro_step = 0
+
             rank0_sync = False
             if rank == 0:
-                if pbar is not None:
+                if pbar is not None and curriculum_sampler is None:
                     pbar.update(1)
 
                 # save_step / snapshot_step are independent intervals; do not nest
@@ -860,7 +1032,11 @@ def train_loop(
                     )
                     if do_snapshot:
                         save_checkpoint(
-                            run_dir / f"checkpoint_step_{next_step:07d}.pt",
+                            _snapshot_ckpt_path(
+                                run_dir,
+                                global_step=next_step,
+                                sampler=curriculum_sampler,
+                            ),
                             model, optimizer, next_step, cfg, model_meta,
                             ema_state=ema_state,
                             curriculum_state=_curriculum_ckpt(),
@@ -899,13 +1075,18 @@ def train_loop(
     # covers the common case where it is not.
     if rank == 0:
         if pbar is not None:
-            pbar.close()
+            if curriculum_sampler is not None and curriculum_sampler.is_complete():
+                _close_stage_pbar(pbar)
+            else:
+                pbar.close()
         save_checkpoint(
             latest_ckpt, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,
             curriculum_state=_curriculum_ckpt(),
         )
-        final_snapshot = run_dir / f"checkpoint_step_{step:07d}.pt"
+        final_snapshot = _snapshot_ckpt_path(
+            run_dir, global_step=step, sampler=curriculum_sampler,
+        )
         save_checkpoint(
             final_snapshot, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,

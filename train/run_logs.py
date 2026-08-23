@@ -17,6 +17,7 @@ from train.metrics import (
     eval_csv_fields,
     init_csv_header,
     train_csv_fields,
+    truncate_csv_for_curriculum_resume,
     truncate_csv_for_resume,
 )
 from models import kind_of
@@ -220,8 +221,13 @@ def prepare_run_logs(
     model: str,
     start_step: int | None = None,
     cfg: Any | None = None,
+    curriculum_resume: tuple[str, int] | None = None,
 ) -> dict[str, int]:
-    """迁移 → schema 对齐 →（可选）按 step 截断。返回 kept 计数。"""
+    """迁移 → schema 对齐 →（可选）按 step 截断。返回 kept 计数。
+
+    ``curriculum_resume=(stage, stage_micro_step)`` 时，train/eval 主表按
+    ``(curriculum_stage, 阶段内 step)`` 字典序截断；``tokens`` 仍是全局累计。
+    """
     migrate_run_logs(run_dir, model=model)
     align_run_log_schemas(run_dir, model=model, cfg=cfg)
 
@@ -233,16 +239,31 @@ def prepare_run_logs(
     init_csv_header(eval_csv, eval_fields)
 
     kept: dict[str, int] = {}
-    if start_step is None:
+    if start_step is None and curriculum_resume is None:
         return kept
 
-    kept["train_log"] = truncate_csv_for_resume(
-        train_csv, start_step, train_fields,
-    )
-    kept["eval_log"] = truncate_csv_for_resume(
-        eval_csv, start_step, eval_fields,
-    )
-    if kind_of(model) == "lm":
+    if curriculum_resume is not None:
+        resume_stage, resume_step = curriculum_resume
+        kept["train_log"] = truncate_csv_for_curriculum_resume(
+            train_csv,
+            resume_stage=resume_stage,
+            resume_step=resume_step,
+            fields=train_fields,
+        )
+        kept["eval_log"] = truncate_csv_for_curriculum_resume(
+            eval_csv,
+            resume_stage=resume_stage,
+            resume_step=resume_step,
+            fields=eval_fields,
+        )
+    elif start_step is not None:
+        kept["train_log"] = truncate_csv_for_resume(
+            train_csv, start_step, train_fields,
+        )
+        kept["eval_log"] = truncate_csv_for_resume(
+            eval_csv, start_step, eval_fields,
+        )
+    if kind_of(model) == "lm" and start_step is not None:
         toff = train_official_csv(run_dir)
         if toff.exists() or start_step is not None:
             if toff.exists():

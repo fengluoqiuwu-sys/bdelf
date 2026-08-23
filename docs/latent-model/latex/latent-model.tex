@@ -24,7 +24,7 @@
 \begin{abstract}
 本文档完整说明 bdelf 仓库中两个 Stage-1 连续 latent 模型族 \texttt{latent\_t5} 与 \texttt{latent\_vae} 的动机、结构、读出变体、损失函数与训练接口。
 二者共享 T5-small 级张量形状（$E{=}512$，$d_{\mathrm{kv}}{=}64$，$d_{\mathrm{ff}}{=}2048$，encoder/decoder 各 6 层），但 decoder 拓扑与辅助损失不同。
-本文档亦说明\textbf{为何}在 Cola 路线之外做这组对照，以及二者作为扩散语言模型（DLM）Stage-2 \emph{语义空间}的初步优劣分析。
+本文档亦说明\textbf{为何}在 Cola 路线之外做这组对照，二者作为扩散语言模型（DLM）Stage-2 \emph{语义空间}的初步优劣分析，以及当前 Stage-1 长度课程的训练矩阵（第~\ref{sec:runs} 节）。
 工程路径、CLI 与配置表见同目录上级 \texttt{README.md}。
 \end{abstract}
 
@@ -416,6 +416,82 @@ S3、S4 各在阶段开头留 \textbf{0.2B} 观察窗（计入该阶段预算）
 S4 的 cosine 退火仅在观察窗之后的最后 0.8B 进行。
 评测须\textbf{按桶}报告 \texttt{recon\_ce}、KL、\texttt{mask\_acc}，并保留 bucket-512 遗忘对照；禁止单条 \texttt{eval\_loss} 决策。
 
+\section{当前 Stage-1 训练矩阵}
+\label{sec:runs}
+
+本节记录\textbf{正在进行 / 即将按此清单执行}的长度课程训练（协议同第~\ref{sec:curriculum} 节：10B 有效 token、\texttt{100m-curriculum}、\texttt{preprocess=latent-curriculum}、OWT）。
+超参以 CLI \texttt{--set} 覆盖，进入配置哈希；每组独立 run 目录。
+$B$ 为 \texttt{latent\_dim}；$D$ 为 \texttt{block\_size}（$D{=}1$ 逐 token 因果，$D{=}16$ 块因果）；T5 的 readout 为 \texttt{e}（$z\in\mathbb{R}^{E}$）或 \texttt{b}（$z\in\mathbb{R}^{B}$）。
+双向 T5 无 $D$（encoder 与 decoder self-attn 全双向，不走块 mask）。
+合计 \textbf{20} 组：VAE 8 + T5 12。
+
+\subsection{硬件}
+
+\begin{center}
+\small
+\begin{tabular}{lllll}
+\toprule
+模型 & 服务 & 调度 & 可见 GPU & 单卡 \\
+\midrule
+\texttt{latent\_vae} & \texttt{ovan-server} & Slurm（\texttt{cls1}，QOS \texttt{long}） & 4$\times$ RTX 4090 & 24\,GiB \\
+\texttt{latent\_t5} & \texttt{train-server-2} & common & 8$\times$ RTX 5090 & 32\,GiB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+VAE 拆成两个 4 卡作业：作业内按 $B$ 升序串跑；作业 1 为 $D{=}1$ 四组，作业 2 为 $D{=}16$ 四组（依赖作业 1 结束后再占卡）。
+T5 在 \texttt{train-server-2} 上按下列格点训练。
+
+\subsection{\texttt{latent\_vae}（ovan-server，4\texttimes4090）}
+
+固定：$B$ 读出、因果/块因果 encoder、并行 decoder。扫 $B{\in}\{16,32,64,128\}$ 与 $D{\in}\{1,16\}$，共 8 组。
+
+\begin{center}
+\small
+\begin{tabular}{lcc}
+\toprule
+$B \backslash D$ & $D{=}1$（逐 token 因果） & $D{=}16$（块因果） \\
+\midrule
+16 & $\checkmark$ & $\checkmark$ \\
+32 & $\checkmark$ & $\checkmark$ \\
+64 & $\checkmark$ & $\checkmark$ \\
+128 & $\checkmark$ & $\checkmark$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{latent\_t5}（train-server-2，8\texttimes5090）}
+
+\begin{center}
+\small
+\begin{tabular}{llllrr}
+\toprule
+方向 & readout & $B$ & $D$ & 组数 & 合计 \\
+\midrule
+双向 & \texttt{e} & 32, 64 & --- & 2 & 2 \\
+单向 & \texttt{e} & 16, 32, 64, 128 & 1, 16 & $4{\times}2$ & 8 \\
+单向 & \texttt{b} & 32, 64 & 1 & 2 & 2 \\
+\midrule
+ &  &  &  &  & \textbf{12} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+逐组展开：
+
+\begin{itemize}
+  \item \textbf{双向 / readout=\texttt{e}}：$(B{=}32)$、$(B{=}64)$。
+  \item \textbf{单向 / readout=\texttt{e}}：$B{\in}\{16,32,64,128\}$、$D{\in}\{1,16\}$ 全组合（8 组）：
+    \begin{itemize}
+      \item $D{=}1$：$(16,1)$、$(32,1)$、$(64,1)$、$(128,1)$
+      \item $D{=}16$：$(16,16)$、$(32,16)$、$(64,16)$、$(128,16)$
+    \end{itemize}
+  \item \textbf{单向 / readout=\texttt{b}}：$(B{=}32,D{=}1)$、$(B{=}64,D{=}1)$。
+\end{itemize}
+
+CLI 对应：双向默认 \texttt{bidirectional=true}；单向 \texttt{--set model.bidirectional=false}；
+\texttt{readout=b} 时 \texttt{--set model.readout=b}；$B,D$ 为 \texttt{model.latent\_dim}、\texttt{model.block\_size}。
+
 \section{设计选择与局限}
 
 \begin{enumerate}
@@ -431,6 +507,7 @@ S4 的 cosine 退火仅在观察窗之后的最后 0.8B 进行。
 \texttt{latent\_t5} 与 \texttt{latent\_vae} 在共享 T5-small 维数 encoder 与 Cola 式 ELBO 下，分别检验「双向并行重建（默认可切单向 AR）+ span 辅助」与「因果 + 并行解码 + BERT-mask」两条 Stage-1 路线（动机与 DLM 语义空间讨论见第~\ref{sec:why}--\ref{sec:dlm-space} 节）。
 读出变体 \texttt{readout=e|b} 控制随机变量所在空间与 cross-attn memory 维数，便于消融瓶颈与 KL 尺度。
 长度课程（10B、四阶段数据配比、WSD 优化器）见第~\ref{sec:curriculum} 节。
+当前 Stage-1 训练矩阵（VAE：ovan-server 4\texttimes4090；T5：train-server-2 8\texttimes5090）见第~\ref{sec:runs} 节。
 工程细节以代码与 \texttt{README.md} 为准；本文档描述设计意图与完整行为规格。
 
 \printbibliography

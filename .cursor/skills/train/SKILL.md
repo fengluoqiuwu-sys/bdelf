@@ -69,7 +69,7 @@ description: >-
 
 `cache/checkpoints/{fast\|full}/{model}/{hash}/`：
 
-- `checkpoint_latest.pt` / `checkpoint_step_*.pt`
+- `checkpoint_latest.pt` / `checkpoint_step_*.pt`（课程 run 的分阶段快照为 `{sn}-checkpoint_step_*.pt`，如 `s1-checkpoint_step_0001000.pt`；`latest` 名不变）
 - `config.json`、`hardware.json`、`train_log.csv`、`eval_log.csv`、曲线图
 - full 训练时 upsert 本地 `hash_guide.csv`（fast 不写入；不同步）
 
