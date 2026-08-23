@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         "--port",
         type=int,
         default=None,
-        help="监听端口（默认随机 16385–65535）",
+        help="监听端口（默认复用上次成功端口，不可用再随机 16385–65535）",
     )
     parser.add_argument(
         "--root",
@@ -40,10 +40,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from monitor.app import create_app
-    from monitor.port import pick_port
+    from monitor.port import pick_port, read_last_port, write_last_port
 
     repo_root = args.root.resolve()
-    port = args.port if args.port is not None else pick_port(args.host)
+    slot = args.instance or "local"
+    if args.port is not None:
+        port = args.port
+    else:
+        port = pick_port(args.host, prefer=read_last_port(repo_root, slot))
+    write_last_port(repo_root, slot, port)
     if port < 16385:
         print(f"警告：端口 {port} < 16385，建议使用高端口", file=sys.stderr)
 

@@ -24,8 +24,8 @@ usage() {
 
   local       本机直接跑 monitor.py（--instance local）
   <服务名>    scripts/servers.csv「名字」列：远端跑 monitor（--instance remote），
-              本机随机高端口做 SSH 隧道。远端若还没有 monitor.py 会
-              sync push --code-only（instance.json 写成 remote）。
+              本机高端口做 SSH 隧道（优先复用上次本机端口，占用再随机）。
+              远端若还没有 monitor.py 会 sync push --code-only（instance.json 写成 remote）。
 
   up          拉起服务；已在跑则打印现有地址
   down        关掉本脚本拉起的进程（远端后端 + 本机隧道），避免继续占端口
@@ -61,17 +61,19 @@ kill_pid() {
 }
 
 pick_local_port() {
-  local prefer="${1:-}"
-  "${PY}" - "${prefer}" <<'PY'
+  local name="$1"
+  local prefer="${2:-}"
+  "${PY}" - "${ROOT}" "${name}" "${prefer}" <<'PY'
 import sys
-from monitor.port import pick_port, port_available
-prefer = sys.argv[1].strip()
-if prefer.isdigit():
-    p = int(prefer)
-    if p >= 16385 and port_available("127.0.0.1", p):
-        print(p)
-        raise SystemExit(0)
-print(pick_port("127.0.0.1"))
+from pathlib import Path
+from monitor.port import pick_port, read_last_port, write_last_port
+root = Path(sys.argv[1])
+name = sys.argv[2]
+prefer = sys.argv[3].strip()
+want = int(prefer) if prefer.isdigit() else read_last_port(root, name)
+port = pick_port("127.0.0.1", prefer=want)
+write_last_port(root, name, port)
+print(port)
 PY
 }
 
@@ -312,7 +314,7 @@ cmd_up_remote() {
   if pid_alive "${tunnel_pid}"; then
     kill_pid "${tunnel_pid}"
   fi
-  local_port="$(pick_local_port "${remote_port}")"
+  local_port="$(pick_local_port "${SERVER_NAME}" "${local_port}")"
   start_tunnel "${local_port}" "${remote_port}"
   tunnel_pid="${TUNNEL_PID}"
   if ! wait_listening "${local_port}" 40; then
