@@ -19,7 +19,7 @@ optimizer:
   muon_weight_decay: 0  # Muon weight decay
   muon_momentum: 0.95  # Muon momentum
   muon_ns_steps: 5  # Muon Newton–Schulz 步数
-  ema_decay: 0.9999  # EMA 衰减；0 表示关闭
+  ema_decay: 0.997  # EMA 衰减；0 表示关闭
 
 # -----------------------------------------------------------------------------
 # Batch（全局批；accum = global_batch_size / (batch_size * world_size)）

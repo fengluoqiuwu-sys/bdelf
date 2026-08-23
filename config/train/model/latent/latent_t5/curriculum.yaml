@@ -19,7 +19,7 @@ optimizer:
   muon_weight_decay: 0  # Muon weight decay
   muon_momentum: 0.95  # Muon momentum
   muon_ns_steps: 5  # Muon Newton–Schulz 步数
-  ema_decay: 0.9999  # EMA 衰减；0 表示关闭
+  ema_decay: 0.997  # EMA 衰减；0 表示关闭
 
 # -----------------------------------------------------------------------------
 # Batch（每 GPU 微批随图长：S1/S2=16，S3=8，S4=4；accum 维持全局条数）

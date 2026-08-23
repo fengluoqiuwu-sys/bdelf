@@ -159,7 +159,7 @@ Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignor
 | stable | ~**9.2B** | 恒定 **2e-3** |
 | decay（仅 S4 末） | **0.8B** | cosine 2e-3 → 2e-4 |
 
-Muon + AdamW 同一峰值 LR；`weight_decay=0`；`beta1=0.9` `beta2=0.95`；`grad_clip=1`；`bf16`；`ema_decay=0.9999`。阶段边界**不**改 LR、**不**重置动量/EMA。换 run 目录须整包 `resume`，LR 按总 10B 进度算。
+Muon + AdamW 同一峰值 LR；`weight_decay=0`；`beta1=0.9` `beta2=0.95`；`grad_clip=1`；`bf16`；`ema_decay=0.997`。阶段边界**不**改 LR、**不**重置动量/EMA。换 run 目录须整包 `resume`，LR 按总 10B 进度算。
 
 ### 阶段闸与观察窗
 
