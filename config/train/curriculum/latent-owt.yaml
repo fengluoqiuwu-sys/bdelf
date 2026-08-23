@@ -5,7 +5,8 @@ seg512_preprocess: owt-seg512  # S1 数据源
 bucket_preprocess: owt-bucket  # S2–S4 数据源
 pad_token_key: pad  # 使用 tokenizer layout 的 pad_token_id
 
-# S1–S4：effective_budget、图 L、全局条数、数据集、桶与有效 token 配比
+# S1–S4：effective_budget、峰值图 L、全局条数、数据集、桶与有效 token 配比
+# 训练图长见 train.latent_curriculum.batch_graph_l（每阶段最多两档；微批按峰值 L 固定）
 stages:
   - name: s1
     effective_budget: 3000000000

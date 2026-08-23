@@ -1,4 +1,4 @@
-"""T5-small 维数 Text VAE：块因果 encoder + 统一生成 decoder + Cola 损失。"""
+"""T5-small 维数 Text VAE：因果 / 可选块因果 encoder + 并行 decoder + Cola 损失。"""
 
 from __future__ import annotations
 
@@ -23,11 +23,12 @@ from models.tokens import FL_TokenLayout, apply_token_layout_to_config, token_la
 
 class _LatentVAEBackbone(nn.Module):
     full_sequence_training = True
+    supports_prefix = True
 
     def __init__(
         self,
         token_layout: FL_TokenLayout,
-        max_seq_len: int = 1024,
+        max_seq_len: int = 4096,
         n_layer_enc: int = 6,
         n_layer_dec: int = 6,
         n_head: int = 8,
@@ -109,6 +110,14 @@ class _LatentVAEBackbone(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
+    def _pad_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+        return tokens == self.token_layout.pad_token_id
+
+    def _attn_pad_mask(self, tokens: torch.Tensor) -> torch.Tensor | None:
+        """无 pad 时返回 None。因果模式下游会忽略；块因果 / 双向才真正屏蔽。"""
+        pad = self._pad_mask(tokens)
+        return pad if pad.any() else None
+
     def _loss_targets(self, tokens: torch.Tensor) -> torch.Tensor:
         pad = self.token_layout.pad_token_id
         ignore = self.token_layout.ignore_index
@@ -122,25 +131,37 @@ class _LatentVAEBackbone(nn.Module):
         *,
         sample: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        h = self.encoder(tokens)
+        h = self.encoder(tokens, key_padding_mask=self._attn_pad_mask(tokens))
         return self.readout(h, sample=sample)
 
-    def decode_logits(self, z: torch.Tensor) -> torch.Tensor:
+    def decode_logits(
+        self,
+        z: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = self.from_latent(z)
         mode = self.encoder.attn_mode()
         for block in self.decoder:
-            x = block(x, attn_mode=mode)
+            x = block(x, attn_mode=mode, key_padding_mask=key_padding_mask)
         x = self.dec_ln(x)
         return self.lm_head(x)
 
     def bert_mask_loss(self, tokens: torch.Tensor) -> torch.Tensor:
+        pad = self._pad_mask(tokens)
         mask = torch.rand(tokens.shape, device=tokens.device) < self.mask_ratio
         mask[:, 0] = False
+        mask = mask & ~pad
+        if not mask.any():
+            self.last_mask_acc = torch.tensor(float("nan"), device=tokens.device)
+            return torch.zeros((), device=tokens.device)
         enc_masked = torch.where(
             mask, torch.full_like(tokens, self.mask_token_id), tokens,
         )
         z_m, _, _ = self.encode(enc_masked, sample=True)
-        logits_m = self.decode_logits(z_m)
+        logits_m = self.decode_logits(
+            z_m, key_padding_mask=self._attn_pad_mask(tokens),
+        )
         ignore = self.token_layout.ignore_index
         targets = self._loss_targets(tokens).masked_fill(~mask, ignore)
         mask_loss = F.cross_entropy(
@@ -149,15 +170,10 @@ class _LatentVAEBackbone(nn.Module):
             ignore_index=ignore,
         )
         with torch.no_grad():
-            if mask.any():
-                pred_m = logits_m.argmax(dim=-1)
-                self.last_mask_acc = (
-                    (pred_m[mask] == tokens[mask]).float().mean().detach()
-                )
-            else:
-                self.last_mask_acc = torch.tensor(
-                    float("nan"), device=tokens.device,
-                )
+            pred_m = logits_m.argmax(dim=-1)
+            self.last_mask_acc = (
+                (pred_m[mask] == tokens[mask]).float().mean().detach()
+            )
         return mask_loss
 
     def forward(
@@ -168,8 +184,9 @@ class _LatentVAEBackbone(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del targets, kwargs
         tokens = idx
+        pad = self._pad_mask(tokens)
         z, mu, logvar = self.encode(tokens, sample=self.training)
-        logits = self.decode_logits(z)
+        logits = self.decode_logits(z, key_padding_mask=self._attn_pad_mask(tokens))
 
         loss_targets = self._loss_targets(tokens)
         ce = F.cross_entropy(
@@ -177,7 +194,7 @@ class _LatentVAEBackbone(nn.Module):
             loss_targets.reshape(-1),
             ignore_index=self.token_layout.ignore_index,
         )
-        kl = kl_gaussian(mu, logvar)
+        kl = kl_gaussian(mu, logvar, mask=~pad)
 
         mask_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         if self.training and self.lambda_mask > 0 and self.mask_ratio > 0:
@@ -244,7 +261,9 @@ class _LatentVAEBackbone(nn.Module):
         top_k: int | None = None,
     ) -> torch.Tensor:
         z, _, _ = self.encode(tokens, sample=False)
-        logits = self.decode_logits(z)
+        logits = self.decode_logits(
+            z, key_padding_mask=self._attn_pad_mask(tokens),
+        )
         return sample_from_logits(logits, temperature=temperature, top_k=top_k)
 
     @torch.compiler.disable
@@ -260,29 +279,39 @@ class _LatentVAEBackbone(nn.Module):
         prefix_tokens: torch.Tensor | None = None,
         sampling_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, int]:
-        del sampling_cfg
+        del bos_token_id
+        cfg = sampling_cfg or {}
+        temperature = float(cfg.get("temperature", temperature))
+        top_k = cfg.get("top_k", top_k)
+        if top_k is not None:
+            top_k = int(top_k)
         seqlen = int(seqlen or self.max_seq_len)
         device = next(self.parameters()).device
-        bos = self.token_layout.bos_token_id if bos_token_id is None else bos_token_id
         if prefix_tokens is not None:
-            idx = prefix_tokens.to(device=device, dtype=torch.long)
-            if idx.size(0) != num_samples:
+            prefix = prefix_tokens.to(device=device, dtype=torch.long)
+            if prefix.size(0) != num_samples:
                 raise ValueError("prefix_tokens batch must match num_samples")
-            if idx.size(1) < seqlen:
-                pad = torch.full(
-                    (num_samples, seqlen - idx.size(1)),
-                    self.token_layout.pad_token_id,
-                    device=device,
-                    dtype=torch.long,
-                )
-                idx = torch.cat([idx, pad], dim=1)
-            else:
-                idx = idx[:, :seqlen]
-        else:
-            idx = torch.full(
-                (num_samples, seqlen), bos, dtype=torch.long, device=device,
+            prefix_len = prefix.size(1)
+            if prefix_len >= seqlen:
+                return prefix[:, :seqlen], 0
+            pad = torch.full(
+                (num_samples, seqlen - prefix_len),
+                self.token_layout.pad_token_id,
+                device=device,
+                dtype=torch.long,
             )
-        out = self.reconstruct(idx, temperature=temperature, top_k=top_k)
+            enc_tokens = torch.cat([prefix, pad], dim=1)
+            z, _, _ = self.encode(enc_tokens, sample=False)
+            logits = self.decode_logits(
+                z, key_padding_mask=self._attn_pad_mask(enc_tokens),
+            )
+            rest = sample_from_logits(
+                logits[:, prefix_len:, :], temperature=temperature, top_k=top_k,
+            )
+            return torch.cat([prefix, rest], dim=1), 1
+        z = torch.randn(num_samples, seqlen, self.latent_dim, device=device)
+        logits = self.decode_logits(z)
+        out = sample_from_logits(logits, temperature=temperature, top_k=top_k)
         return out, 1
 
 

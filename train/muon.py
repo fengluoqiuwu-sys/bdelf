@@ -11,9 +11,9 @@ from torch import nn
 
 from train.train import FL_TrainConfig
 
-# AR/BD3LM/BDELF: c_attn/c_proj/c_fc; ELF: qkv/proj/w12/w3
+# AR/BD3LM/BDELF: c_attn/c_proj/c_fc; ELF: qkv/proj/w12/w3；latent_t5 cross-attn: q_proj/k_proj/v_proj
 _HIDDEN_LINEAR_WEIGHT_RE = re.compile(
-    r"\.(attn|mlp)\.(c_attn|c_proj|c_fc|qkv|proj|w12|w3)\.weight$"
+    r"\.(attn|mlp|cross_attn)\.(c_attn|c_proj|c_fc|qkv|proj|w12|w3|q_proj|k_proj|v_proj)\.weight$"
 )
 
 
@@ -243,6 +243,25 @@ def _adamw_groups(
     return groups
 
 
+def _cuda_adamw(
+    groups: list[dict[str, Any]],
+    *,
+    lr: float,
+    betas: tuple[float, float],
+) -> torch.optim.AdamW:
+    kwargs: dict[str, Any] = {"lr": lr, "betas": betas}
+    on_cuda = False
+    for group in groups:
+        for param in group.get("params", ()):
+            on_cuda = bool(getattr(param, "is_cuda", False))
+            break
+        if on_cuda:
+            break
+    if on_cuda:
+        kwargs["fused"] = True
+    return torch.optim.AdamW(groups, **kwargs)
+
+
 def build_optimizer(
     model: nn.Module,
     cfg: FL_TrainConfig,
@@ -251,11 +270,7 @@ def build_optimizer(
         decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
         nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
         groups = _adamw_groups(decay_params, nodecay_params, model=model, cfg=cfg)
-        return torch.optim.AdamW(
-            groups,
-            lr=cfg.learning_rate,
-            betas=(cfg.beta1, cfg.beta2),
-        )
+        return _cuda_adamw(groups, lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2))
 
     muon_params, decay_params, nodecay_params = split_muon_adamw_params(model)
     ratio = _vae_lr_ratio(model)
@@ -274,7 +289,7 @@ def build_optimizer(
         momentum=cfg.muon_momentum,
         ns_steps=cfg.muon_ns_steps,
     )
-    adamw = torch.optim.AdamW(
+    adamw = _cuda_adamw(
         _adamw_groups(decay_params, nodecay_params, model=model, cfg=cfg),
         lr=cfg.learning_rate,
         betas=(cfg.beta1, cfg.beta2),

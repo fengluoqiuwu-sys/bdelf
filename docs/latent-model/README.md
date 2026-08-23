@@ -6,7 +6,7 @@
 
 | CLI `--model` | 目录 | 类型 | 简述 |
 |---|---|---|---|
-| `latent_t5` | [`models/latent/latent_t5/`](../../models/latent/latent_t5/) | latent | T5-small 维数；encoder 可双向/单向 + AR cross-attn decoder |
+| `latent_t5` | [`models/latent/latent_t5/`](../../models/latent/latent_t5/) | latent | T5-small 维数；encoder **与** decoder self-attn 同为双向或同为因果 + cross-attn |
 | `latent_vae` | [`models/latent/latent_vae/`](../../models/latent/latent_vae/) | latent | 同维数；因果 encoder + 并行 decoder |
 | `cola_vae` | [`models/latent/cola_vae/`](../../models/latent/cola_vae/) | latent | 官方 Cola TextVAE（**未改**；Stage-2 仍只认此族） |
 
@@ -20,9 +20,9 @@
 |---|---|---|
 | `n_embd` / `d_kv` / `d_ff` / 层数 | 512 / 64 / 2048 / enc6+dec6 | 同左 |
 | `latent_dim`（瓶颈 B） | 64 | 64 |
-| `max_seq_len` | 1024 | 1024 |
+| `max_seq_len` | 4096 | 4096 |
 | `tokenizer` | gpt2 | gpt2 |
-| encoder 注意力 | `bidirectional: true`（默认）或 `false`（逐 token 单向） | **禁止双向**；`block_size: 1` 单向（默认）或 `>1` 块因果 |
+| encoder / decoder self-attn | `bidirectional: true`（默认，并行重建）或 `false`（因果 AR） | **禁止双向**；`block_size: 1` 单向（默认）或 `>1` 块因果 |
 | 读出 | `readout: e`（可选 `b`） | 固定 B 读出 |
 | 辅助损失 | `lambda_span` + span 腐蚀 | `lambda_mask` + BERT-mask |
 | `beta_kl` | 0.1 | 0.1 |
@@ -75,9 +75,9 @@ models/latent/
 
 | 条件 | 模式 | 实现 |
 |---|---|---|
-| `bidirectional=true` | 全双向 | SDPA 无 mask |
-| `bidirectional=false`, `block_size=1` | 逐 token 因果 | `is_causal=True`（**不走**块 mask） |
-| `bidirectional=false`, `block_size>1` | 块间单向、块内双向 | [`cola_vae/layers.py`](../../models/latent/cola_vae/layers.py) 块 mask |
+| `bidirectional=true` | 全双向 | SDPA；有 pad 时 key 为 `-inf` |
+| `bidirectional=false`, `block_size=1` | 逐 token 因果 | `is_causal=True`；**不加** pad mask（右 pad 下真实 token 看不到右侧 pad，以便 Flash） |
+| `bidirectional=false`, `block_size>1` | 块间单向、块内双向 | 块 mask；有 pad 时叠加 key mask（flex 退回 SDPA） |
 
 **谁可用哪种模式：**
 
@@ -86,7 +86,7 @@ models/latent/
 | `latent_t5` | 允许（**默认**） | 允许（`--set model.bidirectional=false`） |
 | `latent_vae` | **禁止**（YAML/`--set` 设 true 会报错） | 固定；配合 `block_size` 选单向或块因果 |
 
-`latent_t5` 的 encoder **始终** `block_size=1`（单向时走 `is_causal` 快路径，不启用块 mask）。
+`latent_t5` 的 encoder **始终** `block_size=1`；decoder self-attn 与 encoder **同一** `attn_mode`（双向或因果）。
 `latent_vae` 无 `bidirectional` 配置项；实现层写死 `bidirectional=false`。
 
 ### 读出（瓶颈）
@@ -101,10 +101,10 @@ models/latent/
 
 | | `latent_t5` | `latent_vae` |
 |---|---|---|
-| 结构 | 6×（因果 self-attn + cross-attn + FFN） | 6×（与 encoder 同型 self-attn + FFN） |
-| 输入 | token embedding（BOS + 右移） | `from_latent(z)`，无 teacher-force |
-| 训练移位 | 模型内 `BOS \Vert x_{:-1}`；`full_sequence_training=True` | 无移位 |
-| 生成 | AR + 固定 memory `z`；`supports_prefix=True` | 一次前向 `decode_logits` / `reconstruct` |
+| 结构 | 6×（self-attn 与 encoder 同模式 + cross-attn + FFN） | 6×（与 encoder 同型 self-attn + FFN） |
+| 输入 | 双向：从 \(z\) 起；单向：token embedding（BOS + 右移） | `from_latent(z)`，无 teacher-force |
+| 训练移位 | 双向：无；单向：`BOS \Vert x_{:-1}` | 无移位 |
+| 生成 | 双向：一次前向；单向：AR + 固定 \(z\)（从 BOS 采满 \(L\) 个 token）；`supports_prefix=True` | 无条件从先验采 \(z\) 一次前向；有前缀则 encode 后并行 decode 并保留前缀 |
 
 ### 损失（训练态）
 
@@ -114,9 +114,11 @@ $$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N
 
 | 项 | `latent_t5` | `latent_vae` |
 |---|---|---|
-| $\mathcal{L}_{\mathrm{recon}}$ | 教师强制 AR CE（全长） | 并行全 token CE |
+| $\mathcal{L}_{\mathrm{recon}}$ | 双向：并行 CE；单向：教师强制 AR CE | 并行全 token CE |
 | $\mathcal{L}_{\mathrm{aux}}$ | 原地 span CE（[`span.py`](../../models/latent/latent_t5/span.py)） | BERT-mask CE |
 | 日志键 | `recon_ce`, `kl`, `mask`（span） | 同左（mask 为 BERT） |
+
+Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignore_index`；KL 只对非 pad 位置平均；BERT-mask / span 不抽 pad。双向 self-attn 与 T5 cross-attn 屏蔽 pad key；逐 token 因果**不加** pad mask（右 pad + Flash）；`block_size>1` 时块内双向会叠加 pad mask。`cola_vae` 未改。
 
 `latent_t5` encoder 词表扩展 **100** 个 sentinel（`vocab_size + [0,100)`），仅供 span 腐蚀；**不进** `lm_head`。
 
@@ -126,18 +128,18 @@ $$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N
 
 `latent_t5` 与 `latent_vae` **共用**下列日程。协议动机与表格见 [`latex/latent-model.tex`](latex/latent-model.tex) 长度课程节。
 
-总预算 **10B 有效 token（非 pad）**。配比按**有效 token 抽样比例**（不是条数、不是 pad 后长度）。**同一阶段不混** `owt-seg512` 与 `owt-bucket`（两种 512 切分不是同一分布）。阶段内计算图钉死为该阶段最大 $L$；更短桶右 pad 到 $L$ 并 mask loss。优化器走一条 **WSD**（不重置 Adam/Muon/EMA）；`beta_kl=0.1`、`lambda=1` 全程不变。
+总预算 **10B 有效 token（非 pad）**。配比按**有效 token 抽样比例**（不是条数、不是 pad 后长度）。**同一阶段不混** `owt-seg512` 与 `owt-bucket`（两种 512 切分不是同一分布）。同一步只含同一桶。训练图长**每阶段最多两档**（短桶并入次长档，见下），微批仍按阶段最大 $L$ 固定，避免 `torch.compile` 四图来回切、分配器按四档囤块。Pad 不计损失。优化器走一条 **WSD**（不重置 Adam/Muon/EMA）；`beta_kl=0.1`、`lambda=1` 全程不变。
 
 ### 四阶段总表
 
-每步约 **262K pad-token** = 图 $L$ × 全局条数（方案 2）。
+阶段最大 $L$ 时每步约 **262K 图 token**（$L$ × 全局条数；方案 2）。短档步按该档 $L$ 计（S3 的 512 档、S4 的 1024 档减半）。
 
-| 阶段 | 有效 token | 数据集 | 图 $L$ | 全局条数 |
-|---|---:|---|---:|---:|
-| S1 | **3.0B** | 仅 [`owt-seg512`](../../config/preprocess/owt-seg512.yaml) | 512 | 512 |
-| S2 | **1.5B** | 仅 [`owt-bucket`](../../config/preprocess/owt-bucket.yaml) 的 256+512 桶 | 512 | 512 |
-| S3 | **2.5B** | 仅 owt-bucket 的 256+512+1024 桶 | 1024 | 256 |
-| S4 | **3.0B** | 仅 owt-bucket 四桶 | 2048 | 128 |
+| 阶段 | 有效 token | 数据集 | 峰值 $L$ | 训练图长 | 全局条数 |
+|---|---:|---|---:|---|---:|
+| S1 | **3.0B** | 仅 [`owt-seg512`](../../config/preprocess/owt-seg512.yaml) | 512 | 仅 512 | 512 |
+| S2 | **1.5B** | 仅 [`owt-bucket`](../../config/preprocess/owt-bucket.yaml) 的 256+512 桶 | 512 | 仅 512（256 桶 pad 到 512） | 512 |
+| S3 | **2.5B** | 仅 owt-bucket 的 256+512+1024 桶 | 1024 | 512 或 1024 | 256 |
+| S4 | **3.0B** | 仅 owt-bucket 四桶 | 2048 | 1024 或 2048 | 128 |
 
 ### 有效 token 配比
 
@@ -171,7 +173,7 @@ S3/S4 入口各留 **0.2B** 观察窗（计入该阶段预算）：允许 CE/KL 
 
 ### 采样与评测
 
-- 同一步只来自**同一数据集、同一桶**（256 与 2048 不拼 batch）。
+- 同一步只来自**同一数据集、同一桶**（256 与 2048 不拼 batch）。训练图长见 `batch_graph_l`：S1/S2 钉死 512；S3 为 512 或 1024；S4 为 1024 或 2048。微批不随短档加大。
 - 桶间按上表有效 token 配比抽（非语料自然比例）。
 - S1：owt-seg512 的 dev；S2 起按 owt-bucket **各桶**报 `recon_ce` / `kl` / `mask_acc`，并保留 bucket-512 遗忘对照。禁止用一条 `eval_loss` 决策。
 
@@ -180,7 +182,7 @@ S3/S4 入口各留 **0.2B** 观察窗（计入该阶段预算）：允许 CE/KL 
 - 长度课程：`--preprocess latent-curriculum` + `--config 100m-curriculum`（`scripts/train/latent-*-100m-curriculum.sh`）；sampler `train/latent_curriculum.py`，分桶评测 `train/latent_eval.py`。
 - 在线 eval：S1 起写 `seg512_*`；S2 起追加 `b256/512/1024/2048_*`（`eval_log.csv` 宽表）。
 - 仓库 `target_tokens` 按含 pad 计；设日程时按该阶段有效 token 比折算。
-- 4 卡参考 micro：S1/S2=16；S3=16 或 8；S4=8 或 4（T5 OOM 只减 micro，accum 维持全局条数）。
+- 4 卡参考 micro：`latent_vae` / `latent_t5` 均为 S1/S2=16、S3=8、S4=4（见 recipe `batch.stage_batch_size`；OOM 只减 micro，accum 维持全局条数）。
 
 ## 训练与 checkpoint
 
@@ -234,7 +236,7 @@ bash scripts/train/latent-t5-100m-full.sh
 
 `readout` 进入配置哈希；`e` 与 `b` 为不同 run 目录。
 
-### T5 encoder 单向消融
+### T5 单向消融（encoder 与 decoder 同为因果 AR）
 
 ```bash
 .venv/bin/python train.py \
@@ -246,7 +248,7 @@ bash scripts/train/latent-t5-100m-full.sh
   --set model.bidirectional=false
 ```
 
-仅 `latent_t5` 可切换；`latent_vae` **禁止** `bidirectional=true`。
+仅 `latent_t5` 可切换；`true` 时 encoder **与** decoder self-attn 均为双向（从 \(z\) 并行重建，避免 teacher-force 泄漏）；`false` 时二者均为因果 AR。`latent_vae` **禁止** `bidirectional=true`。
 
 ### Checkpoint 布局
 
@@ -272,7 +274,7 @@ cache/checkpoints/{fast|full}/latent/{latent_t5|latent_vae}/{config-hash}/
 .venv/bin/python generate.py --run fast/latent/latent_t5/<hash>
 ```
 
-`latent_t5` 支持 `--prompt` 前缀；无条件时先验形状随 `readout`（`e`→$(L,E)$，`b`→$(L,B)$）。
+`latent_t5` / `latent_vae` 均支持 `--prompt` 前缀（保留前缀、只填后续）。T5 默认双向为一次前向；`bidirectional=false` 时为 AR（从 BOS 采满 \(L\) 个 token）。VAE 无条件从 \(\mathcal{N}(0,I)\) 采 \(z\) 再一次 decode。T5 无条件先验形状随 `readout`（`e`→$(L,E)$，`b`→$(L,B)$）。
 
 ## 与 `cola_vae` 的关系
 

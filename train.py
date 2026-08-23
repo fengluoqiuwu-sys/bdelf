@@ -53,9 +53,14 @@ from train.loop import set_seed, train_loop
 from train.metrics import _train_log
 from train.scratch import _cleanup_this_job_scratch
 
-# TF32: follow Inductor's recommendation. Filters: residual Dynamo/HF noise.
+# TF32 + SDPA：全模型训练共用。Filters: residual Dynamo/HF noise.
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
 warnings.filterwarnings(
     "ignore",
     message=r".*Dynamo does not know how to trace the builtin.*posix\.(l?stat).*",
@@ -404,6 +409,10 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
             seed=cfg.seed,
             world_size=world_size,
             batch_size=cfg.batch_size,
+            stage_batch_sizes={
+                int(k): int(v)
+                for k, v in (cfg.extra.get("stage_batch_size") or {}).items()
+            } or None,
         )
         seg512 = get_preprocessed(cur_spec.seg512_preprocess, cfg.dataset)
         get_preprocessed(cur_spec.bucket_preprocess, cfg.dataset)
@@ -534,7 +543,7 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         if curriculum_sampler is not None:
             st = curriculum_sampler.curriculum_state()
             _train_log(
-                f"curriculum: {st['stage']} graph_l={st['graph_l']} "
+                f"curriculum: {st['stage']} peak_L={st['graph_l']} "
                 f"target={st['target_effective_tokens']:,} effective tokens"
             )
         elif train_ds is not None:

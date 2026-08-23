@@ -573,7 +573,10 @@ def train_loop(
                     optimizer.zero_grad(set_to_none=True)
                     if rank == 0:
                         _train_log(
-                            f"Curriculum stage -> {curriculum_sampler.current_stage.name}; "
+                            f"Curriculum stage -> {curriculum_sampler.current_stage.name} "
+                            f"peak_L={curriculum_sampler.graph_l} "
+                            f"micro={curriculum_sampler.current_batch_size} "
+                            f"accum={curriculum_sampler.grad_accum_steps}; "
                             "reset grad accum",
                         )
                     curriculum_stage_idx = curriculum_sampler._stage_idx

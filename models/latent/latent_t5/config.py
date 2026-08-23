@@ -1,4 +1,4 @@
-"""latent_t5 配置（T5-small 维数 + AR decoder + span 辅助损失）。"""
+"""latent_t5 配置（T5-small 维数；encoder/decoder self-attn 同模式 + span 辅助）。"""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class FL_LatentT5Config(PretrainedConfig):
         eos_token_id: int = 0,
         pad_token_id: int = 0,
         ignore_index: int = -100,
-        max_seq_len: int = 1024,
+        max_seq_len: int = 4096,
         n_layer_enc: int = 6,
         n_layer_dec: int = 6,
         n_head: int = 8,

@@ -1,4 +1,4 @@
-"""T5-small 维数 latent AR：双向 encoder + cross-attn decoder + span 辅助损失。"""
+"""T5-small 维数 latent：encoder/decoder self-attn 同为双向或同为因果；cross-attn 读 z。"""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class _LatentT5Backbone(nn.Module):
     def __init__(
         self,
         token_layout: FL_TokenLayout,
-        max_seq_len: int = 1024,
+        max_seq_len: int = 4096,
         readout: ReadoutMode = "e",
         n_layer_enc: int = 6,
         n_layer_dec: int = 6,
@@ -66,6 +66,12 @@ class _LatentT5Backbone(nn.Module):
         self.span_mean_len = span_mean_len
         self.num_sentinels = num_sentinels
         self.memory_dim = n_embd if readout == "e" else latent_dim
+        # 双向 decoder 从 z 起并行重建，避免 teacher-force 看到未来 token。
+        self.from_latent: nn.Linear | None = (
+            nn.Linear(self.memory_dim, n_embd, bias=True)
+            if bidirectional and self.memory_dim != n_embd
+            else None
+        )
 
         self.encoder = LatentEncoder(
             token_layout,
@@ -118,6 +124,14 @@ class _LatentT5Backbone(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
+    def _pad_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+        return tokens == self.token_layout.pad_token_id
+
+    def _attn_pad_mask(self, tokens: torch.Tensor) -> torch.Tensor | None:
+        """无 pad 时返回 None，双向 encoder / cross-attn 可走 Flash。"""
+        pad = self._pad_mask(tokens)
+        return pad if pad.any() else None
+
     def _loss_targets(self, tokens: torch.Tensor) -> torch.Tensor:
         pad = self.token_layout.pad_token_id
         ignore = self.token_layout.ignore_index
@@ -131,7 +145,7 @@ class _LatentT5Backbone(nn.Module):
         *,
         sample: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        h = self.encoder(tokens)
+        h = self.encoder(tokens, key_padding_mask=self._attn_pad_mask(tokens))
         return self.readout_head(h, sample=sample)
 
     def _decoder_inputs(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -143,20 +157,48 @@ class _LatentT5Backbone(nn.Module):
         )
         return torch.cat([bos, tokens[:, :-1]], dim=1)
 
-    def decode_logits(self, dec_tokens: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        x = self.encoder.embed(dec_tokens)
+    def decode_logits(
+        self,
+        dec_tokens: torch.Tensor | None,
+        memory: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+        memory_pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        mode = self.encoder.attn_mode()
+        if self.encoder.bidirectional:
+            x = memory if self.from_latent is None else self.from_latent(memory)
+            key_padding_mask = memory_pad_mask
+        else:
+            if dec_tokens is None:
+                raise ValueError("因果 decoder 需要 dec_tokens")
+            x = self.encoder.embed(dec_tokens)
         for block in self.decoder:
-            x = block(x, memory)
+            x = block(
+                x, memory,
+                attn_mode=mode,
+                key_padding_mask=key_padding_mask,
+                memory_pad_mask=memory_pad_mask,
+            )
         x = self.dec_ln(x)
         return self.lm_head(x)
 
-    def span_aux_loss(self, tokens: torch.Tensor, dec_in: torch.Tensor) -> torch.Tensor:
+    def span_aux_loss(
+        self,
+        tokens: torch.Tensor,
+        dec_in: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        pad = self._pad_mask(tokens)
         span_mask = span_corruption_mask(
             tokens.shape,
             mask_ratio=self.span_mask_ratio,
             mean_span_len=self.span_mean_len,
             device=tokens.device,
         )
+        span_mask = span_mask & ~pad
+        if not span_mask.any():
+            self.last_mask_acc = torch.tensor(float("nan"), device=tokens.device)
+            return torch.zeros((), device=tokens.device)
         corrupted = apply_span_sentinels(
             tokens,
             span_mask,
@@ -164,7 +206,13 @@ class _LatentT5Backbone(nn.Module):
             num_sentinels=self.num_sentinels,
         )
         z_c, _, _ = self.encode(corrupted, sample=True)
-        logits_c = self.decode_logits(dec_in, z_c)
+        mem_pad = self._attn_pad_mask(tokens)
+        if self.encoder.bidirectional:
+            logits_c = self.decode_logits(None, z_c, memory_pad_mask=mem_pad)
+        else:
+            if dec_in is None:
+                raise ValueError("因果 span 辅助需要 dec_in")
+            logits_c = self.decode_logits(dec_in, z_c, memory_pad_mask=mem_pad)
         ignore = self.token_layout.ignore_index
         targets = self._loss_targets(tokens).masked_fill(~span_mask, ignore)
         span_loss = F.cross_entropy(
@@ -173,15 +221,10 @@ class _LatentT5Backbone(nn.Module):
             ignore_index=ignore,
         )
         with torch.no_grad():
-            if span_mask.any():
-                pred = logits_c.argmax(dim=-1)
-                self.last_mask_acc = (
-                    (pred[span_mask] == tokens[span_mask]).float().mean().detach()
-                )
-            else:
-                self.last_mask_acc = torch.tensor(
-                    float("nan"), device=tokens.device,
-                )
+            pred = logits_c.argmax(dim=-1)
+            self.last_mask_acc = (
+                (pred[span_mask] == tokens[span_mask]).float().mean().detach()
+            )
         return span_loss
 
     def forward(
@@ -192,9 +235,15 @@ class _LatentT5Backbone(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del targets, kwargs
         tokens = idx
+        pad = self._pad_mask(tokens)
+        mem_pad = self._attn_pad_mask(tokens)
         z, mu, logvar = self.encode(tokens, sample=self.training)
-        dec_in = self._decoder_inputs(tokens)
-        logits = self.decode_logits(dec_in, z)
+        if self.encoder.bidirectional:
+            dec_in = None
+            logits = self.decode_logits(None, z, memory_pad_mask=mem_pad)
+        else:
+            dec_in = self._decoder_inputs(tokens)
+            logits = self.decode_logits(dec_in, z, memory_pad_mask=mem_pad)
 
         loss_targets = self._loss_targets(tokens)
         ce = F.cross_entropy(
@@ -202,7 +251,7 @@ class _LatentT5Backbone(nn.Module):
             loss_targets.reshape(-1),
             ignore_index=self.token_layout.ignore_index,
         )
-        kl = kl_gaussian(mu, logvar)
+        kl = kl_gaussian(mu, logvar, mask=~pad)
 
         span_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         if self.training and self.lambda_span > 0 and self.span_mask_ratio > 0:
@@ -304,22 +353,44 @@ class _LatentT5Backbone(nn.Module):
             )
             enc_tokens = torch.cat([prefix, pad], dim=1)
             z, _, _ = self.encode(enc_tokens, sample=False)
-            idx = prefix.clone()
-            start = prefix_len
+            memory_pad = self._attn_pad_mask(enc_tokens)
+            if self.encoder.bidirectional:
+                logits = self.decode_logits(None, z, memory_pad_mask=memory_pad)
+                rest = sample_from_logits(
+                    logits[:, prefix_len:, :], temperature=temperature, top_k=top_k,
+                )
+                return torch.cat([prefix, rest], dim=1), 1
         else:
             z = self._sample_prior_memory(num_samples, seqlen, device)
-            idx = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
-            start = 1
+            memory_pad = None
+            if self.encoder.bidirectional:
+                logits = self.decode_logits(None, z)
+                out = sample_from_logits(logits, temperature=temperature, top_k=top_k)
+                return out, 1
 
+        # 因果 AR：训练是 dec_in = BOS ‖ x[:-1] 预测 x。生成从单独 BOS 起步，
+        # 采 seqlen 个 token 作为 x（有前缀则 dec = BOS ‖ prefix 后续写）。
+        bos_col = torch.full(
+            (num_samples, 1), bos, dtype=torch.long, device=device,
+        )
+        if prefix_tokens is not None:
+            dec = torch.cat([bos_col, prefix], dim=1)
+            pieces: list[torch.Tensor] = [prefix]
+            steps = seqlen - prefix_len
+        else:
+            dec = bos_col
+            pieces = []
+            steps = seqlen
         nfe = 0
-        for _ in range(start, seqlen):
-            logits = self.decode_logits(idx, z)
+        for _ in range(steps):
+            logits = self.decode_logits(dec, z, memory_pad_mask=memory_pad)
             next_tok = sample_from_logits(
                 logits[:, -1, :], temperature=temperature, top_k=top_k,
             ).unsqueeze(-1)
-            idx = torch.cat([idx, next_tok], dim=1)
+            pieces.append(next_tok)
+            dec = torch.cat([dec, next_tok], dim=1)
             nfe += 1
-        return idx, nfe
+        return torch.cat(pieces, dim=1), nfe
 
 
 class FL_LatentT5Model(FL_PreTrainedModel):

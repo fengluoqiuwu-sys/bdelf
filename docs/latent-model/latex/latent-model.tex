@@ -108,15 +108,15 @@ Stage-1 的 encoder 视野、瓶颈宽度、decoder 因子分解与辅助损失�
   \item \textbf{信息瓶颈}：$B{=}64$ 仍可能限制极细粒度语义；若 Stage-2 需更细风格/事实，可能表现为重建尚可但扩散样本偏模糊。
 \end{itemize}
 
-\subsection{\texttt{latent\_t5}：可选双向/单向 encoder、AR decoder}
+\subsection{\texttt{latent\_t5}：encoder 与 decoder self-attn 同模式}
 
 \paragraph{潜在优势}
 \begin{itemize}
-  \item \textbf{双向 $z_t$（默认 \texttt{bidirectional=true}）}：encoder 见全句，$z_t$ 可编码左右语境；对指代消解、长程依赖更友好，作为 DLM「语义坐标」更贴近 BERT/T5 encoder 表征~\cite{devlin2019bert,raffel2020t5}。
-  \item \textbf{单向 encoder 消融}：\texttt{bidirectional=false} 时与 \texttt{latent\_vae} 同为逐 token 因果视野，可在\textbf{同一 AR decoder 拓扑}下隔离「encoder 双向性」对 $z$ 的影响。
-  \item \textbf{AR 重建}：$p(x|z)$ 为自回归，与主流 LM 评测与课程学习兼容；前缀条件时 decoder 自然续写，便于「前缀 $\to$ encode $z$ $\to$ AR 补全」推理。
+  \item \textbf{双向（默认 \texttt{bidirectional=true}）}：encoder 与 decoder self-attn 均见全句；$z_t$ 可编码左右语境；decoder 从 $z$ 并行重建。作为 DLM「语义坐标」更贴近 BERT/T5 encoder 表征~\cite{devlin2019bert,raffel2020t5}。
+  \item \textbf{单向消融}：\texttt{bidirectional=false} 时 encoder \textbf{与} decoder self-attn 均为逐 token 因果，AR + cross-attn，可与 \texttt{latent\_vae} 的因果视野对照。
+  \item \textbf{单向 AR 重建}：$p(x|z)$ 为自回归，与主流 LM 评测兼容；前缀条件时 decoder 自然续写。
   \item \textbf{span 辅助}：腐蚀 encoder 输入、decoder 仍重建原句，类似去噪自编码，可能使 $z$ 对局部缺失更鲁棒，利于 Stage-2 对 $z$ 的随机扰动。
-  \item \textbf{\texttt{readout=b}}：与 VAE 共享 $z\in\mathbb{R}^B$，便于在\textbf{同一扩散维度}下比较「双向+AR」与「因果+并行」谁学得更好。
+  \item \textbf{\texttt{readout=b}}：与 VAE 共享 $z\in\mathbb{R}^B$，便于在\textbf{同一扩散维度}下比较「双向并行」与「因果+并行 / 因果 AR」谁学得更好。
 \end{itemize}
 
 \paragraph{潜在劣势}
@@ -163,9 +163,9 @@ Stage-2 先验难度 & 低（$L{\times}B$） & \texttt{e} 高；\texttt{b} 与 V
 \midrule
 \texttt{n\_embd} / \texttt{d\_kv} / \texttt{d\_ff} / 层数 & \multicolumn{2}{c}{512 / 64 / 2048 / enc6+dec6} \\
 \texttt{latent\_dim}（$B$） & \multicolumn{2}{c}{16} \\
-\texttt{max\_seq\_len} & \multicolumn{2}{c}{1024} \\
+\texttt{max\_seq\_len} & \multicolumn{2}{c}{4096} \\
 \texttt{tokenizer} & \multicolumn{2}{c}{GPT-2（OWT 管线）} \\
-encoder 注意力 & \texttt{bidirectional}（默认 true；可 false） & 禁止双向；\texttt{block\_size}（默认 1） \\
+encoder / decoder self-attn & \texttt{bidirectional}（默认 true：二者双向并行重建；false：二者因果 AR） & 禁止双向；\texttt{block\_size}（默认 1） \\
 读出 & \texttt{readout=e|b} & 固定 $B$ 读出 \\
 辅助损失 & \texttt{lambda\_span} + span 腐蚀 & \texttt{lambda\_mask} + BERT-mask \\
 \texttt{beta\_kl} & \multicolumn{2}{c}{0.1} \\
@@ -191,8 +191,8 @@ encoder 注意力 & \texttt{bidirectional}（默认 true；可 false） & 禁止
 设 encoder 隐状态为 $h \in \mathbb{R}^{L \times E}$。
 
 \begin{enumerate}
-  \item \textbf{双向}（\texttt{bidirectional=true}，\texttt{latent\_t5} 默认）：self-attention 无因果 mask，等价于 T5 encoder 的「全上下文」语义（算子仍为 RoPE+GELU）。\textbf{仅} \texttt{latent\_t5} 可配置。
-  \item \textbf{逐 token 因果}（\texttt{bidirectional=false}, \texttt{block\_size=1}）：\texttt{scaled\_dot\_product\_attention(..., is\_causal=True)}；\textbf{不}构造块 mask，避免 $B{=}1$ 时不必要的开销。\texttt{latent\_t5} 可通过 \texttt{--set model.bidirectional=false} 选用；\texttt{latent\_vae} 固定此模式（默认 \texttt{block\_size=1}）。
+  \item \textbf{双向}（\texttt{bidirectional=true}，\texttt{latent\_t5} 默认）：encoder \textbf{与} decoder self-attn 均无因果 mask。Decoder 从 $z$ 并行重建（不 teacher-force $x$），以免双向 self-attn 看见未来 token。\textbf{仅} \texttt{latent\_t5} 可配置。
+  \item \textbf{逐 token 因果}（\texttt{bidirectional=false}, \texttt{block\_size=1}）：encoder 与 decoder self-attn 均为 \texttt{is\_causal=True}；decoder 仍 AR + cross-attn。\texttt{latent\_t5} 可通过 \texttt{--set model.bidirectional=false} 选用；\texttt{latent\_vae} 固定此模式（默认 \texttt{block\_size=1}）。
   \item \textbf{块因果}（\texttt{block\_size>1}，可选）：块内双向、块间因果；mask 与 \texttt{cola\_vae} 共用 \texttt{block\_causal\_mask\_mod}。要求 $L \bmod \texttt{block\_size} = 0$。\texttt{latent\_vae} 默认 \texttt{block\_size=1}，即不启用块注意力。
 \end{enumerate}
 
@@ -245,25 +245,26 @@ Self-attention 的 $Q,K,V$ 始终在 $E$ 维。
 
 \section{Decoder 与生成}
 
-\subsection{\texttt{latent\_t5}：AR + cross-attn}
+\subsection{\texttt{latent\_t5}：cross-attn decoder（self-attn 与 encoder 同模式）}
 
-每层：因果 self-attn（RoPE）$\to$ cross-attn($h_{\mathrm{dec}}, z$) $\to$ FFN。
+每层：self-attn（RoPE；\texttt{bidirectional} 与 encoder 一致）$\to$ cross-attn($h_{\mathrm{dec}}, z$) $\to$ FFN。
 
-\paragraph{训练移位}
-数据管线因 \texttt{full\_sequence\_training=True} 传入全长 $x$。
-模型内部构造 decoder 输入 $\tilde{x} = [\mathrm{BOS}, x_1,\ldots,x_{L-1}]$，encoder 仍看完整 $x$。
-\textbf{不}使用 GPT 式外层 \texttt{batch[:,:-1]} 移位（否则 encoder 会丢失末 token）。
+\paragraph{训练}
+\begin{itemize}
+  \item \texttt{bidirectional=true}：decoder 从 $z$ 起步（\texttt{readout=e} 时 $z$ 已是 $E$ 维；\texttt{readout=b} 时经 $B\to E$），一次预测全长 $x$。数据仍因 \texttt{full\_sequence\_training=True} 传入全长。
+  \item \texttt{bidirectional=false}：构造 $\tilde{x} = [\mathrm{BOS}, x_1,\ldots,x_{L-1}]$ 做教师强制 AR。\textbf{不}使用 GPT 式外层 \texttt{batch[:,:-1]} 移位（否则 encoder 会丢失末 token）。
+\end{itemize}
 
 \paragraph{生成}
 \begin{itemize}
-  \item 有前缀：将前缀 pad 至 $L$，encode 得 $z$；自前缀末 token 起 AR 续写。
-  \item 无条件：从 $\mathcal{N}(0,I)$ 采样 $z$，形状为 $(L,E)$ 或 $(L,B)$（随 \texttt{readout}）；再 AR。宽先验（$E{=}512$）下无条件样本质量可能较差，属已知限制。
+  \item 双向：一次 decode 全长；有前缀则 encode（前缀+$L$ pad）后并行重建并覆盖前缀。
+  \item 单向：有前缀则 encode 得 $z$ 再 AR 续写；无条件从 $\mathcal{N}(0,I)$ 采 $z$ 再 AR。
 \end{itemize}
 
 \subsection{\texttt{latent\_vae}：统一生成}
 
 Decoder 仅接收 $\mathrm{from\_latent}(z)$，与 Cola \texttt{decode\_logits} 同型。
-生成：encode 后一次 decode，或从先验采 $z\in\mathbb{R}^{L\times B}$ 再 decode。
+无条件从先验采 $z\in\mathbb{R}^{L\times B}$ 再一次 decode；有前缀则 encode（前缀+$L$ pad）后并行 decode 并保留前缀。
 
 \section{损失函数}
 
@@ -278,11 +279,11 @@ Decoder 仅接收 $\mathrm{from\_latent}(z)$，与 Cola \texttt{decode\_logits} 
 \subsection{重建项 $\mathcal{L}_{\mathrm{recon}}$}
 
 \begin{description}
-  \item[\texttt{latent\_t5}] 教师强制自回归交叉熵：对全长 $x$，$\mathcal{L}_{\mathrm{recon}} = -\sum_t \log p_\theta(x_t \mid x_{<t}, z)$。
+  \item[\texttt{latent\_t5}] 双向（默认）：并行 CE $-\sum_t \log p_\theta(x_t \mid z)$。单向：教师强制 AR CE $-\sum_t \log p_\theta(x_t \mid x_{<t}, z)$。
   \item[\texttt{latent\_vae}] 并行 CE：$-\sum_t \log p_\theta(x_t \mid z)$，所有位置同时预测。
 \end{description}
 
-Held-out 评测：T5 用 teacher-forced AR CE；VAE 用并行重建 CE（\texttt{config/train/eval/latent/default.yaml}）。
+Held-out 评测走模型 \texttt{forward} 的重建 CE（T5 默认并行；单向为 teacher-forced AR；VAE 并行；\texttt{config/train/eval/latent/default.yaml}）。
 
 \subsection{辅助项 $\mathcal{L}_{\mathrm{aux}}$}
 
@@ -338,13 +339,12 @@ OWT 一整遍约 8--9B；10B 约 1.1 遍，多出的量用于长段外推与短�
 \begin{itemize}
   \item 配比按\textbf{有效 token 抽样比例}，不是条数、不是 pad 后张量长度。
   \item \textbf{同一阶段不混} \texttt{owt-seg512} 与 \texttt{owt-bucket}：二者 512 切分规则不同，不是同一分布。
-  \item 阶段内计算图钉死为该阶段最大 $L$；更短桶样本右 pad 到 $L$，loss 对 pad mask。
-  \item 同一步只含同一桶，避免步间改 $L$ 或全局条数。
+  \item 同一步只含同一桶。阶段内训练图长最多两档：短桶并入次长档（S1/S2 钉死 512；S3 为 $512$ 或 $1024$；S4 为 $1024$ 或 $2048$），微批按阶段最大 $L$ 固定。不按桶原生四档切换（\texttt{torch.compile} 多图与分配器碎片），也不把短序列垫到阶段最大 $L$（注意力 $L^2$）。Pad 不计损失。
 \end{itemize}
 
 \subsection{四阶段与配比}
 
-每步约 $262\text{K}$ pad-token（$=$ 图 $L \times$ 全局条数；方案 2：$L$ 加倍则条数减半）。
+每步图 token 在阶段最大 $L$ 时约 $262\text{K}$（$=$ 峰值 $L \times$ 全局条数）。短档步按该档 $L$ 计。
 
 \begin{center}
 \small
@@ -428,7 +428,7 @@ S4 的 cosine 退火仅在观察窗之后的最后 0.8B 进行。
 
 \section{小结}
 
-\texttt{latent\_t5} 与 \texttt{latent\_vae} 在共享 T5-small 维数 encoder 与 Cola 式 ELBO 下，分别检验「（双向或单向）encoder + AR + span 辅助」与「因果 + 并行解码 + BERT-mask」两条 Stage-1 路线（动机与 DLM 语义空间讨论见第~\ref{sec:why}--\ref{sec:dlm-space} 节）。
+\texttt{latent\_t5} 与 \texttt{latent\_vae} 在共享 T5-small 维数 encoder 与 Cola 式 ELBO 下，分别检验「双向并行重建（默认可切单向 AR）+ span 辅助」与「因果 + 并行解码 + BERT-mask」两条 Stage-1 路线（动机与 DLM 语义空间讨论见第~\ref{sec:why}--\ref{sec:dlm-space} 节）。
 读出变体 \texttt{readout=e|b} 控制随机变量所在空间与 cross-attn memory 维数，便于消融瓶颈与 KL 尺度。
 长度课程（10B、四阶段数据配比、WSD 优化器）见第~\ref{sec:curriculum} 节。
 工程细节以代码与 \texttt{README.md} 为准；本文档描述设计意图与完整行为规格。

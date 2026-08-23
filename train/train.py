@@ -694,15 +694,26 @@ def compose_train_config(
     # 数据 token / 优化器步：global_batch × 每序列计入预算的 token 数。
     # denoise/decode 混合只影响 loss，不改变数据消耗与日程推导。
     if is_curriculum:
-        from train.latent_curriculum import stage_grad_accum
+        from train.latent_curriculum import (
+            resolve_stage_batch_sizes,
+            stage_grad_accum,
+        )
 
         max_stage_graph = max(s.graph_l for s in cur_spec.stages)  # type: ignore[possibly-undefined]
         min_global_seq = min(s.global_seq_batch for s in cur_spec.stages)  # type: ignore[possibly-undefined]
         tokens_per_step = min_global_seq * max_stage_graph
+        stage_bs_map = resolve_stage_batch_sizes(
+            cur_spec.stages,  # type: ignore[possibly-undefined]
+            default_batch_size=batch.batch_size,
+            raw=batch.extra.get("stage_batch_size"),
+        )
+        curriculum_extra["stage_batch_size"] = {
+            str(k): v for k, v in sorted(stage_bs_map.items())
+        }
         curriculum_max_accum = max(
             stage_grad_accum(
                 s,
-                batch_size=batch.batch_size,
+                batch_size=stage_bs_map[s.graph_l],
                 world_size=resolved_world_size,
             )
             for s in cur_spec.stages  # type: ignore[possibly-undefined]

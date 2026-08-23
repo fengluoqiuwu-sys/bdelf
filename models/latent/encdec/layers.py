@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from functools import partial
 from typing import Literal
 
@@ -27,6 +26,18 @@ except ImportError:
     FLEX_ATTN_AVAILABLE = False
 
 AttnMode = Literal["bidirectional", "causal", "block_causal"]
+
+
+def key_padding_additive(
+    pad: torch.Tensor,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """``(B, S)`` True=pad → ``(B, 1, 1, S)`` 加性 mask，pad 键为 ``-inf``。"""
+    return torch.zeros(
+        pad.size(0), 1, 1, pad.size(1),
+        dtype=dtype or torch.float32, device=pad.device,
+    ).masked_fill(pad.unsqueeze(1).unsqueeze(1), float("-inf"))
 
 
 class SelfAttention(nn.Module):
@@ -91,6 +102,7 @@ class SelfAttention(nn.Module):
         x: torch.Tensor,
         *,
         attn_mode: AttnMode = "causal",
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_mode = self._resolve_mode(attn_mode)
         bsz, seq_len, _ = x.size()
@@ -104,26 +116,39 @@ class SelfAttention(nn.Module):
         positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
         q, k = self.rope.apply_qk(q, k, positions)
 
+        drop = self.dropout if self.training else 0.0
+        # 右 pad + 逐 token 因果：真实 token 本来看不到右侧 pad，勿加 attn_mask，否则 SDPA 走不出 Flash。
+        use_pad = key_padding_mask is not None and (
+            attn_mode == "bidirectional"
+            or (attn_mode == "block_causal" and self.block_size > 1)
+        )
+        pad_add = (
+            key_padding_additive(key_padding_mask, dtype=q.dtype)
+            if use_pad
+            else None
+        )
+
         if attn_mode == "bidirectional":
             y = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.dropout if self.training else 0.0,
+                q, k, v, attn_mask=pad_add, dropout_p=drop,
             )
         elif attn_mode == "causal":
             y = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
+                q, k, v, attn_mask=pad_add, dropout_p=drop, is_causal=True,
             )
         else:
             attn_mask = self._block_mask(seq_len, x.device)
-            if self.attn_backend == "flex":
+            if self.attn_backend == "flex" and pad_add is None:
                 y = fused_flex_attention(q, k, v, block_mask=attn_mask)
             else:
+                if not isinstance(attn_mask, torch.Tensor):
+                    attn_mask = bool_mask_to_sdpa_additive(
+                        build_block_causal_mask(seq_len, self.block_size, x.device),
+                    )
+                if pad_add is not None:
+                    attn_mask = attn_mask + pad_add
                 y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=self.dropout if self.training else 0.0,
+                    q, k, v, attn_mask=attn_mask, dropout_p=drop,
                 )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.inner_dim)
@@ -173,8 +198,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         *,
         attn_mode: AttnMode = "causal",
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mode=attn_mode)
+        x = x + self.attn(self.ln1(x), attn_mode=attn_mode, key_padding_mask=key_padding_mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -202,7 +228,13 @@ class CrossAttention(nn.Module):
         self.dropout = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         bsz, seq_len, _ = x.size()
         mem_len = memory.size(1)
         q = self.cross_attn.q_proj(x)
@@ -215,17 +247,22 @@ class CrossAttention(nn.Module):
         q = reshape_heads(q, seq_len)
         k = reshape_heads(k, mem_len)
         v = reshape_heads(v, mem_len)
-        scale = 1.0 / math.sqrt(self.d_kv)
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn = F.dropout(attn, p=self.dropout if self.training else 0.0)
-        y = attn @ v
+        pad_add = (
+            key_padding_additive(key_padding_mask, dtype=q.dtype)
+            if key_padding_mask is not None
+            else None
+        )
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=pad_add,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.inner_dim)
         return self.resid_dropout(self.cross_attn.proj(y))
 
 
 class DecoderBlock(nn.Module):
-    """因果 self-attn + cross-attn + FFN。"""
+    """self-attn（模式与 encoder 一致）+ cross-attn + FFN。"""
 
     def __init__(
         self,
@@ -253,8 +290,20 @@ class DecoderBlock(nn.Module):
         self.ln3 = nn.LayerNorm(n_embd)
         self.mlp = MLP(n_embd, d_ff, dropout)
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.ln1(x), attn_mode="causal")
-        x = x + self.cross_attn(self.ln2(x), memory)
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        *,
+        attn_mode: AttnMode = "causal",
+        key_padding_mask: torch.Tensor | None = None,
+        memory_pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x + self.self_attn(
+            self.ln1(x), attn_mode=attn_mode, key_padding_mask=key_padding_mask,
+        )
+        x = x + self.cross_attn(
+            self.ln2(x), memory, key_padding_mask=memory_pad_mask,
+        )
         x = x + self.mlp(self.ln3(x))
         return x

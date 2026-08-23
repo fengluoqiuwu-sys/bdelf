@@ -1,9 +1,9 @@
-_doc: T5-small 维数 latent AR 配置模板  # 文件说明，写入 extra
+_doc: T5-small 维数 latent 配置模板（默认双向并行重建）  # 文件说明，写入 extra
 
 name: prototype  # 配置名；prototype 不可实例化
 tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
 readout: e  # 读出：e=z∈E（默认）| b=z∈B
-max_seq_len: 1024  # 训练序列长度
+max_seq_len: 4096  # 最大序列长度
 n_layer_enc: 6  # 编码器层数（T5-small）
 n_layer_dec: 6  # 解码器层数（T5-small）
 n_head: 8  # 注意力头数（512/64）
@@ -17,7 +17,7 @@ lambda_span: 1.0  # span 辅助损失权重
 span_mask_ratio: 0.15  # span 腐蚀比例
 span_mean_len: 3  # span 平均长度
 num_sentinels: 100  # encoder 专用 sentinel 数
-bidirectional: true  # encoder 注意力：true=全双向（默认）| false=逐 token 单向因果
+bidirectional: true  # encoder 与 decoder self-attn：true=全双向（并行重建）| false=因果 AR
 use_flash: true  # 是否 SDPA
 
 sampling:

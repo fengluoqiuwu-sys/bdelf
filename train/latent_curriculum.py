@@ -113,6 +113,66 @@ def _bucket_indices(split: _PreprocessedSplitDataset) -> Dict[int, np.ndarray]:
     }
 
 
+def batch_graph_l(stage_graph_l: int, bucket: int) -> int:
+    """本 opt 步的训练图长。
+
+    同一步已是单桶。不把短桶垫到阶段最大 L（注意力按 L² 计），
+    也不按桶原生四档切换：full 开 ``torch.compile``，档数×微批组合会
+    让 Inductor 多图来回切，CUDA caching allocator 按 size-class 囤块，
+    峰值近似「各档激活之和」而非 max。折中为**每阶段最多两档**，
+    微批仍按阶段最大 L 固定（不随短档加大 B）：
+
+    * S1/S2（cap≤512）：钉死 512（256 桶 pad 到 512）
+    * S3（cap=1024）：256/512 → 512，1024 → 1024
+    * S4（cap=2048）：≤1024 → 1024，2048 → 2048
+    """
+    if bucket < 1:
+        raise ValueError(f"bucket must be positive, got {bucket}")
+    if bucket > stage_graph_l:
+        raise ValueError(
+            f"bucket={bucket} exceeds stage graph_l={stage_graph_l}"
+        )
+    if stage_graph_l <= 512:
+        return stage_graph_l
+    if stage_graph_l == 1024:
+        return 1024 if bucket >= 1024 else 512
+    if stage_graph_l == 2048:
+        return 2048 if bucket >= 2048 else 1024
+    return stage_graph_l
+
+
+def resolve_stage_batch_sizes(
+    stages: List[CurriculumStageSpec],
+    *,
+    default_batch_size: int,
+    raw: Any | None,
+) -> Dict[int, int]:
+    """按图长 ``graph_l`` 解析每 GPU 微批；缺省用 ``default_batch_size``。"""
+    parsed: Dict[int, int] = {}
+    if raw is not None:
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError(
+                "batch.stage_batch_size must be a non-empty mapping (graph_l → batch)"
+            )
+        for key, val in raw.items():
+            try:
+                length = int(key)
+                size = int(val)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"batch.stage_batch_size 键/值须为整数，got {key!r}: {val!r}"
+                ) from exc
+            if length < 1 or size < 1:
+                raise ValueError(
+                    f"batch.stage_batch_size[{length}]={size} 须为正整数"
+                )
+            parsed[length] = size
+    out: Dict[int, int] = {}
+    for stage in stages:
+        out[stage.graph_l] = parsed.get(stage.graph_l, default_batch_size)
+    return out
+
+
 def stage_grad_accum(
     stage: CurriculumStageSpec,
     *,
@@ -144,8 +204,11 @@ class LatentCurriculumSampler:
     seed: int
     world_size: int
     batch_size: int
+    stage_batch_sizes: Dict[int, int] = field(default_factory=dict)
     effective_tokens_global: int = 0
     _stage_idx: int = 0
+    _last_bucket: int = 0
+    _last_batch_l: int = 0
     _stages: List[_StageRuntime] = field(default_factory=list)
 
     @classmethod
@@ -158,6 +221,7 @@ class LatentCurriculumSampler:
         seed: int,
         world_size: int,
         batch_size: int,
+        stage_batch_sizes: Dict[int, int] | None = None,
     ) -> LatentCurriculumSampler:
         seg512 = get_preprocessed(spec.seg512_preprocess, dataset)
         bucket = get_preprocessed(spec.bucket_preprocess, dataset)
@@ -180,12 +244,16 @@ class LatentCurriculumSampler:
                         f"{stage.dataset} train split"
                     )
             stages.append(_StageRuntime(spec=stage, split=split, pools=pools))
+        sizes = dict(stage_batch_sizes or {})
+        if not sizes:
+            sizes = {stage.graph_l: batch_size for stage in spec.stages}
         return cls(
             spec=spec,
             pad_token_id=pad_token_id,
             seed=seed,
             world_size=world_size,
             batch_size=batch_size,
+            stage_batch_sizes=sizes,
             _stages=stages,
         )
 
@@ -198,10 +266,14 @@ class LatentCurriculumSampler:
         return self.current_stage.graph_l
 
     @property
+    def current_batch_size(self) -> int:
+        return int(self.stage_batch_sizes.get(self.graph_l, self.batch_size))
+
+    @property
     def grad_accum_steps(self) -> int:
         return stage_grad_accum(
             self.current_stage,
-            batch_size=self.batch_size,
+            batch_size=self.current_batch_size,
             world_size=self.world_size,
         )
 
@@ -267,7 +339,8 @@ class LatentCurriculumSampler:
         self.sync_stage()
         rt = self._stages[self._stage_idx]
         stage = rt.spec
-        global_batch = self.batch_size * self.world_size
+        micro_bs = self.current_batch_size
+        global_batch = micro_bs * self.world_size
         stage_global = stage.global_seq_batch
         if global_batch > stage_global:
             raise ValueError(
@@ -285,9 +358,12 @@ class LatentCurriculumSampler:
 
         rng = self._rng(opt_step)
         bucket = self._sample_bucket(rng, stage)
+        batch_l = batch_graph_l(stage.graph_l, bucket)
+        self._last_bucket = bucket
+        self._last_batch_l = batch_l
         indices = self._sample_indices(rt.pools[bucket], stage_global, rng)
         micro_start = micro_in_opt * global_batch
-        rank_indices = indices[micro_start + rank * self.batch_size : micro_start + (rank + 1) * self.batch_size]
+        rank_indices = indices[micro_start + rank * micro_bs : micro_start + (rank + 1) * micro_bs]
 
         rows: List[torch.Tensor] = []
         eff_sum = 0
@@ -297,8 +373,11 @@ class LatentCurriculumSampler:
             row = item["input_ids"]
             eff = int(item["length"]) if "length" in item else int(row.numel())
             eff_sum += eff
-            rows.append(self._pad_row(row, eff, stage.graph_l))
-        return torch.stack(rows, dim=0), eff_sum
+            rows.append(self._pad_row(row, eff, batch_l))
+        out = torch.stack(rows, dim=0)
+        if torch.cuda.is_available():
+            out = out.pin_memory()
+        return out, eff_sum
 
     def curriculum_state(self) -> Dict[str, Any]:
         stage = self.current_stage
@@ -306,6 +385,9 @@ class LatentCurriculumSampler:
             "stage": stage.name,
             "stage_idx": self._stage_idx,
             "graph_l": stage.graph_l,
+            "batch_l": self._last_batch_l,
+            "bucket": self._last_bucket,
+            "batch_size": self.current_batch_size,
             "grad_accum_steps": self.grad_accum_steps,
             "effective_tokens_global": self.effective_tokens_global,
             "target_effective_tokens": self.spec.effective_target_tokens,

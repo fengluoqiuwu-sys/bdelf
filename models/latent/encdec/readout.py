@@ -6,8 +6,19 @@ import torch
 import torch.nn as nn
 
 
-def kl_gaussian(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    return -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).mean()
+def kl_gaussian(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """逐位置 KL；``mask`` 为 True 的位置才计入（忽略 pad）。"""
+    kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+    per_tok = kl.mean(dim=-1)
+    if mask is None:
+        return per_tok.mean()
+    weight = mask.to(dtype=per_tok.dtype)
+    denom = weight.sum().clamp_min(1.0)
+    return (per_tok * weight).sum() / denom
 
 
 def sample_posterior(
@@ -16,6 +27,7 @@ def sample_posterior(
     *,
     sample: bool,
 ) -> torch.Tensor:
+    """``logvar`` 须已 clamp；此处再截一次以防调用方漏夹。"""
     logvar = logvar.clamp(-30.0, 20.0)
     if sample:
         std = torch.exp(0.5 * logvar)
@@ -40,7 +52,8 @@ class PosteriorBReadout(nn.Module):
         sample: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mu = self.enc_latent_norm(self.to_mu(h))
-        logvar = self.to_logvar(h)
+        # 与 cola_vae / 规格一致：采样与 KL 共用 clamp 后的 logσ²。
+        logvar = self.to_logvar(h).clamp(-30.0, 20.0)
         z = sample_posterior(mu, logvar, sample=sample)
         return z, mu, logvar
 
@@ -65,6 +78,6 @@ class PosteriorEReadout(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b = self.to_bottleneck(h)
         mu = self.enc_latent_norm(self.to_mu(b))
-        logvar = self.to_logvar(b)
+        logvar = self.to_logvar(b).clamp(-30.0, 20.0)
         z = sample_posterior(mu, logvar, sample=sample)
         return z, mu, logvar

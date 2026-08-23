@@ -24,7 +24,10 @@ class TokenChunkDataset(Dataset):
 
 
 def collate_input_ids(batch: list[torch.Tensor]) -> torch.Tensor:
-    return torch.stack(batch)
+    out = torch.stack(batch)
+    if torch.cuda.is_available() and not out.is_cuda:
+        out = out.pin_memory()
+    return out
 
 
 def build_eval_subset(

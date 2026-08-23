@@ -55,9 +55,14 @@ class LatentEncoder(nn.Module):
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.drop(self.wte(tokens))
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = self.embed(tokens)
         mode = self.attn_mode()
         for layer in self.layers:
-            x = layer(x, attn_mode=mode)
+            x = layer(x, attn_mode=mode, key_padding_mask=key_padding_mask)
         return x

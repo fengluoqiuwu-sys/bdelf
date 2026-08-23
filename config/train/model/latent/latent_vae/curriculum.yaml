@@ -18,6 +18,13 @@ optimizer:
   muon_ns_steps: 5
   ema_decay: 0.9999
 
+# -----------------------------------------------------------------------------
+# Batch（每 GPU 微批随图长：S1/S2=16，S3=8，S4=4；accum 维持全局条数）
+# -----------------------------------------------------------------------------
 batch:
-  batch_size: 16
-  global_batch_size: 128
+  batch_size: 4  # S4 微批；compose / eval 用最小档
+  global_batch_size: 128  # 与 S4 global_seq_batch 对齐
+  stage_batch_size:  # 按图 L → 每 GPU 微批（S1/S2 同为 512）
+    512: 16
+    1024: 8
+    2048: 4
