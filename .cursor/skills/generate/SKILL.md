@@ -48,6 +48,8 @@ description: >-
 
 ## 注意
 
+- 默认用 checkpoint 里的 **EMA** 权重生成（与 `eval.py` 一致）；没有 `ema` 才用 live。
+- 解码 `skip_special_tokens=True`，与离线 GPT-2 打分同一套文本。
 - 权重旁需有 `model_meta` / `config.json`。
 - ELF 生成无条件：传 `--prompt` 会报错。
 - 给 ELF 显式 `--temperature` 会从 argmax 切到 multinomial。

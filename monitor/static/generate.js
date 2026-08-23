@@ -427,6 +427,7 @@ function paintBatchSummary(batch, ev) {
     metricCell("median-rep", m.median_rep),
     metricCell("accept@human", m.accept_at_human),
     metricCell("nonword%", m.nonword_word_pct, 1),
+    metricCell("ema", m.use_ema),
   ]));
   if (m.gpt2_skipped) {
     wrap.appendChild(el("p", { className: "muted", text: m.gpt2_reason || "未计算 gen-ppl" }));

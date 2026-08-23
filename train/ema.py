@@ -36,6 +36,28 @@ def ema_update(
         ema_state[name].lerp_(param.detach(), 1.0 - decay)
 
 
+def apply_ema_weights(
+    model: nn.Module,
+    ema_state: Dict[str, torch.Tensor] | None,
+) -> bool:
+    """把 EMA 影子权重拷进 ``model``（生成 / 推理用，不还原）。
+
+    无 ``ema`` 或键对不上时返回 False，保留 live 权重。
+    """
+    if not ema_state:
+        return False
+    raw = unwrap_model(model)
+    n = 0
+    for name, param in raw.named_parameters():
+        if name not in ema_state:
+            continue
+        param.data.copy_(
+            ema_state[name].to(device=param.device, dtype=param.dtype)
+        )
+        n += 1
+    return n > 0
+
+
 @contextmanager
 def swap_ema_weights(
     model: nn.Module,

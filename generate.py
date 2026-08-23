@@ -150,7 +150,8 @@ def resolve_dtype(device: torch.device, train_cfg: dict | None) -> torch.dtype:
 def load_model_from_checkpoint(
     ckpt_path: Path,
     device: torch.device,
-) -> tuple[torch.nn.Module, dict, int, dict | None]:
+) -> tuple[torch.nn.Module, dict, int, dict | None, bool]:
+    """加载 checkpoint；有 EMA 则拷进模型（与 ``eval.py`` 默认口径一致）。"""
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_meta = load_model_meta(ckpt_path, ck)
     model_cfg = dict(model_meta["config"] or {})
@@ -163,9 +164,17 @@ def load_model_from_checkpoint(
     model.eval()
 
     train_cfg = ck.get("train_config")
+    step = int(ck.get("step", 0))
+    ema_raw = ck.get("ema")
+    del ck
     dtype = resolve_dtype(device, train_cfg)
     model = model.to(device=device, dtype=dtype)
-    return model, model_meta, int(ck.get("step", 0)), train_cfg
+    used_ema = False
+    if isinstance(ema_raw, dict) and ema_raw:
+        from train.ema import apply_ema_weights
+
+        used_ema = apply_ema_weights(model, ema_raw)
+    return model, model_meta, step, train_cfg, used_ema
 
 
 def set_seed(seed: int) -> None:
@@ -351,7 +360,7 @@ def main() -> None:
     device = resolve_device(args.device)
 
     _log(f"Loading checkpoint: {ckpt_path}")
-    model, model_meta, step, train_cfg = load_model_from_checkpoint(ckpt_path, device)
+    model, model_meta, step, train_cfg, used_ema = load_model_from_checkpoint(ckpt_path, device)
     dtype = resolve_dtype(device, train_cfg)
 
     tokenizer_name = model_meta["config"].get("tokenizer")
@@ -404,7 +413,7 @@ def main() -> None:
         f"{args.temperature if args.temperature is not None else sampling_cfg.get('temperature', 'yaml')}, "
         f"top_k="
         f"{args.top_k if args.top_k is not None else sampling_cfg.get('top_k', 'yaml')}, "
-        f"seed={args.seed}",
+        f"seed={args.seed}, ema={'yes' if used_ema else 'no'}",
     )
 
     tokens, nfe = generate_tokens(
@@ -427,17 +436,17 @@ def main() -> None:
         if prefix_len > 0:
             prompt_decoded = tokenizer.decode(
                 tokens[sample_idx, :prefix_len].tolist(),
-                skip_special_tokens=False,
+                skip_special_tokens=True,
             )
             completion = tokenizer.decode(
                 tokens[sample_idx, prefix_len:].tolist(),
-                skip_special_tokens=False,
+                skip_special_tokens=True,
             )
             print(f"[prompt] {prompt_decoded}")
             print(f"[completion] {completion}")
         else:
             text = tokenizer.decode(
-                tokens[sample_idx].tolist(), skip_special_tokens=False,
+                tokens[sample_idx].tolist(), skip_special_tokens=True,
             )
             print(text)
 

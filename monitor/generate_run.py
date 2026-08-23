@@ -213,7 +213,8 @@ def run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     device = torch.device("cuda")
 
     _emit({"type": "status", "message": "加载模型…"})
-    model, model_meta, step, train_cfg = load_model_from_checkpoint(ckpt_path, device)
+    model, model_meta, step, train_cfg, used_ema = load_model_from_checkpoint(ckpt_path, device)
+    _emit({"type": "status", "message": f"已加载（{'EMA' if used_ema else '无 EMA，用 live'}）"})
     dtype = resolve_dtype(device, train_cfg)
     tokenizer_name = (model_meta.get("config") or {}).get("tokenizer")
     if not tokenizer_name:
@@ -282,9 +283,9 @@ def run_spec(spec: dict[str, Any]) -> dict[str, Any]:
         )
         row = tokens[0].detach().cpu()
         ids = row.tolist()
-        full = tokenizer.decode(ids, skip_special_tokens=False)
+        full = tokenizer.decode(ids, skip_special_tokens=True)
         if prefix_len > 0:
-            completion = tokenizer.decode(ids[prefix_len:], skip_special_tokens=False)
+            completion = tokenizer.decode(ids[prefix_len:], skip_special_tokens=True)
         else:
             completion = full
         cpu_tensors.append(row)
@@ -375,6 +376,7 @@ def run_spec(spec: dict[str, Any]) -> dict[str, Any]:
             "nonword_word_pct": cpu.get("nonword_word_pct"),
             "gpt2_skipped": bool(gpt.get("skipped")),
             "gpt2_reason": gpt.get("reason") or "",
+            "use_ema": used_ema,
         },
         "samples": per,
     }

@@ -239,7 +239,7 @@ def run_m0_shard(
     device = resolve_device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = resolve_checkpoint(checkpoint=None, run=args.run)
     _log(f"load {ckpt} n={n_local} seed={seed} device={device}")
-    model, model_meta, step, train_cfg = load_model_from_checkpoint(ckpt, device)
+    model, model_meta, step, train_cfg, _used_ema = load_model_from_checkpoint(ckpt, device)
     dtype = resolve_dtype(device, train_cfg)
     tokenizer_name = model_meta["config"].get("tokenizer") or "t5-small"
     tokenizer = get_tokenizer(tokenizer_name)
@@ -616,7 +616,7 @@ def run_m2_shard(
     device = resolve_device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = resolve_checkpoint(checkpoint=None, run=args.run)
     _log(f"M2 load {ckpt} n={n_local} seed={seed} device={device}")
-    model, model_meta, step, train_cfg = load_model_from_checkpoint(ckpt, device)
+    model, model_meta, step, train_cfg, _used_ema = load_model_from_checkpoint(ckpt, device)
     dtype = resolve_dtype(device, train_cfg)
     if model_meta["name"] == "elf":
         from models.lm.elf.ace import attach_ace_identity
