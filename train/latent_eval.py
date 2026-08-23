@@ -133,6 +133,7 @@ def _collate_bucket(items: list[dict[str, torch.Tensor]], graph_l: int, pad_id: 
     return torch.stack(rows, dim=0)
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def _latent_batch_metrics(
     model: nn.Module,
@@ -140,18 +141,18 @@ def _latent_batch_metrics(
     device: torch.device,
     amp_dtype: torch.dtype,
 ) -> dict[str, float]:
+    """在线 latent 指标走 eager 原模块，避免 torch.compile 因切 train/eval 重编译。
+
+    mask 指标仍在 ``train()`` 下取（与改前一致）；前向打在 unwrap 后的 ``raw`` 上，
+    不进入 OptimizedModule / DDP 包装。
+    """
     raw = unwrap_model(model)
-    was_training = raw.training
     raw.train()
     use_amp = device.type == "cuda"
-    try:
-        batch = batch.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-            forward_loss(model, batch)
-        return dict(raw.train_metrics())
-    finally:
-        if not was_training:
-            raw.eval()
+    batch = batch.to(device, non_blocking=True)
+    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+        forward_loss(raw, batch)
+    return dict(raw.train_metrics())
 
 
 def _aggregate_metrics(
@@ -188,8 +189,9 @@ def eval_latent_loader_metrics(
     log: bool = True,
     desc: str = "eval",
 ) -> dict[str, float]:
+    # 不调用 model.eval()：compile 包装一旦切模式就会重编译；指标前向见
+    # ``_latent_batch_metrics``（eager + train，与改前 mask 口径一致）。
     was_training = model.training
-    model.eval()
     totals: dict[str, float] = {}
     counts: dict[str, int] = {}
     batch_iter: Iterable = loader

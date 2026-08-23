@@ -432,7 +432,9 @@ def run_online_eval(
                 pbar_parent=pbar_parent,
                 log=(rank == 0),
             )
-            release_eval_cuda_scratch(model, log=(rank == 0))
+            release_eval_cuda_scratch(
+                model, log=(rank == 0), empty_cache=False,
+            )
             if csv_stage:
                 curriculum_eval_row["curriculum_stage"] = csv_stage
         else:

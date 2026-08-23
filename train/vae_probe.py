@@ -70,6 +70,7 @@ def select_probe_samples(
     return out
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def _encode_mu(
     model: nn.Module,
