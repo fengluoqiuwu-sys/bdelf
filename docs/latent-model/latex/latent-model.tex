@@ -423,7 +423,7 @@ S4 的 cosine 退火仅在观察窗之后的最后 0.8B 进行。
 超参以 CLI \texttt{--set} 覆盖，进入配置哈希；每组独立 run 目录。
 $B$ 为 \texttt{latent\_dim}；$D$ 为 \texttt{block\_size}（$D{=}1$ 逐 token 因果，$D{=}16$ 块因果）；T5 的 readout 为 \texttt{e}（$z\in\mathbb{R}^{E}$）或 \texttt{b}（$z\in\mathbb{R}^{B}$）。
 双向 T5 无 $D$（encoder 与 decoder self-attn 全双向，不走块 mask）。
-合计 \textbf{20} 组：VAE 8 + T5 12。
+T5 \textbf{不}扫瓶颈：$B$ 一律 $64$。合计 \textbf{13} 组：VAE 8 + T5 5。
 
 \subsection{硬件}
 
@@ -462,35 +462,33 @@ $B \backslash D$ & $D{=}1$（逐 token 因果） & $D{=}16$（块因果） \\
 
 \subsection{\texttt{latent\_t5}（train-server-2，8\texttimes5090）}
 
+固定 $B{=}64$（配置默认，不扫 $16/32/128$）。消融只做方向、readout，以及单向时的 $D$。
+
 \begin{center}
 \small
 \begin{tabular}{llllrr}
 \toprule
 方向 & readout & $B$ & $D$ & 组数 & 合计 \\
 \midrule
-双向 & \texttt{e} & 32, 64 & --- & 2 & 2 \\
-单向 & \texttt{e} & 16, 32, 64, 128 & 1, 16 & $4{\times}2$ & 8 \\
-单向 & \texttt{b} & 32, 64 & 1 & 2 & 2 \\
+双向 & \texttt{e} & 64 & --- & 1 & 1 \\
+单向 & \texttt{e} & 64 & 1, 16 & 2 & 2 \\
+单向 & \texttt{b} & 64 & 1, 16 & 2 & 2 \\
 \midrule
- &  &  &  &  & \textbf{12} \\
+ &  &  &  &  & \textbf{5} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-逐组展开：
+逐组展开（均为 $B{=}64$）：
 
 \begin{itemize}
-  \item \textbf{双向 / readout=\texttt{e}}：$(B{=}32)$、$(B{=}64)$。
-  \item \textbf{单向 / readout=\texttt{e}}：$B{\in}\{16,32,64,128\}$、$D{\in}\{1,16\}$ 全组合（8 组）：
-    \begin{itemize}
-      \item $D{=}1$：$(16,1)$、$(32,1)$、$(64,1)$、$(128,1)$
-      \item $D{=}16$：$(16,16)$、$(32,16)$、$(64,16)$、$(128,16)$
-    \end{itemize}
-  \item \textbf{单向 / readout=\texttt{b}}：$(B{=}32,D{=}1)$、$(B{=}64,D{=}1)$。
+  \item \textbf{双向 / readout=\texttt{e}}：默认 \texttt{bidirectional=true}（无 $D$）。
+  \item \textbf{单向 / readout=\texttt{e}}：$D{=}1$、$D{=}16$。
+  \item \textbf{单向 / readout=\texttt{b}}：$D{=}1$、$D{=}16$。
 \end{itemize}
 
-CLI 对应：双向默认 \texttt{bidirectional=true}；单向 \texttt{--set model.bidirectional=false}；
-\texttt{readout=b} 时 \texttt{--set model.readout=b}；$B,D$ 为 \texttt{model.latent\_dim}、\texttt{model.block\_size}。
+CLI 对应：双向不改默认；单向 \texttt{--set model.bidirectional=false}；
+\texttt{readout=b} 时 \texttt{--set model.readout=b}；$D$ 为 \texttt{model.block\_size}。$B$ 用配置默认 $64$，不必 \texttt{--set model.latent\_dim}。
 
 \section{设计选择与局限}
 
