@@ -421,9 +421,9 @@ S4 的 cosine 退火仅在观察窗之后的最后 0.8B 进行。
 
 本节记录\textbf{正在进行 / 即将按此清单执行}的长度课程训练（协议同第~\ref{sec:curriculum} 节：10B 有效 token、\texttt{100m-curriculum}、\texttt{preprocess=latent-curriculum}、OWT）。
 超参以 CLI \texttt{--set} 覆盖，进入配置哈希；每组独立 run 目录。
-$B$ 为 \texttt{latent\_dim}；$D$ 为 \texttt{block\_size}（$D{=}1$ 逐 token 因果，$D{=}16$ 块因果）；T5 的 readout 为 \texttt{e}（$z\in\mathbb{R}^{E}$）或 \texttt{b}（$z\in\mathbb{R}^{B}$）。
-双向 T5 无 $D$（encoder 与 decoder self-attn 全双向，不走块 mask）。
-T5 \textbf{不}扫瓶颈：$B$ 一律 $64$。合计 \textbf{13} 组：VAE 8 + T5 5。
+$B$ 为 \texttt{latent\_dim}；$D$ 为 \texttt{block\_size}。本矩阵\textbf{只跑} $D{=}1$（逐 token 因果），不扫块因果 $D{=}16$。
+T5 的 readout 为 \texttt{e}（$z\in\mathbb{R}^{E}$）或 \texttt{b}（$z\in\mathbb{R}^{B}$）；双向 T5 无 $D$。
+T5 \textbf{不}扫瓶颈：$B$ 一律 $64$。合计 \textbf{7} 组：VAE 4 + T5 3。
 
 \subsection{硬件}
 
@@ -439,30 +439,27 @@ T5 \textbf{不}扫瓶颈：$B$ 一律 $64$。合计 \textbf{13} 组：VAE 8 + T5
 \end{tabular}
 \end{center}
 
-VAE 拆成两个 4 卡作业：作业内按 $B$ 升序串跑；作业 1 为 $D{=}1$ 四组，作业 2 为 $D{=}16$ 四组（依赖作业 1 结束后再占卡）。
+VAE 一个 4 卡作业内按 $B$ 升序串跑四组（均为 $D{=}1$）。
 T5 在 \texttt{train-server-2} 上按下列格点训练。
 
 \subsection{\texttt{latent\_vae}（ovan-server，4\texttimes4090）}
 
-固定：$B$ 读出、因果/块因果 encoder、并行 decoder。扫 $B{\in}\{16,32,64,128\}$ 与 $D{\in}\{1,16\}$，共 8 组。
+固定：$B$ 读出、逐 token 因果 encoder、并行 decoder，$D{=}1$。只扫 $B{\in}\{16,32,64,128\}$，共 4 组。
 
 \begin{center}
 \small
-\begin{tabular}{lcc}
+\begin{tabular}{lcccc}
 \toprule
-$B \backslash D$ & $D{=}1$（逐 token 因果） & $D{=}16$（块因果） \\
+$B$ & 16 & 32 & 64 & 128 \\
 \midrule
-16 & $\checkmark$ & $\checkmark$ \\
-32 & $\checkmark$ & $\checkmark$ \\
-64 & $\checkmark$ & $\checkmark$ \\
-128 & $\checkmark$ & $\checkmark$ \\
+$D{=}1$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \subsection{\texttt{latent\_t5}（train-server-2，8\texttimes5090）}
 
-固定 $B{=}64$（配置默认，不扫 $16/32/128$）。消融只做方向、readout，以及单向时的 $D$。
+固定 $B{=}64$（配置默认，不扫 $16/32/128$）、单向 $D{=}1$。消融只做方向与 readout。
 
 \begin{center}
 \small
@@ -471,10 +468,10 @@ $B \backslash D$ & $D{=}1$（逐 token 因果） & $D{=}16$（块因果） \\
 方向 & readout & $B$ & $D$ & 组数 & 合计 \\
 \midrule
 双向 & \texttt{e} & 64 & --- & 1 & 1 \\
-单向 & \texttt{e} & 64 & 1, 16 & 2 & 2 \\
-单向 & \texttt{b} & 64 & 1, 16 & 2 & 2 \\
+单向 & \texttt{e} & 64 & 1 & 1 & 1 \\
+单向 & \texttt{b} & 64 & 1 & 1 & 1 \\
 \midrule
- &  &  &  &  & \textbf{5} \\
+ &  &  &  &  & \textbf{3} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -483,12 +480,12 @@ $B \backslash D$ & $D{=}1$（逐 token 因果） & $D{=}16$（块因果） \\
 
 \begin{itemize}
   \item \textbf{双向 / readout=\texttt{e}}：默认 \texttt{bidirectional=true}（无 $D$）。
-  \item \textbf{单向 / readout=\texttt{e}}：$D{=}1$、$D{=}16$。
-  \item \textbf{单向 / readout=\texttt{b}}：$D{=}1$、$D{=}16$。
+  \item \textbf{单向 / readout=\texttt{e}}：$D{=}1$。
+  \item \textbf{单向 / readout=\texttt{b}}：$D{=}1$。
 \end{itemize}
 
 CLI 对应：双向不改默认；单向 \texttt{--set model.bidirectional=false}；
-\texttt{readout=b} 时 \texttt{--set model.readout=b}；$D$ 为 \texttt{model.block\_size}。$B$ 用配置默认 $64$，不必 \texttt{--set model.latent\_dim}。
+\texttt{readout=b} 时 \texttt{--set model.readout=b}。$B$ 用配置默认 $64$，不必 \texttt{--set model.latent\_dim}；单向 $D$ 用默认 \texttt{block\_size=1}。
 
 \section{设计选择与局限}
 
