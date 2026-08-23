@@ -8,4 +8,6 @@ transformers
 PyYAML
 matplotlib
 httpx[socks]
+fastapi
+uvicorn[standard]
 wordfreq  # TriFluency B 轴假词率（eval.nonword）

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Generate · bdelf monitor</title>
+  <link rel="stylesheet" href="/common.css" />
+</head>
+<body>
+  <header>
+    <h1>bdelf monitor</h1>
+    <span id="instance-badge" class="badge badge-instance" hidden></span>
+    <nav>
+      <a href="/train.html" data-nav="train">Train</a>
+      <a href="/eval.html" data-nav="eval">Eval</a>
+      <a href="/generate.html" data-nav="generate" class="active">Generate</a>
+    </nav>
+  </header>
+  <main>
+    <section id="remote-block" class="hidden">
+      <div class="card">
+        <h2>Generate 仅本机可用</h2>
+        <p class="muted">当前实例是 remote。请在本机 monitor 打开此页。</p>
+      </div>
+    </section>
+    <section id="model-view">
+      <div class="filter-bar" id="model-toolbar">
+        <input id="model-search" type="search" placeholder="按模型名搜索" autocomplete="off" />
+        <span class="badge badge-kind badge-kind-lm">LM</span>
+      </div>
+      <section id="model-section"><p class="muted">正在扫描 LM full run…</p></section>
+    </section>
+    <section id="hash-view" class="hidden">
+      <a class="back-link" href="/generate.html">← 返回模型列表</a>
+      <section id="hash-section"></section>
+    </section>
+    <section id="ckpt-view" class="hidden">
+      <a class="back-link" id="ckpt-back" href="/generate.html">← 返回哈希列表</a>
+      <section id="ckpt-section"></section>
+    </section>
+    <section id="studio-view" class="hidden">
+      <a class="back-link" id="studio-back" href="/generate.html">← 返回 checkpoint 列表</a>
+      <section id="studio-section"></section>
+    </section>
+  </main>
+  <script type="module" src="/generate.js"></script>
+</body>
+</html>

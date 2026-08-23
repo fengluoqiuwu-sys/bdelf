@@ -10,7 +10,7 @@ alwaysApply: true
 | 位置 | 内容 |
 |------|------|
 | 仓库根 | 入口：`train.py`、`generate.py`、`eval.py`（库代码勿塞进 `scripts/`） |
-| `scripts/` | 通用辅助（resolve、download、sync、`workspace_lock.py`、`agent_wakeup.py`、`preprocess.py`、`vram_probe.py`、`launch-train.sh`、`launch-eval.sh`、`job_log_dir.sh` 等） |
+| `scripts/` | 通用辅助（resolve、download、sync、`web.sh`、`workspace_lock.py`、`agent_wakeup.py`、`preprocess.py`、`vram_probe.py`、`launch-train.sh`、`launch-eval.sh`、`job_log_dir.sh` 等） |
 | `scripts/train/` | 训练启动 `.sh`（模板 `prototype.sh`；由包装器拉起） |
 | `scripts/eval/` | 离线评测启动 `.sh`（模板 `prototype.sh`；由 `sbatch-eval` / `launch-eval` 拉起） |
 | `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`eval.slurm` + `sbatch-eval.sh`；`vram-probe.slurm` + `sbatch-vram-probe.sh`；`preprocess.slurm` + `sbatch-preprocess.sh`；`remote_status.sh`（ovan-server 专属）/ `gpu_availability.py` / `tail_remote_logs.py` |
@@ -21,7 +21,7 @@ alwaysApply: true
 ## 执行目录
 
 - **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
-- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-eval.sh <name> -- --run …`、`bash scripts/launch-train.sh <name> --server <服务名> --gpus …`、`bash scripts/launch-eval.sh <name> --server <服务名> --gpus … -- --run …`、`bash slurm/sbatch-vram-probe.sh …`、`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`、`bash scripts/sync.sh <服务名> push|pull|…`、`ssh <服务名> 'cd ~/source/bdelf && …'`、`.venv/bin/python scripts/workspace_lock.py …`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`；均可系统 SSH）。
+- 写成：`.venv/bin/python scripts/foo.py`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-eval.sh <name> -- --run …`、`bash scripts/launch-train.sh <name> --server <服务名> --gpus …`、`bash scripts/launch-eval.sh <name> --server <服务名> --gpus … -- --run …`、`bash slurm/sbatch-vram-probe.sh …`、`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`、`bash scripts/sync.sh <服务名> push|pull|…`、`bash scripts/web.sh <local|服务名> up|down`、`ssh <服务名> 'cd ~/source/bdelf && …'`、`.venv/bin/python scripts/workspace_lock.py …`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`；均可系统 SSH）。
 - 禁止 `cd scripts && python foo.py`。
 - `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
 - `<服务名>` 与工作目录见 `scripts/servers.csv`；均可系统 SSH。

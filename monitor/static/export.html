@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>导出图表 · bdelf monitor</title>
+  <link rel="stylesheet" href="/common.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body class="export-page">
+  <header class="export-bar">
+    <h1 id="export-title">导出图表</h1>
+    <span id="instance-badge" class="badge badge-instance" hidden></span>
+    <label class="export-opt">
+      <input type="checkbox" id="export-invert" />
+      背景反转
+    </label>
+    <label class="export-opt">
+      宽度
+      <input type="number" id="export-width" min="240" max="4096" step="10" value="960" />
+      px
+    </label>
+    <label class="export-opt">
+      高度
+      <input type="number" id="export-height" min="120" max="2400" step="10" value="360" />
+      px
+    </label>
+    <button type="button" id="export-download">下载 PNG</button>
+  </header>
+  <main class="export-main">
+    <p class="muted" id="export-hint">等待图表数据…</p>
+    <div id="export-stage">
+      <div id="export-slot">
+        <div id="export-preview">
+          <canvas id="export-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script type="module" src="/export.js"></script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 供 sync.sh 共用：从 scripts/servers.csv 解析服务行。
+# 供 sync.sh / web.sh 共用：从 scripts/servers.csv 解析服务行。
 # 用法：SCRIPT_DIR 已指向 scripts/ 后 source 本文件；再 load_server <名字>。
 # SSH：一律系统 ssh，目标即「名字」（须已可 ssh <名字>）。
 
@@ -12,6 +12,11 @@ SERVER_SCHEDULER=""
 SERVER_GPU_MAX=""      # csv「最大使用显卡数量」：AI 合计额度
 SERVER_GPU_PER_JOB=""  # csv「单个ai任务最大使用显卡数量」
 SSH_BASE=(ssh)
+
+# 须先 load_server；供 sync.sh / web.sh 等共用。
+remote_ssh() {
+  "${SSH_BASE[@]}" "${REMOTE_SSH_TARGET}" "$@"
+}
 
 list_server_names() {
   python3 - "$SERVERS_CSV" <<'PY'

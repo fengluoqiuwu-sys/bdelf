@@ -11,6 +11,7 @@
 | `servers_lib.sh` | 解析 `servers.csv` |
 | `servers.csv.example` | 服务名 / 调度 / 工作目录 / GPU 额度表头 |
 | `sync.sh` | 代码 push + `logs/` pull；产物路径须重写 |
+| `web.sh` | `local\|服务名` + `up\|down`：本机或 SSH 隧道打开 monitor |
 | `job_log_dir.sh` | `logs/<服务名>/<时间戳>/` |
 | `workspace_lock.py` | 本机非 temp 改动互斥锁 |
 | `agent_wakeup.py` | 延时打印 `AGENT_WAKEUP` |

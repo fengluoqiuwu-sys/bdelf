@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Train · bdelf monitor</title>
+  <link rel="stylesheet" href="/common.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>bdelf monitor</h1>
+    <span id="instance-badge" class="badge badge-instance" hidden></span>
+    <nav>
+      <a href="/train.html" data-nav="train" class="active">Train</a>
+      <a href="/eval.html" data-nav="eval">Eval</a>
+      <a href="/generate.html" data-nav="generate">Generate</a>
+    </nav>
+  </header>
+  <main>
+    <section id="model-view">
+      <div class="filter-bar" id="model-toolbar">
+        <input id="model-search" type="search" placeholder="按模型名搜索" autocomplete="off" />
+        <div class="kind-filters" id="kind-filters">
+          <button type="button" class="kind-filter active" data-kind="">全部</button>
+          <button type="button" class="kind-filter" data-kind="lm">LM</button>
+          <button type="button" class="kind-filter" data-kind="latent">Latent</button>
+        </div>
+      </div>
+      <section id="model-section"><p class="muted">正在扫描 full 训练 run…</p></section>
+    </section>
+    <section id="hash-view" class="hidden">
+      <a class="back-link" href="/train.html">← 返回模型列表</a>
+      <section id="hash-section"></section>
+    </section>
+    <section id="detail-view" class="hidden">
+      <a class="back-link" id="detail-back" href="/train.html">← 返回哈希列表</a>
+      <section id="run-header"></section>
+      <div class="page-tabs" id="detail-tabs">
+        <button type="button" class="page-tab active" data-tab="charts">图表</button>
+        <button type="button" class="page-tab" data-tab="eval">Eval</button>
+      </div>
+      <section id="charts-section">
+        <button type="button" id="add-panel">添加图表</button>
+        <div id="panels"></div>
+      </section>
+      <section id="eval-page" class="hidden">
+        <div class="filter-bar">
+          <label for="eval-step-select">步数</label>
+          <select id="eval-step-select"></select>
+        </div>
+        <section id="eval-params" class="card"></section>
+        <section id="eval-ids" class="card"></section>
+        <section id="eval-item" class="card hidden"></section>
+      </section>
+    </section>
+    <div id="chart-modal" class="modal hidden">
+      <div class="modal-backdrop" id="chart-modal-backdrop"></div>
+      <div class="modal-box">
+        <h3 id="chart-modal-title">添加图表</h3>
+        <div id="chart-modal-fields"></div>
+        <div class="modal-actions">
+          <button type="button" class="secondary" id="chart-modal-cancel">取消</button>
+          <button type="button" id="chart-modal-save">确定</button>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script type="module" src="/train.js"></script>
+</body>
+</html>
