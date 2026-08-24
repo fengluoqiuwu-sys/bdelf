@@ -49,6 +49,8 @@ from train.dist import (
     setup_distributed,
 )
 from train.eval import load_gen_eval_baseline
+from train.async_log import install as install_async_log
+from train.async_log import shutdown as shutdown_async_log
 from train.loop import set_seed, train_loop
 from train.metrics import _train_log
 from train.scratch import _cleanup_this_job_scratch
@@ -344,7 +346,32 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
 
 def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
     rank, world_size, device, is_distributed = setup_distributed(cfg)
+    if rank == 0:
+        install_async_log()
     set_seed(cfg.seed, rank)
+    try:
+        _run_training_body(
+            model_name, model_size, cfg,
+            rank=rank, world_size=world_size, device=device,
+            is_distributed=is_distributed,
+        )
+    finally:
+        if rank == 0:
+            shutdown_async_log()
+        if is_distributed:
+            dist.destroy_process_group()
+
+
+def _run_training_body(
+    model_name: str,
+    model_size: str,
+    cfg: FL_TrainConfig,
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    is_distributed: bool,
+) -> None:
 
     if rank == 0:
         _train_log(f"Model: {model_name}/{model_size}")
@@ -597,9 +624,6 @@ def run_training(model_name: str, model_size: str, cfg: FL_TrainConfig) -> None:
         latent_probe_pool=latent_probe_pool,
         latent_pad_token_id=latent_pad_token_id,
     )
-
-    if is_distributed:
-        dist.destroy_process_group()
 
 
 def main() -> None:

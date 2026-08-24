@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import atexit
 import csv
+import io
 import math
 import sys
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from tqdm import tqdm
 
 from models import kind_of
+from train.async_log import close_path, enqueue_file
 
 # lm 主表：仅核心列
 TRAIN_CSV_FIELDS_LM = [
@@ -124,7 +126,8 @@ def train_official_fields(model: str) -> list[str]:
 def _train_log(msg: str, *, file: Any = None) -> None:
     if file is None:
         file = sys.stdout
-    print(f"{_TRAIN_LOG} {msg}", file=file, flush=True)
+    # 不 flush：BeeGFS 上 flush 会卡住 rank0，进而卡住 DDP。异步包装下 flush 也是空操作。
+    print(f"{_TRAIN_LOG} {msg}", file=file)
 
 
 def loss_to_ppl(loss: float) -> float:
@@ -137,19 +140,15 @@ def _csv_header(csv_path: Path) -> list[str]:
         return list(next(csv.reader(f), []))
 
 
-# 进程内：表头已核对的路径、以及追加用常开句柄（避免每步 open/读表头/close）。
+# 进程内：表头已核对的路径（句柄只活在 async_log 写线程里）。
 _csv_schema_ok: dict[str, tuple[tuple[str, ...], bool]] = {}
-_csv_append_files: dict[str, TextIO] = {}
 _csv_atexit_registered = False
 
 
 def _close_csv_append_files() -> None:
-    for fh in _csv_append_files.values():
-        try:
-            fh.close()
-        except OSError:
-            pass
-    _csv_append_files.clear()
+    for key in list(_csv_schema_ok):
+        close_path(key, wait=False)
+    _csv_schema_ok.clear()
 
 
 def _register_csv_atexit() -> None:
@@ -161,11 +160,9 @@ def _register_csv_atexit() -> None:
 
 
 def _drop_csv_append_handle(csv_path: Path) -> None:
-    key = str(csv_path)
-    fh = _csv_append_files.pop(key, None)
-    if fh is not None:
-        fh.close()
-    _csv_schema_ok.pop(key, None)
+    """关掉后台句柄并等待（改 schema / resume 截断前必须同步）。"""
+    close_path(csv_path, wait=True)
+    _csv_schema_ok.pop(str(csv_path), None)
 
 
 def _mark_csv_schema_ok(
@@ -200,25 +197,28 @@ def append_csv_row(
     *,
     extend: bool = False,
 ) -> None:
-    """只追加一行。新列必须已在 ``prepare_csv_for_append`` / 启动时加好。"""
+    """格式化一行后入队；热路径不 open/exists/flush。"""
     _register_csv_atexit()
     key = str(csv_path)
     spec = (tuple(fields), extend)
     write_header = False
-    if not csv_path.exists():
-        # 未走启动 prepare 的兜底：只写表头，不读已有数据。
+    if key not in _csv_schema_ok:
+        # 未走启动 prepare 的一次性兜底，不当每步 exists。
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        write_header = True
+        write_header = not csv_path.exists()
     _csv_schema_ok[key] = spec
-    fh = _csv_append_files.get(key)
-    if fh is None:
-        # 行缓冲：每行一次 write，不再每步重新打开或读表头。
-        fh = open(csv_path, "a", newline="", encoding="utf-8", buffering=1)
-        _csv_append_files[key] = fh
-    writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf, fieldnames=fields, extrasaction="ignore", lineterminator="\n",
+    )
     if write_header:
         writer.writeheader()
     writer.writerow({k: row.get(k, "") for k in fields})
+    text = buf.getvalue()
+    if enqueue_file(csv_path, text):
+        return
+    with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 def init_csv_header(csv_path: Path, fields: list[str]) -> None:
@@ -571,4 +571,4 @@ def _rank0_log(msg: str, pbar: tqdm | None) -> None:
     if pbar is not None:
         tqdm.write(line)
     else:
-        print(line, flush=True)
+        print(line)

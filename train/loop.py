@@ -55,6 +55,7 @@ from train.metrics import (
 )
 from train.latent_curriculum import LatentCurriculumSampler
 from train.latent_eval import LatentCurriculumEvalContext, curriculum_in_observation_window
+from train.async_log import shutdown as shutdown_async_log
 from train.run_logs import prepare_run_logs, train_official_csv
 from train.muon import build_optimizer, scaled_lr, schedule_optimizer_lrs
 from train.scratch import (
@@ -117,10 +118,13 @@ def _fmt_hms(seconds: float) -> str:
 
 
 def _pbar_kwargs() -> dict[str, Any]:
-    """Slurm 把 stderr 接到 BeeGFS 文件时，每步 refresh 会整行落盘并卡住其他 rank。"""
+    """stderr 走 async_log 包装后，tqdm 刷新入队折叠，不再同步打 BeeGFS。"""
+    kwargs: dict[str, Any] = {"file": sys.stderr}
     if sys.stderr.isatty():
-        return {"mininterval": 0.1, "dynamic_ncols": True}
-    return {"mininterval": 2.0, "dynamic_ncols": False, "ncols": 100}
+        kwargs.update(mininterval=0.1, dynamic_ncols=True)
+    else:
+        kwargs.update(mininterval=2.0, dynamic_ncols=False, ncols=160)
+    return kwargs
 
 
 def _redraw_pbar(pbar: tqdm) -> None:
@@ -1075,6 +1079,7 @@ def train_loop(
                 curriculum_state=_curriculum_ckpt(),
             )
             _train_log(f"Saved; resume from step {next_step} on next run")
+            shutdown_async_log()
         if is_distributed:
             dist.barrier()
         return
@@ -1105,6 +1110,7 @@ def train_loop(
             f"Training finished after {step} steps; "
             f"saved {latest_ckpt.name} and {final_snapshot.name} in {run_dir}"
         )
+        shutdown_async_log()
     if is_distributed:
         # Keep peers alive until rank 0 finishes the (often multi-GB) write;
         # otherwise destroy_process_group can race with the final save.
