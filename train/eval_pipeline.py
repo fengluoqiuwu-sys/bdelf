@@ -160,92 +160,70 @@ def generate_shared_samples(
     raw = unwrap_model(train_model)
     was_training = raw.training
     raw.eval()
-    raw = unwrap_model(train_model)
-    was_training = raw.training
-    raw.eval()
     try:
-        return _generate_shared_samples_body(
-            raw,
-            cfg=cfg,
-            train_device=train_device,
-            train_amp_dtype=train_amp_dtype,
-            seed=seed,
-            rank=rank,
-            world_size=world_size,
-            is_distributed=is_distributed,
-            pbar_parent=pbar_parent,
-            log=log,
+        seqlen = int(cfg.extra.get("chunk_length", 1024))
+        n_total = int(cfg.gen_eval_samples)
+        n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
+        micro_bs = max(1, int(cfg.batch_size))
+        local_seed = seed * max(1, world_size) + rank
+        use_train_amp = train_device.type == "cuda"
+
+        if log and pbar_parent is not None:
+            pbar_parent.clear()
+            tqdm.write(
+                f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen} "
+                f"(world={world_size}, local={n_local}, micro_bs={micro_bs}, "
+                f"seed={local_seed}) ...",
+            )
+
+        devices = [train_device] if train_device.type == "cuda" else []
+        local_texts: list[str] = []
+        local_uniq: list[float] = []
+
+        if n_local > 0:
+            chunks: list[torch.Tensor] = []
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(local_seed)
+                if train_device.type == "cuda":
+                    torch.cuda.manual_seed_all(local_seed)
+                sampling_cfg = _gen_eval_sampling_cfg(cfg)
+                with torch.amp.autocast(
+                    "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
+                ):
+                    remaining = n_local
+                    while remaining > 0:
+                        this_bs = min(micro_bs, remaining)
+                        generated, _nfe = raw.generate(
+                            num_samples=this_bs,
+                            seqlen=seqlen,
+                            for_eval=True,
+                            sampling_cfg=sampling_cfg,
+                        )
+                        chunks.append(generated.detach())
+                        remaining -= this_bs
+            generated = torch.cat(chunks, dim=0)
+            local_uniq = [
+                float(row.unique().numel()) for row in generated.detach().cpu()
+            ]
+            src_tok_name = get_preprocess(cfg.preprocess).tokenizer
+            src_tok = _get_src_tokenizer(src_tok_name)
+            local_texts = [
+                src_tok.decode(row.tolist(), skip_special_tokens=True)
+                for row in generated.detach().cpu()
+            ]
+
+        texts = _gather_object_list(local_texts, is_distributed=is_distributed)
+        uniq_counts = _gather_object_list(local_uniq, is_distributed=is_distributed)
+        texts = texts[:n_total]
+        uniq_counts = uniq_counts[:n_total]
+        return SharedGenBatch(
+            texts=texts, uniq_counts=uniq_counts, seed=seed, seqlen=seqlen,
         )
     finally:
         if was_training:
             raw.train()
-
-
-def _generate_shared_samples_body(
-    n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
-    micro_bs = max(1, int(cfg.batch_size))
-    local_seed = seed * max(1, world_size) + rank
-    use_train_amp = train_device.type == "cuda"
-
-    if log and pbar_parent is not None:
-        pbar_parent.clear()
-        tqdm.write(
-            f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen} "
-            f"(world={world_size}, local={n_local}, micro_bs={micro_bs}, "
-            f"seed={local_seed}) ...",
-        )
-
-    devices = [train_device] if train_device.type == "cuda" else []
-    local_texts: list[str] = []
-    local_uniq: list[float] = []
-
-    if n_local > 0:
-        chunks: list[torch.Tensor] = []
-        with torch.random.fork_rng(devices=devices):
-            torch.manual_seed(local_seed)
-            if train_device.type == "cuda":
-                torch.cuda.manual_seed_all(local_seed)
-            gen_model = raw
-            sampling_cfg = _gen_eval_sampling_cfg(cfg)
-            with torch.amp.autocast(
-                "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
-            ):
-                remaining = n_local
-                while remaining > 0:
-                    this_bs = min(micro_bs, remaining)
-                    generated, _nfe = gen_model.generate(
-                        num_samples=this_bs,
-                        seqlen=seqlen,
-                        for_eval=True,
-                        sampling_cfg=sampling_cfg,
-                    )
-                    chunks.append(generated.detach())
-                    remaining -= this_bs
-        generated = torch.cat(chunks, dim=0)
-        local_uniq = [
-            float(row.unique().numel()) for row in generated.detach().cpu()
-        ]
-        src_tok_name = get_preprocess(cfg.preprocess).tokenizer
-        src_tok = _get_src_tokenizer(src_tok_name)
-        local_texts = [
-            src_tok.decode(row.tolist(), skip_special_tokens=True)
-            for row in generated.detach().cpu()
-        ]
-
-    texts = _gather_object_list(local_texts, is_distributed=is_distributed)
-    uniq_counts = _gather_object_list(local_uniq, is_distributed=is_distributed)
-    # 截到 n_total（余数分配可能导致恰好 n_total）
-    texts = texts[:n_total]
-    uniq_counts = uniq_counts[:n_total]
-
-    if was_training:
-        raw.train()
-    if log and pbar_parent is not None:
-        pbar_parent.refresh()
-
-    return SharedGenBatch(
-        texts=texts, uniq_counts=uniq_counts, seed=seed, seqlen=seqlen,
-    )
+        if log and pbar_parent is not None:
+            pbar_parent.refresh()
 
 
 @torch.no_grad()
