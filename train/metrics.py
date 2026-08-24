@@ -130,6 +130,12 @@ def loss_to_ppl(loss: float) -> float:
     return math.exp(min(loss, 20.0))
 
 
+def _csv_header(csv_path: Path) -> list[str]:
+    """只读首行表头，不载入数据行。"""
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        return list(next(csv.reader(f), []))
+
+
 def append_csv_row(
     csv_path: Path,
     fields: list[str],
@@ -165,7 +171,7 @@ def ensure_csv_schema(
     *,
     extend: bool = False,
 ) -> None:
-    """对齐表头。
+    """对齐表头。表头已一致时只读首行并返回，不把数据行读入内存。
 
     - ``extend=False``：表头严格为 ``fields``（主表 / 官方卫星）。
     - ``extend=True``：保留已有列并追加 ``fields`` 中的新列（外部 / samples）。
@@ -173,10 +179,7 @@ def ensure_csv_schema(
     """
     if not csv_path.exists():
         return
-    with open(csv_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        old_fields = list(reader.fieldnames or [])
-        rows = list(reader)
+    old_fields = _csv_header(csv_path)
     if extend:
         out_fields = list(old_fields)
         for name in fields:
@@ -186,6 +189,9 @@ def ensure_csv_schema(
         out_fields = list(fields)
     if out_fields == old_fields:
         return
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=out_fields, extrasaction="ignore")
         writer.writeheader()
