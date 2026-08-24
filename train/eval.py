@@ -76,6 +76,7 @@ def _eval_loss_branch(model: nn.Module) -> str | None:
     return None
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def eval_model_ppl(
     model: nn.Module,
@@ -91,9 +92,13 @@ def eval_model_ppl(
 
     多卡时各 rank 只跑本地分片，再对 ``(sum_loss, n_batches)`` allreduce，
     得到与单卡全量相同的按 batch 均权平均。
+
+    调用方应传入 ``unwrap_model`` 后的原模块，且不要对 DDP/compile 外壳
+    ``eval()``：只切 raw 的 ``training``，避免 Dynamo 为 eval 模式另编一张图。
     """
-    was_training = model.training
-    model.eval()
+    raw = unwrap_model(model)
+    was_training = raw.training
+    raw.eval()
     branch = _eval_loss_branch(model)
     use_amp = device.type == "cuda"
     total_loss = 0.0
@@ -115,7 +120,7 @@ def eval_model_ppl(
         for eval_batch in batch_iter:
             eval_batch = eval_batch.to(device, non_blocking=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                loss = forward_loss(model, eval_batch, branch=branch)
+                loss = forward_loss(raw, eval_batch, branch=branch)
             total_loss += float(loss.item())
             batches += 1
     finally:
@@ -124,7 +129,7 @@ def eval_model_ppl(
         if show_pbar and pbar_parent is not None:
             pbar_parent.refresh()
         if was_training:
-            model.train()
+            raw.train()
 
     if is_distributed:
         stats = torch.tensor(
@@ -167,6 +172,7 @@ def load_gen_eval_baseline(cfg: FL_TrainConfig) -> nn.Module:
     return model
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def eval_one_batch_gen_ppl(
     train_model: nn.Module,
@@ -190,8 +196,8 @@ def eval_one_batch_gen_ppl(
     Returns ``(gen_loss, gen_ppl, gen_uniq_mean, gen_nonempty_frac)``. The last
     two catch mode-collapse that can fake a very low gen_ppl (e.g. repeated ``/``).
     """
-    was_training = train_model.training
-    train_model.eval()
+    was_training = unwrap_model(train_model).training
+    unwrap_model(train_model).eval()
     gpt2_model.eval()
     gpt2_device = next(gpt2_model.parameters()).device
     gpt2_vocab_size = int(getattr(gpt2_model.config, "vocab_size", 50257))
@@ -316,7 +322,7 @@ def eval_one_batch_gen_ppl(
     gen_nonempty_frac = nonempty_total / max(n_generated, 1)
 
     if was_training:
-        train_model.train()
+        unwrap_model(train_model).train()
     if log and pbar_parent is not None:
         pbar_parent.refresh()
 
@@ -367,8 +373,9 @@ def release_eval_cuda_scratch(
     仍预留峰值；不还池则后续训练步的 nvidia-smi 会钉在峰值。不卸载 gpt2、
     权重、优化器或 EMA。各 rank 都要调用。
 
-    latent 重建 eval 几乎不额外占显存；``empty_cache=True`` 会打散已编译图的
-    allocator 池，后续 compile 越来越慢，故课程 VAE 路径应关。
+    在线评测在 ``torch.compile`` 开启时应传 ``empty_cache=False``：还池会打散
+    已编译图的 allocator，后续训练步重编极慢。Cola gen-eval 的 nvidia-smi
+    峰值钉住可另说，不要用 empty_cache 换 compile 图。
     """
     raw = unwrap_model(model)
     for m in raw.modules():

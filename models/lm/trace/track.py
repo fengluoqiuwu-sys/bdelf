@@ -16,7 +16,7 @@ from models.lm.trace.ace import (
     direction_from_sc_rep_pairs,
 )
 from train.checkpoint import unwrap_model
-from train.ema import swap_ema_weights
+from train.ema import using_ema_weights
 
 
 def _backbone(model: Any) -> Any:
@@ -72,6 +72,7 @@ def _all_gather_pairs(
     return torch.cat(chunks_f, dim=0).cpu(), torch.cat(chunks_r, dim=0).cpu()
 
 
+@torch.compiler.disable
 def maybe_refresh_attr_d(
     model: Any,
     *,
@@ -125,66 +126,67 @@ def maybe_refresh_attr_d(
     dim = int(bb.text_encoder_dim)
 
     start, n_local = _shard(n, world_size if is_distributed else 1, rank)
-    was_training = model.training
-    model.eval()
-    if rank == 0 and log is not None:
-        log(
-            f"TrACE 估 d：opt_step={opt_step} n={n} "
-            f"shard={n_local}@{start} freeze={freeze} ema={ema_state is not None}"
-        )
-
-    feats: torch.Tensor | None = None
-    reps: torch.Tensor | None = None
-    with torch.no_grad():
-        with swap_ema_weights(model, ema_state):
-            if n_local > 0:
-                feats, reps = collect_ace_sc_rep_pairs(
-                    bb,
-                    sampling_cfg=sampling_cfg,
-                    tokenizer_name=tok_name,
-                    n=n_local,
-                    batch_size=bs,
-                    seed=seed + start * 100003,
-                    log_progress=(rank == 0),
-                )
-
-    feats, reps = _all_gather_pairs(
-        feats, reps, dim=dim, device=device, is_distributed=is_distributed,
-    )
-    d_hat, meta = direction_from_sc_rep_pairs(feats, reps)
-    gap = float(meta["rep_gap"])
-    if gap < min_gap:
-        bb.attr_d_last_opt.fill_(int(opt_step))
-        nxt = int(opt_step) + every
+    raw = unwrap_model(model)
+    was_training = raw.training
+    raw.eval()
+    try:
         if rank == 0 and log is not None:
             log(
-                f"TrACE 跳过更新 d：rep_gap={gap:.4f} < {min_gap:g} "
-                f"(rep_lo={meta['rep_lo']:.4f} rep_hi={meta['rep_hi']:.4f})；"
-                f"下次不早于 opt_step={nxt}"
+                f"TrACE 估 d：opt_step={opt_step} n={n} "
+                f"shard={n_local}@{start} freeze={freeze} ema={ema_state is not None}"
             )
-        if was_training:
-            model.train()
-        return False
 
-    d_hat = d_hat.to(device=bb.attr_d.device, dtype=bb.attr_d.dtype)
-    old = bb.attr_d.detach()
-    if valid:
-        mixed = beta * old + (1.0 - beta) * d_hat
-        mixed = mixed / (mixed.norm() + 1e-8)
-        rho = float((d_hat * old).sum().abs().item())
-    else:
-        mixed = d_hat
-        rho = float("nan")
-    bb.attr_d.copy_(mixed)
-    bb.attr_d_valid.fill_(1.0)
-    bb.attr_d_last_opt.fill_(int(opt_step))
-    bb.last_attr_rho = rho
-    if was_training:
-        model.train()
-    if rank == 0 and log is not None:
-        rho_s = "n/a" if rho != rho else f"{rho:.3f}"
-        log(
-            f"TrACE 更新 d：rep_lo={meta['rep_lo']:.4f} rep_hi={meta['rep_hi']:.4f} "
-            f"gap={gap:.4f} cos={rho_s} beta={beta:g}"
+        feats: torch.Tensor | None = None
+        reps: torch.Tensor | None = None
+        with torch.no_grad():
+            with using_ema_weights(model, ema_state):
+                if n_local > 0:
+                    feats, reps = collect_ace_sc_rep_pairs(
+                        bb,
+                        sampling_cfg=sampling_cfg,
+                        tokenizer_name=tok_name,
+                        n=n_local,
+                        batch_size=bs,
+                        seed=seed + start * 100003,
+                        log_progress=(rank == 0),
+                    )
+
+        feats, reps = _all_gather_pairs(
+            feats, reps, dim=dim, device=device, is_distributed=is_distributed,
         )
-    return True
+        d_hat, meta = direction_from_sc_rep_pairs(feats, reps)
+        gap = float(meta["rep_gap"])
+        if gap < min_gap:
+            bb.attr_d_last_opt.fill_(int(opt_step))
+            nxt = int(opt_step) + every
+            if rank == 0 and log is not None:
+                log(
+                    f"TrACE 跳过更新 d：rep_gap={gap:.4f} < {min_gap:g} "
+                    f"(rep_lo={meta['rep_lo']:.4f} rep_hi={meta['rep_hi']:.4f})；"
+                    f"下次不早于 opt_step={nxt}"
+                )
+            return False
+
+        d_hat = d_hat.to(device=bb.attr_d.device, dtype=bb.attr_d.dtype)
+        old = bb.attr_d.detach()
+        if valid:
+            mixed = beta * old + (1.0 - beta) * d_hat
+            mixed = mixed / (mixed.norm() + 1e-8)
+            rho = float((d_hat * old).sum().abs().item())
+        else:
+            mixed = d_hat
+            rho = float("nan")
+        bb.attr_d.copy_(mixed)
+        bb.attr_d_valid.fill_(1.0)
+        bb.attr_d_last_opt.fill_(int(opt_step))
+        bb.last_attr_rho = rho
+        if rank == 0 and log is not None:
+            rho_s = "n/a" if rho != rho else f"{rho:.3f}"
+            log(
+                f"TrACE 更新 d：rep_lo={meta['rep_lo']:.4f} rep_hi={meta['rep_hi']:.4f} "
+                f"gap={gap:.4f} cos={rho_s} beta={beta:g}"
+            )
+        return True
+    finally:
+        if was_training:
+            raw.train()

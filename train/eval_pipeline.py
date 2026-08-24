@@ -137,6 +137,7 @@ def _gather_object_list(local: list[Any], *, is_distributed: bool) -> list[Any]:
     return out
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def generate_shared_samples(
     train_model: nn.Module,
@@ -151,11 +152,36 @@ def generate_shared_samples(
     pbar_parent: tqdm | None,
     log: bool,
 ) -> SharedGenBatch:
-    """各卡分担生成，再汇总 texts / uniq（顺序：rank0, rank1, …）。"""
-    was_training = train_model.training
-    train_model.eval()
-    seqlen = int(cfg.extra.get("chunk_length", 1024))
-    n_total = int(cfg.gen_eval_samples)
+    """各卡分担生成，再汇总 texts / uniq（顺序：rank0, rank1, …）。
+
+    只切 unwrap 后原模块的 ``eval()``，不动 DDP/compile 外壳，避免 Dynamo
+    为 eval 模式另编一张图。
+    """
+    raw = unwrap_model(train_model)
+    was_training = raw.training
+    raw.eval()
+    raw = unwrap_model(train_model)
+    was_training = raw.training
+    raw.eval()
+    try:
+        return _generate_shared_samples_body(
+            raw,
+            cfg=cfg,
+            train_device=train_device,
+            train_amp_dtype=train_amp_dtype,
+            seed=seed,
+            rank=rank,
+            world_size=world_size,
+            is_distributed=is_distributed,
+            pbar_parent=pbar_parent,
+            log=log,
+        )
+    finally:
+        if was_training:
+            raw.train()
+
+
+def _generate_shared_samples_body(
     n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
     micro_bs = max(1, int(cfg.batch_size))
     local_seed = seed * max(1, world_size) + rank
@@ -179,7 +205,7 @@ def generate_shared_samples(
             torch.manual_seed(local_seed)
             if train_device.type == "cuda":
                 torch.cuda.manual_seed_all(local_seed)
-            gen_model = unwrap_model(train_model)
+            gen_model = raw
             sampling_cfg = _gen_eval_sampling_cfg(cfg)
             with torch.amp.autocast(
                 "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
@@ -213,7 +239,7 @@ def generate_shared_samples(
     uniq_counts = uniq_counts[:n_total]
 
     if was_training:
-        train_model.train()
+        raw.train()
     if log and pbar_parent is not None:
         pbar_parent.refresh()
 
@@ -407,15 +433,16 @@ def run_online_eval(
     batch: SharedGenBatch | None = None
     scores: SampleScoreSheet | None = None
 
-    with swap_ema_weights(model, ema_state):
-        if (
-            is_latent
-            and cfg.extra.get("curriculum")
-            and curriculum_eval_ctx is not None
-            and curriculum_sampler is not None
-        ):
-            from train.latent_eval import run_latent_curriculum_eval
+    if (
+        is_latent
+        and cfg.extra.get("curriculum")
+        and curriculum_eval_ctx is not None
+        and curriculum_sampler is not None
+    ):
+        from train.latent_eval import run_latent_curriculum_eval
 
+        # copy_ 进同一 Parameter，前向打编译模块（对齐训练 graph_l）。
+        with swap_ema_weights(model, ema_state):
             curriculum_eval_row = run_latent_curriculum_eval(
                 model,
                 ctx=curriculum_eval_ctx,
@@ -432,12 +459,15 @@ def run_online_eval(
                 pbar_parent=pbar_parent,
                 log=(rank == 0),
             )
-            release_eval_cuda_scratch(
-                model, log=(rank == 0), empty_cache=False,
-            )
-            if csv_stage:
-                curriculum_eval_row["curriculum_stage"] = csv_stage
-        else:
+        release_eval_cuda_scratch(
+            model, log=(rank == 0), empty_cache=False,
+        )
+        if csv_stage:
+            curriculum_eval_row["curriculum_stage"] = csv_stage
+    else:
+        from train.ema import using_ema_weights
+
+        with using_ema_weights(model, ema_state):
             eval_loss, eval_ppl = eval_model_ppl(
                 unwrap_model(model),
                 eval_loader,
@@ -479,7 +509,9 @@ def run_online_eval(
             elif need_samples and gpt2_model is None and rank == 0:
                 _train_log("eval/gen skipped: no gpt2 baseline")
 
-            release_eval_cuda_scratch(model, log=(rank == 0))
+        release_eval_cuda_scratch(
+            model, log=(rank == 0), empty_cache=False,
+        )
 
     if is_distributed:
         dist.barrier()

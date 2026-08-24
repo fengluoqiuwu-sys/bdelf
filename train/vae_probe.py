@@ -167,12 +167,14 @@ def write_vae_probe_dir(
     seed: int,
     meta_extra: dict[str, Any] | None = None,
 ) -> Path | None:
-    """落盘 ``eval_samples/step_*/vae_probe/``。"""
+    """落盘 ``eval_samples/step_*/vae_probe/``。
+
+    不切 ``eval()``/``train()``：Dynamo 对 ``training`` 打 guard，切模式会拆
+    已编译训练图。encode 已 ``@torch.compiler.disable`` + unwrap。
+    """
     if not samples or not model_supports_vae_probe(model):
         return None
 
-    was_training = model.training
-    model.eval()
     step_dir = sample_step_dir(run_dir, step)
     out_dir = step_dir / "vae_probe"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -180,73 +182,69 @@ def write_vae_probe_dir(
     per_sample_metrics: list[dict[str, float]] = []
     pooled_values: list[np.ndarray] = []
 
-    try:
-        for i, tokens in enumerate(samples):
-            eff = _effective_length(tokens, pad_token_id)
-            if eff <= 0:
-                continue
-            z_t = _encode_mu(model, tokens[:eff], device, amp_dtype)
-            z = z_t.numpy()
-            pooled_values.append(z.reshape(-1))
+    for i, tokens in enumerate(samples):
+        eff = _effective_length(tokens, pad_token_id)
+        if eff <= 0:
+            continue
+        z_t = _encode_mu(model, tokens[:eff], device, amp_dtype)
+        z = z_t.numpy()
+        pooled_values.append(z.reshape(-1))
 
-            _plot_latent_matrix(z, out_dir / f"{i:02d}_latent_matrix.png")
-            _plot_self_similarity(z, out_dir / f"{i:02d}_self_similarity.png")
-            _plot_latent_distribution(
-                z.reshape(-1),
-                out_dir / f"{i:02d}_latent_dist.png",
-                title="VAE Latent Distribution",
-            )
-            per_sample_metrics.append({
-                "offdiag_cosine_mean": _offdiag_cosine_mean(z),
-                "z_mean": float(z.mean()),
-                "z_std": float(z.std()),
-                "length": float(eff),
-            })
+        _plot_latent_matrix(z, out_dir / f"{i:02d}_latent_matrix.png")
+        _plot_self_similarity(z, out_dir / f"{i:02d}_self_similarity.png")
+        _plot_latent_distribution(
+            z.reshape(-1),
+            out_dir / f"{i:02d}_latent_dist.png",
+            title="VAE Latent Distribution",
+        )
+        per_sample_metrics.append({
+            "offdiag_cosine_mean": _offdiag_cosine_mean(z),
+            "z_mean": float(z.mean()),
+            "z_std": float(z.std()),
+            "length": float(eff),
+        })
 
-        if pooled_values:
-            pooled = np.concatenate(pooled_values)
-            _plot_latent_distribution(
-                pooled,
-                out_dir / "pooled_latent_dist.png",
-                title="VAE Latent Distribution (pooled)",
-            )
-            probe_metrics = {
-                "step": step,
-                "n": len(per_sample_metrics),
-                "seed": seed,
-                "per_sample": per_sample_metrics,
-                "pooled": {
-                    "z_mean": float(pooled.mean()),
-                    "z_std": float(pooled.std()),
-                },
-            }
-            (out_dir / "probe_metrics.json").write_text(
-                json.dumps(probe_metrics, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-
-        meta = {
+    if pooled_values:
+        pooled = np.concatenate(pooled_values)
+        _plot_latent_distribution(
+            pooled,
+            out_dir / "pooled_latent_dist.png",
+            title="VAE Latent Distribution (pooled)",
+        )
+        probe_metrics = {
             "step": step,
-            "probe_n": len(per_sample_metrics),
-            "probe_seed": seed,
-            **(meta_extra or {}),
+            "n": len(per_sample_metrics),
+            "seed": seed,
+            "per_sample": per_sample_metrics,
+            "pooled": {
+                "z_mean": float(pooled.mean()),
+                "z_std": float(pooled.std()),
+            },
         }
-        step_meta_path = step_dir / "meta.json"
-        if step_meta_path.exists():
-            try:
-                existing = json.loads(step_meta_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-            existing.update(meta)
-            meta = existing
-        step_meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+        (out_dir / "probe_metrics.json").write_text(
+            json.dumps(probe_metrics, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        return out_dir
-    finally:
-        if was_training:
-            model.train()
+
+    meta = {
+        "step": step,
+        "probe_n": len(per_sample_metrics),
+        "probe_seed": seed,
+        **(meta_extra or {}),
+    }
+    step_meta_path = step_dir / "meta.json"
+    if step_meta_path.exists():
+        try:
+            existing = json.loads(step_meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        existing.update(meta)
+        meta = existing
+    step_meta_path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return out_dir
 
 
 def maybe_write_vae_probe(

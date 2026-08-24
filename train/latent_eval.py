@@ -16,7 +16,12 @@ from preprocess.preprocess import _PreprocessedSplitDataset, get_preprocessed
 from train.batching import collate_input_ids
 from train.checkpoint import unwrap_model
 from train.eval import forward_loss
-from train.latent_curriculum import LatentCurriculumSampler, LatentCurriculumSpec, _bucket_indices
+from train.latent_curriculum import (
+    LatentCurriculumSampler,
+    LatentCurriculumSpec,
+    _bucket_indices,
+    batch_graph_l,
+)
 from train.metrics import _TRAIN_LOG, _train_log
 
 
@@ -133,26 +138,42 @@ def _collate_bucket(items: list[dict[str, torch.Tensor]], graph_l: int, pad_id: 
     return torch.stack(rows, dim=0)
 
 
-@torch.compiler.disable
+def _pad_batch_to(batch: torch.Tensor, pad_to: int, pad_id: int) -> torch.Tensor:
+    """只 pad、不截断 held-out token（长度已超过目标时原样返回）。"""
+    t = int(batch.size(1))
+    if t >= pad_to:
+        return batch
+    pad = torch.full(
+        (batch.size(0), pad_to - t),
+        pad_id,
+        dtype=batch.dtype,
+        device=batch.device,
+    )
+    return torch.cat([batch, pad], dim=1)
+
+
 @torch.no_grad()
 def _latent_batch_metrics(
     model: nn.Module,
     batch: torch.Tensor,
     device: torch.device,
     amp_dtype: torch.dtype,
+    *,
+    pad_to_len: int | None = None,
+    pad_token_id: int | None = None,
 ) -> dict[str, float]:
-    """在线 latent 指标走 eager 原模块，避免 torch.compile 因切 train/eval 重编译。
+    """在线 latent 指标：打 DDP/compile 包装（与训练同图），保持 train()。
 
-    mask 指标仍在 ``train()`` 下取（与改前一致）；前向打在 unwrap 后的 ``raw`` 上，
-    不进入 OptimizedModule / DDP 包装。
+    EMA 由调用方 ``swap_ema_weights`` ``copy_`` 进同一 Parameter。输入 pad
+    到当前阶段 ``batch_graph_l``，命中训练已编译的 shape。不切 eval()。
     """
-    raw = unwrap_model(model)
-    raw.train()
     use_amp = device.type == "cuda"
     batch = batch.to(device, non_blocking=True)
+    if pad_to_len is not None and pad_token_id is not None:
+        batch = _pad_batch_to(batch, pad_to_len, pad_token_id)
     with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-        forward_loss(raw, batch)
-    return dict(raw.train_metrics())
+        forward_loss(model, batch)
+    return dict(unwrap_model(model).train_metrics())
 
 
 def _aggregate_metrics(
@@ -188,10 +209,9 @@ def eval_latent_loader_metrics(
     pbar_parent: tqdm | None = None,
     log: bool = True,
     desc: str = "eval",
+    pad_to_len: int | None = None,
+    pad_token_id: int | None = None,
 ) -> dict[str, float]:
-    # 不调用 model.eval()：compile 包装一旦切模式就会重编译；指标前向见
-    # ``_latent_batch_metrics``（eager + train，与改前 mask 口径一致）。
-    was_training = model.training
     totals: dict[str, float] = {}
     counts: dict[str, int] = {}
     batch_iter: Iterable = loader
@@ -212,15 +232,16 @@ def eval_latent_loader_metrics(
                 raise TypeError("loader must yield input_ids tensors")
             _aggregate_metrics(
                 totals, counts,
-                _latent_batch_metrics(model, batch, device, amp_dtype),
+                _latent_batch_metrics(
+                    model, batch, device, amp_dtype,
+                    pad_to_len=pad_to_len, pad_token_id=pad_token_id,
+                ),
             )
     finally:
         if isinstance(batch_iter, tqdm):
             batch_iter.close()
         if show_pbar and pbar_parent is not None:
             pbar_parent.refresh()
-        if was_training:
-            model.train()
 
     if is_distributed:
         keys = sorted(set(totals) | set(counts))
@@ -258,10 +279,18 @@ def eval_bucket_metrics(
     is_distributed: bool,
     pbar_parent: tqdm | None = None,
     log: bool = True,
+    stage_graph_l: int | None = None,
+    max_bucket_len: int | None = None,
 ) -> dict[str, dict[str, float]]:
-    """各 pad 桶 held-out 指标；rank 分片后 allreduce。"""
+    """各 pad 桶 held-out 指标；rank 分片后 allreduce。
+
+    只评 ``bucket <= max_bucket_len``（缺省不截断），避免 S2 去跑 1024/2048
+    图长。桶序列 pad 到 ``batch_graph_l(阶段, bucket)``，与训练同 shape。
+    """
     out: dict[str, dict[str, float]] = {}
     for bucket in sorted(ctx.bucket_indices):
+        if max_bucket_len is not None and int(bucket) > int(max_bucket_len):
+            continue
         pool = ctx.bucket_indices[bucket]
         if pool.size == 0:
             continue
@@ -279,10 +308,15 @@ def eval_bucket_metrics(
             batches: list[torch.Tensor] = []
             bs = 16
             items = [ctx.bucket_split[int(i)] for i in local_ids]
+            pad_l = (
+                batch_graph_l(int(stage_graph_l), int(bucket))
+                if stage_graph_l is not None
+                else int(bucket)
+            )
             for start in range(0, len(items), bs):
                 chunk = items[start : start + bs]
                 batches.append(
-                    _collate_bucket(chunk, int(bucket), ctx.pad_token_id),
+                    _collate_bucket(chunk, pad_l, ctx.pad_token_id),
                 )
             totals: dict[str, float] = {}
             counts: dict[str, int] = {}
@@ -290,7 +324,9 @@ def eval_bucket_metrics(
                 _aggregate_metrics(
                     totals,
                     counts,
-                    _latent_batch_metrics(model, batch, device, amp_dtype),
+                    _latent_batch_metrics(
+                        model, batch, device, amp_dtype,
+                    ),
                 )
             metrics = _finalize_metrics(totals, counts)
             if is_distributed:
@@ -399,7 +435,14 @@ def run_latent_curriculum_eval(
     pbar_parent: tqdm | None = None,
     log: bool = True,
 ) -> dict[str, Any]:
-    """seg512 held-out 全量指标；S2 起追加 bucket 分桶指标。"""
+    """seg512 held-out 全量指标；S2 起追加 bucket 分桶指标。
+
+    保持 ``train()``，前向打编译模块。EMA 由调用方 ``swap_ema_weights``
+    写入同一 Parameter。分桶只评 ``bucket <= 当前阶段 graph_l``，并 pad
+    到 ``batch_graph_l``。
+    """
+    stage_l = sampler.current_stage.graph_l
+    seg_pad = batch_graph_l(stage_l, min(512, stage_l))
     seg512 = eval_latent_loader_metrics(
         model,
         ctx.seg512_loader,
@@ -409,6 +452,8 @@ def run_latent_curriculum_eval(
         pbar_parent=pbar_parent,
         log=log,
         desc="eval seg512",
+        pad_to_len=seg_pad,
+        pad_token_id=ctx.pad_token_id,
     )
     bucket_out: dict[str, dict[str, float]] | None = None
     if sampler._stage_idx >= 1:
@@ -423,6 +468,8 @@ def run_latent_curriculum_eval(
             is_distributed=is_distributed,
             pbar_parent=pbar_parent,
             log=log,
+            stage_graph_l=stage_l,
+            max_bucket_len=stage_l,
         )
     return build_latent_curriculum_eval_row(
         step=step,

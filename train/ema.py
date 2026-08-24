@@ -36,6 +36,29 @@ def ema_update(
         ema_state[name].lerp_(param.detach(), 1.0 - decay)
 
 
+def ema_weight_map(
+    model: nn.Module,
+    ema_state: Dict[str, torch.Tensor] | None,
+) -> Dict[str, torch.Tensor] | None:
+    """组装 EMA 权重表，**不** ``copy_`` 进已编译模块的 Parameter。
+
+    给 ``using_ema_weights``（换模块字典、不 bump version）用。
+    """
+    if not ema_state:
+        return None
+    raw = unwrap_model(model)
+    out: Dict[str, torch.Tensor] = {}
+    for name, param in raw.named_parameters():
+        src = ema_state.get(name)
+        if src is None:
+            out[name] = param
+            continue
+        if src.device != param.device or src.dtype != param.dtype:
+            src = src.to(device=param.device, dtype=param.dtype, non_blocking=True)
+        out[name] = src
+    return out
+
+
 def apply_ema_weights(
     model: nn.Module,
     ema_state: Dict[str, torch.Tensor] | None,
@@ -59,11 +82,40 @@ def apply_ema_weights(
 
 
 @contextmanager
+def using_ema_weights(
+    model: nn.Module,
+    ema_state: Dict[str, torch.Tensor] | None,
+) -> Iterator[None]:
+    """把 EMA 张量挂进模块字典，**不** ``copy_`` 进已捕获的 Parameter。
+
+    给仍须 ``eval()`` 的 eager 路径（ELF PPL / gen / TrACE 估 d）：
+    评测打在 unwrap 后的原模块上，训练 compile 图继续握着原来的
+    Parameter 对象。结束后 ``_reparametrize_module`` 把字典换回去。
+    """
+    if not ema_state:
+        yield
+        return
+    weight_map = ema_weight_map(model, ema_state)
+    if not weight_map:
+        yield
+        return
+    from torch.nn.utils.stateless import _reparametrize_module
+
+    raw = unwrap_model(model)
+    with _reparametrize_module(raw, weight_map, tie_weights=True, strict=False):
+        yield
+
+
+@contextmanager
 def swap_ema_weights(
     model: nn.Module,
     ema_state: Dict[str, torch.Tensor] | None,
 ) -> Iterator[None]:
-    """Temporarily copy EMA weights into ``model`` for eval / generation."""
+    """把 EMA 权重 ``copy_`` 进同一套 Parameter（编译图复用同一 storage）。
+
+    2.13 在 dict-tag 快路径下 ``copy_`` 通常不重编。latent 在线评测要打
+    已编译训练图时走这里；ELF / TrACE 请用 ``using_ema_weights``。
+    """
     if not ema_state:
         yield
         return
