@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from train.metrics import (
+    EVAL_CSV_FIELDS_LM,
     EVAL_OFFICIAL_FIELDS,
     TRAIN_CSV_FIELDS_LM,
     TRAIN_OFFICIAL_FIELDS_LM,
     _train_log,
-    ensure_csv_schema,
     eval_csv_fields,
-    init_csv_header,
+    prepare_csv_for_append,
     train_csv_fields,
     truncate_csv_for_curriculum_resume,
     truncate_csv_for_resume,
@@ -177,23 +177,15 @@ def migrate_run_logs(run_dir: Path, *, model: str) -> None:
 
 
 def align_run_log_schemas(run_dir: Path, *, model: str, cfg: Any | None = None) -> None:
-    """已是新布局时：主表/官方表加列留空。"""
+    """启动时：确保 train/eval 主表存在；有新列则改写一次。之后只追加。"""
     train_fields = train_csv_fields(model, cfg)
     eval_fields = eval_csv_fields(model, cfg)
-    train_csv = run_dir / "train_log.csv"
-    eval_csv = run_dir / "eval_log.csv"
-    if train_csv.exists():
-        ensure_csv_schema(train_csv, train_fields)
-    if eval_csv.exists():
-        ensure_csv_schema(eval_csv, eval_fields)
+    prepare_csv_for_append(run_dir / "train_log.csv", train_fields)
+    prepare_csv_for_append(run_dir / "eval_log.csv", eval_fields)
     if kind_of(model) != "lm":
         return
-    toff = train_official_csv(run_dir)
-    if toff.exists():
-        ensure_csv_schema(toff, TRAIN_OFFICIAL_FIELDS_LM)
-    eoff = eval_official_csv(run_dir)
-    if eoff.exists():
-        ensure_csv_schema(eoff, EVAL_OFFICIAL_FIELDS)
+    prepare_csv_for_append(train_official_csv(run_dir), TRAIN_OFFICIAL_FIELDS_LM)
+    prepare_csv_for_append(eval_official_csv(run_dir), EVAL_OFFICIAL_FIELDS)
 
 
 def truncate_eval_samples(run_dir: Path, start_step: int) -> int:
@@ -235,8 +227,6 @@ def prepare_run_logs(
     eval_fields = eval_csv_fields(model, cfg)
     train_csv = run_dir / "train_log.csv"
     eval_csv = run_dir / "eval_log.csv"
-    init_csv_header(train_csv, train_fields)
-    init_csv_header(eval_csv, eval_fields)
 
     kept: dict[str, int] = {}
     if start_step is None and curriculum_resume is None:

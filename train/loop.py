@@ -116,6 +116,18 @@ def _fmt_hms(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def _pbar_kwargs() -> dict[str, Any]:
+    """Slurm 把 stderr 接到 BeeGFS 文件时，每步 refresh 会整行落盘并卡住其他 rank。"""
+    if sys.stderr.isatty():
+        return {"mininterval": 0.1, "dynamic_ncols": True}
+    return {"mininterval": 2.0, "dynamic_ncols": False, "ncols": 100}
+
+
+def _redraw_pbar(pbar: tqdm) -> None:
+    """按 mininterval 刷新；``set_postfix(refresh=True)`` 会绕过节流。"""
+    pbar.update(0)
+
+
 def _open_curriculum_stage_pbar(
     sampler: LatentCurriculumSampler,
     *,
@@ -129,7 +141,6 @@ def _open_curriculum_stage_pbar(
         unit="tok",
         unit_scale=True,
         unit_divisor=1000,
-        dynamic_ncols=True,
         leave=True,
         smoothing=0.0,
         desc=f"{run_desc} | {stage.name}",
@@ -137,6 +148,7 @@ def _open_curriculum_stage_pbar(
             "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
             "[{elapsed}]{postfix}"
         ),
+        **_pbar_kwargs(),
     )
 
 
@@ -299,16 +311,15 @@ def _params_are_finite(model: nn.Module) -> bool:
 def _sync_after_rank0_work(
     *,
     is_distributed: bool,
-    device: torch.device,
     rank0_work: bool,
 ) -> None:
-    """Barrier only when rank 0 ran eval/save/plot (non-collective) work."""
-    if not is_distributed:
+    """仅当各 rank 都知道 rank0 刚做了非集合写盘（ckpt）时才 barrier。
+
+    ``rank0_work`` 必须在所有 rank 上相同（按 step 判定），不要每步 all_reduce 探测。
+    """
+    if not is_distributed or not rank0_work:
         return
-    flag = torch.tensor([int(rank0_work)], device=device, dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-    if flag.item():
-        dist.barrier()
+    dist.barrier()
 
 
 def _sample_synced_train_branch(
@@ -668,8 +679,8 @@ def train_loop(
                 total=cfg.max_steps,
                 initial=step,
                 unit="step",
-                dynamic_ncols=True,
                 leave=True,
+                **_pbar_kwargs(),
             )
 
     try:
@@ -987,10 +998,11 @@ def train_loop(
                         )
                     postfix.pop("tok_s", None)
                     pbar.n = done
-                    pbar.set_postfix(**postfix)
-                    pbar.refresh()
+                    pbar.set_postfix(**postfix, refresh=False)
+                    _redraw_pbar(pbar)
                 elif pbar is not None:
-                    pbar.set_postfix(**postfix)
+                    pbar.set_postfix(**postfix, refresh=False)
+                    _redraw_pbar(pbar)
                 append_csv_row(train_csv, train_fields, train_row)
                 if official_row is not None:
                     append_csv_row(
@@ -1013,16 +1025,15 @@ def train_loop(
                 if curriculum_sampler._stage_idx != log_stage_idx:
                     curriculum_sampler.stage_micro_step = 0
 
-            rank0_sync = False
+            next_step = step + 1
+            do_save = next_step % cfg.save_step == 0
+            do_snapshot = next_step % cfg.snapshot_step == 0
             if rank == 0:
                 if pbar is not None and curriculum_sampler is None:
                     pbar.update(1)
 
                 # save_step / snapshot_step are independent intervals; do not nest
                 # snapshot under save (snapshot_step need not divide save_step).
-                next_step = step + 1
-                do_save = next_step % cfg.save_step == 0
-                do_snapshot = next_step % cfg.snapshot_step == 0
                 if do_save or do_snapshot:
                     # Always refresh latest when writing any durable checkpoint.
                     save_checkpoint(
@@ -1042,12 +1053,10 @@ def train_loop(
                             curriculum_state=_curriculum_ckpt(),
                         )
                     _rank0_log(f"  [ckpt] saved at step {next_step}", pbar)
-                    rank0_sync = True
 
             _sync_after_rank0_work(
                 is_distributed=is_distributed,
-                device=device,
-                rank0_work=rank0_sync,
+                rank0_work=do_save or do_snapshot,
             )
 
             step += 1

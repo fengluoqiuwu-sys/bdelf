@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import csv
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from tqdm import tqdm
 
@@ -136,6 +137,62 @@ def _csv_header(csv_path: Path) -> list[str]:
         return list(next(csv.reader(f), []))
 
 
+# 进程内：表头已核对的路径、以及追加用常开句柄（避免每步 open/读表头/close）。
+_csv_schema_ok: dict[str, tuple[tuple[str, ...], bool]] = {}
+_csv_append_files: dict[str, TextIO] = {}
+_csv_atexit_registered = False
+
+
+def _close_csv_append_files() -> None:
+    for fh in _csv_append_files.values():
+        try:
+            fh.close()
+        except OSError:
+            pass
+    _csv_append_files.clear()
+
+
+def _register_csv_atexit() -> None:
+    global _csv_atexit_registered
+    if _csv_atexit_registered:
+        return
+    atexit.register(_close_csv_append_files)
+    _csv_atexit_registered = True
+
+
+def _drop_csv_append_handle(csv_path: Path) -> None:
+    key = str(csv_path)
+    fh = _csv_append_files.pop(key, None)
+    if fh is not None:
+        fh.close()
+    _csv_schema_ok.pop(key, None)
+
+
+def _mark_csv_schema_ok(
+    csv_path: Path, fields: list[str], *, extend: bool = False,
+) -> None:
+    _csv_schema_ok[str(csv_path)] = (tuple(fields), extend)
+
+
+def prepare_csv_for_append(
+    csv_path: Path,
+    fields: list[str],
+    *,
+    extend: bool = False,
+) -> None:
+    """训练启动时调用：没有文件则建表头；已有则对齐新列（必要时整表改写一次）。
+
+    之后 ``append_csv_row`` 只追加，不再读/写整文件。
+    """
+    _register_csv_atexit()
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if not csv_path.exists():
+        init_csv_header(csv_path, fields)
+    else:
+        ensure_csv_schema(csv_path, fields, extend=extend)
+    _mark_csv_schema_ok(csv_path, fields, extend=extend)
+
+
 def append_csv_row(
     csv_path: Path,
     fields: list[str],
@@ -143,26 +200,37 @@ def append_csv_row(
     *,
     extend: bool = False,
 ) -> None:
-    if csv_path.exists():
-        ensure_csv_schema(csv_path, fields, extend=extend)
-        write_header = False
-    else:
-        write_header = True
+    """只追加一行。新列必须已在 ``prepare_csv_for_append`` / 启动时加好。"""
+    _register_csv_atexit()
+    key = str(csv_path)
+    spec = (tuple(fields), extend)
+    write_header = False
+    if not csv_path.exists():
+        # 未走启动 prepare 的兜底：只写表头，不读已有数据。
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in fields})
+        write_header = True
+    _csv_schema_ok[key] = spec
+    fh = _csv_append_files.get(key)
+    if fh is None:
+        # 行缓冲：每行一次 write，不再每步重新打开或读表头。
+        fh = open(csv_path, "a", newline="", encoding="utf-8", buffering=1)
+        _csv_append_files[key] = fh
+    writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+    if write_header:
+        writer.writeheader()
+    writer.writerow({k: row.get(k, "") for k in fields})
 
 
 def init_csv_header(csv_path: Path, fields: list[str]) -> None:
     """若尚无文件则只写表头。"""
     if csv_path.exists():
+        _mark_csv_schema_ok(csv_path, fields)
         return
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    _drop_csv_append_handle(csv_path)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
+    _mark_csv_schema_ok(csv_path, fields)
 
 
 def ensure_csv_schema(
@@ -171,7 +239,9 @@ def ensure_csv_schema(
     *,
     extend: bool = False,
 ) -> None:
-    """对齐表头。表头已一致时只读首行并返回，不把数据行读入内存。
+    """对齐表头。仅训练启动时调用；表头已一致则只读首行。
+
+    有新列才整表改写一次。训练循环里请用 ``append_csv_row``，不要走这里。
 
     - ``extend=False``：表头严格为 ``fields``（主表 / 官方卫星）。
     - ``extend=True``：保留已有列并追加 ``fields`` 中的新列（外部 / samples）。
@@ -189,6 +259,7 @@ def ensure_csv_schema(
         out_fields = list(fields)
     if out_fields == old_fields:
         return
+    _drop_csv_append_handle(csv_path)
     with open(csv_path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -197,12 +268,14 @@ def ensure_csv_schema(
         writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k, "") for k in out_fields})
+    _mark_csv_schema_ok(csv_path, out_fields, extend=extend)
 
 
 def truncate_csv_for_resume(csv_path: Path, start_step: int, fields: list[str]) -> int:
     """保留 step < start_step 的行；表头用 ``fields``（缺列留空）。"""
     if not csv_path.exists():
         return 0
+    _drop_csv_append_handle(csv_path)
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows_by_step: dict[int, dict[str, str]] = {}
@@ -217,6 +290,7 @@ def truncate_csv_for_resume(csv_path: Path, start_step: int, fields: list[str]) 
         writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k, "") for k in fields})
+    _mark_csv_schema_ok(csv_path, fields)
     return len(rows)
 
 
@@ -237,6 +311,7 @@ def truncate_csv_for_curriculum_resume(
     """保留 (curriculum_stage, step) 严格早于 resume 点的行（step 为阶段内计数）。"""
     if not csv_path.exists():
         return 0
+    _drop_csv_append_handle(csv_path)
     resume_key = (_curriculum_stage_rank(resume_stage), int(resume_step))
     kept_rows: list[dict[str, str]] = []
     with open(csv_path, encoding="utf-8") as f:
@@ -255,6 +330,7 @@ def truncate_csv_for_curriculum_resume(
         writer.writeheader()
         for row in kept_rows:
             writer.writerow({k: row.get(k, "") for k in fields})
+    _mark_csv_schema_ok(csv_path, fields)
     return len(kept_rows)
 
 

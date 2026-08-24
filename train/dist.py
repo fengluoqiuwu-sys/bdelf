@@ -28,8 +28,8 @@ def setup_distributed(cfg: FL_TrainConfig) -> tuple[int, int, torch.device, bool
 
     if not dist.is_initialized():
         # Rank0 ELF gen-eval (SDE/32 + GPT-2 score) can exceed the default
-        # 10min NCCL watchdog while peers wait on a 1-element all_reduce in
-        # _sync_after_rank0_work; use a longer PG timeout to avoid false hangs.
+        # 10min NCCL watchdog while peers wait at the post-eval/ckpt barrier;
+        # use a longer PG timeout to avoid false hangs.
         dist.init_process_group(
             backend="nccl",
             device_id=torch.device(f"cuda:{local_rank}"),
