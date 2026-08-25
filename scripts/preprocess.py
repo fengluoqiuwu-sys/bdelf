@@ -41,11 +41,14 @@ def validate_raw_dataset(dataset: str) -> None:
     print("raw dataset OK")
 
 
-def build_cache(dataset: str, preprocess: str) -> None:
+def build_cache(dataset: str, preprocess: str, *, cache_source: str | None = None) -> None:
     from preprocess import get_preprocessed
 
-    print(f"[preprocess] building cache: dataset={dataset!r} preprocess={preprocess!r}")
-    ds = get_preprocessed(preprocess, dataset)
+    print(
+        f"[preprocess] building cache: dataset={dataset!r} "
+        f"preprocess={preprocess!r} cache_source={cache_source!r}"
+    )
+    ds = get_preprocessed(preprocess, dataset, cache_source=cache_source)
     splits = ds.get_splits()
     print(f"[preprocess] splits={splits}")
     for split in splits:
@@ -108,13 +111,29 @@ def main() -> None:
         required=True,
         help="预处理配置名（config/preprocess/<name>.yaml）",
     )
+    parser.add_argument(
+        "--cache-source",
+        choices=["hf", "raw"],
+        default=None,
+        help="覆盖 YAML：hf=下载 Hub 成品；raw=从原文切分（不改变配置哈希）",
+    )
     args = parser.parse_args()
 
-    print("=== validate raw dataset ===")
-    validate_raw_dataset(args.dataset)
+    from preprocess.preprocess import get_preprocess, resolved_cache_source
+
+    cfg = get_preprocess(args.preprocess)
+    if args.cache_source is not None:
+        cfg.cache_source = args.cache_source
+    source_kind = resolved_cache_source(cfg)
+    print(f"=== cache_source={source_kind} ===")
+    if source_kind == "raw":
+        print("=== validate raw dataset ===")
+        validate_raw_dataset(args.dataset)
+    else:
+        print("=== skip raw dataset (Hub preprocessed) ===")
 
     print("=== build preprocess cache (single process) ===")
-    build_cache(args.dataset, args.preprocess)
+    build_cache(args.dataset, args.preprocess, cache_source=args.cache_source)
 
     print("=== validate manifest ===")
     validate_manifest(args.dataset, args.preprocess)

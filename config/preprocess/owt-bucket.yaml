@@ -12,3 +12,6 @@ chunk_length: 2048
 overflow_mode: discard
 seed: 42
 text_column: text
+cache_source: hf  # 缓存构建：hf=下载 Hub 已切分成品；raw=从 OWT 原文切分（不进指纹）
+hf_preprocessed_repo: fengluoqiuwu/owt-bucket  # Hub dataset 仓库，不进指纹
+hf_preprocessed_revision: main  # Hub revision，不进指纹

@@ -29,6 +29,12 @@ CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "preprocessed_datase
 OverflowMode = Literal["wrap", "discard", "pad_eos"]
 PadMode = Literal["fixed", "bucket"]
 Strategy = Literal["stream", "owt_segment"]
+CacheSource = Literal["hf", "raw"]
+# 有 Hub 成品的 preprocess 名 → 仓库。不进指纹；仅影响如何填满同一 hash 目录。
+_HF_PREPROCESSED_REPOS: Dict[str, str] = {
+    "owt-seg512": "fengluoqiuwu/owt-seg512",
+    "owt-bucket": "fengluoqiuwu/owt-bucket",
+}
 _MANIFEST_VERSION_STREAM = 2
 _MANIFEST_VERSION_OWT = 3
 _OVERFLOW_MODES = frozenset({"wrap", "discard", "pad_eos"})
@@ -80,6 +86,10 @@ class FL_PreprocessConfig:
     pad_mode: PadMode = "fixed"
     bucket_lengths: List[int] = field(default_factory=list)
     shuffle_seed: int = 42
+    # 以下两项不进指纹：只决定如何填同一 hash 目录（Hub 成品 vs 原文切分）。
+    cache_source: str = ""
+    hf_preprocessed_repo: str = ""
+    hf_preprocessed_revision: str = "main"
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -104,6 +114,18 @@ class FL_PreprocessConfig:
                 raise ValueError(f"{path}: pad_mode must be 'fixed' or 'bucket'")
             if config.pad_mode == "bucket" and not config.bucket_lengths:
                 config.bucket_lengths = [256, 512, 1024, 2048]
+        source = str(config.cache_source or "").strip().lower()
+        if source and source not in ("hf", "raw"):
+            raise ValueError(
+                f"{path}: cache_source must be 'hf' or 'raw', got {config.cache_source!r}"
+            )
+        config.cache_source = source
+        if config.hf_preprocessed_repo:
+            config.hf_preprocessed_repo = str(config.hf_preprocessed_repo).strip()
+        if config.hf_preprocessed_revision:
+            config.hf_preprocessed_revision = str(
+                config.hf_preprocessed_revision
+            ).strip()
         return config
 
     def manifest_version(self) -> int:
@@ -154,9 +176,36 @@ def get_preprocess(name: str) -> FL_PreprocessConfig:
 def get_preprocessed(
     preprocess_name: str,
     dataset: Union[str, FL_Dataset],
+    *,
+    cache_source: str | None = None,
 ) -> "FL_PreprocessedDataset":
     source = get_dataset(dataset) if isinstance(dataset, str) else dataset
-    return FL_PreprocessedDataset(get_preprocess(preprocess_name), source)
+    config = get_preprocess(preprocess_name)
+    if cache_source is not None:
+        src = str(cache_source).strip().lower()
+        if src not in ("hf", "raw"):
+            raise ValueError(f"cache_source must be 'hf' or 'raw', got {cache_source!r}")
+        config.cache_source = src
+    return FL_PreprocessedDataset(config, source)
+
+
+def resolved_hf_repo(config: FL_PreprocessConfig) -> str:
+    """Hub 成品仓库；YAML 优先，否则按 preprocess 名查表。不进指纹。"""
+    if config.hf_preprocessed_repo:
+        return config.hf_preprocessed_repo
+    return _HF_PREPROCESSED_REPOS.get(config.name, "")
+
+
+def resolved_hf_revision(config: FL_PreprocessConfig) -> str:
+    return config.hf_preprocessed_revision or "main"
+
+
+def resolved_cache_source(config: FL_PreprocessConfig) -> CacheSource:
+    """hf=下载 Hub 成品；raw=从原文切分。有成品映射时默认 hf。不进指纹。"""
+    src = str(config.cache_source or "").strip().lower()
+    if src in ("hf", "raw"):
+        return src  # type: ignore[return-value]
+    return "hf" if resolved_hf_repo(config) else "raw"
 
 
 def _dataset_fingerprint_payload(dc) -> Dict[str, Any]:
@@ -1253,16 +1302,27 @@ def _ensure_cache(
                         return split_counts, splits
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    source_kind = resolved_cache_source(config)
     _log_preprocess(
-        f"Cache miss; building: dataset={source.config.name!r} "
+        f"Cache miss; building via {source_kind}: dataset={source.config.name!r} "
         f"preprocess={config.name!r}"
     )
     _log_preprocess(f"Output directory: {cache_dir}")
-    _log_preprocess(
-        f"Parallel workers: {_worker_count()} "
-        f"(tokenize stage uses all CPU cores; first run may take a while)"
-    )
-    split_counts = _build_cache(config, source, cache_dir)
+    if source_kind == "hf":
+        from preprocess.hf_preprocessed import build_cache_from_hf
+
+        _log_preprocess(
+            f"Using Hub preprocessed repo {resolved_hf_repo(config)}@"
+            f"{resolved_hf_revision(config)} (fingerprint unchanged)"
+        )
+        split_counts = build_cache_from_hf(config, source, cache_dir)
+    else:
+        source.ensure_downloaded()
+        _log_preprocess(
+            f"Parallel workers: {_worker_count()} "
+            f"(tokenize stage uses all CPU cores; first run may take a while)"
+        )
+        split_counts = _build_cache(config, source, cache_dir)
     _log_preprocess(f"Cache build complete: {split_counts}")
     manifest = _load_manifest(cache_dir) or {}
     splits = {
@@ -1385,8 +1445,6 @@ class FL_PreprocessedDataset:
         self.config = config
         self.source = source
         self._split_views: Dict[str, _PreprocessedSplitDataset] = {}
-
-        source.ensure_downloaded()
 
         self.cache_dir = _cache_dir(config, source)
         self.split_counts, self._split_meta = _ensure_cache(

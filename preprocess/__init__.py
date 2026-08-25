@@ -4,6 +4,7 @@ from .preprocess import (
     get_preprocess,
     get_preprocessed,
     list_preprocess,
+    resolved_cache_source,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "get_preprocess",
     "get_preprocessed",
     "list_preprocess",
+    "resolved_cache_source",
 ]
