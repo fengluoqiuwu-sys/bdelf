@@ -5,6 +5,7 @@ Usage:
     python generate.py
     python generate.py --run full/lm/elf/<hash>
     python generate.py --checkpoint cache/checkpoints/full/lm/elf/<hash>/checkpoint_latest.pt
+    python generate.py --latent-model latent_vae --tag 100m-b32-d1
     python generate.py --num-tokens 1024 --seed 42
     python generate.py --prompt "Once upon a time" --num-tokens 256
     python generate.py --prompt-file prompt.txt --run full/ar/<hash>
@@ -21,6 +22,7 @@ import torch
 
 import hf_config  # noqa: F401
 from models import build_model
+from models.latent.artifact_loader import load_latent_artifact
 from tokenizer import get_token_layout, get_tokenizer
 from train import CHECKPOINT_ROOT
 
@@ -278,6 +280,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--latent-model",
+        help=(
+            "只读加载 artifacts/latent/<name>/<tag>/ "
+            "（须与 --tag 同时给出；与 --run / --checkpoint 互斥）"
+        ),
+    )
+    parser.add_argument(
+        "--tag",
+        help="artifacts 选用 tag（须与 --latent-model 同时给出）",
+    )
+    parser.add_argument(
         "--num-tokens",
         type=int,
         default=1024,
@@ -356,11 +369,32 @@ def main() -> None:
             _log(f"{rel}\tmtime={mtime:.0f}\t{ckpt}")
         return
 
-    ckpt_path = resolve_checkpoint(checkpoint=args.checkpoint, run=args.run)
     device = resolve_device(args.device)
-
-    _log(f"Loading checkpoint: {ckpt_path}")
-    model, model_meta, step, train_cfg, used_ema = load_model_from_checkpoint(ckpt_path, device)
+    used_artifact = bool(args.latent_model or args.tag)
+    if used_artifact:
+        if not args.latent_model or not args.tag:
+            raise ValueError("--latent-model 与 --tag 必须同时指定")
+        if args.checkpoint or args.run:
+            raise ValueError("--latent-model/--tag 与 --checkpoint / --run 互斥")
+        loaded = load_latent_artifact(
+            args.latent_model, args.tag, device=device
+        )
+        ckpt_path = loaded.ckpt_path
+        _log(
+            f"Loading artifacts: latent_model={loaded.latent_model} "
+            f"tag={loaded.tag} path={ckpt_path}"
+        )
+        model = loaded.model
+        model_meta = loaded.model_meta
+        step = loaded.step
+        train_cfg = loaded.train_cfg
+        used_ema = loaded.used_ema
+    else:
+        ckpt_path = resolve_checkpoint(checkpoint=args.checkpoint, run=args.run)
+        _log(f"Loading checkpoint: {ckpt_path}")
+        model, model_meta, step, train_cfg, used_ema = load_model_from_checkpoint(
+            ckpt_path, device
+        )
     dtype = resolve_dtype(device, train_cfg)
 
     tokenizer_name = model_meta["config"].get("tokenizer")

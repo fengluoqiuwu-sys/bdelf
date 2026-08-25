@@ -17,6 +17,7 @@ description: >-
 |------|------|
 | `--run <rel>` | `cache/checkpoints/<rel>/checkpoint_latest.pt`，`<rel>`=`{fast\|full}/{model}/{hash}` |
 | `--checkpoint <path>` | 任意 `.pt` |
+| `--latent-model` + `--tag` | 只读 `artifacts/latent/<model>/<tag>/`（与上两项互斥） |
 | （省略） | 扫全部 `checkpoint_latest.pt` 取 mtime 最新 |
 
 ```bash
@@ -30,6 +31,7 @@ description: >-
 ```bash
 .venv/bin/python generate.py
 .venv/bin/python generate.py --run full/elf/19de90b094488c46
+.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1
 .venv/bin/python generate.py --checkpoint cache/checkpoints/full/ar/<hash>/checkpoint_step_0100000.pt
 .venv/bin/python generate.py --generate generate          # 默认正式生成配置
 .venv/bin/python generate.py --generate eval              # 与训练在线评测同配置
@@ -49,6 +51,7 @@ description: >-
 ## 注意
 
 - 默认用 checkpoint 里的 **EMA** 权重生成（与 `eval.py` 一致）；没有 `ema` 才用 live。
+- `--latent-model` / `--tag` 走 `artifacts/latent/` 只读加载器，不会写回该目录。
 - 解码 `skip_special_tokens=True`，与离线 GPT-2 打分同一套文本。
 - 权重旁需有 `model_meta` / `config.json`。
 - ELF 生成无条件：传 `--prompt` 会报错。

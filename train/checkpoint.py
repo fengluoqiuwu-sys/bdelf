@@ -48,6 +48,9 @@ def save_checkpoint(
     process is killed mid-write; resume would then fail on a corrupt latest ckpt.
     """
     path = Path(path)
+    from models.latent.artifact_loader import assert_not_artifacts_latent_path
+
+    assert_not_artifacts_latent_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = unwrap_model(model)
     grads = [

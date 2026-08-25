@@ -27,8 +27,11 @@ cache/checkpoints/artifacts/<kind>/…                     # 非训练选用产�
 |---|---|---|
 | ACE direction | `artifacts/ace/{model-hash}/{step}/` | 自动估计/缓存（仅 ACE 用 hash/step） |
 | 选用 VAE 等 | `artifacts/<name>/<tag>/` | 人手从训练 run 拷贝；按 **tag** 选用 |
+| 选用 latent（HF） | `artifacts/latent/{model}/{tag}/` | `scripts/export_latent_artifact.py` 从训练 latest 导出（EMA 熔进权重）；加载只读 |
 
 Cola Stage-2 默认只认 `artifacts/cola_vae/<tag>/`（或 `COLA_VAE_CHECKPOINT` / `COLA_VAE_TAG` / `vae_run`）；**不**再按 mtime 扫 `full/cola_vae` 的 latest。`cola_vae` **训练**仍写 `fast|full/cola_vae/<hash>/`。
+
+`artifacts/latent/{model}/{tag}/` 供下游 / HuggingFace 固定引用。导出：`scripts/export_latent_artifact.py --run full/latent/<model>/<hash>`（只写最终参数与模型 config）。加载：`load_latent_artifact(latent_model, tag)`。训练保存若目标落在 `artifacts/latent/` 会拒绝（不影响 `artifacts/ace` 等）。
 
 本地 `cache/checkpoints/hash_guide.csv` 给人看（**仅 full** 训练时自动 upsert；fast 不写入）；**不随 sync 推送/拉取**。
 
