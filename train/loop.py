@@ -99,6 +99,11 @@ def _curriculum_run_desc(cfg: FL_TrainConfig) -> str:
     readout = mo.get("readout")
     if readout is not None:
         parts.append(str(readout))
+    dec_bi = mo.get("decoder_bidirectional")
+    if dec_bi is False:
+        parts.append("dec-causal")
+    elif dec_bi is True:
+        parts.append("dec-bi")
     if "latent_dim" in mo:
         parts.append(f"B={mo['latent_dim']}")
     if "block_size" in mo:

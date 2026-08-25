@@ -11,9 +11,10 @@ from torch import nn
 
 from train.train import FL_TrainConfig
 
-# AR/BD3LM/BDELF: c_attn/c_proj/c_fc; ELF: qkv/proj/w12/w3；latent_t5 cross-attn: q_proj/k_proj/v_proj
+# AR/BD3LM/BDELF: c_attn/c_proj/c_fc; ELF: qkv/proj/w12/w3；latent_t5 cross-attn: q_proj/k_proj/v_proj；
+# readout=none 原 T5：attn.{q,k,v,o} / dense.{wi,wo}
 _HIDDEN_LINEAR_WEIGHT_RE = re.compile(
-    r"\.(attn|mlp|cross_attn)\.(c_attn|c_proj|c_fc|qkv|proj|w12|w3|q_proj|k_proj|v_proj)\.weight$"
+    r"\.(attn|mlp|cross_attn|dense)\.(c_attn|c_proj|c_fc|qkv|proj|w12|w3|q_proj|k_proj|v_proj|q|k|v|o|wi|wo)\.weight$"
 )
 
 

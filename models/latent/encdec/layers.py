@@ -262,7 +262,7 @@ class CrossAttention(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """self-attn（模式与 encoder 一致）+ cross-attn + FFN。"""
+    """self-attn（模式由调用方传入）+ cross-attn + FFN。"""
 
     def __init__(
         self,

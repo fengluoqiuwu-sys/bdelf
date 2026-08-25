@@ -1,4 +1,4 @@
-"""T5-small 维数 latent：encoder/decoder self-attn 同为双向或同为因果；cross-attn 读 z。"""
+"""T5-small 维数 latent：encoder/decoder self-attn 默认同模式；可读出 none 做原 T5。"""
 
 from __future__ import annotations
 
@@ -17,6 +17,13 @@ from models.latent.encdec.readout import (
 )
 from models.latent.latent_t5.config import FL_LatentT5Config
 from models.latent.latent_t5.span import apply_span_sentinels, span_corruption_mask
+from models.latent.latent_t5.t5_blocks import (
+    T5Attention,
+    T5DecoderBlock,
+    T5DenseReluDense,
+    T5LayerNorm,
+    T5StyleEncoder,
+)
 from models.model import (
     FL_PreTrainedModel,
     ensure_token_layout,
@@ -25,7 +32,7 @@ from models.model import (
 )
 from models.tokens import FL_TokenLayout, apply_token_layout_to_config, token_layout_from_cfg
 
-ReadoutMode = Literal["e", "b"]
+ReadoutMode = Literal["e", "b", "none"]
 
 
 class _LatentT5Backbone(nn.Module):
@@ -43,7 +50,7 @@ class _LatentT5Backbone(nn.Module):
         n_embd: int = 512,
         d_kv: int = 64,
         d_ff: int = 2048,
-        latent_dim: int = 64,
+        latent_dim: int = 32,
         dropout: float = 0.0,
         beta_kl: float = 0.1,
         lambda_span: float = 1.0,
@@ -51,6 +58,7 @@ class _LatentT5Backbone(nn.Module):
         span_mean_len: int = 3,
         num_sentinels: int = 100,
         bidirectional: bool = True,
+        decoder_bidirectional: bool | None = None,
         use_flash: bool = True,
     ) -> None:
         super().__init__()
@@ -65,50 +73,92 @@ class _LatentT5Backbone(nn.Module):
         self.span_mask_ratio = span_mask_ratio
         self.span_mean_len = span_mean_len
         self.num_sentinels = num_sentinels
-        self.memory_dim = n_embd if readout == "e" else latent_dim
+        # null：decoder 与 encoder 同模式。readout=none（原 T5）写死双向。
+        if readout == "none":
+            if bidirectional is False or decoder_bidirectional is False:
+                raise ValueError("readout=none（原 T5）只支持双向，禁止 unidirectional")
+            bidirectional = True
+            decoder_bidirectional = True
+        self.decoder_bidirectional = (
+            bidirectional if decoder_bidirectional is None else bool(decoder_bidirectional)
+        )
+        self.memory_dim = n_embd if readout in ("e", "none") else latent_dim
         # 双向 decoder 从 z 起并行重建，避免 teacher-force 看到未来 token。
         self.from_latent: nn.Linear | None = (
             nn.Linear(self.memory_dim, n_embd, bias=True)
-            if bidirectional and self.memory_dim != n_embd
+            if self.decoder_bidirectional and self.memory_dim != n_embd
             else None
         )
+        # readout=none：HF 原版 t5-small 算子；e/b 仍走 encdec RoPE 栈。
+        self._t5_style = readout == "none"
+        self._logits_scale = 1.0
+        self.n_head = n_head
+        self.d_kv = d_kv
+        self.d_ff = d_ff
 
-        self.encoder = LatentEncoder(
-            token_layout,
-            n_embd=n_embd,
-            n_head=n_head,
-            d_kv=d_kv,
-            d_ff=d_ff,
-            n_layer=n_layer_enc,
-            dropout=dropout,
-            use_flash=use_flash,
-            attn_backend="sdpa",
-            bidirectional=bidirectional,
-            block_size=1,
-            extra_vocab=num_sentinels,
-        )
-        if readout == "e":
-            self.readout_head = PosteriorEReadout(n_embd, latent_dim)
-        else:
-            self.readout_head = PosteriorBReadout(n_embd, latent_dim)
-
-        self.decoder = nn.ModuleList([
-            DecoderBlock(
-                n_embd, n_head, d_kv, d_ff, self.memory_dim, dropout,
-                use_flash=use_flash,
+        if self._t5_style:
+            self.encoder = T5StyleEncoder(
+                self.vocab_size,
+                num_sentinels,
+                n_embd=n_embd,
+                n_head=n_head,
+                d_kv=d_kv,
+                d_ff=d_ff,
+                n_layer=n_layer_enc,
+                dropout=dropout,
             )
-            for _ in range(n_layer_dec)
-        ])
-        self.dec_ln = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, self.vocab_size, bias=True)
+            self.readout_head = None
+            self.decoder = nn.ModuleList([
+                T5DecoderBlock(
+                    n_embd, n_head, d_kv, d_ff, dropout,
+                    has_relative_attention_bias=(i == 0),
+                )
+                for i in range(n_layer_dec)
+            ])
+            self.dec_ln = T5LayerNorm(n_embd)
+            self.dec_dropout = nn.Dropout(dropout)
+            # 与 HF T5 默认 tie：lm_head 无 bias，权重与基础 vocab embed 共享。
+            self.lm_head = nn.Linear(n_embd, self.vocab_size, bias=False)
+            self.lm_head.weight = self.encoder.wte.weight
+            self._logits_scale = n_embd ** -0.5
+            self._init_t5_weights()
+        else:
+            self.encoder = LatentEncoder(
+                token_layout,
+                n_embd=n_embd,
+                n_head=n_head,
+                d_kv=d_kv,
+                d_ff=d_ff,
+                n_layer=n_layer_enc,
+                dropout=dropout,
+                use_flash=use_flash,
+                attn_backend="sdpa",
+                bidirectional=bidirectional,
+                block_size=1,
+                extra_vocab=num_sentinels,
+            )
+            if readout == "e":
+                self.readout_head = PosteriorEReadout(n_embd, latent_dim)
+            else:
+                self.readout_head = PosteriorBReadout(n_embd, latent_dim)
+
+            self.decoder = nn.ModuleList([
+                DecoderBlock(
+                    n_embd, n_head, d_kv, d_ff, self.memory_dim, dropout,
+                    use_flash=use_flash,
+                )
+                for _ in range(n_layer_dec)
+            ])
+            self.dec_ln = nn.LayerNorm(n_embd)
+            self.dec_dropout = nn.Identity()
+            self.lm_head = nn.Linear(n_embd, self.vocab_size, bias=True)
+            self.apply(self._init_weights)
 
         self.last_ce_loss = float("nan")
         self.last_kl_loss = float("nan")
         self.last_mask_loss = float("nan")
         self.last_token_acc = float("nan")
         self.last_mask_acc = float("nan")
-
-        self.apply(self._init_weights)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -123,6 +173,48 @@ class _LatentT5Backbone(nn.Module):
                 nn.init.ones_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+
+    def _init_t5_weights(self) -> None:
+        """HF T5 Mesh 初始化（factor=1）；tied lm_head 只经 embedding 初始化。"""
+        factor = 1.0
+        d_model = self.n_embd
+        d_kv = self.d_kv
+        n_heads = self.n_head
+        d_ff = self.d_ff
+        for name, module in self.named_modules():
+            if isinstance(module, T5LayerNorm):
+                nn.init.ones_(module.weight)
+            elif isinstance(module, T5Attention):
+                nn.init.normal_(
+                    module.q.weight, mean=0.0,
+                    std=factor * ((d_model * d_kv) ** -0.5),
+                )
+                nn.init.normal_(
+                    module.k.weight, mean=0.0, std=factor * (d_model ** -0.5),
+                )
+                nn.init.normal_(
+                    module.v.weight, mean=0.0, std=factor * (d_model ** -0.5),
+                )
+                nn.init.normal_(
+                    module.o.weight, mean=0.0,
+                    std=factor * ((n_heads * d_kv) ** -0.5),
+                )
+                if module.has_relative_attention_bias:
+                    nn.init.normal_(
+                        module.relative_attention_bias.weight,
+                        mean=0.0, std=factor * (d_model ** -0.5),
+                    )
+            elif isinstance(module, T5DenseReluDense):
+                nn.init.normal_(
+                    module.wi.weight, mean=0.0, std=factor * (d_model ** -0.5),
+                )
+                nn.init.normal_(
+                    module.wo.weight, mean=0.0, std=factor * (d_ff ** -0.5),
+                )
+            elif isinstance(module, nn.Embedding):
+                if name.endswith("relative_attention_bias"):
+                    continue
+                nn.init.normal_(module.weight, mean=0.0, std=factor * 1.0)
 
     def _pad_mask(self, tokens: torch.Tensor) -> torch.Tensor:
         return tokens == self.token_layout.pad_token_id
@@ -146,6 +238,8 @@ class _LatentT5Backbone(nn.Module):
         sample: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.encoder(tokens, key_padding_mask=self._attn_pad_mask(tokens))
+        if self.readout_head is None:
+            return h, h, torch.zeros((), device=h.device, dtype=h.dtype)
         return self.readout_head(h, sample=sample)
 
     def _decoder_inputs(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -165,14 +259,30 @@ class _LatentT5Backbone(nn.Module):
         key_padding_mask: torch.Tensor | None = None,
         memory_pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        mode = self.encoder.attn_mode()
-        if self.encoder.bidirectional:
+        mode: Literal["bidirectional", "causal"] = (
+            "bidirectional" if self.decoder_bidirectional else "causal"
+        )
+        if self.decoder_bidirectional:
             x = memory if self.from_latent is None else self.from_latent(memory)
             key_padding_mask = memory_pad_mask
         else:
             if dec_tokens is None:
                 raise ValueError("因果 decoder 需要 dec_tokens")
             x = self.encoder.embed(dec_tokens)
+        if self._t5_style:
+            x = self.dec_dropout(x)
+            position_bias: torch.Tensor | None = None
+            enc_dec_bias: torch.Tensor | None = None
+            for block in self.decoder:
+                x, position_bias, enc_dec_bias = block(
+                    x, memory,
+                    key_padding_mask=key_padding_mask,
+                    memory_pad_mask=memory_pad_mask,
+                    position_bias=position_bias,
+                    encoder_decoder_position_bias=enc_dec_bias,
+                )
+            x = self.dec_dropout(self.dec_ln(x))
+            return self.lm_head(x * self._logits_scale)
         for block in self.decoder:
             x = block(
                 x, memory,
@@ -207,7 +317,7 @@ class _LatentT5Backbone(nn.Module):
         )
         z_c, _, _ = self.encode(corrupted, sample=True)
         mem_pad = self._attn_pad_mask(tokens)
-        if self.encoder.bidirectional:
+        if self.decoder_bidirectional:
             logits_c = self.decode_logits(None, z_c, memory_pad_mask=mem_pad)
         else:
             if dec_in is None:
@@ -238,7 +348,7 @@ class _LatentT5Backbone(nn.Module):
         pad = self._pad_mask(tokens)
         mem_pad = self._attn_pad_mask(tokens)
         z, mu, logvar = self.encode(tokens, sample=self.training)
-        if self.encoder.bidirectional:
+        if self.decoder_bidirectional:
             dec_in = None
             logits = self.decode_logits(None, z, memory_pad_mask=mem_pad)
         else:
@@ -251,7 +361,10 @@ class _LatentT5Backbone(nn.Module):
             loss_targets.reshape(-1),
             ignore_index=self.token_layout.ignore_index,
         )
-        kl = kl_gaussian(mu, logvar, mask=~pad)
+        if self.readout_head is None:
+            kl = torch.zeros((), device=tokens.device, dtype=ce.dtype)
+        else:
+            kl = kl_gaussian(mu, logvar, mask=~pad)
 
         span_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         if self.training and self.lambda_span > 0 and self.span_mask_ratio > 0:
@@ -308,13 +421,40 @@ class _LatentT5Backbone(nn.Module):
     def online_eval_components(self) -> list:
         return []
 
+    def _uncond_memory(
+        self,
+        batch: int,
+        seq_len: int,
+        device: torch.device,
+        *,
+        bos_token_id: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """无条件 memory：VAE 从先验采样；无瓶颈则 encode BOS+pad（原 T5 空源）。"""
+        if self.readout_head is None:
+            bos = (
+                self.token_layout.bos_token_id
+                if bos_token_id is None
+                else bos_token_id
+            )
+            enc = torch.full(
+                (batch, seq_len),
+                self.token_layout.pad_token_id,
+                device=device,
+                dtype=torch.long,
+            )
+            enc[:, 0] = bos
+            z, _, _ = self.encode(enc, sample=False)
+            return z, self._attn_pad_mask(enc)
+        return torch.randn(batch, seq_len, self.memory_dim, device=device), None
+
     def _sample_prior_memory(
         self,
         batch: int,
         seq_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        return torch.randn(batch, seq_len, self.memory_dim, device=device)
+        z, _ = self._uncond_memory(batch, seq_len, device)
+        return z
 
     @torch.compiler.disable
     @torch.no_grad()
@@ -354,17 +494,18 @@ class _LatentT5Backbone(nn.Module):
             enc_tokens = torch.cat([prefix, pad], dim=1)
             z, _, _ = self.encode(enc_tokens, sample=False)
             memory_pad = self._attn_pad_mask(enc_tokens)
-            if self.encoder.bidirectional:
+            if self.decoder_bidirectional:
                 logits = self.decode_logits(None, z, memory_pad_mask=memory_pad)
                 rest = sample_from_logits(
                     logits[:, prefix_len:, :], temperature=temperature, top_k=top_k,
                 )
                 return torch.cat([prefix, rest], dim=1), 1
         else:
-            z = self._sample_prior_memory(num_samples, seqlen, device)
-            memory_pad = None
-            if self.encoder.bidirectional:
-                logits = self.decode_logits(None, z)
+            z, memory_pad = self._uncond_memory(
+                num_samples, seqlen, device, bos_token_id=bos,
+            )
+            if self.decoder_bidirectional:
+                logits = self.decode_logits(None, z, memory_pad_mask=memory_pad)
                 out = sample_from_logits(logits, temperature=temperature, top_k=top_k)
                 return out, 1
 

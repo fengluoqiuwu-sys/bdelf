@@ -1,4 +1,4 @@
-"""latent_t5 配置（T5-small 维数；encoder/decoder self-attn 同模式 + span 辅助）。"""
+"""latent_t5 配置（T5-small 维数；默认同模式 self-attn + span 辅助；可读出 none）。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 
 from models.tokens import FL_TokenLayout
 
-ReadoutMode = Literal["e", "b"]
+ReadoutMode = Literal["e", "b", "none"]
 
 
 class FL_LatentT5Config(PretrainedConfig):
@@ -31,6 +31,7 @@ class FL_LatentT5Config(PretrainedConfig):
             "span_mask_ratio",
             "num_sentinels",
             "bidirectional",
+            "decoder_bidirectional",
         }
     )
 
@@ -51,7 +52,7 @@ class FL_LatentT5Config(PretrainedConfig):
         n_embd: int = 512,
         d_kv: int = 64,
         d_ff: int = 2048,
-        latent_dim: int = 64,
+        latent_dim: int = 32,
         dropout: float = 0.0,
         beta_kl: float = 0.1,
         lambda_span: float = 1.0,
@@ -59,13 +60,25 @@ class FL_LatentT5Config(PretrainedConfig):
         span_mean_len: int = 3,
         num_sentinels: int = 100,
         bidirectional: bool = True,
+        decoder_bidirectional: bool | None = None,
         use_flash: bool = True,
         sampling: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if readout not in ("e", "b"):
-            raise ValueError(f"readout must be 'e' or 'b', got {readout!r}")
+        if readout not in ("e", "b", "none"):
+            raise ValueError(f"readout must be 'e', 'b' or 'none', got {readout!r}")
+        if decoder_bidirectional is not None and not isinstance(
+            decoder_bidirectional, bool
+        ):
+            raise ValueError(
+                f"decoder_bidirectional 须为 true/false/null，得到 {decoder_bidirectional!r}"
+            )
+        if readout == "none":
+            if bidirectional is False or decoder_bidirectional is False:
+                raise ValueError("readout=none（原 T5）只支持双向，禁止 unidirectional")
+            bidirectional = True
+            decoder_bidirectional = True
         self.name = name
         self.tokenizer = tokenizer
         self.readout = readout
@@ -89,6 +102,7 @@ class FL_LatentT5Config(PretrainedConfig):
         self.span_mean_len = span_mean_len
         self.num_sentinels = num_sentinels
         self.bidirectional = bidirectional
+        self.decoder_bidirectional = decoder_bidirectional
         self.use_flash = use_flash
         self.sampling = sampling or {}
 
@@ -120,6 +134,7 @@ class FL_LatentT5Config(PretrainedConfig):
             "span_mean_len": self.span_mean_len,
             "num_sentinels": self.num_sentinels,
             "bidirectional": self.bidirectional,
+            "decoder_bidirectional": self.decoder_bidirectional,
             "use_flash": self.use_flash,
         }
 

@@ -34,6 +34,8 @@ def default_artifact_tag(model_cfg: dict[str, Any]) -> str:
     size = m.group(1).lower() if m else "unk"
     b = model_cfg.get("latent_dim")
     d = model_cfg.get("block_size", 1)
+    if str(model_cfg.get("readout") or "") == "none":
+        return f"{size}-none"
     if b is None:
         raise ValueError("model config 缺少 latent_dim，无法生成 tag")
     return f"{size}-b{int(b)}-d{int(d)}"

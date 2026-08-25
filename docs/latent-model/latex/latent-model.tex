@@ -41,7 +41,7 @@ Cola DLM~\cite{cola2026dlm} 在 Stage-1 训练 Text VAE，损失为重建、KL �
 \subsection{与仓库内其它模型的关系}
 
 \begin{itemize}
-  \item \textbf{非} HuggingFace 冻结 \texttt{t5-small}（ELF 家族用法）；内部为手写 Transformer。
+  \item \textbf{非} HuggingFace 冻结 \texttt{t5-small}（ELF 家族用法）。\texttt{readout=e|b} 为手写 RoPE Transformer；\texttt{readout=none} 算子对齐原版 \texttt{t5-small}（相对位置偏置、RMSNorm、ReLU FFN），但 decoder 写死双向、词表仍为 GPT-2。
   \item \textbf{非} \texttt{cola\_vae} 替换品；Cola Stage-2 仍只加载 \texttt{cola\_vae}。
   \item 二者注册为 \texttt{kind=latent}，训练日志字段与 \texttt{cola\_vae} 同构（\texttt{recon\_ce}、\texttt{kl}、\texttt{mask} 等）。
 \end{itemize}
@@ -88,8 +88,10 @@ Stage-1 的 encoder 视野、瓶颈宽度、decoder 因子分解与辅助损失�
 
 二者均用 Cola 式 ELBO 训练，$z_{1:L}$ 为\textbf{逐位置}连续向量序列（非整句单向量）。
 扩散模型通常在 $L\times d_z$ 张量上操作；故 $d_z$ 与 $L$ 共同决定先验难度。
-默认 $B{=}64$ 时，\texttt{latent\_vae} 与 \texttt{latent\_t5}（\texttt{readout=b}）的 KL 均在 $B$ 维；
+默认 $B{=}64$ 时 \texttt{latent\_vae} 的 KL 在 $B$ 维；
+\texttt{latent\_t5}（\texttt{readout=b}）默认 $B{=}32$，KL 同在瓶颈维；
 \texttt{readout=e} 则在 $E{=}512$ 维施加 KL，先验负担显著更重。
+\texttt{readout=none} 无高斯后验、无 KL。
 
 \subsection{\texttt{latent\_vae}：并行解码、低维 $z$}
 
@@ -135,7 +137,7 @@ Stage-1 的 encoder 视野、瓶颈宽度、decoder 因子分解与辅助损失�
 \toprule
 维度 & \texttt{latent\_vae} & \texttt{latent\_t5} \\
 \midrule
-$z$ 默认维数 & $B{=}64$ & $E{=}512$ 或 $B{=}64$（\texttt{readout}） \\
+$z$ 默认维数 & $B{=}64$ & $E{=}512$ 或 $B{=}32$（\texttt{readout}）；\texttt{none} 无 $z$ \\
 Encoder 语境 & 因果/块因果（禁止双向） & 双向（默认）或单向 \\
 Decoder & 并行，一次出全长 & AR + cross-attn \\
 辅助损失 & BERT-mask & span corruption \\
@@ -162,28 +164,35 @@ Stage-2 先验难度 & 低（$L{\times}B$） & \texttt{e} 高；\texttt{b} 与 V
 键 & \texttt{latent\_t5} & \texttt{latent\_vae} \\
 \midrule
 \texttt{n\_embd} / \texttt{d\_kv} / \texttt{d\_ff} / 层数 & \multicolumn{2}{c}{512 / 64 / 2048 / enc6+dec6} \\
-\texttt{latent\_dim}（$B$） & \multicolumn{2}{c}{16} \\
+\texttt{latent\_dim}（$B$） & 32 & 64 \\
 \texttt{max\_seq\_len} & \multicolumn{2}{c}{4096} \\
 \texttt{tokenizer} & \multicolumn{2}{c}{GPT-2（OWT 管线）} \\
-encoder / decoder self-attn & \texttt{bidirectional}（默认 true：二者双向并行重建；false：二者因果 AR） & 禁止双向；\texttt{block\_size}（默认 1） \\
-读出 & \texttt{readout=e|b} & 固定 $B$ 读出 \\
+encoder / decoder self-attn & encoder：\texttt{bidirectional}；decoder：\texttt{decoder\_bidirectional}（null=同 encoder） & 禁止双向；\texttt{block\_size}（默认 1） \\
+读出 & \texttt{readout=e|b|none} & 固定 $B$ 读出 \\
 辅助损失 & \texttt{lambda\_span} + span 腐蚀 & \texttt{lambda\_mask} + BERT-mask \\
 \texttt{beta\_kl} & \multicolumn{2}{c}{0.1} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-与 T5-small 的 $d_{\mathrm{model}}, d_{\mathrm{kv}}, d_{\mathrm{ff}}, 6{+}6$ 层对齐；\textbf{未}复现 T5 相对位置偏置、RMSNorm 与 ReLU FFN，而采用本仓库 AR 栈惯例：pre-norm LayerNorm、RoPE~\cite{su2024rope}、GELU FFN。
+与 T5-small 的 $d_{\mathrm{model}}, d_{\mathrm{kv}}, d_{\mathrm{ff}}, 6{+}6$ 层对齐。
+\texttt{readout=e|b} \textbf{未}复现 T5 相对位置偏置、RMSNorm 与 ReLU FFN，而采用本仓库 AR 栈惯例：pre-norm LayerNorm、RoPE~\cite{su2024rope}、GELU FFN。
+\texttt{readout=none}（原 T5）块算子对齐 HuggingFace 原版 \texttt{t5-small}：相对位置偏置（32 buckets）、T5LayerNorm（无均值、无 bias 的 RMSNorm，$\varepsilon{=}10^{-6}$）、DenseReluDense（ReLU、无 gate）、独立 $Q,K,V,O$ 投影（注意力分数不除 $\sqrt{d_{\mathrm{kv}}}$）、基础词表 embedding 与 \texttt{lm\_head} 权重绑定。
+用户写死双向：encoder 与 decoder self-attn 均为全双向，decoder 的 relative bias 亦按双向桶（与 encoder 同构），\textbf{不}使用原版 T5 的 causal decoder。
 
 \subsection{共享模块 \texttt{models/latent/encdec/}}
 
 \begin{description}
-  \item[\texttt{SelfAttention}] $Q,K,V$ 投影至 $H \cdot d_{\mathrm{kv}}$；RoPE 施加于 $Q,K$。
+  \item[\texttt{SelfAttention}]（\texttt{encdec}，\texttt{readout=e|b}）$Q,K,V$ 投影至 $H \cdot d_{\mathrm{kv}}$；RoPE 施加于 $Q,K$。
   \item[\texttt{TransformerBlock}] pre-norm self-attn + FFN。
   \item[\texttt{LatentEncoder}] token embedding + $N_{\mathrm{enc}}$ 层 block；支持三种注意力模式（第~\ref{sec:attn} 节）。
   \item[\texttt{PosteriorBReadout}] $\mu,\log\sigma^2$ 均为 $\mathbb{R}^{E}\!\to\!\mathbb{R}^{B}$；$\mu$ 经无仿射 LayerNorm。
   \item[\texttt{PosteriorEReadout}] 瓶颈 $\mathbb{R}^{E}\!\to\!\mathbb{R}^{B}$，再 $\mathbb{R}^{B}\!\to\!\mathbb{R}^{E}$ 得 $\mu,\log\sigma^2$。
 \end{description}
+
+\subsection{原 T5 块（\texttt{models/latent/latent\_t5/t5\_blocks.py}）}
+
+仅 \texttt{readout=none} 组装。\texttt{T5LayerNorm}、相对位置偏置（首层共享）、\texttt{T5DenseReluDense}、独立 $Q/K/V/O$。Decoder 每层为 self-attn $\to$ cross-attn $\to$ FFN。
 
 \section{Encoder 注意力三路}
 \label{sec:attn}
@@ -191,11 +200,13 @@ encoder / decoder self-attn & \texttt{bidirectional}（默认 true：二者双�
 设 encoder 隐状态为 $h \in \mathbb{R}^{L \times E}$。
 
 \begin{enumerate}
-  \item \textbf{双向}（\texttt{bidirectional=true}，\texttt{latent\_t5} 默认）：encoder \textbf{与} decoder self-attn 均无因果 mask。Decoder 从 $z$ 并行重建（不 teacher-force $x$），以免双向 self-attn 看见未来 token。\textbf{仅} \texttt{latent\_t5} 可配置。
-  \item \textbf{逐 token 因果}（\texttt{bidirectional=false}, \texttt{block\_size=1}）：encoder 与 decoder self-attn 均为 \texttt{is\_causal=True}；decoder 仍 AR + cross-attn。\texttt{latent\_t5} 可通过 \texttt{--set model.bidirectional=false} 选用；\texttt{latent\_vae} 固定此模式（默认 \texttt{block\_size=1}）。
+  \item \textbf{双向}（\texttt{bidirectional=true}，\texttt{latent\_t5} 默认）：encoder 无因果 mask。Decoder 默认同为双向，从 $z$ 并行重建（不 teacher-force $x$）。\textbf{仅} \texttt{latent\_t5} 可配置。
+  \item \textbf{逐 token 因果}（\texttt{bidirectional=false}, \texttt{block\_size=1}）：encoder 为 \texttt{is\_causal=True}；decoder 默认同为因果 AR + cross-attn。\texttt{latent\_t5} 可通过 \texttt{--set model.bidirectional=false} 选用；\texttt{latent\_vae} 固定此模式（默认 \texttt{block\_size=1}）。
   \item \textbf{块因果}（\texttt{block\_size>1}，可选）：块内双向、块间因果；mask 与 \texttt{cola\_vae} 共用 \texttt{block\_causal\_mask\_mod}。要求 $L \bmod \texttt{block\_size} = 0$。\texttt{latent\_vae} 默认 \texttt{block\_size=1}，即不启用块注意力。
 \end{enumerate}
 
+\texttt{latent\_t5} 另有 \texttt{decoder\_bidirectional}：\texttt{null} 时 decoder 跟随 encoder；显式 \texttt{false} 时 decoder 因果 AR（仅 \texttt{readout=e|b}）。
+\texttt{readout=none}（原 T5）\textbf{写死} encoder 与 decoder 均为双向，禁止单向。
 \texttt{latent\_vae} \textbf{禁止} \texttt{bidirectional=true}（配置层与实现层均拒绝；encoder 写死 \texttt{False}）。
 
 \section{瓶颈与读出}
@@ -241,24 +252,32 @@ $\mu,\log\sigma^2$ 与 \texttt{latent\_vae} 相同（均在 $B$ 维）。
 而 $Q$ 仍来自 decoder 隐状态 $h_{\mathrm{dec}}\in\mathbb{R}^E$。
 Self-attention 的 $Q,K,V$ 始终在 $E$ 维。
 
-此变体使 T5 路径上的 KL 与 VAE 一样在 $B{=}16$ 维平均，便于公平对比瓶颈宽度；代价是 cross-attn memory 信息带宽更低。
+此变体使 T5 路径上的 KL 与 VAE 一样在瓶颈维平均，便于公平对比瓶颈宽度；代价是 cross-attn memory 信息带宽更低。
+
+\subsubsection{\texttt{readout=none}：无瓶颈}
+
+不建 \texttt{Posterior*Readout}，decoder memory 即为 encoder 隐状态 $h\in\mathbb{R}^{L\times E}$。
+无重参数化、KL 记 0。encoder 与 decoder \textbf{写死双向}（并行从 $h$ 重建）；\texttt{bidirectional=false} 或 \texttt{decoder\_bidirectional=false} 会报错。
+块算子走 \texttt{models/latent/latent\_t5/t5\_blocks.py}（原版 t5-small），\textbf{不}走 \texttt{encdec} 的 RoPE 栈。
 
 \section{Decoder 与生成}
 
 \subsection{\texttt{latent\_t5}：cross-attn decoder（self-attn 与 encoder 同模式）}
 
-每层：self-attn（RoPE；\texttt{bidirectional} 与 encoder 一致）$\to$ cross-attn($h_{\mathrm{dec}}, z$) $\to$ FFN。
+每层：self-attn $\to$ cross-attn($h_{\mathrm{dec}}, z$) $\to$ FFN。
+\texttt{readout=e|b} 的 self-attn 为 RoPE（默认与 encoder 的 \texttt{bidirectional} 一致，可被 \texttt{decoder\_bidirectional} 覆盖）；
+\texttt{readout=none} 的 self-attn 为 T5 相对位置偏置（双向桶）且写死双向。
 
 \paragraph{训练}
 \begin{itemize}
-  \item \texttt{bidirectional=true}：decoder 从 $z$ 起步（\texttt{readout=e} 时 $z$ 已是 $E$ 维；\texttt{readout=b} 时经 $B\to E$），一次预测全长 $x$。数据仍因 \texttt{full\_sequence\_training=True} 传入全长。
-  \item \texttt{bidirectional=false}：构造 $\tilde{x} = [\mathrm{BOS}, x_1,\ldots,x_{L-1}]$ 做教师强制 AR。\textbf{不}使用 GPT 式外层 \texttt{batch[:,:-1]} 移位（否则 encoder 会丢失末 token）。
+  \item decoder 双向：decoder 从 $z$ 起步（\texttt{readout=e}/\texttt{none} 时已是 $E$ 维；\texttt{readout=b} 时经 $B\to E$），一次预测全长 $x$。数据仍因 \texttt{full\_sequence\_training=True} 传入全长。
+  \item decoder 因果：构造 $\tilde{x} = [\mathrm{BOS}, x_1,\ldots,x_{L-1}]$ 做教师强制 AR。\textbf{不}使用 GPT 式外层 \texttt{batch[:,:-1]} 移位（否则 encoder 会丢失末 token）。
 \end{itemize}
 
 \paragraph{生成}
 \begin{itemize}
-  \item 双向：一次 decode 全长；有前缀则 encode（前缀+$L$ pad）后并行重建并覆盖前缀。
-  \item 单向：有前缀则 encode 得 $z$ 再 AR 续写；无条件从 $\mathcal{N}(0,I)$ 采 $z$ 再 AR。
+  \item decoder 双向：一次 decode 全长；有前缀则 encode（前缀+$L$ pad）后并行重建并覆盖前缀。无条件：VAE 读出从先验采 $z$；\texttt{readout=none} 则 encode 首位 BOS + 其余 pad。
+  \item decoder 因果（仅 \texttt{e|b}）：有前缀则 encode 得 memory 再 AR 续写；无条件从 $\mathcal{N}(0,I)$ 采 $z$ 再 AR。
 \end{itemize}
 
 \subsection{\texttt{latent\_vae}：统一生成}
@@ -279,7 +298,7 @@ Decoder 仅接收 $\mathrm{from\_latent}(z)$，与 Cola \texttt{decode\_logits} 
 \subsection{重建项 $\mathcal{L}_{\mathrm{recon}}$}
 
 \begin{description}
-  \item[\texttt{latent\_t5}] 双向（默认）：并行 CE $-\sum_t \log p_\theta(x_t \mid z)$。单向：教师强制 AR CE $-\sum_t \log p_\theta(x_t \mid x_{<t}, z)$。
+  \item[\texttt{latent\_t5}] decoder 双向（默认）：并行 CE $-\sum_t \log p_\theta(x_t \mid z)$。decoder 因果：教师强制 AR CE $-\sum_t \log p_\theta(x_t \mid x_{<t}, z)$。\texttt{readout=none} 时 $z$ 即为 $h$。
   \item[\texttt{latent\_vae}] 并行 CE：$-\sum_t \log p_\theta(x_t \mid z)$，所有位置同时预测。
 \end{description}
 
@@ -421,9 +440,10 @@ S4 的 cosine 退火仅在观察窗之后的最后 0.8B 进行。
 
 本节记录\textbf{正在进行 / 即将按此清单执行}的长度课程训练（协议同第~\ref{sec:curriculum} 节：10B 有效 token、\texttt{100m-curriculum}、\texttt{preprocess=latent-curriculum}、OWT）。
 超参以 CLI \texttt{--set} 覆盖，进入配置哈希；每组独立 run 目录。
-$B$ 为 \texttt{latent\_dim}；$D$ 为 \texttt{block\_size}。本矩阵\textbf{只跑} $D{=}1$（逐 token 因果），不扫块因果 $D{=}16$。
-T5 的 readout 为 \texttt{e}（$z\in\mathbb{R}^{E}$）或 \texttt{b}（$z\in\mathbb{R}^{B}$）；双向 T5 无 $D$。
-T5 \textbf{不}扫瓶颈：$B$ 一律 $64$。合计 \textbf{7} 组：VAE 4 + T5 3。
+$B$ 为 \texttt{latent\_dim}；$D$ 为 \texttt{block\_size}。
+VAE 在 $D{=}1$（逐 token 因果）上扫全部 $B$；另在 $B{=}32$ 上扫块因果 $D{\in}\{16,32\}$（相对原 $D{=}1$ 四组\textbf{增加两组}）。
+T5 的 readout 为 \texttt{e}（$z\in\mathbb{R}^{E}$）、\texttt{b}（$z\in\mathbb{R}^{B}$）或 \texttt{none}（无瓶颈）；双向 T5 无 $D$。
+T5 有瓶颈的三组 $B$ 一律 $32$（配置默认，不扫 $16/64/128$）。另增一组原 T5（\texttt{readout=none}）。合计 \textbf{10} 组：VAE 6 + T5 4。
 
 \subsection{硬件}
 
@@ -433,18 +453,19 @@ T5 \textbf{不}扫瓶颈：$B$ 一律 $64$。合计 \textbf{7} 组：VAE 4 + T5 
 \toprule
 模型 & 服务 & 调度 & 可见 GPU & 单卡 \\
 \midrule
-\texttt{latent\_vae} & \texttt{ovan-server} & Slurm（\texttt{cls1}，QOS \texttt{long}） & 4$\times$ RTX 4090 & 24\,GiB \\
-\texttt{latent\_t5} & \texttt{train-server-2} & common & 8$\times$ RTX 5090 & 32\,GiB \\
+\texttt{latent\_vae}、\texttt{latent\_t5} & \texttt{ovan-server} & Slurm（\texttt{cls1}，QOS \texttt{long}） & 4$\times$ RTX 4090 & 24\,GiB \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-VAE 一个 4 卡作业内按 $B$ 升序串跑四组（均为 $D{=}1$）。
-T5 在 \texttt{train-server-2} 上按下列格点训练。
+两条模型共用 ovan-server 4 卡、QOS \texttt{long}。
+VAE 两个 4 卡作业：按 $B$ 升序串跑 $D{=}1$ 四组；对 $B{=}32$ 串跑 $D{=}16$ 再 $D{=}32$。
+T5 两个 4 卡作业：单向 \texttt{e} 再 \texttt{b} 串跑；双向默认 \texttt{e} 再原版 \texttt{none} 串跑。
 
 \subsection{\texttt{latent\_vae}（ovan-server，4\texttimes4090）}
 
-固定：$B$ 读出、逐 token 因果 encoder、并行 decoder，$D{=}1$。只扫 $B{\in}\{16,32,64,128\}$，共 4 组。
+固定：$B$ 读出、并行 decoder。主扫 $D{=}1$（因果 encoder）的 $B{\in}\{16,32,64,128\}$；
+$B{=}32$ 再扫块因果 $D{\in}\{16,32\}$。共 6 组；提交为两个 Slurm（$D{=}1$ 四段、$B{=}32$ 两段）。
 
 \begin{center}
 \small
@@ -453,13 +474,16 @@ T5 在 \texttt{train-server-2} 上按下列格点训练。
 $B$ & 16 & 32 & 64 & 128 \\
 \midrule
 $D{=}1$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+$D{=}16$ &  & $\checkmark$ &  &  \\
+$D{=}32$ &  & $\checkmark$ &  &  \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\subsection{\texttt{latent\_t5}（train-server-2，8\texttimes5090）}
+\subsection{\texttt{latent\_t5}（ovan-server，4\texttimes4090）}
 
-固定 $B{=}64$（配置默认，不扫 $16/32/128$）、单向 $D{=}1$。消融只做方向与 readout。
+有瓶颈三组固定 $B{=}32$（配置默认）、单向 $D{=}1$。另增原 T5 一组（无瓶颈）。
+提交：单向两组一个 Slurm；双向与原版一个 Slurm。
 
 \begin{center}
 \small
@@ -467,42 +491,46 @@ $D{=}1$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
 \toprule
 方向 & readout & $B$ & $D$ & 组数 & 合计 \\
 \midrule
-双向 & \texttt{e} & 64 & --- & 1 & 1 \\
-单向 & \texttt{e} & 64 & 1 & 1 & 1 \\
-单向 & \texttt{b} & 64 & 1 & 1 & 1 \\
+双向 & \texttt{e} & 32 & --- & 1 & 1 \\
+单向 & \texttt{e} & 32 & 1 & 1 & 1 \\
+单向 & \texttt{b} & 32 & 1 & 1 & 1 \\
+原 T5（双向写死） & \texttt{none} & --- & --- & 1 & 1 \\
 \midrule
- &  &  &  &  & \textbf{3} \\
+ &  &  &  &  & \textbf{4} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-逐组展开（均为 $B{=}64$）：
+逐组展开：
 
 \begin{itemize}
-  \item \textbf{双向 / readout=\texttt{e}}：默认 \texttt{bidirectional=true}（无 $D$）。
-  \item \textbf{单向 / readout=\texttt{e}}：$D{=}1$。
-  \item \textbf{单向 / readout=\texttt{b}}：$D{=}1$。
+  \item \textbf{双向 / readout=\texttt{e}}：默认 \texttt{bidirectional=true}，$B{=}32$（无 $D$）。
+  \item \textbf{单向 / readout=\texttt{e}}：$D{=}1$，$B{=}32$。
+  \item \textbf{单向 / readout=\texttt{b}}：$D{=}1$，$B{=}32$。
+  \item \textbf{原 T5}：\texttt{readout=none}；encoder/decoder \textbf{写死双向}。无读出层、无 KL。
 \end{itemize}
 
 CLI 对应：双向不改默认；单向 \texttt{--set model.bidirectional=false}；
-\texttt{readout=b} 时 \texttt{--set model.readout=b}。$B$ 用配置默认 $64$，不必 \texttt{--set model.latent\_dim}；单向 $D$ 用默认 \texttt{block\_size=1}。
+\texttt{readout=b} 时 \texttt{--set model.readout=b}。
+有瓶颈组 $B$ 用配置默认 $32$，不必 \texttt{--set model.latent\_dim}；单向 $D$ 用默认 \texttt{block\_size=1}。
+原 T5：\texttt{--set model.readout=none}（不必也不许改方向）。
 
 \section{设计选择与局限}
 
 \begin{enumerate}
-  \item \textbf{RoPE 而非 T5 相对偏置}：与仓库 AR/块因果路径统一；双向 encoder 语义对齐 T5，算子不对齐 HF 权重。
-  \item \textbf{GPT-2 词表}：与 OWT 预处理一致；未 tie 的 embedding 与 \texttt{lm\_head} 占模型参数较大头，高于 32k SPM 的 T5-small 计数。
-  \item \textbf{KL 空间}：\texttt{readout=e} 时 KL 在 $E{=}512$；与 \texttt{latent\_vae} 的 $B{=}16$ 后验容量不对等；\texttt{readout=b} 可缓解。
-  \item \textbf{span 辅助损失}：固定长度「原地 CE」是工程折中，非严格 T5 预训练目标。
-  \item \textbf{无条件生成}：latent AR 依赖宽先验 $z$；实用场景建议前缀 encode。
+  \item \textbf{RoPE 而非 T5 相对偏置}（仅 \texttt{readout=e|b}）：与仓库 AR/块因果路径统一。\texttt{readout=none} 已改用原版 t5-small 相对偏置 + RMSNorm + ReLU FFN；decoder 仍写死双向（相对 bias 亦为双向桶）。
+  \item \textbf{GPT-2 词表}：与 OWT 预处理一致，不换 SentencePiece 32k。\texttt{readout=none} 将 \texttt{lm\_head} 与基础 vocab embed tie（sentinel 行不进 \texttt{lm\_head}）；\texttt{e|b} 仍不 tie。
+  \item \textbf{KL 空间}：\texttt{readout=e} 时 KL 在 $E{=}512$；与 \texttt{latent\_vae} 默认 $B{=}64$ 后验容量不对等；\texttt{readout=b}（$B{=}32$）可缓解；\texttt{none} 无 KL。
+  \item \textbf{span 辅助损失}：固定长度「原地 CE」是工程折中，非严格 T5 预训练目标。原 T5 消融只去掉瓶颈并写死双向，损失仍为重建+span 辅助。
+  \item \textbf{无条件生成}：VAE 读出依赖宽先验 $z$；\texttt{readout=none} 无条件 encode 首位 BOS + 其余 pad。实用场景建议前缀 encode。
 \end{enumerate}
 
 \section{小结}
 
 \texttt{latent\_t5} 与 \texttt{latent\_vae} 在共享 T5-small 维数 encoder 与 Cola 式 ELBO 下，分别检验「双向并行重建（默认可切单向 AR）+ span 辅助」与「因果 + 并行解码 + BERT-mask」两条 Stage-1 路线（动机与 DLM 语义空间讨论见第~\ref{sec:why}--\ref{sec:dlm-space} 节）。
-读出变体 \texttt{readout=e|b} 控制随机变量所在空间与 cross-attn memory 维数，便于消融瓶颈与 KL 尺度。
+读出变体 \texttt{readout=e|b|none} 控制随机变量所在空间与是否保留瓶颈；\texttt{none} 另将块算子对齐原版 t5-small（仍保留双向 decoder、GPT-2 词表与定长 span）。
 长度课程（10B、四阶段数据配比、WSD 优化器）见第~\ref{sec:curriculum} 节。
-当前 Stage-1 训练矩阵（VAE：ovan-server 4\texttimes4090；T5：train-server-2 8\texttimes5090）见第~\ref{sec:runs} 节。
+当前 Stage-1 训练矩阵（二者均 ovan-server 4\texttimes4090）见第~\ref{sec:runs} 节。
 工程细节以代码与 \texttt{README.md} 为准；本文档描述设计意图与完整行为规格。
 
 \printbibliography

@@ -6,24 +6,24 @@
 
 | CLI `--model` | 目录 | 类型 | 简述 |
 |---|---|---|---|
-| `latent_t5` | [`models/latent/latent_t5/`](../../models/latent/latent_t5/) | latent | T5-small 维数；encoder **与** decoder self-attn 同为双向或同为因果 + cross-attn |
+| `latent_t5` | [`models/latent/latent_t5/`](../../models/latent/latent_t5/) | latent | T5-small 维数；e/b 走仓库 RoPE 栈；`readout=none` 对齐原版 t5-small 算子（写死双向） |
 | `latent_vae` | [`models/latent/latent_vae/`](../../models/latent/latent_vae/) | latent | 同维数；因果 encoder + 并行 decoder |
 | `cola_vae` | [`models/latent/cola_vae/`](../../models/latent/cola_vae/) | latent | 官方 Cola TextVAE（**未改**；Stage-2 仍只认此族） |
 
 共享算子：[`models/latent/encdec/`](../../models/latent/encdec/)（**不是**独立 `--model`）。
 
-二者与 ELF 冻结 `t5-small` encoder **无关**；内部为手写 RoPE Transformer，维数对齐 T5-small（`E=512, d_kv=64, d_ff=2048, 6+6 层`）。
+二者与 ELF 冻结 `t5-small` encoder **无关**。`readout=e|b` 为手写 RoPE Transformer，维数对齐 T5-small（`E=512, d_kv=64, d_ff=2048, 6+6 层`）。`readout=none`（原 T5）**算子**对齐 HuggingFace 原版 `t5-small`（相对位置偏置、T5LayerNorm/RMS、ReLU FFN、独立 q/k/v/o、embedding↔lm_head tie），但 decoder **写死双向**、词表仍为 GPT-2、损失仍为定长重建 CE + 原地 span。
 
 ## 参数表（`100m.yaml`）
 
 | 键 | `latent_t5` | `latent_vae` |
 |---|---|---|
 | `n_embd` / `d_kv` / `d_ff` / 层数 | 512 / 64 / 2048 / enc6+dec6 | 同左 |
-| `latent_dim`（瓶颈 B） | 64 | 64 |
+| `latent_dim`（瓶颈 B） | 32 | 64 |
 | `max_seq_len` | 4096 | 4096 |
 | `tokenizer` | gpt2 | gpt2 |
-| encoder / decoder self-attn | `bidirectional: true`（默认，并行重建）或 `false`（因果 AR） | **禁止双向**；`block_size: 1` 单向（默认）或 `>1` 块因果 |
-| 读出 | `readout: e`（可选 `b`） | 固定 B 读出 |
+| encoder / decoder self-attn | encoder：`bidirectional`；decoder：`decoder_bidirectional`（`null`=同 encoder） | **禁止双向**；`block_size: 1` 单向（默认）或 `>1` 块因果 |
+| 读出 | `readout: e`（可选 `b` / `none`） | 固定 B 读出 |
 | 辅助损失 | `lambda_span` + span 腐蚀 | `lambda_mask` + BERT-mask |
 | `beta_kl` | 0.1 | 0.1 |
 
@@ -58,13 +58,14 @@
 
 ```
 models/latent/
-├── encdec/                 # 共享 block / encoder / 读出
-│   ├── layers.py           # SelfAttention, TransformerBlock, DecoderBlock, CrossAttention
+├── encdec/                 # 共享 block / encoder / 读出（readout=e|b 与 latent_vae）
+│   ├── layers.py           # SelfAttention（RoPE）, TransformerBlock, DecoderBlock, CrossAttention
 │   ├── encoder.py          # LatentEncoder（三路 mask）
 │   └── readout.py          # PosteriorBReadout, PosteriorEReadout, KL
 ├── latent_t5/
 │   ├── config.py           # FL_LatentT5Config
 │   ├── model.py            # _LatentT5Backbone, FL_LatentT5Model
+│   ├── t5_blocks.py        # readout=none：原版 t5-small 算子（相对偏置 / RMS / ReLU）
 │   └── span.py             # span corruption（L_aux）
 └── latent_vae/
     ├── config.py           # FL_LatentVAEConfig
@@ -86,7 +87,7 @@ models/latent/
 | `latent_t5` | 允许（**默认**） | 允许（`--set model.bidirectional=false`） |
 | `latent_vae` | **禁止**（YAML/`--set` 设 true 会报错） | 固定；配合 `block_size` 选单向或块因果 |
 
-`latent_t5` 的 encoder **始终** `block_size=1`；decoder self-attn 与 encoder **同一** `attn_mode`（双向或因果）。
+`latent_t5` 的 encoder **始终** `block_size=1`；decoder self-attn 默认与 encoder 同一 `attn_mode`，可用 `decoder_bidirectional=false` 单独改成因果（**仅** `readout=e|b`）。`readout=none`（原 T5）**写死双向**，设 `bidirectional=false` 或 `decoder_bidirectional=false` 会报错。
 `latent_vae` 无 `bidirectional` 配置项；实现层写死 `bidirectional=false`。
 
 ### 读出（瓶颈）
@@ -96,15 +97,16 @@ models/latent/
 | `latent_vae` | — | $\mathbb{R}^B$ | `PosteriorBReadout` |
 | `latent_t5` | `readout=e` | $\mathbb{R}^E$ | `PosteriorEReadout`（E→B→E） |
 | `latent_t5` | `readout=b` | $\mathbb{R}^B$ | `PosteriorBReadout`；decoder cross-attn K/V 从 B 投影 |
+| `latent_t5` | `readout=none` | encoder \(h\in\mathbb{R}^E\) | 无读出层；无 KL；memory 即 encoder 隐状态；块算子为原版 t5-small（见 `t5_blocks.py`） |
 
 ### Decoder 差异
 
 | | `latent_t5` | `latent_vae` |
 |---|---|---|
-| 结构 | 6×（self-attn 与 encoder 同模式 + cross-attn + FFN） | 6×（与 encoder 同型 self-attn + FFN） |
-| 输入 | 双向：从 \(z\) 起；单向：token embedding（BOS + 右移） | `from_latent(z)`，无 teacher-force |
-| 训练移位 | 双向：无；单向：`BOS \Vert x_{:-1}` | 无移位 |
-| 生成 | 双向：一次前向；单向：AR + 固定 \(z\)（从 BOS 采满 \(L\) 个 token）；`supports_prefix=True` | 无条件从先验采 \(z\) 一次前向；有前缀则 encode 后并行 decode 并保留前缀 |
+| 结构 | 6×（self-attn + cross-attn + FFN）；none 为 T5 相对偏置块，e/b 为 RoPE 块 | 6×（与 encoder 同型 self-attn + FFN） |
+| 输入 | decoder 双向：从 \(z\) 起；decoder 因果：token embedding（BOS + 右移） | `from_latent(z)`，无 teacher-force |
+| 训练移位 | decoder 双向：无；decoder 因果：`BOS \Vert x_{:-1}` | 无移位 |
+| 生成 | decoder 双向：一次前向；decoder 因果：AR + 固定 memory（从 BOS 采满 \(L\) 个 token）；`supports_prefix=True` | 无条件从先验采 \(z\) 一次前向；有前缀则 encode 后并行 decode 并保留前缀 |
 
 ### 损失（训练态）
 
@@ -114,13 +116,13 @@ $$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N
 
 | 项 | `latent_t5` | `latent_vae` |
 |---|---|---|
-| $\mathcal{L}_{\mathrm{recon}}$ | 双向：并行 CE；单向：教师强制 AR CE | 并行全 token CE |
+| $\mathcal{L}_{\mathrm{recon}}$ | decoder 双向：并行 CE；decoder 因果：教师强制 AR CE | 并行全 token CE |
 | $\mathcal{L}_{\mathrm{aux}}$ | 原地 span CE（[`span.py`](../../models/latent/latent_t5/span.py)） | BERT-mask CE |
 | 日志键 | `recon_ce`, `kl`, `mask`（span） | 同左（mask 为 BERT） |
 
 Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignore_index`；KL 只对非 pad 位置平均；BERT-mask / span 不抽 pad。双向 self-attn 与 T5 cross-attn 屏蔽 pad key；逐 token 因果**不加** pad mask（右 pad + Flash）；`block_size>1` 时块内双向会叠加 pad mask。`cola_vae` 未改。
 
-`latent_t5` encoder 词表扩展 **100** 个 sentinel（`vocab_size + [0,100)`），仅供 span 腐蚀；**不进** `lm_head`。
+`latent_t5` encoder 词表扩展 **100** 个 sentinel（`vocab_size + [0,100)`），仅供 span 腐蚀；**不进** `lm_head`。`readout=none` 时 `lm_head.weight` 与 encoder **基础词表** embed 绑定（HF T5 默认 tie）；sentinel 行独立。
 
 `latent_vae` encoder 词表 **+1** mask 行（`mask_token_id = vocab_size`）。
 
@@ -211,6 +213,13 @@ bash scripts/train/latent-vae-100m-curriculum.sh
 bash scripts/train/latent-t5-100m-curriculum.sh
 ```
 
+VAE 矩阵包装（各一个 Slurm 作业、作业内串跑）：
+`latent-vae-100m-curriculum-d1.sh`（`D=1`，扫 `B∈{16,32,64,128}`）；
+`latent-vae-100m-curriculum-b32.sh`（仅 `B=32`，`D=16` 再 `D=32`）。
+T5 矩阵包装（各一个 Slurm 作业、作业内串跑）：
+`latent-t5-100m-curriculum-uni.sh`（单向 `e` 再 `b`）；
+`latent-t5-100m-curriculum-bi.sh`（双向默认 `e` 再原版 `none`）。
+
 `--preprocess latent-curriculum`；checkpoint 仍在 `full/latent/...`。
 
 ### 远端 full（定长，无课程）
@@ -234,7 +243,7 @@ bash scripts/train/latent-t5-100m-full.sh
   --set model.readout=b
 ```
 
-`readout` 进入配置哈希；`e` 与 `b` 为不同 run 目录。
+`readout` 进入配置哈希；`e`、`b`、`none` 为不同 run 目录。
 
 ### T5 单向消融（encoder 与 decoder 同为因果 AR）
 
@@ -248,7 +257,25 @@ bash scripts/train/latent-t5-100m-full.sh
   --set model.bidirectional=false
 ```
 
-仅 `latent_t5` 可切换；`true` 时 encoder **与** decoder self-attn 均为双向（从 \(z\) 并行重建，避免 teacher-force 泄漏）；`false` 时二者均为因果 AR。`latent_vae` **禁止** `bidirectional=true`。
+默认 `decoder_bidirectional=null`：decoder 跟随 encoder。`bidirectional=true` 时二者均为双向（从 \(z\) 并行重建）；`false` 时二者均为因果 AR。`latent_vae` **禁止** `bidirectional=true`。
+
+### 原 T5（无瓶颈；双向写死）
+
+仍用 `--model latent_t5`，只改 `readout`（encoder/decoder 均为双向并行重建；禁止单向）。
+块算子对齐原版 `t5-small`：相对位置偏置（32 buckets；encoder 与 decoder self-attn **均为双向桶**）、T5LayerNorm（RMS、eps=1e-6）、DenseReluDense（ReLU）、独立 q/k/v/o、embed↔lm_head tie。
+**不**改回原版 T5 的 causal decoder，**不**换 SentencePiece 词表，**不**改成变长 sentinel decoder 目标。
+
+```bash
+.venv/bin/python train.py \
+  --model latent_t5 \
+  --config 100m-fast \
+  --dataset owt \
+  --preprocess default \
+  --generate eval \
+  --set model.readout=none
+```
+
+无 E→B→E / E→B 层；memory 为 encoder 隐状态；KL 记 0。课程 run 同样 `--set`。
 
 ### Checkpoint 布局
 
@@ -295,7 +322,7 @@ loaded = load_latent_artifact("latent_vae", "100m-b32-d1")
 .venv/bin/python generate.py --run fast/latent/latent_t5/<hash>
 ```
 
-`latent_t5` / `latent_vae` 均支持 `--prompt` 前缀（保留前缀、只填后续）。T5 默认双向为一次前向；`bidirectional=false` 时为 AR（从 BOS 采满 \(L\) 个 token）。VAE 无条件从 \(\mathcal{N}(0,I)\) 采 \(z\) 再一次 decode。T5 无条件先验形状随 `readout`（`e`→$(L,E)$，`b`→$(L,B)$）。
+`latent_t5` / `latent_vae` 均支持 `--prompt` 前缀（保留前缀、只填后续）。T5 默认 decoder 双向为一次前向；decoder 因果时为 AR（从 BOS 采满 \(L\) 个 token）。VAE 无条件从 \(\mathcal{N}(0,I)\) 采 \(z\) 再一次 decode。T5 无条件：`readout=e`→$(L,E)$ 先验，`b`→$(L,B)$；`none` 则 encode 首位 BOS + 其余 pad 作空源。
 
 ## 与 `cola_vae` 的关系
 
