@@ -370,6 +370,16 @@ def set_seed(seed: int, rank: int) -> None:
         torch.cuda.manual_seed_all(s)
 
 
+def _notify_tokens_seen(model: nn.Module, n: int, optimizer: Any) -> None:
+    """向前兼容：模型若实现 ``on_tokens_seen`` 则通知累计 token，否则 no-op。"""
+    raw = unwrap_model(model)
+    fn = getattr(raw, "on_tokens_seen", None)
+    if not callable(fn):
+        fn = getattr(getattr(raw, "backbone", None), "on_tokens_seen", None)
+    if callable(fn):
+        fn(int(n), optimizer)
+
+
 def train_loop(
     model: nn.Module,
     cfg: FL_TrainConfig,
@@ -559,6 +569,13 @@ def train_loop(
                     "Checkpoint has no EMA state; re-initialized EMA from model weights",
                 )
                 ema_state = init_ema(model)
+        if curriculum_sampler is not None:
+            seen_n = int(curriculum_sampler.effective_tokens_global)
+        elif step == 0:
+            seen_n = 0
+        else:
+            seen_n = cfg.tokens_seen_after_step(step - 1)
+        _notify_tokens_seen(model, seen_n, optimizer)
         if rank == 0:
             curr_resume = None
             if curriculum_sampler is not None and has_stage_micro:
@@ -584,22 +601,45 @@ def train_loop(
                 _train_log(
                     f"Reached max_steps={cfg.max_steps}; training is already complete"
                 )
+                from train.stage_chain import write_complete_marker
+
+                write_complete_marker(
+                    run_dir,
+                    step=step,
+                    cfg=cfg,
+                    curriculum_state=_curriculum_ckpt(),
+                )
             return
     else:
         init_spec = cfg.extra.get("init_ckpt")
         if init_spec:
-            repo = Path(__file__).resolve().parent
+            repo = Path(__file__).resolve().parents[1]
             init_path = Path(str(init_spec))
             if not init_path.is_absolute():
                 init_path = (repo / init_path).resolve()
             init_path = _stage_ckpt_to_local(
                 init_path, rank=rank, is_distributed=is_distributed,
             )
-            loaded_ema, init_info = load_init_weights(init_path, model, device)
+            from_ema = bool(cfg.extra.get("init_from_ema"))
+            loaded_ema, init_info = load_init_weights(
+                init_path, model, device, from_ema=from_ema,
+            )
             _release_staged_ckpt(
                 init_path, rank=rank, is_distributed=is_distributed,
             )
-            if ema_state is not None:
+            if from_ema:
+                prior = int(cfg.extra.get("stage1_tokens_seen") or 0)
+                if prior > 0:
+                    _notify_tokens_seen(model, prior, optimizer)
+                if ema_state is not None:
+                    ema_state = init_ema(model)
+                if rank == 0:
+                    _train_log(
+                        f"init-ckpt 从 EMA 写入 live 权重 "
+                        f"(n_ema_applied={init_info.get('n_ema_applied', 0)})；"
+                        f"stage1_tokens_seen={prior} 已通知解冻并重建 EMA"
+                    )
+            elif ema_state is not None:
                 if loaded_ema:
                     n_ema = 0
                     for k, v in loaded_ema.items():
@@ -850,6 +890,7 @@ def train_loop(
                 if curriculum_sampler is not None
                 else cfg.tokens_seen_after_step(step)
             )
+            _notify_tokens_seen(model, log_tokens, optimizer)
             if is_latent:
                 train_row = build_latent_train_row(
                     log_csv_step,
@@ -1109,6 +1150,14 @@ def train_loop(
         save_checkpoint(
             final_snapshot, model, optimizer, step, cfg, model_meta,
             ema_state=ema_state,
+            curriculum_state=_curriculum_ckpt(),
+        )
+        from train.stage_chain import write_complete_marker
+
+        write_complete_marker(
+            run_dir,
+            step=step,
+            cfg=cfg,
             curriculum_state=_curriculum_ckpt(),
         )
         _train_log(

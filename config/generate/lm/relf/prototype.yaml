@@ -1,0 +1,12 @@
+# =============================================================================
+# 生成 / 采样（generate=正式生成；eval=训练在线 gen-eval / 测试）
+# =============================================================================
+_doc: RELF 生成配置模板（不可实例化）  # 文件说明，写入 extra
+name: prototype  # 配置名；非 prototype 时与文件名一致
+commit_x0hat: true  # 是否把 x0_hat 提交进下一窗
+sampling_method: sde  # 采样方法：sde | ode
+num_sampling_steps: 16  # 流步上界（实现按升档 + pop）
+sde_gamma: 1.5  # SDE churn 系数；末流关闭
+w_sc: 3.0  # 推理 self-cond CFG 缩放
+w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
+temperature: 1.0  # 采样温度；≤0 为 argmax

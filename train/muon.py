@@ -320,8 +320,8 @@ def scaled_lr(
     effective_tokens: int | None = None,
 ) -> float:
     if cfg.extra.get("lr_schedule") == "wsd" and effective_tokens is not None:
-        warmup = int(cfg.extra.get("wsd_warmup_tokens", 0))
-        decay = int(cfg.extra.get("wsd_decay_tokens", 0))
+        warmup = int(cfg.extra.get("wsd_warmup_tokens") or 0)
+        decay = int(cfg.extra.get("wsd_decay_tokens") or 0)
         total = int(
             cfg.extra.get("curriculum_effective_tokens")
             or cfg.target_tokens

@@ -1,7 +1,7 @@
 # BELF / RELF（工程说明）
 
 本文档描述两族半自回归连续语言模型在 **bdelf 仓库里如何落地**：与现有模块的关系、拟议目录、加载入口、训练 / 推理接口、checkpoint 与配置指纹。  
-**主树尚未注册 `--model belf` / `--model relf`**；下列路径是规格对齐后的拟议布局，不是当前可跑的 CLI。设计公式、时间场、掩码与消融网格见 [`math.md`](math.md) 与 [`latex/belf-relf.tex`](latex/belf-relf.tex)。
+**主树已登记 `--model belf` / `--model relf`。** 设计公式、时间场、掩码与消融网格见 [`math.md`](math.md) 与 [`latex/belf-relf.tex`](latex/belf-relf.tex)。
 
 | 文档 | 内容 |
 |---|---|
@@ -21,15 +21,13 @@ latexmk -xelatex -interaction=nonstopmode -halt-on-error belf-relf.tex
 | 项 | 状态 |
 |---|---|
 | 规格 | 冻结于本夹 LaTeX；`temp/ideas/belf-relf/proposal/` 不再同步 |
-| 主树模型包 | **无** `models/lm/belf/`、`models/lm/relf/` |
-| 配置 | **无** `config/models/lm/{belf,relf}/`、`config/train/model/{belf,relf}/` |
-| 启动脚本 | **无** `scripts/train/belf-*.sh` / `relf-*.sh` |
-| 入口 VAE | 已有：`load_latent_artifact(latent_model, tag)` |
+| 主树模型包 | `models/lm/belf/`、`models/lm/relf/`、共享 `models/lm/belf_relf_core/` |
+| 配置 | `config/models/lm/{belf,relf}/`、`config/train/model/lm/{belf,relf}/` |
+| 启动脚本 | Stage1 `scripts/train/{belf,relf}-100m-full-s1.sh`；Stage2 `…-s2.sh`；fast 冒烟 `…-100m-fast.sh` |
+| 入口 VAE | `load_latent_artifact(latent_model, tag)` |
 | 近邻实现 | ELF（`models/lm/elf/`）、Cola Stage-2（`models/lm/cola/`）、`latent_vae` |
 
-迁入主树时按仓库惯例：`config/models/lm/<family>/` 出现后，`models.kinds` 才会把该名登记为 `kind=lm`。未登记前 `train.py --model belf` 会失败。
-
-两族**共享模块代码、分开训练、不共享权重**。生成循环锁死：BELF=`block_generate`，RELF=`rolling_generate`，不设 `gen_mode`。
+两族**共享模块代码、分开训练、不共享权重**。生成循环锁死：BELF=`block_generate`，RELF=`rolling_generate`，不设 `gen_mode`。主训与扩展是两次独立作业，不共用 checkpoint 目录。
 
 ## 与仓库内其它模型的关系
 
@@ -41,7 +39,7 @@ latexmk -xelatex -interaction=nonstopmode -halt-on-error belf-relf.tex
 | [`cola`](../../models/lm/cola/) | 2L pack `[clean\|noisy]`、块因果注意力、AdaLN-Zero DiT、独立读出 | \(t=0\) 干净；速度靶 \(z_1-z_0\)；压缩码 + `cola_vae` |
 | [`bd3lm`](../../models/lm/bd3lm/) | 块间提交、KV 的**离散**对应物 | 吸收态 mask、同一网络出 logits |
 
-入口 encoder 的注意力块长以加载结果为准（例如 `latent_vae` 的 `block_size`）。BELF 去噪块长只能是 \(1\) 或该加载块长。RELF **不声明** `block_size`，但要求加载入口块长为 \(1\)。
+入口 encoder 的注意力块长以加载结果为准（例如 `latent_vae` 的 `block_size`），不随 BELF 的 \(W\) 改写。BELF 的 `block_size`（\(W\)）是 \(G\) 的去噪块长：100m 默认 16，主跑 \(W=T\)。受约束的是加载入口块长：只能是 \(1\)（逐 token 因果）或等于本题 BELF \(W\)。RELF **不声明** `block_size`，加载入口块长必须为 \(1\)；窗长 `window_size` 与入口无关。
 
 Cola 的 VAE 加载器与本规格入口不是同一条路：
 
@@ -103,7 +101,7 @@ VAE-dec 只服务 \(\mathcal{L}_{\mathrm{s1}}\)，不代替出口读 token。
 | 架构 | `config/models/lm/belf/{prototype,100m}.yaml`；`config/models/lm/relf/...` |
 | 训练 optimizer/batch | `config/train/model/belf/{fast,full}.yaml`（relf 同） |
 | 在线评测 generate | `config/generate/lm/belf/{generate,eval}.yaml` |
-| 启动 | `scripts/train/belf-100m-full.sh` 等；远端经 `sbatch-train` / `launch-train` |
+| 启动 | Stage1 `scripts/train/belf-100m-full-s1.sh`（短名 `belf-100m-full.sh`）；Stage2 `…-s2.sh`。RELF 同。远端经 `sbatch-train` / `launch-train` |
 
 参数分三类（进入哪份指纹以规格为准）：
 
@@ -119,8 +117,8 @@ VAE-dec 只服务 \(\mathcal{L}_{\mathrm{s1}}\)，不代替出口读 token。
 
 - 加载 \(X\) 与映射一致；`n_embd` 整除 `n_head`
 - 两族 `time_step` \(T\ge 4\)
-- BELF：`block_size` \(\in\{1,\) 加载入口块长\(\}\)
-- RELF：无 `block_size`；加载入口块长 \(=1\)；\(S\cdot T=W\)
+- BELF：加载入口 `encoder.block_size` \(\in\{1,W\}\)
+- RELF：无 `block_size`；加载入口块长 \(=1\)；\(S\cdot T=W\)，\(T\ge 4\)
 - 可训档（`full` / 解冻后 `mid`）须具备 VAE-dec（加载自带或另配）
 
 ### 100m 默认（规格）
@@ -133,13 +131,15 @@ RELF：`window_size=32`，`time_step=16`，`step_size=2`。
 
 ## Checkpoint
 
-s2 run 仍走全局布局（`world_size` 不进哈希）：
+主训（Stage1，45B@512）与扩展（Stage2，5B 混桶）是**两份独立训练**：不同 preprocess → 不同配置哈希 → 不同保存目录。`world_size` / GPU 型号不进哈希，Stage2 可换更大显存的卡。布局仍是：
 
 ```
 cache/checkpoints/{fast|full}/{belf|relf}/{config-hash}/
 ```
 
-无论是否训练 latent，该目录的 checkpoint **必须写入完整 latent 参数**（含另配的 VAE-dec）。续训只认本 run；`mid` 按本 run `tokens_seen` 是否已过 `latent_thaw_tokens` 决定解冻。新 run 自 step 0 调用 `load_latent_artifact`，之后只用本 s2 副本。
+Stage2 启动时解析同参 Stage1 哈希目录：须已有 `complete.json`（训练正常结束才写）与 `checkpoint_latest.pt`，否则直接报错退出。新 Stage2 run 从该 latest 的 **EMA** 初始化 live 权重（不恢复优化器 / step / RNG）；本 run 的 `hardware.json` 独立。`mid` 若 Stage1 已过 `latent_thaw_tokens`，扩展启动时立即解冻。
+
+无论是否训练 latent，该目录的 checkpoint **必须写入完整 latent 参数**（含另配的 VAE-dec）。同一 Stage 的续训只认本 run。新 run 自 step 0 调用 `load_latent_artifact`，再被 Stage1 EMA 覆盖，之后只用本 run 副本。
 
 入口选用权重仍在：
 
@@ -164,11 +164,18 @@ cache/checkpoints/artifacts/latent/{latent_model}/{tag}/
   --model belf \
   --config 100m-fast \
   --dataset owt \
-  --preprocess default \
+  --preprocess owt-seg512 \
   --generate eval
 ```
 
-RELF 把 `--model` 换成 `relf`。`--set` 可改训练/推理字段；改模型类字段会换哈希。本机只跑 fast 冒烟；full 经 `sbatch-train` / `launch-train`（须用户授权占 GPU）。
+full 主训 / 扩展分开（可换卡）：
+
+```bash
+bash scripts/train/belf-100m-full-s1.sh    # 45B@512
+bash scripts/train/belf-100m-full-s2.sh    # 5B 混桶；须同参 s1 已完成
+```
+
+RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段；改模型类字段会换哈希。本机只跑 fast 冒烟；full 经 `sbatch-train` / `launch-train`（须用户授权占 GPU）。
 
 | 族 | `forward(tokens)` | 生成 |
 |---|---|---|

@@ -121,7 +121,7 @@ v_z & g=0.
 p_G(z_0)=\prod_b p_G\bigl(z_0^{(b)}\mid z_0^{(<b)}\bigr).
 \]
 
-每一因子是条件 rectified flow：**未知槽共享同一标量 \(t\)**；已知余数钉 \(t=1\)。去噪块长 \(W\) 为 BELF 的 `block_size`，合法值 \(1\) 或加载入口块长。默认 \(W=\) 加载且主跑 \(W=T\)；若 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。
+每一因子是条件 rectified flow：**未知槽共享同一标量 \(t\)**；已知余数钉 \(t=1\)。去噪块长 \(W\) 为 BELF 的 `block_size`：100m 默认 16，主跑 \(W=T\)。加载入口块长须 \(\in\{1,W\}\)（逐 token 因果，或与本题 \(W\) 相同）；入口注意力按加载结果，不随 \(W\) 改写。若 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。
 
 训练：抽一跳，把 \(t=L_i\) 广播到未知槽。推理 `block_generate`：跳 \(i=0,\ldots,T-2\) Euler \(\Delta t=L_{i+1}-L_i\)（末流到 \(1-\varepsilon\)）；跳 \(T-1\) 在 \(t=1-\varepsilon\)、\(m=\mathrm{decode}\)，**不 Euler**，出口读 token。已知槽每跳覆写 encoder 干净码。SDE churn 关在最后一次流（跳 \(T-2\)）。
 

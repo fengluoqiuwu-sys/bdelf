@@ -170,11 +170,16 @@ def load_init_weights(
     path: Path,
     model: nn.Module,
     device: torch.device,
+    *,
+    from_ema: bool = False,
 ) -> tuple[dict[str, torch.Tensor] | None, dict[str, Any]]:
     """从另一 run 的 ckpt **只加载权重**（及可选 EMA），不恢复优化器 / step / RNG。
 
     允许源 ``model`` 名不同（如 ELF → TrACE）；``strict=False`` 以容纳
     新增 buffer（``attr_d`` 等）。训练从 step 0 开始，写入新 hash 目录。
+
+    ``from_ema=True``：先载入 ``model`` 权重，再把 EMA 影子覆盖到同名
+    Parameter（Stage2 续主训：live = Stage1 EMA）。无 EMA 则报错。
     """
     path = Path(path)
     if not path.is_file():
@@ -203,9 +208,28 @@ def load_init_weights(
         "n_overlap": n_overlap,
         "missing": list(incompatible.missing_keys),
         "unexpected": list(incompatible.unexpected_keys),
+        "from_ema": bool(from_ema),
+        "n_ema_applied": 0,
     }
     ema_raw = ck.get("ema")
     ema_loaded: dict[str, torch.Tensor] | None = None
     if isinstance(ema_raw, dict) and ema_raw:
         ema_loaded = {k: v.to(device=device) for k, v in ema_raw.items()}
+    if from_ema:
+        if not ema_loaded:
+            raise ValueError(
+                f"{path}: Stage2 要求从 EMA 初始化，但 checkpoint 无 ema"
+            )
+        n_applied = 0
+        for name, param in raw.named_parameters():
+            tensor = ema_raw.get(name) if isinstance(ema_raw, dict) else None
+            if tensor is None:
+                continue
+            param.data.copy_(
+                tensor.to(device=param.device, dtype=param.dtype)
+            )
+            n_applied += 1
+        if n_applied < 1:
+            raise ValueError(f"{path}: EMA 与当前模型没有同名参数")
+        info["n_ema_applied"] = n_applied
     return ema_loaded, info

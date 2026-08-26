@@ -1,0 +1,52 @@
+_doc: BELF ~100M（12×768）+ latent_vae/100m-b32-d1；块长 W=16  # 文件说明，写入 extra
+
+name: belf-100m  # 配置名；非 prototype 时与文件名一致
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+max_seq_len: 4096  # 训练 / 生成最大序列长度
+n_layer: 12  # G 的 AdaLN-Zero 层数
+n_head: 12  # 注意力头数
+n_embd: 768  # 隐层宽度 D
+dropout: 0.0  # Dropout
+latent_model: latent_vae  # 入口 latent 家族名
+tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
+exit: decoder  # 读出：decoder | linear
+sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
+latent_tune: mid  # 入口可训档：frozen | full | mid
+time_step: 16  # 梯子档数 T；须 >= 4
+proj_type: linear  # 白化后 X→D 映射
+attn_backend: sdpa  # 注意力后端；本族仅 sdpa
+block_size: 16  # G 去噪块长 W；入口 encoder 块长须 ∈{1,W}
+n_layer_dec: 6  # exit=decoder 时读出层数
+latent_thaw_tokens: 15000000000  # mid 解冻有效 token 点
+p_mean: -1.5  # 梯子 logit-normal 均值
+p_std: 0.8  # 梯子 logit-normal 标准差
+t_eps: 0.05  # 干净端 1-ε
+vel_eps: 1.0e-5  # x-pred→v 分母下限
+ce_detach_g: false  # CE 是否 detach G
+cond_mode: clean  # 条件模式；主跑 clean
+clean_block_prob: 0.05  # 抽混合块并把余数钉 t=1 的概率
+lambda_mse: 1.0  # denoise v-MSE 权重
+lambda_ce: 1.0  # decode CE 权重
+lambda_s1: 1.0  # 联合训时 L_s1 权重
+lambda_vae: 1.0  # s1 重建项权重
+lambda_ref: 1.0  # s1 参考编码器 KL 权重
+sc_p_mean: 0.0  # w_sc 采样 logit-normal 均值
+sc_p_std: 1.0  # w_sc 采样 logit-normal 标准差
+w_sc_min: 0.5  # w_sc 下界
+w_sc_max: 5.0  # w_sc 上界
+sc_guided_prob: 0.5  # 训练 teacher 走 guided 混合的概率
+ctx_drop_prob: 0.1  # 丢掉左段前缀的概率（不进 AdaLN）
+denoiser_noise_scale: 1.0  # 插值噪声尺度
+rope_dim: null  # 每头 RoPE 维；null 表示用 head_dim
+qk_norm: true  # Q/K RMSNorm
+mlp_ratio: 4.0  # SwiGLU 扩展比
+whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
+
+sampling:
+  sampling_method: sde  # 采样方法：sde | ode
+  num_sampling_steps: 16  # 每块流步上界（实现按 T-1 流 + 1 decode）
+  sde_gamma: 1.5  # SDE churn 系数；末流关闭
+  w_sc: 3.0  # 推理 self-cond CFG 缩放
+  w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
+  temperature: 0.0  # 采样温度；≤0 为 argmax
+  commit_x0hat: true  # 是否把 x0_hat 提交进下一块

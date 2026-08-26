@@ -281,11 +281,13 @@ def eval_bucket_metrics(
     log: bool = True,
     stage_graph_l: int | None = None,
     max_bucket_len: int | None = None,
+    graph_pad: str | None = None,
 ) -> dict[str, dict[str, float]]:
     """各 pad 桶 held-out 指标；rank 分片后 allreduce。
 
     只评 ``bucket <= max_bucket_len``（缺省不截断），避免 S2 去跑 1024/2048
-    图长。桶序列 pad 到 ``batch_graph_l(阶段, bucket)``，与训练同 shape。
+    图长。桶序列 pad 到 ``batch_graph_l(阶段, bucket, graph_pad=...)``，
+    与训练同 shape。
     """
     out: dict[str, dict[str, float]] = {}
     for bucket in sorted(ctx.bucket_indices):
@@ -309,7 +311,11 @@ def eval_bucket_metrics(
             bs = 16
             items = [ctx.bucket_split[int(i)] for i in local_ids]
             pad_l = (
-                batch_graph_l(int(stage_graph_l), int(bucket))
+                batch_graph_l(
+                    int(stage_graph_l),
+                    int(bucket),
+                    graph_pad=graph_pad,
+                )
                 if stage_graph_l is not None
                 else int(bucket)
             )
@@ -439,10 +445,12 @@ def run_latent_curriculum_eval(
 
     保持 ``train()``，前向打编译模块。EMA 由调用方 ``swap_ema_weights``
     写入同一 Parameter。分桶只评 ``bucket <= 当前阶段 graph_l``，并 pad
-    到 ``batch_graph_l``。
+    到 ``batch_graph_l(..., graph_pad=sampler.graph_pad)``。
     """
     stage_l = sampler.current_stage.graph_l
-    seg_pad = batch_graph_l(stage_l, min(512, stage_l))
+    seg_pad = batch_graph_l(
+        stage_l, min(512, stage_l), graph_pad=sampler.graph_pad,
+    )
     seg512 = eval_latent_loader_metrics(
         model,
         ctx.seg512_loader,
@@ -470,6 +478,7 @@ def run_latent_curriculum_eval(
             log=log,
             stage_graph_l=stage_l,
             max_bucket_len=stage_l,
+            graph_pad=sampler.graph_pad,
         )
     return build_latent_curriculum_eval_row(
         step=step,

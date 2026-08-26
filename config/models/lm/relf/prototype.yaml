@@ -1,0 +1,62 @@
+_doc: RELF 配置模板（滚动窗流；不可实例化）  # 文件说明，写入 extra
+
+name: prototype  # 配置名；prototype 不可实例化
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+max_seq_len: 4096  # 训练 / 生成最大序列长度
+n_layer: 12  # G 的 AdaLN-Zero 层数
+n_head: 12  # 注意力头数
+n_embd: 768  # 隐层宽度 D
+dropout: 0.0  # Dropout
+mlp_ratio: 4.0  # SwiGLU 扩展比
+latent_model: latent_vae  # 入口 latent 家族名
+tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
+exit: decoder  # 读出：decoder | linear
+sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
+latent_tune: mid  # 入口可训档：frozen | full | mid
+time_step: 16  # 梯子档数 T；须 >= 4
+proj_type: linear  # 白化后 X→D 映射
+attn_backend: sdpa  # 注意力后端；本族仅 sdpa
+window_size: 32  # 滚动窗长 W；须等于 step_size×time_step
+step_size: 2  # 每步弹出槽数 S
+bottleneck_dim: 128  # 可选瓶颈维；linear 映射可忽略
+proj_bias: true  # 入口投影是否带 bias
+proj_norm: rmsnorm  # 投影后归一化
+whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
+whiten_on: mu  # 白化统计作用对象
+qk_norm: true  # Q/K RMSNorm
+rope_theta: 10000.0  # RoPE 基频
+t_freq_dim: 256  # 时间正弦嵌入维
+n_exit_layer: 2  # exit=decoder 时读出层数
+lm_head_bias: false  # lm_head 是否带 bias
+noise_sigma: 1.0  # SDE 回噪标准差
+latent_thaw_tokens: 15000000000  # mid 解冻有效 token 点
+lambda_vae: 1.0  # s1 重建项权重
+lambda_ref: 1.0  # s1 参考编码器 KL 权重
+denoiser_p_mean: -1.5  # 梯子 logit-normal 均值
+denoiser_p_std: 0.8  # 梯子 logit-normal 标准差
+t_clean_eps: 0.05  # 干净端 1-ε
+vel_eps: 1.0e-5  # x-pred→v 分母下限
+lambda_mse: 1.0  # denoise v-MSE 权重
+lambda_ce: 1.0  # decode CE 权重
+ce_detach_g: false  # CE 是否 detach G
+ctx_source: z  # 左段条件来源：z | mu
+x0_source: z  # 干净端来源：z | mu
+cond_mode: clean  # 条件模式；主跑 clean
+clean_block_prob: 0.05  # 非句首窗抽余数 r 的概率
+train_t_schedule: mixed  # 训练时间场：mixed
+window_t: ladder  # 窗内时间锁死梯子
+self_cond_cfg_p_mean: -1.5  # w_sc 采样 logit-normal 均值
+self_cond_cfg_p_std: 0.8  # w_sc 采样 logit-normal 标准差
+sc_guided_prob: 0.5  # 训练 teacher 走 guided 混合的概率
+ctx_p_drop: 0.1  # 丢掉左段前缀的概率（不进 AdaLN）
+self_cond_cfg_min: 0.5  # w_sc 下界
+self_cond_cfg_max: 5.0  # w_sc 上界
+
+sampling:
+  sampling_method: sde  # 采样方法：sde | ode
+  num_sampling_steps: 16  # 流步上界（实现按升档 + pop）
+  sde_gamma: 1.5  # SDE churn 系数；末流关闭
+  w_sc: 3.0  # 推理 self-cond CFG 缩放
+  w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
+  temperature: 0.0  # 采样温度；≤0 为 argmax
+  commit_x0hat: true  # 是否把 x0_hat 提交进下一窗

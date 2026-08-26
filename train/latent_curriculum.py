@@ -113,25 +113,52 @@ def _bucket_indices(split: _PreprocessedSplitDataset) -> Dict[int, np.ndarray]:
     }
 
 
-def batch_graph_l(stage_graph_l: int, bucket: int) -> int:
+GRAPH_PAD_STAGED = "staged"
+GRAPH_PAD_PEAK = "peak"
+_VALID_GRAPH_PAD = frozenset({GRAPH_PAD_STAGED, GRAPH_PAD_PEAK})
+
+
+def normalize_graph_pad(raw: Any | None) -> str:
+    """``staged``（默认，与 latent 同两档）或 ``peak``（一律 pad 到阶段 graph_l）。"""
+    if raw is None or raw == "":
+        return GRAPH_PAD_STAGED
+    name = str(raw).strip().lower()
+    if name not in _VALID_GRAPH_PAD:
+        raise ValueError(
+            f"extra.graph_pad 须为 staged|peak，收到 {raw!r}"
+        )
+    return name
+
+
+def batch_graph_l(
+    stage_graph_l: int,
+    bucket: int,
+    *,
+    graph_pad: str = GRAPH_PAD_STAGED,
+) -> int:
     """本 opt 步的训练图长。
 
-    同一步已是单桶。不把短桶垫到阶段最大 L（注意力按 L² 计），
-    也不按桶原生四档切换：full 开 ``torch.compile``，档数×微批组合会
-    让 Inductor 多图来回切，CUDA caching allocator 按 size-class 囤块，
-    峰值近似「各档激活之和」而非 max。折中为**每阶段最多两档**，
-    微批仍按阶段最大 L 固定（不随短档加大 B）：
+    ``graph_pad=peak``：一律 pad 到 ``stage_graph_l``（单张编译图）。
+
+    ``graph_pad=staged``（默认）：同一步已是单桶。不把短桶垫到阶段最大 L
+    （注意力按 L² 计），也不按桶原生四档切换：full 开 ``torch.compile``，
+    档数×微批组合会让 Inductor 多图来回切，CUDA caching allocator 按
+    size-class 囤块，峰值近似「各档激活之和」而非 max。折中为**每阶段最多
+    两档**，微批仍按阶段最大 L 固定（不随短档加大 B）：
 
     * S1/S2（cap≤512）：钉死 512（256 桶 pad 到 512）
     * S3（cap=1024）：256/512 → 512，1024 → 1024
     * S4（cap=2048）：≤1024 → 1024，2048 → 2048
     """
+    mode = normalize_graph_pad(graph_pad)
     if bucket < 1:
         raise ValueError(f"bucket must be positive, got {bucket}")
     if bucket > stage_graph_l:
         raise ValueError(
             f"bucket={bucket} exceeds stage graph_l={stage_graph_l}"
         )
+    if mode == GRAPH_PAD_PEAK:
+        return stage_graph_l
     if stage_graph_l <= 512:
         return stage_graph_l
     if stage_graph_l == 1024:
@@ -210,6 +237,7 @@ class LatentCurriculumSampler:
     _stage_idx: int = 0
     _last_bucket: int = 0
     _last_batch_l: int = 0
+    graph_pad: str = GRAPH_PAD_STAGED
     _stages: List[_StageRuntime] = field(default_factory=list)
 
     @classmethod
@@ -223,6 +251,7 @@ class LatentCurriculumSampler:
         world_size: int,
         batch_size: int,
         stage_batch_sizes: Dict[int, int] | None = None,
+        graph_pad: str | None = None,
     ) -> LatentCurriculumSampler:
         seg512 = get_preprocessed(spec.seg512_preprocess, dataset)
         bucket = get_preprocessed(spec.bucket_preprocess, dataset)
@@ -255,6 +284,7 @@ class LatentCurriculumSampler:
             world_size=world_size,
             batch_size=batch_size,
             stage_batch_sizes=sizes,
+            graph_pad=normalize_graph_pad(graph_pad),
             _stages=stages,
         )
 
@@ -377,7 +407,9 @@ class LatentCurriculumSampler:
 
         rng = self._rng(opt_step)
         bucket = self._sample_bucket(rng, stage)
-        batch_l = batch_graph_l(stage.graph_l, bucket)
+        batch_l = batch_graph_l(
+            stage.graph_l, bucket, graph_pad=self.graph_pad,
+        )
         self._last_bucket = bucket
         self._last_batch_l = batch_l
         indices = self._sample_indices(rt.pools[bucket], stage_global, rng)
@@ -406,6 +438,7 @@ class LatentCurriculumSampler:
             "graph_l": stage.graph_l,
             "batch_l": self._last_batch_l,
             "bucket": self._last_bucket,
+            "graph_pad": self.graph_pad,
             "batch_size": self.current_batch_size,
             "grad_accum_steps": self.grad_accum_steps,
             "effective_tokens_global": self.effective_tokens_global,

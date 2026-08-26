@@ -1,0 +1,22 @@
+_doc: BELF/RELF Stage2 扩展（5B 混桶；owt-bucket）  # 文件说明，写入 extra
+name: belf-relf-s2  # 配置名；非 prototype 时与文件名一致
+effective_target_tokens: 5000000000  # 本阶段有效 token 预算（非 pad）
+seg512_preprocess: owt-seg512  # 定长 512 数据源（本阶段不用，与 s1 同键）
+bucket_preprocess: owt-bucket  # 分桶数据源
+pad_token_key: pad  # 使用 tokenizer layout 的 pad_token_id
+
+# 单阶段：有效预算、峰值图 L、全局条数、数据集、桶与有效 token 配比
+# 训练图长见 train.latent_curriculum.batch_graph_l；默认 graph_pad=staged（两档 1024/2048），--set extra.graph_pad=peak 则全部 pad 到 graph_l
+stages:
+  - name: s2  # 扩展阶段名
+    effective_budget: 5000000000  # 本阶段有效 token
+    graph_l: 2048  # 峰值图长
+    global_seq_batch: 128  # 全局序列条数
+    dataset: bucket  # 数据源：seg512 | bucket
+    mix:
+      256: 0.1  # 桶长 256 配比（1:2:3:4 的 1）
+      512: 0.2  # 桶长 512 配比
+      1024: 0.3  # 桶长 1024 配比
+      2048: 0.4  # 桶长 2048 配比
+
+observation_window_tokens: 200000000  # 入口观察窗（计入该阶段预算）

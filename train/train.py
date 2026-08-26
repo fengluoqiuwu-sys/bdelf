@@ -295,6 +295,8 @@ def parse_train_overrides(items: list[str] | None) -> dict[str, dict[str, Any]]:
     Allowed sections: optimizer, batch, schedule, eval, generate, model, extra.
     ``model.*`` 覆盖 ``config/models/<model>/<size>.yaml`` 键（进指纹）。
     ``extra.init_ckpt`` 为跨 run 初始化权重路径（进指纹；不恢复优化器）。
+    ``extra.graph_pad`` 为课程图长：staged（默认，与 latent 同两档）|
+    peak（一律 pad 到阶段 graph_l）；进指纹。
     ``eval.skip`` 关闭在线 held-out / gen-eval（省略为 false；不进指纹）。
     """
     if not items:
@@ -613,6 +615,8 @@ def compose_train_config(
         config_name=config_name,
         overrides=ov.get("batch"),
     )
+    # 仅 100m-curriculum 配方 / 旧 latent-curriculum preprocess 锁 WSD；
+    # 其它带 extra.curriculum 的 preprocess 仍走 CLI variant（full/fast）日程。
     schedule_name: str | None = None
     if recipe_variant == "curriculum" or preprocess == "latent-curriculum":
         schedule_name = "latent-curriculum"
@@ -626,7 +630,11 @@ def compose_train_config(
     if schedule.use_muon:
         run_label = f"{run_label}-muon"
     chunk_length = get_preprocess(preprocess).chunk_length
-    is_curriculum = preprocess == "latent-curriculum" or recipe_variant == "curriculum"
+    # 课程 sampler / 指纹 / stage batch：preprocess extra.curriculum 非空，或 curriculum 配方。
+    is_curriculum = (
+        bool(get_preprocess(preprocess).extra.get("curriculum"))
+        or recipe_variant == "curriculum"
+    )
     curriculum_extra: dict[str, Any] = {}
     if is_curriculum:
         from train.latent_curriculum import (
@@ -641,10 +649,17 @@ def compose_train_config(
             "curriculum": cur_name,
             "curriculum_spec": curriculum_fingerprint_piece(cur_spec),
             "curriculum_effective_tokens": cur_spec.effective_target_tokens,
-            "lr_schedule": schedule.extra.get("lr_schedule", "wsd"),
-            "wsd_warmup_tokens": schedule.extra.get("wsd_warmup_tokens"),
-            "wsd_decay_tokens": schedule.extra.get("wsd_decay_tokens"),
         }
+        # 仅 latent-curriculum 日程带 lr_schedule=wsd；belf-relf 等走 fast/full 余弦。
+        lr_sched = schedule.extra.get("lr_schedule")
+        if lr_sched:
+            curriculum_extra["lr_schedule"] = lr_sched
+            curriculum_extra["wsd_warmup_tokens"] = (
+                schedule.extra.get("wsd_warmup_tokens") or 0
+            )
+            curriculum_extra["wsd_decay_tokens"] = (
+                schedule.extra.get("wsd_decay_tokens") or 0
+            )
 
     resolved_world_size = 1 if world_size is None else world_size
     accum, global_batch = _resolve_grad_accum(

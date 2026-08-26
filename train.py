@@ -29,7 +29,7 @@ from models import (
     resolve_model_config_path,
 )
 from dataset import list_datasets
-from preprocess import get_preprocessed, list_preprocess
+from preprocess import get_preprocess, get_preprocessed, list_preprocess
 from train import (
     FL_TrainConfig,
     get_train_config,
@@ -103,6 +103,18 @@ def _spawn_worker(
         world_size=world_size,
         overrides=overrides,
     )
+    if str(get_preprocess(preprocess).extra.get("predecessor_preprocess") or "").strip():
+        from train.stage_chain import bind_stage_predecessor
+
+        bind_stage_predecessor(
+            cfg,
+            model=model_name,
+            train_config=train_config,
+            dataset=dataset,
+            generate=generate,
+            world_size=world_size,
+            overrides=overrides,
+        )
     size = train_config.rsplit("-", 1)[0]
     run_training(model_name, size, cfg)
 
@@ -317,8 +329,14 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
     except ValueError as exc:
         raise SystemExit(f"Invalid --set override: {exc}") from exc
 
-    if getattr(args, "init_ckpt", None):
-        rel = _normalize_init_ckpt(args.init_ckpt)
+    pred_name = str(
+        get_preprocess(args.preprocess).extra.get("predecessor_preprocess") or ""
+    ).strip()
+    user_init_ckpt = getattr(args, "init_ckpt", None)
+    # 有前置的 Stage2：init_ckpt 由 bind_stage_predecessor 在哈希之后注入，
+    # 不进指纹（前置关系已在 preprocess YAML 里）。
+    if user_init_ckpt and not pred_name:
+        rel = _normalize_init_ckpt(user_init_ckpt)
         extra_ov = overrides.setdefault("extra", {})
         prev = extra_ov.get("init_ckpt")
         if prev not in (None, rel):
@@ -340,6 +358,22 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"Failed to load train config: {exc}") from exc
+
+    if pred_name:
+        from train.stage_chain import bind_stage_predecessor
+
+        msg = bind_stage_predecessor(
+            cfg,
+            model=args.model,
+            train_config=args.train_config,
+            dataset=args.dataset,
+            generate=args.generate,
+            world_size=launch_world_size,
+            overrides=overrides,
+            user_init_ckpt=user_init_ckpt,
+        )
+        if msg:
+            _train_log(msg)
 
     return args.model, size, cfg
 
@@ -414,7 +448,7 @@ def _run_training_body(
     latent_probe_pool = None
     latent_pad_token_id: int | None = None
 
-    if cfg.preprocess == "latent-curriculum":
+    if get_preprocess(cfg.preprocess).extra.get("curriculum"):
         from train.latent_curriculum import (
             LatentCurriculumSampler,
             load_curriculum_spec,
@@ -440,6 +474,7 @@ def _run_training_body(
                 int(k): int(v)
                 for k, v in (cfg.extra.get("stage_batch_size") or {}).items()
             } or None,
+            graph_pad=cfg.extra.get("graph_pad"),
         )
         seg512 = get_preprocessed(cur_spec.seg512_preprocess, cfg.dataset)
         get_preprocessed(cur_spec.bucket_preprocess, cfg.dataset)
@@ -571,6 +606,7 @@ def _run_training_body(
             st = curriculum_sampler.curriculum_state()
             _train_log(
                 f"curriculum: {st['stage']} peak_L={st['graph_l']} "
+                f"graph_pad={st.get('graph_pad', 'staged')} "
                 f"target={st['target_effective_tokens']:,} effective tokens"
             )
         elif train_ds is not None:
@@ -656,7 +692,7 @@ def main() -> None:
         # a warm cache; a cold build inside a worker could exceed the NCCL
         # barrier timeout that the other ranks wait on.
         try:
-            if cfg.preprocess == "latent-curriculum":
+            if get_preprocess(cfg.preprocess).extra.get("curriculum"):
                 from train.latent_curriculum import (
                     load_curriculum_spec,
                     resolve_curriculum_spec_name,
