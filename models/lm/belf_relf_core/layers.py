@@ -20,7 +20,7 @@ _MODE_DENOISE = 1
 _MODE_DECODE = 2
 
 
-def _as_sdpa_mask(attn_mask: torch.Tensor | None) -> torch.Tensor | None:
+def as_sdpa_mask(attn_mask: torch.Tensor | None) -> torch.Tensor | None:
     """布尔 ``True=可见`` → 加性 SDPA mask；浮点原样。避免 bool 极性踩坑。"""
     if attn_mask is None:
         return None
@@ -410,7 +410,7 @@ class AdaLNZeroStack(nn.Module):
         cond = self._cond(t, w_sc, m, batch=bsz, seq_len=seq_len)
         if positions is None:
             positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
-        attn_mask = _as_sdpa_mask(attn_mask)
+        attn_mask = as_sdpa_mask(attn_mask)
         for block in self.blocks:
             x = block(x, cond, attn_mask=attn_mask, positions=positions)
         return self.final(x, cond)

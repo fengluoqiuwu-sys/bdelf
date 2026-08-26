@@ -19,9 +19,11 @@ from models.lm.belf.generate import (
 from models.lm.belf_relf_core import (
     AdaLNZeroStack,
     LatentBundle,
+    as_sdpa_mask,
     blend_v_tgt,
     check_time_step,
     interpolate,
+    keep_params_in_graph,
     ladder_levels,
     maybe_drop_left,
     pack_2l,
@@ -227,9 +229,13 @@ class _BelfBackbone(nn.Module):
         key = (left_len, right_len, self.block_size, device)
         cached = self._mask_cache.get(key)
         if cached is None:
-            cached = pack_2l_mask(
-                left_len, right_len, self.block_size, self.block_size, device,
+            cached = as_sdpa_mask(
+                pack_2l_mask(
+                    left_len, right_len, self.block_size, self.block_size, device,
+                )
             )
+            if cached is None:
+                raise RuntimeError("2L mask 不能为空")
             if len(self._mask_cache) > 16:
                 self._mask_cache.pop(next(iter(self._mask_cache)))
             self._mask_cache[key] = cached
@@ -295,19 +301,13 @@ class _BelfBackbone(nn.Module):
         return (per_token * mask_f).sum() / denom
 
     def train_metrics(self) -> dict[str, float]:
-        out: dict[str, float] = {
+        return {
             "mse": self.last_l2_loss,
             "ce": self.last_ce_loss,
             "denoise_mse": self.last_l2_loss,
             "decode_ce": self.last_ce_loss,
+            "s1": self.last_s1_loss,
         }
-        s1 = self.last_s1_loss
-        if isinstance(s1, torch.Tensor):
-            if bool(torch.isfinite(s1).item()):
-                out["s1"] = s1
-        elif s1 == s1:
-            out["s1"] = s1
-        return out
 
     def forward(
         self,
@@ -388,49 +388,45 @@ class _BelfBackbone(nn.Module):
             guided = torch.rand(bsz, device=device) < self.sc_guided_prob
 
         v_z = v_star(x0, z_t, t_right, self.vel_eps)
-        v_u: torch.Tensor | None = None
-        guided_any = bool(guided.any().item()) if isinstance(guided, torch.Tensor) else bool(guided)
         # teacher 先于 student，避免与 student 图叠峰；v_c 复用 student.detach()。
-        if self.sc_cfg and self.training and denoise_mask.any() and guided_any:
+        # 训练期始终跑 teacher，用 guided mask 混合（B 稍大时与「有 guided 才跑」同结果，无 .item()）。
+        if self.sc_cfg and self.training:
             w_zero = torch.zeros_like(w_sc)
             with torch.no_grad():
                 x_u = self._forward_g_m(h_left, z_t, t_right, m_right, w_zero)
                 v_u = x_to_v(x_u, z_t, t_right, self.vel_eps)
-
-        x_hat = self._forward_g_m(h_left, z_t, t_right, m_right, w_sc)
-        v_tgt = v_z
-        if v_u is not None:
+            x_hat = self._forward_g_m(h_left, z_t, t_right, m_right, w_sc)
             v_c = x_to_v(x_hat.detach(), z_t, t_right, self.vel_eps)
             v_tgt = blend_v_tgt(v_z, v_u, v_c, w_sc, guided)
+        else:
+            x_hat = self._forward_g_m(h_left, z_t, t_right, m_right, w_sc)
+            v_tgt = v_z
 
         v_hat = x_to_v(x_hat, z_t, t_right, self.vel_eps)
         l2_tok = (v_hat - v_tgt).pow(2).mean(dim=-1)
         zero = x0.new_zeros(())
-        nan = x0.new_full((), float("nan"))
-        if denoise_mask.any():
-            mse = self._masked_mean(l2_tok, denoise_mask)
-            self.last_l2_loss = mse.detach() if bool(torch.isfinite(mse).item()) else nan
-        else:
-            mse = zero
-            self.last_l2_loss = nan
+        mse = self._masked_mean(l2_tok, denoise_mask)
+        self.last_l2_loss = mse.detach()
 
-        if decode_mask.any():
-            x_ce = x_hat.detach() if self.ce_detach_g else x_hat
+        # 出口按样本因果，只跑 decode hop 行；与整批再 mask 的 CE 相同。
+        dec_rows = is_decode.nonzero(as_tuple=True)[0]
+        if dec_rows.numel() == 0:
+            ce = zero + keep_params_in_graph(self.exit_head, zero)
+            self.last_ce_loss = zero.new_full((), float("nan"))
+        else:
+            x_ce = x_hat.index_select(0, dec_rows)
+            if self.ce_detach_g:
+                x_ce = x_ce.detach()
             logits = self.exit_logits(x_ce)
             ce_tok = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
-                tokens.reshape(-1),
+                tokens.index_select(0, dec_rows).reshape(-1),
                 ignore_index=self.token_layout.ignore_index,
                 reduction="none",
-            ).view(bsz, seq_len)
-            ce = self._masked_mean(ce_tok, decode_mask)
-            self.last_ce_loss = ce.detach() if bool(torch.isfinite(ce).item()) else nan
+            ).view(dec_rows.size(0), seq_len)
+            ce = self._masked_mean(ce_tok, decode_mask.index_select(0, dec_rows))
+            self.last_ce_loss = ce.detach()
             del logits
-        else:
-            ce = zero
-            self.last_ce_loss = nan
-            # 纯 denoise 微批也要把出口留在图里，避免 DDP 未使用参数。
-            ce = ce + 0.0 * sum(p.sum() for p in self.exit_head.parameters())
 
         s1 = self.bundle.s1_loss(tokens, z=z, mu=mu, logvar=logvar)
         if self.bundle.is_trainable:

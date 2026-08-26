@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
+
+
+def keep_params_in_graph(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
+    """把 ``module`` 参数留在图里（空 CE 支路 / 单卡也安全），不扫全部元素。"""
+    acc = like.new_zeros(())
+    for p in module.parameters():
+        acc = acc + p.reshape(-1)[0] * 0.0
+    return acc
 
 
 def sample_w_sc(
