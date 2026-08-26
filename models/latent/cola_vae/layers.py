@@ -276,8 +276,13 @@ class TextVAEBlock(nn.Module):
         self.mlp = _VAESwiGLU(n_embd, ffn_dim, dropout, bias=bias)
         self._mask_cache: dict[tuple[str, int, torch.device], object] = {}
 
+    @torch.compiler.disable
     def _attn_mask(self, seq_len: int, device: torch.device):
-        """Flex BlockMask 或 SDPA 加性 mask；按 seq_len 缓存，避免每层重建 L×L。"""
+        """Flex BlockMask 或 SDPA 加性 mask；按 seq_len 缓存，避免每层重建 L×L。
+
+        必须 eager：与 ``encdec.SelfAttention._block_mask`` 相同，避免 Dynamo+DDP
+        把 ``seq_len`` 送进子图后 Inductor 报 ``int`` 无 ``.meta``。
+        """
         key = (self.attn_backend, seq_len, device)
         cached = self._mask_cache.get(key)
         if cached is None:

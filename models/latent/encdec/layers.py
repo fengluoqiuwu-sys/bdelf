@@ -77,7 +77,14 @@ class SelfAttention(nn.Module):
             return "causal"
         return attn_mode
 
+    @torch.compiler.disable
     def _block_mask(self, seq_len: int, device: torch.device):
+        """块因果 mask（Flex BlockMask 或 SDPA 加性）。
+
+        必须 eager：Dynamo+DDP 若把 ``seq_len`` 当 Python int 送进子图，
+        Inductor 会在 ``n.meta['val']`` 上报 ``'int' object has no attribute 'meta'``
+        （``block_size>1`` 在课程切到更长 L 时复现）。
+        """
         key = (self.attn_backend, seq_len, device, self.block_size)
         cached = self._mask_cache.get(key)
         if cached is None:
