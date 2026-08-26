@@ -22,8 +22,11 @@ optimizer:
   ema_decay: 0.9999  # EMA 衰减；0 表示关闭
 
 # -----------------------------------------------------------------------------
-# Batch（全局批；accum = global_batch_size / (batch_size * world_size)）
+# Batch（s1：16 / 全局 512；s2：4 / 全局 128，见 curriculum global_seq_batch）
 # -----------------------------------------------------------------------------
 batch:
   batch_size: 16  # 每 GPU 微批大小
   global_batch_size: 512  # 全局批大小（推导梯度累积）
+  stage_batch_size:  # 按课程图长覆盖微批
+    512: 16  # s1 L512
+    2048: 4  # s2 L2048

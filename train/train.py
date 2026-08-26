@@ -665,6 +665,7 @@ def compose_train_config(
     accum, global_batch = _resolve_grad_accum(
         batch, world_size=resolved_world_size, run_name=run_label,
     )
+    resolved_batch_size = batch.batch_size
 
     if schedule.variant != variant:
         raise ValueError(
@@ -725,6 +726,15 @@ def compose_train_config(
         curriculum_extra["stage_batch_size"] = {
             str(k): v for k, v in sorted(stage_bs_map.items())
         }
+        if len(cur_spec.stages) == 1:  # type: ignore[possibly-undefined]
+            st = cur_spec.stages[0]  # type: ignore[possibly-undefined]
+            resolved_batch_size = stage_bs_map[st.graph_l]
+            accum = stage_grad_accum(
+                st,
+                batch_size=resolved_batch_size,
+                world_size=resolved_world_size,
+            )
+            global_batch = int(st.global_seq_batch)
         curriculum_max_accum = max(
             stage_grad_accum(
                 s,
@@ -835,7 +845,7 @@ def compose_train_config(
         preprocess=preprocess,
         generate=generate,
         checkpoint_root=CHECKPOINT_ROOT,
-        batch_size=batch.batch_size,
+        batch_size=resolved_batch_size,
         grad_accum_steps=accum,
         global_batch_size=global_batch,
         world_size=resolved_world_size,

@@ -27,3 +27,6 @@ optimizer:
 batch:
   batch_size: 2  # 每 GPU 微批大小
   global_batch_size: 8  # 全局批大小（推导梯度累积）
+  stage_batch_size:  # 按课程图长覆盖微批
+    512: 2  # s1 L512
+    2048: 2  # s2 L2048

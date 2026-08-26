@@ -11,7 +11,7 @@ stages:
   - name: s2  # 扩展阶段名
     effective_budget: 5000000000  # 本阶段有效 token
     graph_l: 2048  # 峰值图长
-    global_seq_batch: 128  # 全局序列条数
+    global_seq_batch: 128  # 全局序列条数（s2 微批 4）
     dataset: bucket  # 数据源：seg512 | bucket
     mix:
       256: 0.1  # 桶长 256 配比（1:2:3:4 的 1）

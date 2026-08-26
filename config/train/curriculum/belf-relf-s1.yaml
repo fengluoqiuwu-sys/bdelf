@@ -11,7 +11,7 @@ stages:
   - name: s1  # 主训阶段名
     effective_budget: 45000000000  # 本阶段有效 token
     graph_l: 512  # 峰值图长
-    global_seq_batch: 512  # 全局序列条数
+    global_seq_batch: 512  # 全局序列条数（s1 微批 16）
     dataset: seg512  # 数据源：seg512 | bucket
     mix:
       512: 1.0  # 桶长 512 的有效 token 配比
