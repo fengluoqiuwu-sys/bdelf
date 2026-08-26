@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -12,8 +11,10 @@ import torch.nn.functional as F
 from models.lm.belf_relf_core import (
     AdaLNZeroStack,
     LatentBundle,
+    as_sdpa_mask,
     blend_v_tgt,
     check_time_step,
+    group_causal_mask,
     interpolate,
     ladder_levels,
     maybe_drop_left,
@@ -24,7 +25,6 @@ from models.lm.belf_relf_core import (
     validate_loaded_block,
     x_to_v,
 )
-from torch.utils.checkpoint import checkpoint
 
 from models.lm.relf.config import FL_RelfConfig
 from models.model import (
@@ -38,6 +38,19 @@ from models.tokens import apply_token_layout_to_config, token_layout_from_cfg
 _MODE_NONE = 0
 _MODE_DENOISE = 1
 _MODE_DECODE = 2
+
+
+def _tile_window_starts(seq_len: int, offset: int, window_size: int) -> list[int]:
+    """按 ``W`` 铺不重叠窗；``offset>0`` 时在 ``offset-W`` 补一扇余段窗。"""
+    if window_size < 1:
+        raise ValueError(f"window_size 须 >= 1，收到 {window_size}")
+    if offset < 0 or offset >= window_size:
+        raise ValueError(f"offset 须在 [0, W)，收到 {offset} (W={window_size})")
+    starts: list[int] = []
+    if offset > 0:
+        starts.append(offset - window_size)
+    starts.extend(range(offset, seq_len, window_size))
+    return starts
 
 
 class _RMSNorm(nn.Module):
@@ -112,15 +125,6 @@ class _CausalExit(nn.Module):
         return self.lm_head(self.ln_f(x))
 
 
-@dataclass
-class _WindowPlan:
-    u: int
-    k0: int
-    known_r: int
-    bos_cut: bool
-    eos_cut: bool
-
-
 class _RelfBackbone(nn.Module):
     """RELF 骨干：``LatentBundle`` + 映射 + AdaLN-Zero G + 出口。"""
 
@@ -129,8 +133,6 @@ class _RelfBackbone(nn.Module):
     # 一次 forward 按槽拆 MSE/CE；不要 ELF decoder_prob 抽支。
     dual_branch_logging = False
     mixed_branch_training = False
-    # 每块最多叠这么多窗，避免 2L 全长物化（左全序 + n_win×W）。
-    _win_chunk = 8
 
     def __init__(self, config: FL_RelfConfig, bundle: LatentBundle) -> None:
         super().__init__()
@@ -223,6 +225,9 @@ class _RelfBackbone(nn.Module):
             [levels[self.time_step - 1 - (k // self.step_size)] for k in range(self.window_size)]
         )
         self.register_buffer("F", f_k, persistent=False)
+        self._ladder_cap = float(levels[-1].item())
+        self._mask_base_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        self._gen_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
         self.last_l2_loss: torch.Tensor | float = float("nan")
         self.last_ce_loss: torch.Tensor | float = float("nan")
@@ -270,123 +275,123 @@ class _RelfBackbone(nn.Module):
         del pos
         return bos, eos
 
-    def _plan_windows(self, tokens: torch.Tensor) -> list[list[_WindowPlan]]:
-        """合法 S 对齐窗；未句首切时以 ``clean_block_prob`` 抽余数爬梯一帧。"""
+    def _plan_windows(
+        self,
+        tokens: torch.Tensor,
+        bos: torch.Tensor,
+        eos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """按 ``W`` 铺窗；返回 ``u,k0,known_r,active`` 各 ``(B, n_win)``。
+
+        训练抽一个 S 对齐偏移。未句首切时以 ``clean_block_prob`` 抽余数爬梯。
+        评测偏移固定 0。
+        """
         bsz, seq_len = tokens.shape
-        bos, eos = self._bos_eos(tokens)
+        device = tokens.device
         w_sz = self.window_size
         step = self.step_size
         t_steps = self.time_step
+        n_phase = w_sz // step
+        n_win = (seq_len + w_sz - 1) // w_sz + 1
         pad_id = int(self.token_layout.pad_token_id)
         p_clean = float(self.config.clean_block_prob)
         use_clean = str(self.config.cond_mode).lower() == "clean" and step > 1
-        out: list[list[_WindowPlan]] = []
-        for b in range(bsz):
-            i_bos = int(bos[b].item())
-            i_eos = int(eos[b].item())
-            plans: list[_WindowPlan] = []
-            for u in range(0, seq_len, step):
-                if u >= seq_len:
-                    break
-                lo = max(u, i_bos)
-                hi = min(u + w_sz - 1, i_eos, seq_len - 1)
-                if lo > hi:
-                    continue
-                if not bool((tokens[b, lo : hi + 1] != pad_id).any()):
-                    continue
-                bos_cut = u < i_bos
-                eos_cut = u + w_sz - 1 > i_eos
-                k0 = 0
-                known_r = 0
-                if use_clean and (not bos_cut) and (torch.rand((), device=tokens.device) < p_clean):
-                    h = int(torch.randint(0, t_steps, (1,), device=tokens.device).item())
-                    k0 = step * (t_steps - h - 1)
-                    # 真窗长：从 k0 起到 EOS / 右端。
-                    n_prime = 0
-                    for k in range(k0, w_sz):
-                        j = u + k
-                        if j > i_eos or j >= seq_len:
-                            break
-                        if int(tokens[b, j].item()) == pad_id:
-                            continue
-                        n_prime += 1
-                    r_hi = min(step - 1, n_prime - 1)
-                    if r_hi >= 1:
-                        known_r = int(torch.randint(1, r_hi + 1, (1,), device=tokens.device).item())
-                    else:
-                        k0 = 0
-                plans.append(
-                    _WindowPlan(
-                        u=u, k0=k0, known_r=known_r, bos_cut=bos_cut, eos_cut=eos_cut,
-                    )
-                )
-            if not plans:
-                # 至少放一个从 0 起的窗，避免空 pack。
-                plans.append(_WindowPlan(u=0, k0=0, known_r=0, bos_cut=False, eos_cut=False))
-            out.append(plans)
-        return out
-
-    def _window_fields(
-        self,
-        plan: _WindowPlan,
-        *,
-        i_bos: int,
-        i_eos: int,
-        seq_len: int,
-        is_pad: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """返回 ``(in_win, known, t, m, md)`` 各 ``(W,)``；``mc`` 由 t 推出。"""
-        device = is_pad.device
-        w_sz = self.window_size
+        if self.training and n_phase > 1:
+            off = torch.randint(0, n_phase, (bsz,), device=device) * step
+        else:
+            off = torch.zeros(bsz, device=device, dtype=torch.long)
+        slot = torch.arange(n_win, device=device)
+        u = off[:, None] + (slot - 1) * w_sz
         k = torch.arange(w_sz, device=device)
-        j = plan.u + k
-        in_win = (j >= i_bos) & (j <= i_eos) & (j < seq_len) & (j >= 0) & (k >= plan.k0)
-        safe_j = j.clamp(0, seq_len - 1)
-        in_win = in_win & (~is_pad[safe_j])
-        known = torch.zeros(w_sz, device=device, dtype=torch.bool)
-        if plan.known_r > 0:
-            known = (k >= plan.k0) & (k < plan.k0 + plan.known_r) & in_win
-            # EOS 不当已知。
-            known = known & (j != i_eos)
-        t = self.F.to(device=device)
-        t = torch.where(in_win & (~known), t, torch.ones_like(t))
-        cap = float(self.ladder[-1].item())
-        unknown = in_win & (~known)
-        is_dec = unknown & (t >= cap - 1e-8)
-        is_den = unknown & (~is_dec)
-        m = torch.full((w_sz,), _MODE_NONE, device=device, dtype=torch.long)
-        m = torch.where(is_den, torch.full_like(m, _MODE_DENOISE), m)
-        m = torch.where(is_dec, torch.full_like(m, _MODE_DECODE), m)
-        return in_win, known, t, m, is_den
+        j = u[:, :, None] + k
+        valid = (
+            (j >= bos[:, None, None])
+            & (j <= eos[:, None, None])
+            & (j >= 0)
+            & (j < seq_len)
+        )
+        safe_j = j.clamp(0, max(seq_len - 1, 0))
+        not_pad = tokens.gather(1, safe_j.reshape(bsz, -1)).reshape(
+            bsz, n_win, w_sz,
+        ) != pad_id
+        active = (valid & not_pad).any(dim=-1)
+        empty = ~active.any(dim=1)
+        first = slot == 0
+        active = active | (empty[:, None] & first)
+        u = torch.where(empty[:, None] & first, torch.zeros_like(u), u)
 
-    def _build_pack_mask(
+        k0 = torch.zeros(bsz, n_win, device=device, dtype=torch.long)
+        known_r = torch.zeros(bsz, n_win, device=device, dtype=torch.long)
+        if use_clean and p_clean > 0:
+            bos_cut = u < bos[:, None]
+            draw = (
+                active & (~bos_cut)
+                & (torch.rand(bsz, n_win, device=device) < p_clean)
+            )
+            h = torch.randint(0, t_steps, (bsz, n_win), device=device)
+            k0_h = step * (t_steps - 1 - h)
+            n_prime = (
+                (k >= k0_h[:, :, None]) & valid & not_pad
+            ).sum(dim=-1)
+            r_hi = torch.minimum(
+                torch.full((), step - 1, device=device, dtype=torch.long),
+                n_prime - 1,
+            )
+            can_r = draw & (r_hi >= 1)
+            k0 = torch.where(can_r, k0_h, k0)
+            known_r = torch.where(
+                can_r,
+                1 + (torch.rand(bsz, n_win, device=device) * r_hi.clamp(min=1).float()).to(
+                    dtype=torch.long,
+                ),
+                known_r,
+            )
+        return u, k0, known_r, active
+
+    def _windows_attn_mask(
         self,
         left_len: int,
-        plans: list[_WindowPlan],
-        n_win: int,
-        device: torch.device,
+        u: torch.Tensor,
+        active: torch.Tensor,
     ) -> torch.Tensor:
-        """多窗右段拼接：各窗独立 ``pack_2l_mask``，禁止跨窗右段互看。"""
+        """``(B, 1, two, two)`` SDPA 加性掩码：左因果，各窗看 ``left[:u]`` + 窗内组因果。"""
+        device = u.device
+        bsz, n_win = u.shape
         w_sz = self.window_size
         right_len = n_win * w_sz
         two = left_len + right_len
-        vis = torch.zeros(two, two, device=device, dtype=torch.bool)
+        key = (left_len, n_win, device)
+        base = self._mask_base_cache.get(key)
+        if base is None:
+            base = u.new_zeros(two, two, dtype=torch.bool)
+            if left_len > 0:
+                q = torch.arange(left_len, device=device)
+                base[:left_len, :left_len] = q[None, :] <= q[:, None]
+            ridx = torch.arange(right_len, device=device)
+            loc = ridx % w_sz
+            win_vis = group_causal_mask(w_sz, self.step_size, device=device)
+            same = (ridx[:, None] // w_sz) == (ridx[None, :] // w_sz)
+            base[left_len:, left_len:] = same & win_vis[loc[:, None], loc[None, :]]
+            if len(self._mask_base_cache) > 16:
+                self._mask_base_cache.pop(next(iter(self._mask_base_cache)))
+            self._mask_base_cache[key] = base
+        vis = base.expand(bsz, two, two).clone()
+        ridx = torch.arange(right_len, device=device)
+        u_clamped = u.clamp(min=0, max=left_len)
+        u_of_r = u_clamped[:, ridx // w_sz]
         if left_len > 0:
-            q = torch.arange(left_len, device=device)[:, None]
-            kv = torch.arange(left_len, device=device)[None, :]
-            vis[:left_len, :left_len] = kv <= q
-        for i, plan in enumerate(plans):
-            u = min(max(int(plan.u), 0), left_len)
-            local = pack_2l_mask(u, w_sz, 1, self.step_size, device=device)
-            r0 = left_len + i * w_sz
-            if u > 0:
-                vis[r0 : r0 + w_sz, :u] = local[u:, :u]
-            vis[r0 : r0 + w_sz, r0 : r0 + w_sz] = local[u:, u:]
-        eye = torch.eye(w_sz, device=device, dtype=torch.bool)
-        for i in range(len(plans), n_win):
-            r0 = left_len + i * w_sz
-            vis[r0 : r0 + w_sz, r0 : r0 + w_sz] = eye
-        return vis
+            left_idx = torch.arange(left_len, device=device)
+            vis[:, left_len:, :left_len] = left_idx[None, None, :] < u_of_r[:, :, None]
+        act_r = active[:, ridx // w_sz]
+        vis[:, left_len:, :] = vis[:, left_len:, :] & act_r[:, :, None]
+        eye_r = ridx[:, None] == ridx[None, :]
+        vis[:, left_len:, left_len:] = vis[:, left_len:, left_len:] | (
+            (~act_r[:, :, None]) & eye_r
+        )
+        mask = as_sdpa_mask(vis)
+        if mask is None:
+            raise RuntimeError("2L mask 不能为空")
+        return mask
 
     def _run_g(
         self,
@@ -414,172 +419,33 @@ class _RelfBackbone(nn.Module):
             x_hat = x_hat.detach()
         return self.exit_head(x_hat)
 
-    def _forward_win_chunk(
-        self,
-        tokens: torch.Tensor,
-        h_left_full: torch.Tensor,
-        h_x0: torch.Tensor,
-        plans: list[list[_WindowPlan]],
-        *,
-        noise: torch.Tensor,
-        i0: int,
-        n_chunk: int,
-        orig_left: int,
-        w_vec: torch.Tensor,
-        guided: torch.Tensor,
-        compute_loss: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """一块最多 ``n_chunk`` 窗的 2L。返回 MSE/CE 的 (分子, 分母)。"""
-        device = tokens.device
-        dtype = h_x0.dtype
-        bsz, seq_len, d_dim = h_x0.shape
-        w_sz = self.window_size
-        step = self.step_size
-        bos, eos = self._bos_eos(tokens)
-        is_pad = tokens == int(self.token_layout.pad_token_id)
-        ignore = int(self.token_layout.ignore_index)
-        vel_eps = float(self.config.vel_eps)
-
-        max_u = 0
-        for plist in plans:
-            for plan in plist:
-                max_u = max(max_u, int(plan.u))
-        left_len = int(max_u)
-        right_len = n_chunk * w_sz
-        h_left = h_left_full[:, :left_len]
-        h_right = h_x0.new_zeros(bsz, right_len, d_dim)
-        t_right = torch.ones(bsz, right_len, device=device, dtype=dtype)
-        m_right = torch.zeros(bsz, right_len, device=device, dtype=torch.long)
-        md = torch.zeros(bsz, right_len, device=device, dtype=dtype)
-        mc = torch.zeros(bsz, right_len, device=device, dtype=dtype)
-        tgt_right = torch.full(
-            (bsz, right_len), ignore, device=device, dtype=torch.long,
-        )
-        x0_right = h_x0.new_zeros(bsz, right_len, d_dim)
-        vis_b: list[torch.Tensor] = []
-
-        for b in range(bsz):
-            plist = plans[b]
-            i_bos = int(bos[b].item())
-            i_eos = int(eos[b].item())
-            vis_b.append(self._build_pack_mask(left_len, plist, n_chunk, device))
-            for i, plan in enumerate(plist):
-                r0 = i * w_sz
-                in_win, known, t_w, m_w, is_den = self._window_fields(
-                    plan, i_bos=i_bos, i_eos=i_eos, seq_len=seq_len, is_pad=is_pad[b],
-                )
-                sl = slice(plan.u, min(plan.u + w_sz, seq_len))
-                local_n = sl.stop - sl.start
-                x0 = h_x0.new_zeros(w_sz, d_dim)
-                nse = noise.new_zeros(w_sz, d_dim)
-                if local_n > 0:
-                    x0[:local_n] = h_x0[b, sl]
-                    nse[:local_n] = noise[b, sl]
-                z = interpolate(x0, t_w, nse)
-                z = torch.where(known.unsqueeze(-1), x0, z)
-                z = torch.where(in_win.unsqueeze(-1), z, torch.zeros_like(z))
-                h_right[b, r0 : r0 + w_sz] = z
-                x0_right[b, r0 : r0 + w_sz] = x0
-                t_right[b, r0 : r0 + w_sz] = t_w
-                m_right[b, r0 : r0 + w_sz] = m_w
-                md[b, r0 : r0 + w_sz] = is_den.to(dtype)
-                mc[b, r0 : r0 + w_sz] = (m_w == _MODE_DECODE).to(dtype)
-                if local_n > 0:
-                    tgt_right[b, r0 : r0 + local_n] = tokens[b, sl]
-                    tgt_right[b, r0 : r0 + w_sz].masked_fill_(
-                        ~in_win, ignore,
-                    )
-        attn = torch.stack(vis_b, dim=0)
-        t_left = h_right.new_ones(bsz, left_len)
-        m_left = torch.zeros(bsz, left_len, device=device, dtype=torch.long)
-        h = pack_2l(h_left, h_right)
-        t_all = torch.cat([t_left, t_right], dim=1) if left_len > 0 else t_right
-        m_all = torch.cat([m_left, m_right], dim=1) if left_len > 0 else m_right
-        pos_left = torch.arange(left_len, device=device)
-        pos_right = torch.arange(
-            orig_left + i0 * w_sz,
-            orig_left + i0 * w_sz + right_len,
-            device=device,
-        )
-        positions = torch.cat([pos_left, pos_right]) if left_len > 0 else pos_right
-        w_pos = None
-        if self.sc_cfg:
-            den = (m_all == _MODE_DENOISE).to(dtype)
-            w_pos = w_vec[:, None] * den
-
-        v_z = v_star(x0_right, h_right, t_right, vel_eps)
-        has_den = bool((md.sum() > 0).item())
-        guided_any = bool((guided > 0).any().item())
-        sc = torch.zeros_like(h) if self.sc_cfg else None
-        v_u: torch.Tensor | None = None
-        if (
-            self.sc_cfg
-            and self.training
-            and compute_loss
-            and has_den
-            and guided_any
-        ):
-            with torch.no_grad():
-                x_hat_u = self._run_g(
-                    h, t_all, w_pos, m_all, torch.zeros_like(h),
-                    attn_mask=attn, positions=positions,
-                )
-                x_u_r = x_hat_u[:, left_len:] if left_len > 0 else x_hat_u
-                v_u = x_to_v(x_u_r, h_right, t_right, vel_eps)
-                sc_stu = x_u_r.detach().clone()
-                sc_stu = sc_stu.reshape(bsz, n_chunk, w_sz, d_dim)
-                sc_stu[:, :, w_sz - step :, :] = 0
-                sc_stu = sc_stu.reshape(bsz, right_len, d_dim)
-                sc = torch.zeros_like(h)
-                sc_r = sc_stu * guided[:, None, None]
-                if left_len > 0:
-                    sc[:, left_len:] = sc_r
-                else:
-                    sc = sc_r
-
-        x_hat = self._run_g(
-            h, t_all, w_pos if self.sc_cfg else None, m_all,
-            sc if self.sc_cfg else None,
-            attn_mask=attn, positions=positions,
-        )
-        x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
-        v_hat = x_to_v(x_right, h_right, t_right, vel_eps)
-        if v_u is not None:
-            v_c = x_to_v(x_right.detach(), h_right, t_right, vel_eps)
-            v_tgt = blend_v_tgt(v_z, v_u, v_c, w_vec, guided)
-            v_tgt = torch.where(md.unsqueeze(-1) > 0, v_tgt, v_z)
-        else:
-            v_tgt = v_z
-        mse_tok = (v_hat - v_tgt).pow(2).mean(dim=-1)
-        mse_num = (mse_tok * md).sum()
-        mse_den = md.sum()
-
-        logits = self._exit_logits(x_hat)
-        log_r = logits[:, left_len:] if left_len > 0 else logits
-        ce_tok = F.cross_entropy(
-            log_r.reshape(-1, log_r.size(-1)),
-            tgt_right.reshape(-1),
-            ignore_index=ignore,
-            reduction="none",
-        ).view(bsz, right_len)
-        ce_num = (ce_tok * mc).sum()
-        ce_den = mc.sum()
-        return mse_num, mse_den, ce_num, ce_den
-
     def _pack_forward(
         self,
         tokens: torch.Tensor,
         h_ctx: torch.Tensor,
         h_x0: torch.Tensor,
-        plans: list[list[_WindowPlan]],
+        u: torch.Tensor,
+        k0: torch.Tensor,
+        known_r: torch.Tensor,
+        active: torch.Tensor,
+        bos: torch.Tensor,
+        eos: torch.Tensor,
         *,
         compute_loss: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """分块 2L，避免一次物化 ``L + n_win·W``。返回 ``(loss, mse, ce)``。"""
+        """一次 2L：``[n | n_win·W]``，与 BELF 同形的单次 G。"""
         device = tokens.device
         dtype = h_x0.dtype
-        bsz, seq_len, _ = h_x0.shape
-        n_win = max(len(p) for p in plans)
+        bsz, seq_len, d_dim = h_x0.shape
+        n_win = int(u.size(1))
+        w_sz = self.window_size
+        step = self.step_size
+        is_pad = tokens == int(self.token_layout.pad_token_id)
+        ignore = int(self.token_layout.ignore_index)
+        vel_eps = float(self.config.vel_eps)
+        left_len = int(seq_len)
+        right_len = n_win * w_sz
+
         h_left = maybe_drop_left(
             h_ctx[:, :seq_len].detach(),
             float(self.config.ctx_p_drop) if (self.training and compute_loss) else 0.0,
@@ -600,47 +466,120 @@ class _RelfBackbone(nn.Module):
                 torch.rand(bsz, device=device) < float(self.config.sc_guided_prob)
             ).to(dtype=dtype)
 
-        mse_num = h_x0.new_zeros(())
-        mse_den = h_x0.new_zeros(())
-        ce_num = h_x0.new_zeros(())
-        ce_den = h_x0.new_zeros(())
-        chunk = max(1, int(self._win_chunk))
-        for i0 in range(0, n_win, chunk):
-            n_chunk = min(chunk, n_win - i0)
-            plans_c = [p[i0 : i0 + n_chunk] for p in plans]
+        k = torch.arange(w_sz, device=device)
+        j = u[:, :, None] + k
+        i_bos = bos[:, None, None]
+        i_eos = eos[:, None, None]
+        in_win = (
+            active[:, :, None]
+            & (j >= i_bos) & (j <= i_eos)
+            & (j < seq_len) & (j >= 0)
+            & (k >= k0[:, :, None])
+        )
+        safe_j = j.clamp(0, max(seq_len - 1, 0))
+        in_win = in_win & (
+            ~is_pad.gather(1, safe_j.reshape(bsz, -1)).reshape(bsz, n_win, w_sz)
+        )
+        known = (
+            (k >= k0[:, :, None])
+            & (k < (k0[:, :, None] + known_r[:, :, None]))
+            & in_win
+            & (j != i_eos)
+        )
+        t_w = self.F.to(device=device).view(1, 1, w_sz)
+        t_w = torch.where(
+            in_win & (~known),
+            t_w.expand(bsz, n_win, w_sz),
+            torch.ones(bsz, n_win, w_sz, device=device, dtype=t_w.dtype),
+        )
+        cap = t_w.new_tensor(self._ladder_cap)
+        unknown = in_win & (~known)
+        is_dec = unknown & (t_w >= cap - 1e-8)
+        is_den = unknown & (~is_dec)
+        m_w = torch.zeros(bsz, n_win, w_sz, device=device, dtype=torch.long)
+        m_w = torch.where(is_den, torch.full_like(m_w, _MODE_DENOISE), m_w)
+        m_w = torch.where(is_dec, torch.full_like(m_w, _MODE_DECODE), m_w)
 
-            def _ck(
-                h_left_t: torch.Tensor,
-                h_x0_t: torch.Tensor,
-                noise_t: torch.Tensor,
-                w_vec_t: torch.Tensor,
-                guided_t: torch.Tensor,
-                _i0: int = i0,
-                _n: int = n_chunk,
-                _plans: list[list[_WindowPlan]] = plans_c,
-            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                return self._forward_win_chunk(
-                    tokens, h_left_t, h_x0_t, _plans,
-                    noise=noise_t, i0=_i0, n_chunk=_n, orig_left=seq_len,
-                    w_vec=w_vec_t, guided=guided_t, compute_loss=compute_loss,
+        valid_pos = (j >= 0) & (j < seq_len)
+        idx = safe_j.reshape(bsz, right_len, 1).expand(bsz, right_len, d_dim)
+        x0 = h_x0.gather(1, idx).reshape(bsz, n_win, w_sz, d_dim)
+        nse = noise.gather(1, idx).reshape(bsz, n_win, w_sz, d_dim)
+        x0 = torch.where(valid_pos.unsqueeze(-1), x0, torch.zeros_like(x0))
+        nse = torch.where(valid_pos.unsqueeze(-1), nse, torch.zeros_like(nse))
+        z = interpolate(x0, t_w, nse)
+        z = torch.where(known.unsqueeze(-1), x0, z)
+        z = torch.where(in_win.unsqueeze(-1), z, torch.zeros_like(z))
+
+        h_right = z.reshape(bsz, right_len, d_dim)
+        x0_right = x0.reshape(bsz, right_len, d_dim)
+        t_right = t_w.reshape(bsz, right_len)
+        m_right = m_w.reshape(bsz, right_len)
+        md = is_den.to(dtype).reshape(bsz, right_len)
+        mc = is_dec.to(dtype).reshape(bsz, right_len)
+        tok_g = tokens.gather(1, safe_j.reshape(bsz, right_len)).reshape(
+            bsz, n_win, w_sz,
+        )
+        tgt_right = torch.where(
+            in_win & valid_pos, tok_g, torch.full_like(tok_g, ignore),
+        ).reshape(bsz, right_len)
+
+        attn = self._windows_attn_mask(left_len, u, active)
+        t_left = h_right.new_ones(bsz, left_len)
+        m_left = torch.zeros(bsz, left_len, device=device, dtype=torch.long)
+        h = pack_2l(h_left, h_right)
+        t_all = torch.cat([t_left, t_right], dim=1) if left_len > 0 else t_right
+        m_all = torch.cat([m_left, m_right], dim=1) if left_len > 0 else m_right
+        positions = torch.arange(left_len + right_len, device=device)
+        w_pos = None
+        if self.sc_cfg:
+            den = (m_all == _MODE_DENOISE).to(dtype)
+            w_pos = w_vec[:, None] * den
+
+        v_z = v_star(x0_right, h_right, t_right, vel_eps)
+        sc = torch.zeros_like(h) if self.sc_cfg else None
+        v_u: torch.Tensor | None = None
+        if self.sc_cfg and self.training and compute_loss:
+            with torch.no_grad():
+                x_hat_u = self._run_g(
+                    h, t_all, w_pos, m_all, torch.zeros_like(h),
+                    attn_mask=attn, positions=positions,
                 )
+                x_u_r = x_hat_u[:, left_len:] if left_len > 0 else x_hat_u
+                v_u = x_to_v(x_u_r, h_right, t_right, vel_eps)
+                sc_stu = x_u_r.detach().clone().reshape(bsz, n_win, w_sz, d_dim)
+                sc_stu[:, :, w_sz - step :, :] = 0
+                sc_r = sc_stu.reshape(bsz, right_len, d_dim) * guided[:, None, None]
+                sc = torch.zeros_like(h)
+                if left_len > 0:
+                    sc[:, left_len:] = sc_r
+                else:
+                    sc = sc_r
 
-            if self.training and compute_loss:
-                a, b, c, d = checkpoint(
-                    _ck, h_left, h_x0, noise, w_vec, guided,
-                    use_reentrant=False,
-                )
-            else:
-                a, b, c, d = _ck(h_left, h_x0, noise, w_vec, guided)
-            mse_num = mse_num + a
-            mse_den = mse_den + b
-            ce_num = ce_num + c
-            ce_den = ce_den + d
+        x_hat = self._run_g(
+            h, t_all, w_pos if self.sc_cfg else None, m_all,
+            sc if self.sc_cfg else None,
+            attn_mask=attn, positions=positions,
+        )
+        x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
+        v_hat = x_to_v(x_right, h_right, t_right, vel_eps)
+        if v_u is not None:
+            v_c = x_to_v(x_right.detach(), h_right, t_right, vel_eps)
+            v_tgt = blend_v_tgt(v_z, v_u, v_c, w_vec, guided)
+            v_tgt = torch.where(md.unsqueeze(-1) > 0, v_tgt, v_z)
+        else:
+            v_tgt = v_z
+        mse_tok = (v_hat - v_tgt).pow(2).mean(dim=-1)
+        mse = (mse_tok * md).sum() / md.sum().clamp(min=1.0)
 
-        mse = mse_num / mse_den.clamp(min=1.0)
-        ce = ce_num / ce_den.clamp(min=1.0)
-        if not bool((ce_den > 0).item()):
-            ce = ce + 0.0 * sum(p.sum() for p in self.exit_head.parameters())
+        logits = self._exit_logits(x_hat)
+        log_r = logits[:, left_len:] if left_len > 0 else logits
+        ce_tok = F.cross_entropy(
+            log_r.reshape(-1, log_r.size(-1)),
+            tgt_right.reshape(-1),
+            ignore_index=ignore,
+            reduction="none",
+        ).view(bsz, right_len)
+        ce = (ce_tok * mc).sum() / mc.sum().clamp(min=1.0)
         loss = float(self.config.lambda_mse) * mse + float(self.config.lambda_ce) * ce
         return loss, mse, ce
 
@@ -667,14 +606,15 @@ class _RelfBackbone(nn.Module):
         src_ctx = mu if str(self.config.ctx_source).lower() == "mu" else z
         h_x0 = self._map_h(src_x0)
         h_ctx = self._map_h(src_ctx)
-        plans = self._plan_windows(tokens)
+        bos, eos = self._bos_eos(tokens)
+        u, k0, known_r, active = self._plan_windows(tokens, bos, eos)
         loss, mse, ce = self._pack_forward(
-            tokens, h_ctx, h_x0, plans, compute_loss=True,
+            tokens, h_ctx, h_x0, u, k0, known_r, active, bos, eos, compute_loss=True,
         )
         s1 = self.latent.s1_loss(tokens, z=z, mu=mu, logvar=logvar)
-        self.last_l2_loss = mse.detach() if bool(torch.isfinite(mse).item()) else float("nan")
-        self.last_ce_loss = ce.detach() if bool(torch.isfinite(ce).item()) else float("nan")
-        self.last_s1_loss = s1.detach() if bool(torch.isfinite(s1).item()) else float("nan")
+        self.last_l2_loss = mse.detach()
+        self.last_ce_loss = ce.detach()
+        self.last_s1_loss = s1.detach()
         total = loss + s1
         empty = torch.zeros(
             tokens.size(0), 0, int(self.token_layout.vocab_size),
@@ -792,9 +732,18 @@ class _RelfBackbone(nn.Module):
         ) -> torch.Tensor:
             nonlocal nfe
             bsz = z_win.size(0)
-            left_len = h_left.size(1)
-            vis = pack_2l_mask(left_len, w_sz, 1, step, device=z_win.device)
-            attn = vis
+            left_len = int(h_left.size(1))
+            mk = (left_len, z_win.device)
+            attn = self._gen_mask_cache.get(mk)
+            if attn is None:
+                attn = as_sdpa_mask(
+                    pack_2l_mask(left_len, w_sz, 1, step, device=z_win.device),
+                )
+                if attn is None:
+                    raise RuntimeError("2L mask 不能为空")
+                if len(self._gen_mask_cache) > 32:
+                    self._gen_mask_cache.pop(next(iter(self._gen_mask_cache)))
+                self._gen_mask_cache[mk] = attn
             if drop_left and left_len > 0:
                 h_left = torch.zeros_like(h_left)
             h = pack_2l(h_left, z_win)
@@ -831,30 +780,39 @@ class _RelfBackbone(nn.Module):
         def _fields_for_u(u: int, tok: torch.Tensor, *, target_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """推理窗：BOS 左切、EOS/目标长右切，其余铺 ``F``。"""
             bsz = tok.size(0)
-            t_w = self.F.to(device=device, dtype=dtype).expand(bsz, -1).clone()
-            m_w = torch.full((bsz, w_sz), _MODE_NONE, device=device, dtype=torch.long)
-            in_win = torch.zeros(bsz, w_sz, device=device, dtype=torch.bool)
-            has_eos = (tok == eos_id).any(dim=1)
-            bos_idx = torch.zeros(bsz, device=device, dtype=torch.long)
             bos_hit = tok == bos_id
-            bos_idx = torch.where(bos_hit.any(dim=1), bos_hit.float().argmax(dim=1), bos_idx)
+            bos_idx = torch.where(
+                bos_hit.any(dim=1),
+                bos_hit.float().argmax(dim=1),
+                torch.zeros(bsz, device=device, dtype=torch.long),
+            )
+            has_eos = (tok == eos_id).any(dim=1)
             eos_idx = torch.where(
                 has_eos,
                 (tok == eos_id).float().argmax(dim=1),
                 torch.full((bsz,), target_len - 1, device=device, dtype=torch.long),
             )
-            for b in range(bsz):
-                i_bos = int(bos_idx[b].item())
-                i_eos = int(eos_idx[b].item())
-                for k in range(w_sz):
-                    j = u + k
-                    if j < i_bos or j > i_eos or j >= target_len:
-                        continue
-                    in_win[b, k] = True
-                    t_w[b, k] = self.F[k]
-                    m_w[b, k] = (
-                        _MODE_DECODE if float(self.F[k].item()) >= cap - 1e-8 else _MODE_DENOISE
-                    )
+            k = torch.arange(w_sz, device=device)
+            j = u + k
+            in_win = (
+                (j[None, :] >= bos_idx[:, None])
+                & (j[None, :] <= eos_idx[:, None])
+                & (j < target_len)
+            )
+            f = self.F.to(device=device, dtype=dtype)
+            t_w = torch.where(
+                in_win, f.expand(bsz, -1), torch.ones(bsz, w_sz, device=device, dtype=dtype),
+            )
+            dec = f >= (cap - 1e-8)
+            m_w = torch.where(
+                in_win,
+                torch.where(
+                    dec.expand(bsz, -1),
+                    torch.full((bsz, w_sz), _MODE_DECODE, device=device, dtype=torch.long),
+                    torch.full((bsz, w_sz), _MODE_DENOISE, device=device, dtype=torch.long),
+                ),
+                torch.zeros(bsz, w_sz, device=device, dtype=torch.long),
+            )
             return t_w, m_w, in_win
 
         def _append_decoded(
@@ -862,24 +820,20 @@ class _RelfBackbone(nn.Module):
             sampled: torch.Tensor,
             dec: torch.Tensor,
         ) -> tuple[torch.Tensor, bool]:
-            rows: list[list[int]] = []
-            stop = False
-            for b in range(tok.size(0)):
-                row: list[int] = []
-                for k in range(w_sz):
-                    if not bool(dec[b, k]):
-                        continue
-                    tid = int(sampled[b, k].item())
-                    row.append(tid)
-                    if tid == eos_id:
-                        stop = True
-                        break
-                rows.append(row)
-            max_n = max((len(r) for r in rows), default=0)
+            is_eos = dec & (sampled == eos_id)
+            prev_eos = is_eos.cumsum(dim=1) - is_eos.long()
+            keep = dec & (prev_eos == 0)
+            stop = bool(is_eos.any())
+            counts = keep.sum(dim=1)
+            max_n = int(counts.max().item())
             if max_n == 0:
                 return tok, stop
-            padded = [r + [pad_id] * (max_n - len(r)) for r in rows]
-            add = torch.tensor(padded, device=device, dtype=torch.long)
+            idx = torch.arange(w_sz, device=device).expand_as(keep)
+            order = torch.where(keep, idx, torch.full_like(idx, w_sz)).sort(dim=1).values
+            take = order[:, :max_n]
+            valid = take < w_sz
+            gathered = sampled.gather(1, take.clamp(max=w_sz - 1))
+            add = torch.where(valid, gathered, torch.full_like(gathered, pad_id))
             return torch.cat([tok, add], dim=1), stop
 
         h_left_cache: torch.Tensor | None = _encode_h(tokens) if tokens.size(1) > 0 else None
@@ -904,14 +858,13 @@ class _RelfBackbone(nn.Module):
                     if u < 0:
                         u = 0
                     t_w, m_w, in_win = _fields_for_u(u, tokens, target_len=seqlen)
-                    known = torch.zeros_like(in_win)
-                    for k in range(w_sz):
-                        if k0 <= k < k0 + r:
-                            j = u + k
-                            if 0 <= j < L:
-                                known[:, k] = True
-                                m_w[:, k] = _MODE_NONE
-                                t_w[:, k] = 1.0
+                    kk = torch.arange(w_sz, device=device)
+                    jj = u + kk
+                    known = (
+                        (kk >= k0) & (kk < k0 + r) & (jj >= 0) & (jj < L)
+                    ).expand(tokens.size(0), -1)
+                    m_w = torch.where(known, torch.zeros_like(m_w), m_w)
+                    t_w = torch.where(known, torch.ones_like(t_w), t_w)
                     m_w = torch.where(in_win & (~known), m_w, torch.zeros_like(m_w))
                     h_all = h_left_cache if h_left_cache is not None else _encode_h(tokens)
                     h_left = h_all[:, :u] if u > 0 else h_all[:, :0]
