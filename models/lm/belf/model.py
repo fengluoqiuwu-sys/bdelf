@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.latent.encdec.layers import TransformerBlock
 from models.lm.belf.config import FL_BelfConfig
 from models.lm.belf.generate import (
     MODE_DECODE,
@@ -18,16 +17,19 @@ from models.lm.belf.generate import (
 )
 from models.lm.belf_relf_core import (
     AdaLNZeroStack,
+    ExitMap,
     LatentBundle,
     as_sdpa_mask,
     blend_v_tgt,
     check_time_step,
+    hide_left_keys,
     interpolate,
     keep_params_in_graph,
     ladder_levels,
     maybe_drop_left,
     pack_2l,
     pack_2l_mask,
+    pack_2l_parallel_blocks_mask,
     sample_w_sc,
     v_star,
     validate_loaded_block,
@@ -56,47 +58,16 @@ def _whiten_vec(mod: nn.Module, names: tuple[str, ...], dim: int) -> torch.Tenso
     return None
 
 
-class _CausalExit(nn.Module):
-    """出口：等宽因果 decoder + Linear(D→V)，或仅 Linear。"""
-
-    def __init__(
-        self,
-        *,
-        kind: str,
-        n_embd: int,
-        n_head: int,
-        vocab_size: int,
-        n_layer_dec: int,
-        dropout: float,
-        attn_backend: str,
-    ) -> None:
+class _RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
-        kind = str(kind).strip().lower()
-        if kind not in ("decoder", "linear"):
-            raise ValueError(f"exit 须为 decoder|linear，收到 {kind!r}")
-        self.kind = kind
-        d_kv = n_embd // n_head
-        d_ff = 4 * n_embd
-        self.blocks = nn.ModuleList()
-        if kind == "decoder":
-            for _ in range(int(n_layer_dec)):
-                self.blocks.append(
-                    TransformerBlock(
-                        n_embd, n_head, d_kv, d_ff, dropout,
-                        use_flash=True, attn_backend=attn_backend, block_size=1,
-                    )
-                )
-            self.ln = nn.LayerNorm(n_embd)
-        else:
-            self.ln = nn.Identity()
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=True)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.kind == "decoder":
-            for block in self.blocks:
-                x = block(x, attn_mode="causal")
-            x = self.ln(x)
-        return self.lm_head(x)
+        var = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.eps).to(dtype=x.dtype)
+        return self.weight.to(dtype=x.dtype) * x
 
 
 class _BelfBackbone(nn.Module):
@@ -130,38 +101,54 @@ class _BelfBackbone(nn.Module):
                 f"n_embd={self.n_embd} 须能被 n_head={self.n_head} 整除"
             )
         proj = str(config.proj_type).strip().lower()
-        if proj != "linear":
-            raise ValueError(f"proj_type 仅支持 linear，收到 {config.proj_type!r}")
+        if proj not in ("linear", "bottleneck"):
+            raise ValueError(f"proj_type 须为 linear|bottleneck，收到 {config.proj_type!r}")
 
         self.bundle = bundle
         self.latent_dim = int(bundle.latent_dim)
+        if self.latent_dim <= 0:
+            raise ValueError("LatentBundle.latent_dim 无效")
         self.sc_cfg = bool(config.sc_cfg)
         self.exit_kind = str(config.exit).strip().lower()
+        if self.exit_kind not in ("decoder", "linear"):
+            raise ValueError(f"exit 须为 decoder|linear，收到 {config.exit!r}")
+        if self.exit_kind == "decoder":
+            bundle.require_vae_dec(reason="exit=decoder")
         self.ce_detach_g = bool(config.ce_detach_g)
         self.cond_mode = str(config.cond_mode)
         self.clean_block_prob = float(config.clean_block_prob)
         self.lambda_mse = float(config.lambda_mse)
         self.lambda_ce = float(config.lambda_ce)
         self.lambda_s1 = float(config.lambda_s1)
-        self.p_mean = float(config.p_mean)
-        self.p_std = float(config.p_std)
-        self.t_eps = float(config.t_eps)
+        self.denoiser_p_mean = float(config.denoiser_p_mean)
+        self.denoiser_p_std = float(config.denoiser_p_std)
+        self.t_clean_eps = float(config.t_clean_eps)
         self.vel_eps = float(config.vel_eps)
-        self.sc_p_mean = float(config.sc_p_mean)
-        self.sc_p_std = float(config.sc_p_std)
-        self.w_sc_min = float(config.w_sc_min)
-        self.w_sc_max = float(config.w_sc_max)
+        self.sc_p_mean = float(config.self_cond_cfg_p_mean)
+        self.sc_p_std = float(config.self_cond_cfg_p_std)
+        self.w_sc_min = float(config.self_cond_cfg_min)
+        self.w_sc_max = float(config.self_cond_cfg_max)
         self.sc_guided_prob = float(config.sc_guided_prob)
-        self.ctx_drop_prob = float(config.ctx_drop_prob)
-        self.denoiser_noise_scale = float(config.denoiser_noise_scale)
+        self.ctx_drop_prob = float(config.ctx_p_drop)
+        self.denoiser_noise_scale = float(config.noise_sigma)
         self.attn_backend = str(config.attn_backend)
+        self.whiten = bool(config.whiten)
+        self.whiten_on = str(config.whiten_on).strip().lower()
+        self.x0_source = str(config.x0_source).strip().lower()
+        self.ctx_source = str(config.ctx_source).strip().lower()
 
         x_dim = self.latent_dim
         mean = torch.zeros(x_dim)
         std = torch.ones(x_dim)
         src = getattr(bundle.latent, "backbone", bundle.latent)
-        found_m = _whiten_vec(src, ("whitening_mean", "latent_mean"), x_dim)
-        found_s = _whiten_vec(src, ("whitening_std", "latent_std"), x_dim)
+        if self.whiten_on == "z":
+            names_m = ("whitening_mean_z", "whitening_mean", "latent_mean")
+            names_s = ("whitening_std_z", "whitening_std", "latent_std")
+        else:
+            names_m = ("whitening_mean", "latent_mean")
+            names_s = ("whitening_std", "latent_std")
+        found_m = _whiten_vec(src, names_m, x_dim)
+        found_s = _whiten_vec(src, names_s, x_dim)
         if found_m is not None:
             mean = found_m
         if found_s is not None:
@@ -169,9 +156,24 @@ class _BelfBackbone(nn.Module):
         self.register_buffer("whiten_mean", mean, persistent=True)
         self.register_buffer("whiten_std", std, persistent=True)
 
-        self.in_proj = nn.Linear(x_dim, self.n_embd)
-        nn.init.xavier_uniform_(self.in_proj.weight)
-        nn.init.zeros_(self.in_proj.bias)
+        bias = bool(config.proj_bias)
+        if proj == "bottleneck":
+            bdim = int(config.bottleneck_dim)
+            self.in_proj = nn.Sequential(
+                nn.Linear(x_dim, bdim, bias=bias),
+                nn.GELU(),
+                nn.Linear(bdim, self.n_embd, bias=bias),
+            )
+        else:
+            self.in_proj = nn.Linear(x_dim, self.n_embd, bias=bias)
+            nn.init.xavier_uniform_(self.in_proj.weight)
+            if self.in_proj.bias is not None:
+                nn.init.zeros_(self.in_proj.bias)
+        self.proj_norm = (
+            _RMSNorm(self.n_embd)
+            if str(config.proj_norm).lower() == "rmsnorm"
+            else nn.Identity()
+        )
 
         head_dim = self.n_embd // self.n_head
         rope_dim = config.rope_dim
@@ -186,60 +188,112 @@ class _BelfBackbone(nn.Module):
             dropout=float(config.dropout),
             mlp_ratio=float(config.mlp_ratio),
             rope_dim=rope_dim,
+            rope_theta=float(config.rope_theta),
             qk_norm=bool(config.qk_norm),
             attn_backend=self.attn_backend,
             num_time_tokens=0,
             use_scale=self.sc_cfg,
+            t_freq_dim=int(config.t_freq_dim),
         )
-        self.exit_head = _CausalExit(
-            kind=self.exit_kind,
-            n_embd=self.n_embd,
-            n_head=self.n_head,
-            vocab_size=int(self.token_layout.vocab_size),
-            n_layer_dec=int(config.n_layer_dec),
-            dropout=float(config.dropout),
-            attn_backend=self.attn_backend,
+        self.sc_proj = (
+            nn.Linear(2 * self.n_embd, self.n_embd, bias=True) if self.sc_cfg else None
         )
+        if self.exit_kind == "decoder":
+            self.exit_head = ExitMap(
+                kind="decoder",
+                n_embd=self.n_embd,
+                out_dim=x_dim,
+                bias=bias,
+            )
+        else:
+            self.exit_head = ExitMap(
+                kind="linear",
+                n_embd=self.n_embd,
+                out_dim=int(self.token_layout.vocab_size),
+                bias=bool(config.lm_head_bias),
+            )
 
         levels = ladder_levels(
-            self.time_step, self.p_mean, self.p_std, self.t_eps,
+            self.time_step, self.denoiser_p_mean, self.denoiser_p_std, self.t_clean_eps,
         )
         self.register_buffer("levels", levels, persistent=True)
-        self._mask_cache: dict[tuple[int, int, int, torch.device], torch.Tensor] = {}
+        self._mask_cache: dict[tuple[int, int, int, torch.device, bool], torch.Tensor] = {}
 
         self.last_l2_loss = float("nan")
         self.last_ce_loss = float("nan")
         self.last_s1_loss = float("nan")
 
     def to_d(self, z: torch.Tensor) -> torch.Tensor:
-        """白化后 Linear X→D。"""
-        std = self.whiten_std.clamp(min=1e-8).to(dtype=z.dtype, device=z.device)
-        mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
-        return self.in_proj((z - mean) / std)
+        """可选白化后 Linear / bottleneck X→D。"""
+        h = z
+        if self.whiten:
+            std = self.whiten_std.clamp(min=1e-8).to(dtype=z.dtype, device=z.device)
+            mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
+            h = (z - mean) / std
+        return self.proj_norm(self.in_proj(h))
 
     def exit_logits(self, x: torch.Tensor) -> torch.Tensor:
-        return self.exit_head(x)
+        mapped = self.exit_head(x)
+        if self.exit_kind == "decoder":
+            return self.bundle.decode_logits(mapped)
+        return mapped
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         return self.bundle.on_tokens_seen(n, optimizer)
 
     def _cached_2l_mask(
-        self, left_len: int, right_len: int, device: torch.device,
+        self,
+        left_len: int,
+        right_len: int,
+        device: torch.device,
+        *,
+        parallel: bool = False,
     ) -> torch.Tensor:
-        key = (left_len, right_len, self.block_size, device)
+        key = (left_len, right_len, self.block_size, device, parallel)
         cached = self._mask_cache.get(key)
         if cached is None:
-            cached = as_sdpa_mask(
-                pack_2l_mask(
+            if parallel:
+                if left_len != right_len:
+                    raise ValueError(
+                        f"并行块 mask 要求左右等长，收到 left={left_len}, right={right_len}"
+                    )
+                raw = pack_2l_parallel_blocks_mask(
+                    left_len, self.block_size, device,
+                )
+            else:
+                raw = pack_2l_mask(
                     left_len, right_len, self.block_size, self.block_size, device,
                 )
-            )
+            cached = as_sdpa_mask(raw)
             if cached is None:
                 raise RuntimeError("2L mask 不能为空")
             if len(self._mask_cache) > 16:
                 self._mask_cache.pop(next(iter(self._mask_cache)))
             self._mask_cache[key] = cached
         return cached
+
+    def _apply_sc(
+        self,
+        packed: torch.Tensor,
+        sc_right: torch.Tensor | None,
+        left_len: int,
+        *,
+        known_right: int = 0,
+        known_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """把右段 sc 拼进 2L 后经 ``sc_proj``；左段 / 已知槽为 0。"""
+        if self.sc_proj is None:
+            return packed
+        sc = torch.zeros_like(packed)
+        if sc_right is not None:
+            sc[:, left_len:] = sc_right
+        if known_right > 0:
+            sc[:, left_len : left_len + known_right] = 0
+        if known_mask is not None:
+            sc[:, left_len:] = torch.where(
+                known_mask.unsqueeze(-1), torch.zeros_like(sc[:, left_len:]), sc[:, left_len:],
+            )
+        return self.sc_proj(torch.cat([packed, sc], dim=-1))
 
     def forward_g(
         self,
@@ -251,6 +305,7 @@ class _BelfBackbone(nn.Module):
         *,
         known_right: int = 0,
         drop_left: bool = False,
+        sc_right: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """2L G，返回右段 x-pred。"""
         bsz, right_len, _ = h_right.shape
@@ -280,14 +335,14 @@ class _BelfBackbone(nn.Module):
         m_all = torch.cat([m_l, m_r], dim=1) if left_len > 0 else m_r
         w_all = w_sc
         mask = self._cached_2l_mask(left_len, right_len, device)
-        if left_len == right_len and left_len > 0:
-            positions = pair_positions(left_len, device)
-        else:
-            pos_l = torch.arange(left_len, device=device, dtype=torch.long)
-            pos_r = torch.arange(
-                left_len, left_len + right_len, device=device, dtype=torch.long,
-            )
-            positions = torch.cat([pos_l, pos_r]) if left_len > 0 else pos_r
+        pos_l = torch.arange(left_len, device=device, dtype=torch.long)
+        pos_r = torch.arange(
+            left_len, left_len + right_len, device=device, dtype=torch.long,
+        )
+        positions = torch.cat([pos_l, pos_r]) if left_len > 0 else pos_r
+        packed = self._apply_sc(
+            packed, sc_right, left_len, known_right=known_right,
+        )
         x_hat = self.g(
             packed, t_all, w_all, m_all, attn_mask=mask, positions=positions,
         )
@@ -333,7 +388,10 @@ class _BelfBackbone(nn.Module):
             raise ValueError(
                 f"latent 形状 {tuple(z.shape[:2])} 须与 token {tuple(tokens.shape)} 一致"
             )
-        x0 = self.to_d(z)
+        src_x0 = mu if self.x0_source == "mu" else z
+        src_ctx = mu if self.ctx_source == "mu" else z
+        x0 = self.to_d(src_x0)
+        h_ctx = self.to_d(src_ctx)
         dtype = x0.dtype
         pad_id = int(self.token_layout.pad_token_id)
         not_pad = tokens != pad_id
@@ -343,27 +401,40 @@ class _BelfBackbone(nn.Module):
         is_decode = hops == (self.time_step - 1)
 
         rem = torch.zeros(bsz, device=device, dtype=torch.long)
-        if self.cond_mode == "clean" and self.clean_block_prob > 0:
+        b_cur = torch.zeros(bsz, device=device, dtype=torch.long)
+        n_blocks = seq_len // w
+        if (
+            self.cond_mode == "clean"
+            and self.clean_block_prob > 0
+            and n_blocks > 0
+            and w > 1
+        ):
             use_mix = torch.rand(bsz, device=device) < self.clean_block_prob
             rem = torch.where(
                 use_mix,
                 torch.randint(1, w, (bsz,), device=device),
                 rem,
             )
-        local = torch.arange(seq_len, device=device) % w
-        known = local[None, :] < rem[:, None]
+            b_cur = torch.where(
+                use_mix,
+                torch.randint(0, n_blocks, (bsz,), device=device),
+                b_cur,
+            )
+        pos = torch.arange(seq_len, device=device)
+        known = (pos[None, :] // w == b_cur[:, None]) & (pos[None, :] % w < rem[:, None])
         unknown = (~known) & not_pad
         denoise_mask = unknown & (~is_decode[:, None])
         decode_mask = unknown & is_decode[:, None]
 
         noise = torch.randn_like(x0) * self.denoiser_noise_scale
+        is_pad = ~not_pad
         t_right = torch.where(
-            known,
+            known | is_pad,
             x0.new_ones(bsz, seq_len),
             t_hop[:, None].expand(bsz, seq_len),
         )
         z_t = interpolate(x0, t_right, noise)
-        z_t = torch.where(known.unsqueeze(-1), x0, z_t)
+        z_t = torch.where((known | is_pad).unsqueeze(-1), x0, z_t)
 
         m_den = torch.full(
             (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
@@ -372,11 +443,14 @@ class _BelfBackbone(nn.Module):
             (bsz, seq_len), MODE_DECODE, device=device, dtype=torch.long,
         )
         m_right = torch.where(is_decode[:, None], m_dec, m_den)
-        m_right = torch.where(known, torch.zeros_like(m_right), m_right)
+        m_right = torch.where(
+            known | is_pad, torch.zeros_like(m_right), m_right,
+        )
 
-        h_left = maybe_drop_left(
-            x0.detach(),
+        h_left, drop_left = maybe_drop_left(
+            h_ctx.detach(),
             self.ctx_drop_prob if self.training else 0.0,
+            return_drop=True,
         )
         w_sc = None
         guided: torch.Tensor | bool = False
@@ -388,18 +462,43 @@ class _BelfBackbone(nn.Module):
             guided = torch.rand(bsz, device=device) < self.sc_guided_prob
 
         v_z = v_star(x0, z_t, t_right, self.vel_eps)
-        # teacher 先于 student，避免与 student 图叠峰；v_c 复用 student.detach()。
-        # 训练期始终跑 teacher，用 guided mask 混合（B 稍大时与「有 guided 才跑」同结果，无 .item()）。
-        if self.sc_cfg and self.training:
-            w_zero = torch.zeros_like(w_sc)
+        sc_zero = torch.zeros_like(z_t)
+        need_teacher = (
+            self.sc_cfg and self.training and bool((~is_decode).any().item())
+        )
+        if need_teacher:
             with torch.no_grad():
-                x_u = self._forward_g_m(h_left, z_t, t_right, m_right, w_zero)
+                x_u = self._forward_g_m(
+                    h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
+                    drop_left=drop_left,
+                )
                 v_u = x_to_v(x_u, z_t, t_right, self.vel_eps)
-            x_hat = self._forward_g_m(h_left, z_t, t_right, m_right, w_sc)
-            v_c = x_to_v(x_hat.detach(), z_t, t_right, self.vel_eps)
+                sc_cond = x_u.detach()
+                sc_cond = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_cond), sc_cond)
+                sc_cond = torch.where(
+                    is_decode[:, None, None], torch.zeros_like(sc_cond), sc_cond,
+                )
+                x_c = self._forward_g_m(
+                    h_left, z_t, t_right, m_right, w_sc, sc_right=sc_cond,
+                    drop_left=drop_left,
+                )
+                v_c = x_to_v(x_c, z_t, t_right, self.vel_eps)
+            g = guided.to(dtype=dtype)[:, None, None]
+            sc_stu = x_u.detach() * g
+            sc_stu = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_stu), sc_stu)
+            sc_stu = torch.where(
+                is_decode[:, None, None], torch.zeros_like(sc_stu), sc_stu,
+            )
+            x_hat = self._forward_g_m(
+                h_left, z_t, t_right, m_right, w_sc, sc_right=sc_stu,
+                drop_left=drop_left,
+            )
             v_tgt = blend_v_tgt(v_z, v_u, v_c, w_sc, guided)
         else:
-            x_hat = self._forward_g_m(h_left, z_t, t_right, m_right, w_sc)
+            x_hat = self._forward_g_m(
+                h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
+                drop_left=drop_left,
+            )
             v_tgt = v_z
 
         v_hat = x_to_v(x_hat, z_t, t_right, self.vel_eps)
@@ -432,7 +531,7 @@ class _BelfBackbone(nn.Module):
         if self.bundle.is_trainable:
             self.last_s1_loss = s1.detach()
         else:
-            self.last_s1_loss = nan
+            self.last_s1_loss = float("nan")
             s1 = zero.to(dtype=x0.dtype)
 
         loss = self.lambda_mse * mse + self.lambda_ce * ce + self.lambda_s1 * s1
@@ -448,8 +547,11 @@ class _BelfBackbone(nn.Module):
         t_right: torch.Tensor,
         m_right: torch.Tensor,
         w_sc: torch.Tensor | None,
+        *,
+        sc_right: torch.Tensor | None = None,
+        drop_left: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """与 ``forward_g`` 相同，但右段 ``m`` 逐列给定。"""
+        """与 ``forward_g`` 相同，但右段 ``m`` 逐列给定；训练走并行块 mask。"""
         bsz, right_len, _ = h_right.shape
         left_len = int(h_left.size(1))
         device = h_right.device
@@ -458,12 +560,21 @@ class _BelfBackbone(nn.Module):
         m_l = torch.zeros(bsz, left_len, device=device, dtype=torch.long)
         t_all = torch.cat([t_l, t_right], dim=1)
         m_all = torch.cat([m_l, m_right], dim=1)
-        mask = self._cached_2l_mask(left_len, right_len, device)
+        parallel = left_len == right_len
+        mask = self._cached_2l_mask(left_len, right_len, device, parallel=parallel)
+        if drop_left is not None:
+            mask = hide_left_keys(mask, drop_left, left_len)
         positions = pair_positions(left_len, device) if left_len == right_len else (
             torch.cat([
                 torch.arange(left_len, device=device, dtype=torch.long),
                 torch.arange(left_len, left_len + right_len, device=device, dtype=torch.long),
             ])
+        )
+        packed = self._apply_sc(
+            packed,
+            sc_right,
+            left_len,
+            known_mask=(m_right == MODE_NONE) | (m_right == MODE_DECODE),
         )
         x_hat = self.g(
             packed, t_all, w_sc, m_all, attn_mask=mask, positions=positions,

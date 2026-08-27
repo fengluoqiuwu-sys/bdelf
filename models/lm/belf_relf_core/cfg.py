@@ -59,12 +59,40 @@ def blend_v_tgt(
     return v_z + _bcast_like(scale, v_z) * (v_c - v_u)
 
 
-def maybe_drop_left(h_left: torch.Tensor, drop_prob: float) -> torch.Tensor:
-    """以 ``drop_prob`` 按样本把左段置 0（训练期无条件上下文）。"""
+def maybe_drop_left(
+    h_left: torch.Tensor,
+    drop_prob: float,
+    *,
+    return_drop: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """以 ``drop_prob`` 按样本把左段置 0（训练期无条件上下文）。
+
+    ``return_drop=True`` 时另返回 ``(B,)`` 布尔：该样本是否丢掉左段，供切断注意力。
+    """
     p = float(drop_prob)
-    if p <= 0.0:
-        return h_left
     bsz = h_left.size(0)
+    if p <= 0.0:
+        drop = torch.zeros(bsz, device=h_left.device, dtype=torch.bool)
+        return (h_left, drop) if return_drop else h_left
     drop = torch.rand(bsz, device=h_left.device, dtype=torch.float32) < p
     keep = (~drop).to(dtype=h_left.dtype).reshape(bsz, *([1] * (h_left.ndim - 1)))
-    return h_left * keep
+    out = h_left * keep
+    return (out, drop) if return_drop else out
+
+
+def hide_left_keys(
+    attn_mask: torch.Tensor,
+    drop: torch.Tensor,
+    left_len: int,
+) -> torch.Tensor:
+    """``drop`` 为 ``(B,)``：丢掉左段的样本，右段 query 看不见左段 key。"""
+    if left_len <= 0 or drop.numel() == 0 or not bool(drop.any().item()):
+        return attn_mask
+    bsz = int(drop.size(0))
+    mask = attn_mask
+    if mask.size(0) == 1 and bsz > 1:
+        mask = mask.expand(bsz, *([-1] * (mask.ndim - 1))).clone()
+    else:
+        mask = mask.clone()
+    mask[drop, :, left_len:, :left_len] = float("-inf")
+    return mask

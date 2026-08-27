@@ -50,14 +50,14 @@ def block_generate(
 ) -> tuple[torch.Tensor, int]:
     """逐块：``T-1`` 次流 Euler + 1 次 decode（decode 不做 Euler）。
 
-    末流关闭 SDE churn。默认 ``commit_x0hat=true``。
+    末流关闭 SDE churn。默认 ``commit_x0hat=true``。末块可短；EOS 后该样本停。
     """
-    del bos_token_id
+    _ = bos_token_id
     cfg = sampling_cfg or {}
     seqlen = int(seqlen or backbone.max_seq_len)
     w = int(backbone.block_size)
-    if seqlen % w != 0:
-        raise ValueError(f"seqlen {seqlen} 须能被 block_size {w} 整除")
+    if seqlen < 1:
+        raise ValueError(f"seqlen 须为正，收到 {seqlen}")
     if seqlen > int(backbone.max_seq_len):
         raise ValueError(
             f"seqlen {seqlen} 超过 max_seq_len={backbone.max_seq_len}"
@@ -70,15 +70,17 @@ def block_generate(
     if top_k is not None:
         top_k = int(top_k)
     commit_x0hat = bool(cfg.get("commit_x0hat", True))
-    w_sc_val = float(cfg.get("w_sc", 1.0))
-    w_ctx = float(cfg.get("w_ctx", 1.0))
+    w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 3.0)))
+    w_ctx = float(cfg.get("w_ctx", cfg.get("ctx_cfg_scale", 1.0)))
+    x0_src = str(getattr(backbone, "x0_source", "z")).strip().lower()
 
     device = next(backbone.parameters()).device
     dtype = next(backbone.parameters()).dtype
     levels = backbone.levels.to(device=device, dtype=dtype)
     t_steps = int(backbone.time_step)
-    n_blocks = seqlen // w
+    n_blocks = (seqlen + w - 1) // w
     pad_id = int(backbone.token_layout.pad_token_id)
+    eos_id = int(backbone.token_layout.eos_token_id)
 
     prefix_len = 0
     prefix: torch.Tensor | None = None
@@ -99,8 +101,11 @@ def block_generate(
         tokens[:, :prefix_len] = prefix
 
     if n_full > 0:
-        z_pref, _, _ = backbone.bundle.encode(prefix[:, : n_full * w], sample=False)
-        clean = backbone.to_d(z_pref)
+        z_pref, mu_pref, _ = backbone.bundle.encode(
+            prefix[:, : n_full * w], sample=False,
+        )
+        src_pref = mu_pref if x0_src == "mu" else z_pref
+        clean = backbone.to_d(src_pref)
     else:
         clean = torch.zeros(
             num_samples, 0, backbone.n_embd, device=device, dtype=dtype,
@@ -113,42 +118,66 @@ def block_generate(
     nfe = 0
     start_block = n_full
     known_rem = rem if str(backbone.cond_mode) == "clean" else 0
+    alive = torch.ones(num_samples, dtype=torch.bool, device=device)
+    if prefix_len > 0:
+        alive = alive & ~(tokens[:, :prefix_len] == eos_id).any(dim=1)
 
     for b_idx in range(start_block, n_blocks):
+        if not bool(alive.any().item()):
+            break
+        w_cur = min(w, seqlen - b_idx * w)
         z_block = torch.randn(
-            num_samples, w, backbone.n_embd, device=device, dtype=dtype,
+            num_samples, w_cur, backbone.n_embd, device=device, dtype=dtype,
         ) * float(backbone.denoiser_noise_scale)
 
         known_n = known_rem if b_idx == start_block else 0
+        if known_n > w_cur:
+            known_n = w_cur
         x_known: torch.Tensor | None = None
         if known_n > 0 and prefix is not None:
-            # 当前块余数：编码已给出的 token，钉为已知（t=1）。
-            raw = prefix[:, n_full * w : prefix_len]
-            pad_blk = raw.new_full((num_samples, w), pad_id)
-            pad_blk[:, :known_n] = raw
-            z_k, _, _ = backbone.bundle.encode(pad_blk, sample=False)
-            x_known = backbone.to_d(z_k)[:, :known_n]
+            z_k, mu_k, _ = backbone.bundle.encode(
+                prefix[:, :prefix_len], sample=False,
+            )
+            src_k = mu_k if x0_src == "mu" else z_k
+            x_known = backbone.to_d(src_k)[:, n_full * w : prefix_len]
             z_block = z_block.clone()
             z_block[:, :known_n] = x_known
 
         left = clean
-        if w_ctx == 0.0:
-            left = left[:, :0]
+        drop_ctx = abs(float(w_ctx) - 1.0) > 1e-8 and left.size(1) > 0
 
-        def _predict_v(z_cur: torch.Tensor, t_scalar: float) -> tuple[torch.Tensor, torch.Tensor]:
+        def _predict_v(
+            z_cur: torch.Tensor,
+            t_scalar: float,
+            sc_right: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             nonlocal nfe
             nfe += 1
             x_hat = backbone.forward_g(
                 left, z_cur, t_scalar, MODE_DENOISE, w_sc,
                 known_right=known_n,
+                sc_right=sc_right,
             )
             t_tok = z_cur.new_full((z_cur.size(0), z_cur.size(1)), float(t_scalar))
             if known_n > 0:
                 t_tok[:, :known_n] = 1.0
-            v = x_to_v(x_hat, z_cur, t_tok, backbone.vel_eps)
+            v_c = x_to_v(x_hat, z_cur, t_tok, backbone.vel_eps)
+            if drop_ctx:
+                nfe += 1
+                empty = left[:, :0]
+                x_u = backbone.forward_g(
+                    empty, z_cur, t_scalar, MODE_DENOISE, w_sc,
+                    known_right=known_n,
+                    sc_right=sc_right,
+                )
+                v_u = x_to_v(x_u, z_cur, t_tok, backbone.vel_eps)
+                v = v_u + float(w_ctx) * (v_c - v_u)
+            else:
+                v = v_c
             return v, x_hat
 
         x_hat = z_block
+        sc_right = torch.zeros_like(z_block)
         for hop in range(t_steps - 1):
             t_curr = float(levels[hop].item())
             t_next = float(levels[hop + 1].item())
@@ -160,27 +189,33 @@ def block_generate(
                 )
                 if x_known is not None:
                     z_back[:, :known_n] = x_known
-                v, x_hat = _predict_v(z_back, t_back)
+                v, x_hat = _predict_v(z_back, t_back, sc_right)
                 z_block = ode_update(z_back, v, t_back, t_next)
             elif method in ("sde", "ode"):
-                v, x_hat = _predict_v(z_block, t_curr)
+                v, x_hat = _predict_v(z_block, t_curr, sc_right)
                 z_block = ode_update(z_block, v, t_curr, t_next)
             else:
                 raise ValueError(f"未知 sampling_method={method!r}")
             if x_known is not None:
                 z_block[:, :known_n] = x_known
+            sc_right = x_hat.detach()
+            if known_n > 0:
+                sc_right = sc_right.clone()
+                sc_right[:, :known_n] = 0
 
         nfe += 1
         t_dec = float(levels[-1].item())
+        w_sc_dec = torch.zeros_like(w_sc) if w_sc is not None else None
         x_hat = backbone.forward_g(
-            left, z_block, t_dec, MODE_DECODE, w_sc,
+            left, z_block, t_dec, MODE_DECODE, w_sc_dec,
             known_right=known_n,
+            sc_right=sc_right,
         )
         dec_in = x_hat
-        if clean.size(1) > 0 and w_ctx != 0.0:
+        if clean.size(1) > 0:
             dec_in = torch.cat([clean, x_hat], dim=1)
         logits = backbone.exit_logits(dec_in)
-        block_logits = logits[:, -w:]
+        block_logits = logits[:, -w_cur:]
         if temperature <= 0:
             blk_tok = block_logits.argmax(dim=-1)
         else:
@@ -189,20 +224,26 @@ def block_generate(
             )
         if known_n > 0 and prefix is not None:
             blk_tok = blk_tok.clone()
-            blk_tok[:, :known_n] = prefix[:, n_full * w : prefix_len]
+            blk_tok[:, :known_n] = prefix[:, n_full * w : prefix_len][:, :known_n]
         start = b_idx * w
-        tokens[:, start : start + w] = blk_tok
+        write = blk_tok.clone()
+        write[~alive] = pad_id
+        tokens[:, start : start + w_cur] = write
 
         if commit_x0hat:
             committed = x_hat
         else:
-            z_c, _, _ = backbone.bundle.encode(blk_tok, sample=False)
-            committed = backbone.to_d(z_c)
+            z_c, mu_c, _ = backbone.bundle.encode(
+                tokens[:, : start + w_cur], sample=x0_src != "mu",
+            )
+            src_c = mu_c if x0_src == "mu" else z_c
+            committed = backbone.to_d(src_c)[:, start : start + w_cur]
         if x_known is not None:
             committed = committed.clone()
             committed[:, :known_n] = x_known
         clean = torch.cat([clean, committed], dim=1)
         known_rem = 0
+        alive = alive & ~(tokens[:, : start + w_cur] == eos_id).any(dim=1)
 
     if prefix_len > 0 and prefix is not None:
         tokens = tokens.clone()

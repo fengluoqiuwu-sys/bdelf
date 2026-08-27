@@ -107,6 +107,7 @@ class LatentBundle(nn.Module):
         self.lambda_vae = float(lambda_vae)
         self.lambda_ref = float(lambda_ref)
         self._thawed = mode == _TUNE_FULL
+        self._require_vae_dec_if_needed()
         # 冻结副本：s2 开始时的 encoder，供 ref-KL。
         # 不注册进 module 树，避免 .cuda() 时 GPU 上双份 VAE；ref-KL 在 CPU 上算。
         ref = copy.deepcopy(self.latent)
@@ -116,6 +117,33 @@ class LatentBundle(nn.Module):
         ref.to("cpu")
         self._ref_cpu: list[nn.Module] = [ref]
         self.set_tune(mode)
+
+    def _has_vae_dec(self) -> bool:
+        return callable(getattr(self._module(), "decode_logits", None))
+
+    def require_vae_dec(self, *, reason: str) -> None:
+        """``exit=decoder`` 或可训档必须能 ``decode_logits``。"""
+        if not self._has_vae_dec():
+            raise ValueError(
+                f"{reason} 须具备 VAE-dec（decode_logits），"
+                f"加载 {self.latent_model}/{self.tag} 没有该接口"
+            )
+
+    def decode_logits(
+        self,
+        z: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """走加载入口的 VAE-dec。参数是否可训由 ``latent_tune`` 决定。"""
+        return self._module().decode_logits(z, **kwargs)
+
+    def _require_vae_dec_if_needed(self) -> None:
+        """full，或 mid（含尚未解冻）须具备 VAE-dec，否则启动即拒绝。"""
+        if self.tune == _TUNE_FROZEN:
+            return
+        if self.tune not in (_TUNE_FULL, _TUNE_MID):
+            return
+        self.require_vae_dec(reason=f"latent_tune={self.tune!r}")
 
     def _module(self) -> nn.Module:
         """真正的 VAE backbone（加载器给的是 FL_PreTrainedModel 包装）。"""
@@ -163,6 +191,7 @@ class LatentBundle(nn.Module):
             return False
         self._thawed = True
         self._set_requires_grad(True)
+        self._require_vae_dec_if_needed()
         _try_add_to_optimizer(optimizer, list(self.latent.parameters()))
         return True
 

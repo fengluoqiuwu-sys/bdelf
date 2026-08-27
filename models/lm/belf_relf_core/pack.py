@@ -65,3 +65,33 @@ def pack_2l_mask(
     noisy_q_noisy_k = (~q_clean) & (~k_clean) & (q_blk >= k_blk)
     clean_q_clean_k = q_clean & k_clean & (q_blk >= k_blk)
     return noisy_q_clean_k | noisy_q_noisy_k | clean_q_clean_k
+
+
+def pack_2l_parallel_blocks_mask(
+    seq_len: int,
+    block_size: int,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """训练用并行块 2L：左右对齐同一文档块号。
+
+    noisy Q 只看更早 clean 块（``k_blk < q_blk``），噪声块之间仅同组可见；
+    clean 组因果、不看噪声。与 ``pack_2l_mask``（前缀|当前块/窗）不同，
+    专给 ``[全长 clean | 全长 noisy]``。
+    """
+    n = int(seq_len)
+    w = int(block_size)
+    if n < 1 or w < 1:
+        raise ValueError(f"seq_len 与 block_size 须 >= 1，收到 {seq_len}, {block_size}")
+    two = 2 * n
+    idx = torch.arange(two, device=device)
+    is_clean = idx < n
+    local = torch.where(is_clean, idx, idx - n)
+    blk = local // w
+    q_blk = blk[:, None]
+    k_blk = blk[None, :]
+    q_clean = is_clean[:, None]
+    k_clean = is_clean[None, :]
+    noisy_q_clean_k = (~q_clean) & k_clean & (q_blk > k_blk)
+    noisy_q_noisy_k = (~q_clean) & (~k_clean) & (q_blk == k_blk)
+    clean_q_clean_k = q_clean & k_clean & (q_blk >= k_blk)
+    return noisy_q_clean_k | noisy_q_noisy_k | clean_q_clean_k

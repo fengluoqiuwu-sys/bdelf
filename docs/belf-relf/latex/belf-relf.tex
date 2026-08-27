@@ -30,7 +30,7 @@
 
 \begin{abstract}
 本文档完整说明 bdelf 中两族半自回归连续语言模型 BELF 与 RELF 的动机、流几何、时间场、损失、CFG、训练接口与推理循环。
-二者实现上可共享模块代码，但须分别描述、分别训练，且不共享参数。共用 ELF 约定的 rectified flow（\(t=1\) 为干净端）、token 对齐 VAE、2L pack、去噪器 \(G\)，以及 \(G\) 之后的出口读 token。默认出口为与 \(G\) 等宽的因果 decoder，再计算交叉熵（CE）；默认 CE 对 \(G\) 反向传播。
+二者实现上可共享模块代码，但须分别描述、分别训练，且不共享参数。共用 ELF 约定的 rectified flow（\(t=1\) 为干净端）、token 对齐 VAE、2L pack、去噪器 \(G\)，以及 \(G\) 之后的出口读 token。默认出口为 \(D\to X\) 再走 VAE-dec（Cola）；对照为 \(D\to V\) 直接出 logits（ELF）。默认 CE 对 \(G\) 反向传播。
 \textbf{BELF} 在块内未知槽共享同一标量 \(t\)，已知余数钉干净条件，块间将提交结果写入 KV cache。
 \textbf{RELF} 在窗内使用降序局部时间梯子，每步自窗左端移出（pop）\(S\) 个槽；当前窗已知余数钉干净条件。
 每一族、每一档 \texttt{latent\_tune} 均须完成主训与扩展 token 预算；生成长度上限为 \texttt{max\_seq\_len}。
@@ -89,7 +89,7 @@ Rolling Diffusion~\cite{rolling2024} 将全局 \(t\) 映射为帧局部 \(t_k\)�
 \paragraph{模型。}
 网络结构。必填 \texttt{latent\_model} 与 \texttt{tag}，无默认，用于调用已有加载器 \texttt{load\_latent\_artifact}。入口 encoder / decoder 在参数表里只记这两项；隐维 \(X\)、词表、VAE 层数、s1 系数以加载结果为准，不列表。入口 encoder 的注意力块长以加载结果为准，不随本规格改写。\texttt{block\_size} 仅 BELF：\(G\) 去噪块长，100m 默认 16，主跑 \(W=T\)。加载入口块长须为 \(1\)（逐 token 因果）或等于本题 BELF \(W\)。RELF 无此字段；加载入口块长必须为 \(1\)；窗长 \texttt{window\_size} 与入口无关。
 
-\texttt{n\_embd}（记 \(D\)）是 \(G\) 与 decoder 出口的隐层宽度，须整除 \texttt{n\_head}，全文只声明一次。\texttt{max\_seq\_len} 是位置编码与生成长度上限。出口 \texttt{exit} 二选一：默认 \texttt{decoder}，接与 \(D\) 等宽的因果 decoder 再计算 CE；对照 \texttt{linear}，将 \(\hat x_0\) 线性映射到词表。两类仅改变 \(\hat x_0\to\mathrm{logits}\) 这一段；CE 施加于哪些位置由本族规定。
+\texttt{n\_embd}（记 \(D\)）是 \(G\) 的隐层宽度，须整除 \texttt{n\_head}，全文只声明一次。\texttt{max\_seq\_len} 是位置编码与生成长度上限。出口 \texttt{exit} 只有一层线性，映射目标不同：默认 \texttt{decoder}（Cola）为 \(D\to X\) 再走加载的 VAE-dec 得 logits；对照 \texttt{linear}（ELF）为 \(D\to V\) 直接得 logits。两类只改 \(\hat x_0\to\mathrm{logits}\) 这一段；CE 施加于哪些位置由本族规定。无出口层数键。
 
 \texttt{sc\_cfg} 决定网络是否包含 ScaleEmbedder 与 self-cond 通道，因此进入模型指纹。
 
@@ -113,11 +113,11 @@ Rolling Diffusion~\cite{rolling2024} 将全局 \(t\) 映射为帧局部 \(t_k\)�
 
 第二阶段（s2）始终训练映射、\(G\) 与出口。冻结档不计算 \(\mathcal{L}_{\mathrm{s1}}\)。
 \texttt{full} 与解冻后的 \texttt{mid}：只要更新 latent 的任一侧（encoder、VAE-dec、或两侧），就必须计算完整的 \(\mathcal{L}_{\mathrm{s1}}\)（重建 + \(\mathrm{KL}(q\|N(0,I))\) + BERT-mask + ref-KL）。\(\mathcal{L}_{\mathrm{s1}}\) 与 \(\mathcal{L}\) 分开相加。
-出口 CE 计入 \(\mathcal{L}\)；VAE-dec 仅由 \(\mathcal{L}_{\mathrm{s1}}\) 提供监督。若加载结果只有 encoder，可训档必须另配 VAE-dec，同样仅由 \(\mathcal{L}_{\mathrm{s1}}\) 提供监督。\texttt{full} 与 \texttt{mid} 在启动时即须具备该模块；\texttt{mid} 解冻前仍不计算 \(\mathcal{L}_{\mathrm{s1}}\)。
+出口 CE 计入 \(\mathcal{L}\)。\texttt{exit=decoder} 时 CE 经 \(D\to X\) 与 VAE-dec 回传；VAE-dec 参数是否更新仍只由 \texttt{latent\_tune} 决定（frozen 时参数冻结，梯度仍可回到 \(G\)）。可训档的 \(\mathcal{L}_{\mathrm{s1}}\) 仍经同一 VAE-dec。\texttt{exit=decoder} 或可训档启动时须具备 VAE-dec。\texttt{mid} 解冻前仍不计算 \(\mathcal{L}_{\mathrm{s1}}\)。
 速度误差仍可反向传播到 encoder；2L 左段的 \texttt{sg} 只切断 pack 左半，不切断该梯度。默认 CE 对 \(G\) 反向传播。
 
 \paragraph{启动校验。}
-加载结果的 \(X\) 须与映射一致；入口 encoder 块长以加载结果为准，不随 \(W\) 改写。BELF：加载入口 \texttt{encoder.block\_size} \(\in\{1,W\}\)。RELF 无 \texttt{block\_size}；加载入口块长必须为 \(1\)，且 \(S\cdot T=W\)。两族 \texttt{time\_step} \(T\ge 4\)，否则报错。\(G\) 的宽度等于 \(D\)；\texttt{exit} 与实际模块匹配；可训档须具备 VAE-dec（加载结果自带，或另配）。VAE-dec 仅由 \(\mathcal{L}_{\mathrm{s1}}\) 提供监督。各族额外校验见本族章。
+加载结果的 \(X\) 须与映射一致；入口 encoder 块长以加载结果为准，不随 \(W\) 改写。BELF：加载入口 \texttt{encoder.block\_size} \(\in\{1,W\}\)。RELF 无 \texttt{block\_size}；加载入口块长必须为 \(1\)，且 \(S\cdot T=W\)。两族 \texttt{time\_step} \(T\ge 4\)，否则报错。\(G\) 的宽度等于 \(D\)；\texttt{exit} 与实际模块匹配；\texttt{exit=decoder} 或可训档须具备 VAE-dec。各族额外校验见本族章。
 
 \subsection{流、去噪器与出口}
 
@@ -145,7 +145,7 @@ v^\star=x_0-\varepsilon.
 +\lambda_{\mathrm{mask}}\,\mathcal{L}_{\mathrm{mask}}
 +\lambda_{\mathrm{ref}}\,\mathrm{KL}(q_\phi\|q_{\phi_{\mathrm{ref}}}).
 \]
-\(\mathrm{CE}_{\mathrm{rec}}\) 与 BERT-mask 都经 VAE-dec（不是出口）。\(q_{\phi_{\mathrm{ref}}}\) 是 s2 开始时加载器给出的 encoder 冻结副本。\texttt{frozen} 时 \(\mathcal{L}_{\mathrm{s1}}=0\)。
+\(\mathrm{CE}_{\mathrm{rec}}\) 与 BERT-mask 都经 VAE-dec（不经 \texttt{ExitMap}）。\(q_{\phi_{\mathrm{ref}}}\) 是 s2 开始时加载器给出的 encoder 冻结副本。\texttt{frozen} 时 \(\mathcal{L}_{\mathrm{s1}}=0\)。
 
 网络默认分为三段：加载器编码、去噪器 \(G\)、出口。\(G\) 一律使用逐位置时间嵌入与 AdaLN-Zero；若本族各位置 \(t\) 相同，则广播同一标量。
 
@@ -162,17 +162,22 @@ pack_2l [sg(h_left)|h_t]
   |                -> AdaLN-Zero -> SwiGLU)
   |  FinalLayer (AdaLN-Zero) -> x0_hat
   v
-Exit (exactly one):  eq-width Dec -> Linear(D->V)  |  Linear(D->V)
+Exit (exactly one linear):  Linear(D->X) + VAE-dec  |  Linear(D->V)
 \end{verbatim}
 
-2L 与 Cola 块因果结构同构：已完成段写入 KV 后组内双向、组间单向；右段可见左段。BELF 的组是本规格 \texttt{block\_size} \(W\)；RELF 已完成段按加载入口块长（必须为 1，即逐 token 因果），窗内组是档 \(S\)。左段 \(t=1\)，不加 \(m\)，AdaLN-Zero 不以 \(w_{\mathrm{sc}}\) 为条件。\texttt{sc\_cfg} 为真时仅右段未知 denoise 槽再以 \(w_{\mathrm{sc}}\) 为条件；未知 decode 槽加 \(m=\mathrm{decode}\)、不以 \(w_{\mathrm{sc}}\) 为条件。s1 的 VAE-dec 仅服务于 \(\mathcal{L}_{\mathrm{s1}}\)，不代替出口读 token。\(G\) 的注意力可见性按本族掩码节落地。时间梯子与各族如何铺 \(t\)，见第~\ref{sec:time}~节。
+\paragraph{出口叠法。}
+两族共用一层线性 \texttt{ExitMap}，不算 \(G\) 的一部分，也无层数键。\texttt{linear}（ELF）：\(\mathrm{Linear}(D\to V)\) 直接出 logits。\texttt{decoder}（Cola）：\(\mathrm{Linear}(D\to X)\) 映回入口隐空间，再调用加载的 VAE-dec 出 logits。VAE-dec 的层数 / 块长以加载结果为准，不在本规格另建。CE 施加于哪些位置仍由本族规定。
+
+喂给出口的序列两族不同。BELF 训练只把右段 \(\hat x_0\)（一批块拼成一条）送进出口，\textbf{不}拼接已提交前缀；推理 \texttt{block\_generate} 把已提交的干净码与当前块 \(\hat x_0\) 拼接后再取末 \(W\) 个 logits。RELF 训练在 \texttt{decoder} 下对每个窗做 \(\mathrm{cat}(\hat x_0^{\mathrm{left}}[{:}g],\,\hat x_0^{\mathrm{win}})\)（\(g=u+k_0\)），再取窗内 logits；\texttt{linear} 只看右段。推理 \texttt{rolling\_generate} 把 \(G\) 的整段 2L 输出送进出口，再切右段窗。因此：BELF 训练出口看不到前缀，推理前缀是提交码而不是 \(G\) 左段输出；RELF 训练与推理的 decoder 前缀都是 \(G\) 左段的 \(\hat x_0\)。
+
+2L 与 Cola 块因果结构同构：已完成段写入 KV 后组内双向、组间单向；右段可见左段。BELF 的组是本规格 \texttt{block\_size} \(W\)；RELF 已完成段按加载入口块长（必须为 1，即逐 token 因果），窗内组是档 \(S\)。左段 \(t=1\)，不加 \(m\)，AdaLN-Zero 不以 \(w_{\mathrm{sc}}\) 为条件。\texttt{sc\_cfg} 为真时仅右段未知 denoise 槽再以 \(w_{\mathrm{sc}}\) 为条件；未知 decode 槽加 \(m=\mathrm{decode}\)、不以 \(w_{\mathrm{sc}}\) 为条件。\texttt{exit=decoder} 时 VAE-dec 读 token；\(\mathcal{L}_{\mathrm{s1}}\) 仍只用它做重建。\(G\) 的注意力可见性按本族掩码节落地。时间梯子与各族如何铺 \(t\)，见第~\ref{sec:time}~节。
 
 \subsection{日程与 checkpoint}
 
 Token 预算：每族 \(\times\) 每一 \texttt{latent\_tune} 各有主训与扩展两份，不共用（\(B_{\mathrm{main}}\) / \(B_{\mathrm{ext}}\) 见表）。切分长度与档比见附录~\ref{sec:len}。工程上主训与扩展是两次独立训练（不同 preprocess / 不同 checkpoint 哈希），扩展可用更大显存的卡。扩展启动时要求同参主训已正常结束，并从主训 \texttt{checkpoint\_latest} 的 EMA 初始化 live 权重（不恢复优化器）。\texttt{mid} 的解冻点落在主训内；若主训已过解冻点，扩展立即保持解冻。
 
 新 run 自 step 0 调用 \texttt{load\_latent\_artifact}，扩展 run 再被主训 EMA 覆盖。此后只使用本 run 的 checkpoint 中的 latent 副本。无论是否训练 latent，该 checkpoint 都必须包含完整 latent 参数。同一 Stage 续训先读取本 run，再按累计 token 判断是否已超过 \texttt{latent\_thaw\_tokens}。
-模型类字段进入模型指纹（包括 \texttt{latent\_model}+\texttt{tag}、\texttt{sc\_cfg}）；训练类进入训练指纹（包括 \texttt{latent\_tune}）；推理类不进入训练指纹。
+模型类字段进入模型指纹（包括 \texttt{latent\_model}+\texttt{tag}、\texttt{sc\_cfg}）；训练类进入训练指纹（包括 \texttt{latent\_tune}）。现网只有一份训练哈希 \texttt{build\_train\_fingerprint}：整份 model YAML（含 \texttt{sampling}）与 \texttt{generate\_cfg} 一并纳入；推理字段因此也会换 run 目录。规格分类上的「推理不进训练指纹」与此现网行为分开：本次不改全局管线。
 
 \subsection{共性参数}
 
@@ -187,11 +192,11 @@ Token 预算：每族 \(\times\) 每一 \texttt{latent\_tune} 各有主训与扩
 \multicolumn{4}{@{}l}{\textit{模型（共用）}} \\
 \texttt{latent\_model} & & 交给 \texttt{load\_latent\_artifact} 的家族名。 & 必填 \\
 \texttt{tag} & & 交给加载器的 tag。 & 必填 \\
-\texttt{n\_embd} & \(D\) & \(G\) 与 decoder 出口隐层宽。只声明一次。 & \(768\) \\
+\texttt{n\_embd} & \(D\) & \(G\) 隐层宽。只声明一次。 & \(768\) \\
 \texttt{proj\_type} & & \(X\to D\)：\texttt{linear} 一层线性，或 \texttt{bottleneck} 经 \(b\) 再扩到 \(D\)。 & \texttt{linear} \\
 \texttt{bottleneck\_dim} & \(b\) & 仅 \texttt{proj\_type=bottleneck} 的中间维。 & \(128\) \\
 \texttt{max\_seq\_len} & & 位置编码与生成长度上限。 & \(4096\) \\
-\texttt{exit} & & 等宽 \texttt{decoder}，或对照 \texttt{linear}。 & \texttt{decoder} \\
+\texttt{exit} & & \texttt{decoder}：\(D\to X\) 再 VAE-dec（Cola）；\texttt{linear}：\(D\to V\)（ELF）。 & \texttt{decoder} \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练（共用）}} \\
 \texttt{latent\_tune} & & 加载之后是否训练 latent 本体。三档对应三个训练配置哈希。 & \texttt{mid} \\
@@ -326,7 +331,7 @@ CFG 含两根相互独立的轴。\(w_{\mathrm{sc}}\) 仅进入右段未知 \tex
 条件对象为上一跳的 \(\hat x_0\)。启用时 \(w_{\mathrm{sc}}\) 进入 AdaLN 的 \texttt{ScaleEmbedder}，与 \(t\) 的 \texttt{TimestepEmbedder} 分开。推理为单次前向。
 
 \paragraph{启动开关。}
-\texttt{sc\_cfg} 默认 \texttt{true}，进入模型指纹，因其决定网络是否包含 ScaleEmbedder 与 self-cond 通道。为真时必须具备 sc 通道。训练启动时若设为 \texttt{false}：不构建 ScaleEmbedder、无 sc 通道、AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件（仍逐列加 \(m\)）、\(v_{\mathrm{tgt}}=v_z\)、不做 teacher 的 \(\Delta v\) 前向；推理忽略 \texttt{self\_cond\_cfg\_scale}。\texttt{sc\_cfg} 为真则 \texttt{self\_cond=true}。
+\texttt{sc\_cfg} 默认 \texttt{true}，进入模型指纹，因其决定网络是否包含 ScaleEmbedder 与 self-cond 通道。为真时必须具备 sc 通道。训练启动时若设为 \texttt{false}：不构建 ScaleEmbedder、无 sc 通道、AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件（仍逐列加 \(m\)）、\(v_{\mathrm{tgt}}=v_z\)、不做 teacher 的 \(\Delta v\) 前向；推理忽略 \texttt{w\_sc}。\texttt{sc\_cfg} 为真则 \texttt{self\_cond=true}。
 
 \paragraph{训练采样。}
 \texttt{sc\_cfg} 为真时，每个样本独立采样两项：
@@ -399,8 +404,8 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \texttt{ctx\_p\_drop} & \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) & 丢弃 2L 左段的概率。与 \(g\) 独立。不进消融。 & \(0.1\) \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
-\texttt{self\_cond\_cfg\_scale} & \(w_{\mathrm{sc}}\) & 推理尺度。\texttt{sc\_cfg=false} 的 ckpt 忽略。 & \(3.0\) \\
-\texttt{ctx\_cfg\_scale} & \(w_{\mathrm{ctx}}\) & 推理上下文外推；\(1\)=不外推。 & \(1.0\) \\
+\texttt{w\_sc} & \(w_{\mathrm{sc}}\) & 推理尺度。\texttt{sc\_cfg=false} 的 ckpt 忽略。YAML / \texttt{sampling} 键名即此；实现仍接受 ELF 别名 \texttt{self\_cond\_cfg\_scale}，但已写 \texttt{w\_sc} 时别名不生效。 & \(3.0\) \\
+\texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & 推理上下文外推；\(1\)=不外推。YAML 键名即此；别名 \texttt{ctx\_cfg\_scale} 同上。 & \(1.0\) \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -428,8 +433,8 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \texttt{sc\_cfg} & & \texttt{true} & \texttt{false}（训练启动时关闭整套 \(w_{\mathrm{sc}}\)，无 sc 通道） \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
-\texttt{self\_cond\_cfg\_scale} & \(w_{\mathrm{sc}}\) & \(3\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\
-\texttt{ctx\_cfg\_scale} & \(w_{\mathrm{ctx}}\) & \(1\) & \(\{1,2,3,5,7\}\) \\
+\texttt{w\_sc} & \(w_{\mathrm{sc}}\) & \(3\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\
+\texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & \(1\) & \(\{1,2,3,5,7\}\) \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -482,7 +487,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 
 \subsection{训练}
 
-加载并按 \texttt{latent\_tune} 编码，按 \(W\) 切块（主训切分见附录~\ref{sec:len}），映射后 2L pack。CFG 采样见第~\ref{sec:cfg}~节。切块对齐 \(0,W,2W,\ldots\)。是否混合块、已知槽如何钉干净，见第~\ref{sec:belf-clean}~节。按第~\ref{sec:belf-t}~节指定右段时间并加噪：未知槽 \(t=L_i\)；已知槽见 Clean 节。
+加载并按 \texttt{latent\_tune} 编码，按 \(W\) 切块（主训切分见附录~\ref{sec:len}），映射后 2L pack。CFG 采样见第~\ref{sec:cfg}~节。切块对齐 \(0,W,2W,\ldots\)。\textbf{训练要求}序列长度被 \(W\) 整除，否则报错拒绝；混合块余数按满块 \(W\) 抽取 \(r\sim\mathrm{Unif}\{1,\ldots,W-1\}\)，不按短末块有效长 \(W'\)。推理末块可短，见第~\ref{sec:belf}~节推理。是否混合块、已知槽如何钉干净，见第~\ref{sec:belf-clean}~节。按第~\ref{sec:belf-t}~节指定右段时间并加噪：未知槽 \(t=L_i\)；已知槽见 Clean 节。
 
 未知槽 \(z_t=t x_0+(1-t)\varepsilon\)。\(i=0,\ldots,T-2\)：右段未知有效位计算 v-MSE（\(m=\mathrm{denoise}\)），\(\mathcal{L}_{\mathrm{ce}}=0\)。\(i=T-1\)：右段未知有效位纯 CE（\(t=1-\varepsilon\)，\(m=\mathrm{decode}\)），无 v-MSE、不以 \(w_{\mathrm{sc}}\) 为条件。已知槽不进入 \(\mathcal{L}\)。不引入 \(m_d\)/\(m_c\)。注意力与 sc 通道按第~\ref{sec:belf-mask}~节排布。默认 CE 对 \(G\) 反向传播。
 
@@ -491,7 +496,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \subsection{掩码排布}
 \label{sec:belf-mask}
 
-一次前向的 pack 是 \(\bigl[\text{左段前缀}\mid\text{右段当前块}\bigr]\)。切块对齐 \(0,W,2W,\ldots\)。一批块时右段按块拼接，各块独立套用下列规则，禁止跨块右段相互可见。末块可短于 \(W\)（指序列末端不够一整块）。pad / 短块空位不计入损失。左段与已知槽不进入 \(\mathcal{L}\)。损失为右段未知有效位平均，见训练节；不引入 \(m_d\)/\(m_c\)。
+一次前向的 pack 是 \(\bigl[\text{左段前缀}\mid\text{右段当前块}\bigr]\)。切块对齐 \(0,W,2W,\ldots\)。一批块时右段按块拼接，各块独立套用下列规则，禁止跨块右段相互可见。\textbf{训练}序列长度须被 \(W\) 整除，因而训练右段没有短末块。推理末块可短于 \(W\)（序列末端不够一整块）。pad 不计入损失。左段与已知槽不进入 \(\mathcal{L}\)。损失为右段未知有效位平均，见训练节；不引入 \(m_d\)/\(m_c\)。
 
 \paragraph{注意力。}
 见图~\ref{fig:belf-attn}。已完成块写入 KV：块内双向、块间单向（后块可见前块）。当前块内双向，且可见文档位置早于本块起点的已完成内容；已完成块不能看当前块。一批右段时各块独立，禁止跨块互看。\(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 时切断左段。
@@ -533,12 +538,13 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \texttt{train\_t\_schedule} & & 训练期时间采样规则。 & \texttt{block} \\
 \texttt{cond\_mode} & & 当前块内已知余数如何条件化。 & \texttt{clean} \\
 \texttt{clean\_block\_prob} & \(p_{\mathrm{clean}}\) & 训练时当前块抽成混合块的概率。不进消融。 & \(0.05\) \\
+训练长度 & & \texttt{forward} 要求序列长度被 \(W\) 整除，否则报错。切分档须满足此约束。 & 须整除 \\
 \bottomrule
 \end{tabularx}
 \end{center}
 }
 
-CE 仅在 \(i=T-1\) 对未知有效位叠加（该跳无 v-MSE、不以 \(w_{\mathrm{sc}}\) 为条件）；不引入 \(m_d\)/\(m_c\)。注意力见第~\ref{sec:belf-mask}~节。未知槽同一标量 \(t\)；已知槽钉 \(t=1\)。生成使用 \texttt{block\_generate}。加载入口块长须 \(\in\{1,W\}\)。默认 \(W\) 见表（100m 为 16），主跑 \(W=T\)；满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。\texttt{clean\_block\_prob} 不进消融。全局提交、采样器与温度见第~\ref{sec:infer}~节；CFG 尺度见第~\ref{sec:cfg}~节。
+CE 仅在 \(i=T-1\) 对未知有效位叠加（该跳无 v-MSE、不以 \(w_{\mathrm{sc}}\) 为条件）；不引入 \(m_d\)/\(m_c\)。注意力见第~\ref{sec:belf-mask}~节。未知槽同一标量 \(t\)；已知槽钉 \(t=1\)。生成使用 \texttt{block\_generate}。加载入口块长须 \(\in\{1,W\}\)。训练序列长度须被 \(W\) 整除。默认 \(W\) 见表（100m 为 16），主跑 \(W=T\)；满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。\texttt{clean\_block\_prob} 不进消融。全局提交、采样器与温度见第~\ref{sec:infer}~节；CFG 尺度见第~\ref{sec:cfg}~节。
 
 \subsection{BELF 消融}
 
@@ -755,7 +761,7 @@ m_d(k)=\mathbf{1}[F_k<1-\varepsilon].
 
 本节给出两族共用的推理项。这些字段可在同一 checkpoint 上更改，不进入训练指纹。BELF 生成使用 \texttt{block\_generate}，RELF 生成使用 \texttt{rolling\_generate}。CFG 的推理尺度见第~\ref{sec:cfg}~节。
 
-默认 \texttt{commit\_x0hat=true}：将 \(G\) 的 \(\hat x_0\) 写入 \(G\) 的 KV；若出口为 decoder，亦写入 decoder 的 KV。对照 \texttt{false}：先由出口读出 token，再 encode 采样 \(z\) 写入。写入 KV 的空间必须与 \texttt{x0\_source} 一致，两条策略分开报告。训练时左段仍是 encoder 的干净码。提交与 \texttt{forward\_clean} 时，左段 \(t=1\)，AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件，sc 通道为 0。
+默认 \texttt{commit\_x0hat=true}：将 \(G\) 的 \(\hat x_0\) 写入 \(G\) 的 KV。对照 \texttt{false}：先由出口读出 token，再 encode 采样 \(z\) 写入。写入 KV 的空间必须与 \texttt{x0\_source} 一致，两条策略分开报告。训练时左段仍是 encoder 的干净码。出口是无状态的一层线性（\texttt{decoder} 再接加载的 VAE-dec），不维护 KV。提交时左段 \(t=1\)，AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件，sc 通道为 0。
 
 采样默认 \texttt{sampling\_method=sde}（\(\gamma\) 见表），对照 \texttt{ode}。\texttt{sde} 时 churn 关在最后一次\textbf{流}（BELF 跳 \(T-2\)；RELF 升档侧），decode 前向无速度。\texttt{sc\_cfg} 为真时，仅 denoise 未知槽 AdaLN 以推理 \(w_{\mathrm{sc}}\) 为条件（仅开训 checkpoint 可扫描）；decode 列 \(w_{\mathrm{sc}}=0\)。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
@@ -809,7 +815,7 @@ m_d(k)=\mathbf{1}[F_k<1-\varepsilon].
 
 \subsection{已确定：\texorpdfstring{\(w_{\mathrm{sc}}\)}{w\_sc} 进入哪一段 AdaLN}
 
-左段是 \(t=1\) 的干净前缀。若 AdaLN 亦以推理 \(w_{\mathrm{sc}}\) 为条件，前缀 KV 会随 \(w_{\mathrm{sc}}\) 变化，与训练中「左段不以 \(w_{\mathrm{sc}}\) 为条件」不一致。规格如下：\textbf{仅右段未知 denoise 槽以 \((t,w_{\mathrm{sc}},m=\mathrm{denoise})\) 为条件}。未知 decode 槽以 \((t,m=\mathrm{decode})\) 为条件、不以 \(w_{\mathrm{sc}}\) 为条件。提交、\texttt{forward\_clean}、左段与已知槽均不以 \(w_{\mathrm{sc}}\) 为条件、不加 \(m\)。\(g=0\) 时 sc 仍为 \(0\)，但 denoise 未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。扫描 \(w_{\mathrm{sc}}\) 时不重算前缀 KV。见第~\ref{sec:cfg}~节、第~\ref{sec:infer}~节。
+左段是 \(t=1\) 的干净前缀。若 AdaLN 亦以推理 \(w_{\mathrm{sc}}\) 为条件，前缀 KV 会随 \(w_{\mathrm{sc}}\) 变化，与训练中「左段不以 \(w_{\mathrm{sc}}\) 为条件」不一致。规格如下：\textbf{仅右段未知 denoise 槽以 \((t,w_{\mathrm{sc}},m=\mathrm{denoise})\) 为条件}。未知 decode 槽以 \((t,m=\mathrm{decode})\) 为条件、不以 \(w_{\mathrm{sc}}\) 为条件。提交、左段与已知槽均不以 \(w_{\mathrm{sc}}\) 为条件、不加 \(m\)。\(g=0\) 时 sc 仍为 \(0\)，但 denoise 未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。扫描 \(w_{\mathrm{sc}}\) 时不重算前缀 KV。见第~\ref{sec:cfg}~节、第~\ref{sec:infer}~节。
 
 \subsection{已确定：BELF / RELF 用 clean 处理已知余数}
 
@@ -839,11 +845,12 @@ m_d(k)=\mathbf{1}[F_k<1-\varepsilon].
   \item 主训对齐长度 512，全部样本为该长度。
   \item 扩展对齐长度 2048；\(5\mathrm{B}\) 按档 token 比 \(1{:}2{:}3{:}4\) 分成 \(0.5{+}1.0{+}1.5{+}2.0\,\mathrm{B}\)，档 \(\{256,512,1024,2048\}\)。
   \item 训练切分止于 2048。\(2048<S\le 4096\) 仅出现于推理外推。eval 主报 2048，4096 作为外推。
+  \item BELF 训练另要求每条样本长度被 \(W\) 整除（100m 默认 \(W=16\)；上列档均满足）。不整除则 \texttt{forward} 报错。RELF 无此整除约束。
 \end{itemize}
 
 \section{共性参数附表}
 
-下列为共性章未列入主表的字段，仍按模型 / 训练 / 推理分栏。CFG 主表见第~\ref{sec:cfg}~节，全局推理主表见第~\ref{sec:infer}~节。修改这些字段仍须写入对应指纹（推理类除外），但本文档不以它们为对照轴。入口 encoder / decoder 只记 \texttt{latent\_model} 与 \texttt{tag}；隐维、词表、VAE 容量、s1 系数以加载结果为准，不列入本表。出口 decoder 与 \(G\) 等宽，层数亦不列入本表。表中 100m 数字供该规模实现对齐，并非另一套规范。BELF 的 \texttt{block\_size}、RELF 的窗字段在本族章，不在本表。
+下列为共性章未列入主表的字段，仍按模型 / 训练 / 推理分栏。CFG 主表见第~\ref{sec:cfg}~节，全局推理主表见第~\ref{sec:infer}~节。修改这些字段仍须写入对应指纹（推理类除外），但本文档不以它们为对照轴。入口 encoder / decoder 只记 \texttt{latent\_model} 与 \texttt{tag}；隐维、词表、VAE 容量、s1 系数以加载结果为准，不列入本表。出口只有一层线性，无层数键；\texttt{decoder} 再接的 VAE-dec 以加载结果为准。表中 100m 数字供该规模实现对齐，并非另一套规范。BELF 的 \texttt{block\_size}、RELF 的窗字段在本族章，不在本表。
 
 {\small
 \setlength{\tabcolsep}{4pt}
@@ -892,18 +899,21 @@ m_d(k)=\mathbf{1}[F_k<1-\varepsilon].
 \texttt{ce\_detach\_g} & & 出口 CE 是否在 \(\hat x_0\) 处 stop-grad。默认对 \(G\) 反向传播；不列入训练消融。 & \texttt{false} \\
 \texttt{ctx\_source} & & 2L 左段用 \(z\) 还是 \(\mu\)。 & \texttt{z} \\
 \texttt{x0\_source} & & 流的干净端 / v-MSE 靶。 & \texttt{z} \\
-\texttt{learning\_rate} & & AdamW 学习率。 & \(10^{-3}\) \\
-\texttt{muon\_learning\_rate} & & Muon 学习率。 & \(10^{-3}\) \\
+\texttt{optimizer.dtype} & & 训练精度。与 ELF 配方相同。 & \texttt{bf16} \\
+\texttt{learning\_rate} & & AdamW 学习率。与 ELF 配方相同。 & \(0.002\) \\
+\texttt{muon\_learning\_rate} & & Muon 学习率。与 ELF 配方相同。 & \(0.002\) \\
 \texttt{weight\_decay} & & weight decay。 & \(0\) \\
+\texttt{muon\_weight\_decay} & & Muon weight decay。 & \(0\) \\
 \texttt{beta1} & \(\beta_1\) & AdamW \(\beta_1\)。 & \(0.9\) \\
 \texttt{beta2} & \(\beta_2\) & AdamW \(\beta_2\)。 & \(0.95\) \\
 \texttt{grad\_clip} & & 全局梯度裁剪。 & \(1.0\) \\
 \texttt{muon\_momentum} & & Muon momentum。 & \(0.95\) \\
+\texttt{muon\_ns\_steps} & & Muon Newton–Schulz 步数。 & \(5\) \\
 \texttt{use\_muon} & & 隐藏层 Linear 用 Muon。 & \texttt{true} \\
 \texttt{ema\_decay} & & EMA；\(0\) 关闭。 & \(0.9999\) \\
 \texttt{warmup\_ratio} & & 预热占 \texttt{max\_steps} 的比例。 & \(0.005\) \\
-\texttt{min\_lr\_ratio} & & 最小学习率相对峰值；\(1\)=constant。 & \(1.0\) \\
-\texttt{global\_batch\_size} & & 全局批。 & \(512\) \\
+\texttt{min\_lr\_ratio} & & 最小学习率相对峰值；\(1\)=constant（BELF/RELF 脚本 \texttt{--set}）。 & \(1.0\) \\
+\texttt{global\_batch\_size} & & 全局批。s1 为 512；s2 用 curriculum \texttt{global\_seq\_batch}=128。 & \(512\)（s1） \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
 \texttt{ctx\_cfg\_min} & \(w^{\mathrm{ctx}}_{\min}\) & 推理 \(w_{\mathrm{ctx}}\) 下界。 & \(1\) \\

@@ -7,44 +7,52 @@ n_layer: 12  # G 的 AdaLN-Zero 层数
 n_head: 12  # 注意力头数
 n_embd: 768  # 隐层宽度 D
 dropout: 0.0  # Dropout
+mlp_ratio: 4.0  # SwiGLU 扩展比
 latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
-exit: decoder  # 读出：decoder | linear
+exit: decoder  # 读出：linear 映到 logits（ELF）；decoder 映到 VAE-dec（Cola）
 sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
 latent_tune: mid  # 入口可训档：frozen | full | mid
 time_step: 16  # 梯子档数 T；须 >= 4
 proj_type: linear  # 白化后 X→D 映射
 attn_backend: sdpa  # 注意力后端；本族仅 sdpa
 block_size: 16  # G 去噪块长 W；入口 encoder 块长须 ∈{1,W}
-n_layer_dec: 6  # exit=decoder 时读出层数
+bottleneck_dim: 128  # 可选瓶颈维；linear 映射可忽略
+proj_bias: true  # 入口投影是否带 bias
+proj_norm: rmsnorm  # 投影后归一化
+whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
+whiten_on: mu  # 白化统计作用对象
+qk_norm: true  # Q/K RMSNorm
+rope_dim: null  # 每头 RoPE 维；null 表示用 head_dim
+rope_theta: 10000.0  # RoPE 基频
+t_freq_dim: 256  # 时间正弦嵌入维
+lm_head_bias: false  # lm_head 是否带 bias
+noise_sigma: 1.0  # 插值噪声尺度
 latent_thaw_tokens: 15000000000  # mid 解冻有效 token 点
-p_mean: -1.5  # 梯子 logit-normal 均值
-p_std: 0.8  # 梯子 logit-normal 标准差
-t_eps: 0.05  # 干净端 1-ε
-vel_eps: 1.0e-5  # x-pred→v 分母下限
+denoiser_p_mean: -1.5  # 梯子 logit-normal 均值
+denoiser_p_std: 0.8  # 梯子 logit-normal 标准差
+t_clean_eps: 0.05  # 干净端 1-ε
+vel_eps: 1.0e-3  # x-pred→v 分母下限
 ce_detach_g: false  # CE 是否 detach G
 cond_mode: clean  # 条件模式；主跑 clean
 clean_block_prob: 0.05  # 抽混合块并把余数钉 t=1 的概率
+train_t_schedule: block  # 训练抽跳：block
 lambda_mse: 1.0  # denoise v-MSE 权重
 lambda_ce: 1.0  # decode CE 权重
 lambda_s1: 1.0  # 联合训时 L_s1 权重
 lambda_vae: 1.0  # s1 重建项权重
 lambda_ref: 1.0  # s1 参考编码器 KL 权重
-sc_p_mean: 0.0  # w_sc 采样 logit-normal 均值
-sc_p_std: 1.0  # w_sc 采样 logit-normal 标准差
-w_sc_min: 0.5  # w_sc 下界
-w_sc_max: 5.0  # w_sc 上界
+ctx_source: z  # 左段条件来源：z | mu
+x0_source: z  # 干净端来源：z | mu
+self_cond_cfg_p_mean: -1.5  # w_sc 采样 logit-normal 均值
+self_cond_cfg_p_std: 0.8  # w_sc 采样 logit-normal 标准差
+self_cond_cfg_min: 0.5  # w_sc 下界
+self_cond_cfg_max: 5.0  # w_sc 上界
 sc_guided_prob: 0.5  # 训练 teacher 走 guided 混合的概率
-ctx_drop_prob: 0.1  # 丢掉左段前缀的概率（不进 AdaLN）
-denoiser_noise_scale: 1.0  # 插值噪声尺度
-rope_dim: null  # 每头 RoPE 维；null 表示用 head_dim
-qk_norm: true  # Q/K RMSNorm
-mlp_ratio: 4.0  # SwiGLU 扩展比
-whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
+ctx_p_drop: 0.1  # 丢掉左段前缀的概率（不进 AdaLN）
 
 sampling:
   sampling_method: sde  # 采样方法：sde | ode
-  num_sampling_steps: 16  # 每块流步上界（实现按 T-1 流 + 1 decode）
   sde_gamma: 1.5  # SDE churn 系数；末流关闭
   w_sc: 3.0  # 推理 self-cond CFG 缩放
   w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀

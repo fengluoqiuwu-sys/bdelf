@@ -68,7 +68,6 @@ class FL_RelfConfig(PretrainedConfig):
         qk_norm: bool = True,
         rope_theta: float = 10000.0,
         t_freq_dim: int = 256,
-        n_exit_layer: int = 2,
         lm_head_bias: bool = False,
         noise_sigma: float = 1.0,
         latent_thaw_tokens: int = 15_000_000_000,
@@ -80,6 +79,7 @@ class FL_RelfConfig(PretrainedConfig):
         vel_eps: float = 1e-3,
         lambda_mse: float = 1.0,
         lambda_ce: float = 1.0,
+        lambda_s1: float = 1.0,
         ce_detach_g: bool = False,
         ctx_source: str = "z",
         x0_source: str = "z",
@@ -100,6 +100,8 @@ class FL_RelfConfig(PretrainedConfig):
             raise ValueError("relf 无 block_size；请用 window_size / step_size")
         if "gen_mode" in kwargs:
             raise ValueError("relf 不设 gen_mode；生成锁死 rolling_generate")
+        if "n_exit_layer" in kwargs or "n_layer_dec" in kwargs:
+            raise ValueError("relf 出口无层数；exit=linear 映到 logits，exit=decoder 映到 VAE-dec")
         super().__init__(**kwargs)
         self.name = name
         self.tokenizer = tokenizer
@@ -132,7 +134,6 @@ class FL_RelfConfig(PretrainedConfig):
         self.qk_norm = bool(qk_norm)
         self.rope_theta = float(rope_theta)
         self.t_freq_dim = int(t_freq_dim)
-        self.n_exit_layer = int(n_exit_layer)
         self.lm_head_bias = bool(lm_head_bias)
         self.noise_sigma = float(noise_sigma)
         self.latent_thaw_tokens = int(latent_thaw_tokens)
@@ -144,13 +145,24 @@ class FL_RelfConfig(PretrainedConfig):
         self.vel_eps = float(vel_eps)
         self.lambda_mse = float(lambda_mse)
         self.lambda_ce = float(lambda_ce)
+        self.lambda_s1 = float(lambda_s1)
         self.ce_detach_g = bool(ce_detach_g)
         self.ctx_source = str(ctx_source).strip().lower()
         self.x0_source = str(x0_source).strip().lower()
         self.cond_mode = str(cond_mode).strip().lower()
+        if self.cond_mode != "clean":
+            raise ValueError(f"relf cond_mode 锁死 clean，收到 {cond_mode!r}")
         self.clean_block_prob = float(clean_block_prob)
         self.train_t_schedule = str(train_t_schedule).strip().lower()
         self.window_t = str(window_t).strip().lower()
+        if self.train_t_schedule != "mixed":
+            raise ValueError(
+                f"relf train_t_schedule 锁死 mixed，收到 {train_t_schedule!r}"
+            )
+        if self.window_t != "ladder":
+            raise ValueError(
+                f"relf window_t 锁死 ladder，收到 {window_t!r}"
+            )
         self.self_cond_cfg_p_mean = float(self_cond_cfg_p_mean)
         self.self_cond_cfg_p_std = float(self_cond_cfg_p_std)
         self.sc_guided_prob = float(sc_guided_prob)

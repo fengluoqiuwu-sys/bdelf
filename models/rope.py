@@ -42,11 +42,22 @@ class RotaryEmbedding(nn.Module):
         positions: torch.Tensor,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build ``(1, 1, L, head_dim)`` cos/sin tables from token positions ``(L,)``."""
-        freqs = torch.outer(positions.float(), self.inv_freq.to(positions.device))
-        cos = torch.repeat_interleave(freqs.cos(), 2, dim=-1).to(dtype)
-        sin = torch.repeat_interleave(freqs.sin(), 2, dim=-1).to(dtype)
-        return cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)
+        """Build cos/sin from positions ``(L,)`` → ``(1,1,L,D)`` or ``(B,L)`` → ``(B,1,L,D)``."""
+        pos = positions.float()
+        inv = self.inv_freq.to(device=positions.device)
+        if pos.ndim == 1:
+            freqs = torch.outer(pos, inv)
+            cos = torch.repeat_interleave(freqs.cos(), 2, dim=-1).to(dtype)
+            sin = torch.repeat_interleave(freqs.sin(), 2, dim=-1).to(dtype)
+            return cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)
+        if pos.ndim == 2:
+            freqs = pos.unsqueeze(-1) * inv.view(1, 1, -1)
+            cos = torch.repeat_interleave(freqs.cos(), 2, dim=-1).to(dtype)
+            sin = torch.repeat_interleave(freqs.sin(), 2, dim=-1).to(dtype)
+            return cos.unsqueeze(1), sin.unsqueeze(1)
+        raise ValueError(
+            f"RoPE positions 须为 (L,) 或 (B, L)，收到 {tuple(positions.shape)}"
+        )
 
     def apply_qk(
         self,

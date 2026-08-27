@@ -123,7 +123,7 @@ p_G(z_0)=\prod_b p_G\bigl(z_0^{(b)}\mid z_0^{(<b)}\bigr).
 
 每一因子是条件 rectified flow：**未知槽共享同一标量 \(t\)**；已知余数钉 \(t=1\)。去噪块长 \(W\) 为 BELF 的 `block_size`：100m 默认 16，主跑 \(W=T\)。加载入口块长须 \(\in\{1,W\}\)（逐 token 因果，或与本题 \(W\) 相同）；入口注意力按加载结果，不随 \(W\) 改写。若 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。
 
-训练：抽一跳，把 \(t=L_i\) 广播到未知槽。推理 `block_generate`：跳 \(i=0,\ldots,T-2\) Euler \(\Delta t=L_{i+1}-L_i\)（末流到 \(1-\varepsilon\)）；跳 \(T-1\) 在 \(t=1-\varepsilon\)、\(m=\mathrm{decode}\)，**不 Euler**，出口读 token。已知槽每跳覆写 encoder 干净码。SDE churn 关在最后一次流（跳 \(T-2\)）。
+训练：序列长度须被 \(W\) 整除，否则报错；抽一跳，把 \(t=L_i\) 广播到未知槽。推理 `block_generate`：跳 \(i=0,\ldots,T-2\) Euler \(\Delta t=L_{i+1}-L_i\)（末流到 \(1-\varepsilon\)）；跳 \(T-1\) 在 \(t=1-\varepsilon\)、\(m=\mathrm{decode}\)，**不 Euler**，出口读 token。已知槽每跳覆写 encoder 干净码。SDE churn 关在最后一次流（跳 \(T-2\)）。推理末块可短。
 
 `cond_mode=clean`：前缀长 \(L\) 时 \(r=L\bmod W\)。完整块进 KV；当前块槽 \([0,r)\) 为已知余数（\(t=1\)，不进损失）。一块一次读出，不会在同一块内把刚 decode 的 token 立刻改成已知余数再继续流。
 
@@ -159,5 +159,5 @@ RELF 的联合由「pop 后条件于 KV 的窗上局部时间流」迭代定义�
 2. **半群。** RELF 滑窗后梯子复位只依赖 \(\Delta t\) 与 \(S\cdot T=W\)；状态 Euler 的截断误差是数值问题，用末流关 churn 避免读出前把左槽拉回噪声。
 3. **分母。** \(t\) 截到 \(1-\varepsilon\) 且分母有 \(\varepsilon_t\)，v-MSE 有界。丢掉的格不进 \(m_d\)。
 4. **教师强制。** 训练条件是 encoder 码，推理条件是 \(\hat x_0\)。要闭合需 self-forcing，本规格不强制。
-5. **出口。** token 对齐 \(z\) 上，`linear` 出口可能退化成浅 unembed；这不影响流匹配合法性。默认等宽 decoder，CE 回 \(G\)。
+5. **出口。** 只有一层线性，无层数。`linear`（ELF）为 \(D\to V\)；`decoder`（Cola）为 \(D\to X\) 再走加载的 VAE-dec。BELF 训练只喂右段 \(\hat x_0\)，推理拼接已提交干净码。RELF decoder 前缀是 \(G\) 左段 \(\hat x_0\)。CE 回 \(G\)。
 6. **两族。** 不同 \(t\) 场是不同输入分布。共享结构合法；共享一份权重会让同一网络逼近两种条件场。规格是两个模型族、两套训练剖面。

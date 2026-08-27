@@ -131,7 +131,7 @@ def build_train_fingerprint(
     else:
         gen_piece = dataclass_fingerprint(generate_cfg)
 
-    return {
+    out = {
         "model": model,
         "model_config": model_config,
         "variant": variant,
@@ -148,6 +148,13 @@ def build_train_fingerprint(
         "preprocess_cfg": preprocess_yaml,
         "dataset_cfg": dataset_yaml,
     }
+    if model in ("belf", "relf"):
+        cur_name = preprocess_yaml.get("curriculum")
+        if cur_name:
+            out["curriculum_cfg"] = _load_yaml_mapping(
+                repo / "config" / "train" / "curriculum" / f"{cur_name}.yaml",
+            )
+    return out
 
 
 def config_hash_from_fingerprint(fingerprint: Mapping[str, Any]) -> str:
