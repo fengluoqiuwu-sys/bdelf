@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.lm.belf_relf_core.flex_mask import fused_flex_attention, require_flex
 from models.lm.belf_relf_core.pack import group_causal_mask
 from models.rope import RotaryEmbedding
 
@@ -166,13 +167,16 @@ class _AdaLNAttention(nn.Module):
         super().__init__()
         if n_embd % n_head != 0:
             raise ValueError(f"n_embd ({n_embd}) 须能被 n_head ({n_head}) 整除")
-        if attn_backend != "sdpa":
-            raise ValueError(f"attn_backend 仅支持 sdpa，收到 {attn_backend!r}")
+        backend = str(attn_backend).strip().lower()
+        if backend not in ("flex", "sdpa"):
+            raise ValueError(f"attn_backend 须为 flex|sdpa，收到 {attn_backend!r}")
+        if backend == "flex":
+            require_flex()
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         self.n_embd = n_embd
         self.dropout = dropout
-        self.attn_backend = attn_backend
+        self.attn_backend = backend
         rd = self.head_dim if rope_dim is None else int(rope_dim)
         if rd <= 0 or rd > self.head_dim or rd % 2 != 0:
             raise ValueError(
@@ -226,12 +230,16 @@ class _AdaLNAttention(nn.Module):
         *,
         bsz: int,
         seq_len: int,
+        flex_block_mask=None,
     ) -> torch.Tensor:
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        if flex_block_mask is not None:
+            y = fused_flex_attention(q, k, v, block_mask=flex_block_mask)
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_embd)
         return self.resid_dropout(self.c_proj(y))
 
@@ -241,10 +249,14 @@ class _AdaLNAttention(nn.Module):
         *,
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
+        flex_block_mask=None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
         q, k, v = self._project_qkv(x, positions)
-        return self._attend(q, k, v, attn_mask, bsz=bsz, seq_len=seq_len)
+        return self._attend(
+            q, k, v, attn_mask,
+            bsz=bsz, seq_len=seq_len, flex_block_mask=flex_block_mask,
+        )
 
 
 class _DiTBlock(nn.Module):
@@ -286,13 +298,17 @@ class _DiTBlock(nn.Module):
         *,
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
+        flex_block_mask=None,
     ) -> torch.Tensor:
         mod = self.adaLN_modulation(cond)
         if mod.ndim == 2:
             mod = mod.unsqueeze(1)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
         h = self.norm1(x) * (1.0 + scale_msa) + shift_msa
-        x = x + gate_msa * self.attn(h, attn_mask=attn_mask, positions=positions)
+        x = x + gate_msa * self.attn(
+            h, attn_mask=attn_mask, positions=positions,
+            flex_block_mask=flex_block_mask,
+        )
         h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
         x = x + gate_mlp * self.mlp(h)
         return x
@@ -404,10 +420,13 @@ class AdaLNZeroStack(nn.Module):
             raise ValueError(
                 f"AdaLNZeroStack 要求 num_time_tokens=0，收到 {num_time_tokens}"
             )
-        if attn_backend != "sdpa":
-            raise ValueError(f"attn_backend 仅支持 sdpa，收到 {attn_backend!r}")
+        backend = str(attn_backend).strip().lower()
+        if backend not in ("flex", "sdpa"):
+            raise ValueError(f"attn_backend 须为 flex|sdpa，收到 {attn_backend!r}")
+        if backend == "flex":
+            require_flex()
         self.n_embd = n_embd
-        self.attn_backend = attn_backend
+        self.attn_backend = backend
         self.use_scale = bool(use_scale)
         out = n_embd if out_dim is None else int(out_dim)
         self.t_embedder = TimestepEmbedder(n_embd, frequency_embedding_size=t_freq_dim)
@@ -424,7 +443,7 @@ class AdaLNZeroStack(nn.Module):
                     n_embd, n_head, dropout=dropout,
                     rope_dim=rope_dim, rope_theta=rope_theta,
                     qk_norm=qk_norm, mlp_ratio=mlp_ratio,
-                    attn_backend=attn_backend, norm_eps=norm_eps,
+                    attn_backend=backend, norm_eps=norm_eps,
                 )
                 for _ in range(n_layer)
             ]
@@ -480,10 +499,6 @@ class AdaLNZeroStack(nn.Module):
             w_emb = self.w_embedder(w_pos)
             denoise = (m == _MODE_DENOISE).unsqueeze(-1).to(dtype=cond.dtype)
             cond = cond + w_emb * denoise
-        if bool((m < 0).any().item()) or bool((m > 2).any().item()):
-            raise ValueError(
-                f"m 须 ∈ {{0,1,2}}，收到 min={int(m.min().item())} max={int(m.max().item())}"
-            )
         m_emb = self.mode_embed(m)
         known = (m != _MODE_NONE).unsqueeze(-1).to(dtype=cond.dtype)
         return cond + m_emb * known
@@ -498,10 +513,12 @@ class AdaLNZeroStack(nn.Module):
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         return_hidden: bool = False,
+        flex_block_mask=None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``x`` 为 ``(B, L, D)``；返回 x-pred，形状 ``(B, L, out_dim)``。
 
         ``return_hidden=True`` 时另返回末层前的 ``D`` 隐状态（``exit=linear``）。
+        训练 Flex 传 ``flex_block_mask``；生成仍走 SDPA ``attn_mask``。
         """
         bsz, seq_len, _ = x.shape
         if x.size(-1) != self.n_embd:
@@ -511,9 +528,14 @@ class AdaLNZeroStack(nn.Module):
         cond = self._cond(t, w_sc, m, batch=bsz, seq_len=seq_len)
         if positions is None:
             positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
-        attn_mask = as_sdpa_mask(attn_mask)
+        use_flex = flex_block_mask is not None
+        if not use_flex:
+            attn_mask = as_sdpa_mask(attn_mask)
         for block in self.blocks:
-            x = block(x, cond, attn_mask=attn_mask, positions=positions)
+            x = block(
+                x, cond, attn_mask=attn_mask, positions=positions,
+                flex_block_mask=flex_block_mask if use_flex else None,
+            )
         x_hat = self.final(x, cond)
         if return_hidden:
             return x_hat, x

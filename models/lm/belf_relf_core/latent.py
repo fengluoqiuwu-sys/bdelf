@@ -324,10 +324,14 @@ class LatentBundle(nn.Module):
     ) -> torch.Tensor:
         """``KL(q||q_ref)`` 对有效位平均；PAD 与 prior-KL / CE 一样排除。"""
         with torch.no_grad():
-            tok_cpu = tokens.detach().to(device="cpu")
-            _, mu_ref, logvar_ref = self._ref_module().encode(tok_cpu, sample=False)
-            mu_ref = mu_ref.to(device=mu.device, dtype=mu.dtype)
-            logvar_ref = logvar_ref.to(device=logvar.device, dtype=logvar.dtype)
+            ref = self._ref_module()
+            # 冻副本不进 module 树；首次 s1 时挪到与 q 同设备，避免 CPU encode。
+            ref_dev = next(ref.parameters()).device
+            if ref_dev != mu.device:
+                ref.to(device=mu.device)
+            _, mu_ref, logvar_ref = ref.encode(tokens, sample=False)
+            mu_ref = mu_ref.to(dtype=mu.dtype)
+            logvar_ref = logvar_ref.to(dtype=logvar.dtype)
         var = logvar.exp()
         var_ref = logvar_ref.exp()
         kl = 0.5 * (

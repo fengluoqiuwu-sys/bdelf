@@ -15,7 +15,7 @@ sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
 latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
 time_step: 16  # 梯子档数 T；须 >= 4
 latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
-attn_backend: sdpa  # 注意力后端；本族仅 sdpa
+attn_backend: flex  # 注意力后端：flex | sdpa
 block_size: 16  # G 去噪块长 W；入口 encoder 块长须 ∈{1,W}
 proj_bias: true  # G 茎 Linear(X→D) 是否带 bias
 proj_norm: rmsnorm  # 茎后归一化

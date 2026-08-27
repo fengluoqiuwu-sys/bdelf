@@ -22,6 +22,7 @@ from models.lm.belf_relf_core import (
     LeftKVCache,
     as_sdpa_mask,
     blend_v_tgt,
+    build_belf_flex_block_mask,
     check_time_step,
     group_causal_mask,
     hide_left_keys,
@@ -554,7 +555,7 @@ class _BelfBackbone(nn.Module):
             t_hop[:, None].expand(bsz, seq_len),
         )
         x_known = x0
-        if bool((rem > 0).any().item()):
+        if rem.any():
             cond_tokens = tokens.clone()
             leak = (
                 (pos[None, :] // w == b_cur[:, None])
@@ -596,7 +597,7 @@ class _BelfBackbone(nn.Module):
         v_z = v_star(x0, z_t, t_right, self.vel_eps)
         sc_zero = torch.zeros_like(z_t)
         need_teacher = (
-            self.sc_cfg and self.training and bool((~is_decode).any().item())
+            self.sc_cfg and self.training and bool((~is_decode).any())
         )
         if need_teacher:
             with torch.no_grad():
@@ -708,16 +709,25 @@ class _BelfBackbone(nn.Module):
         t_all = torch.cat([t_l, t_right], dim=1)
         m_all = torch.cat([m_l, m_right], dim=1)
         parallel = left_len == right_len
-        raw = self._raw_2l_mask(left_len, right_len, device, parallel=parallel)
-        if is_pad is not None and unknown is not None:
-            raw = hide_right_pad_from_unknown(
-                raw, is_pad, unknown, self.block_size,
+        use_flex = self.attn_backend == "flex" and parallel
+        flex_mask = None
+        mask = None
+        if use_flex:
+            flex_mask = build_belf_flex_block_mask(
+                left_len, self.block_size, device,
+                is_pad=is_pad, unknown=unknown, drop_left=drop_left,
             )
-        mask = as_sdpa_mask(raw)
-        if mask is None:
-            raise RuntimeError("2L mask 不能为空")
-        if drop_left is not None:
-            mask = hide_left_keys(mask, drop_left, left_len)
+        else:
+            raw = self._raw_2l_mask(left_len, right_len, device, parallel=parallel)
+            if is_pad is not None and unknown is not None:
+                raw = hide_right_pad_from_unknown(
+                    raw, is_pad, unknown, self.block_size,
+                )
+            mask = as_sdpa_mask(raw)
+            if mask is None:
+                raise RuntimeError("2L mask 不能为空")
+            if drop_left is not None:
+                mask = hide_left_keys(mask, drop_left, left_len)
         positions = pair_positions(left_len, device) if left_len == right_len else (
             torch.cat([
                 torch.arange(left_len, device=device, dtype=torch.long),
@@ -733,7 +743,7 @@ class _BelfBackbone(nn.Module):
         want_h = self.exit_kind == "linear"
         out = self.g(
             packed, t_all, w_sc, m_all, attn_mask=mask, positions=positions,
-            return_hidden=want_h,
+            return_hidden=want_h, flex_block_mask=flex_mask,
         )
         if want_h:
             x_hat, hidden = out

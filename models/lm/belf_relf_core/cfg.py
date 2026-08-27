@@ -104,7 +104,7 @@ def hide_left_keys(
     left_len: int,
 ) -> torch.Tensor:
     """``drop`` 为 ``(B,)``：丢掉左段的样本，右段 query 看不见左段 key。"""
-    if left_len <= 0 or drop.numel() == 0 or not bool(drop.any().item()):
+    if left_len <= 0 or drop.numel() == 0:
         return attn_mask
     bsz = int(drop.size(0))
     mask = attn_mask
@@ -112,5 +112,6 @@ def hide_left_keys(
         mask = mask.expand(bsz, *([-1] * (mask.ndim - 1))).clone()
     else:
         mask = mask.clone()
+    # 不用 drop.any()：避免热路径 GPU 同步。全假时这步是空写。
     mask[drop, :, left_len:, :left_len] = float("-inf")
     return mask

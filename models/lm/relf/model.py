@@ -15,6 +15,8 @@ from models.lm.belf_relf_core import (
     LeftKVCache,
     as_sdpa_mask,
     blend_v_tgt,
+    build_relf_flex_block_mask,
+    relf_windows_visible,
     check_time_step,
     group_causal_mask,
     interpolate,
@@ -86,8 +88,10 @@ class _RelfBackbone(nn.Module):
             raise ValueError(f"n_embd={self.n_embd} 须能被 n_head={self.n_head} 整除")
         if str(config.exit).lower() not in ("decoder", "linear"):
             raise ValueError(f"exit 须为 decoder|linear，收到 {config.exit!r}")
-        if str(config.attn_backend).lower() != "sdpa":
-            raise ValueError(f"relf attn_backend 仅支持 sdpa，收到 {config.attn_backend!r}")
+        backend = str(config.attn_backend).strip().lower()
+        if backend not in ("flex", "sdpa"):
+            raise ValueError(f"relf attn_backend 须为 flex|sdpa，收到 {config.attn_backend!r}")
+        self.attn_backend = backend
         if str(config.train_t_schedule).strip().lower() != "mixed":
             raise ValueError(
                 f"relf train_t_schedule 锁死 mixed，收到 {config.train_t_schedule!r}"
@@ -154,7 +158,7 @@ class _RelfBackbone(nn.Module):
             mlp_ratio=float(config.mlp_ratio),
             rope_theta=float(config.rope_theta),
             qk_norm=bool(config.qk_norm),
-            attn_backend="sdpa",
+            attn_backend=self.attn_backend,
             num_time_tokens=0,
             use_scale=self.sc_cfg,
             t_freq_dim=int(config.t_freq_dim),
@@ -184,7 +188,6 @@ class _RelfBackbone(nn.Module):
         )
         self.register_buffer("F", f_k, persistent=False)
         self._ladder_cap = float(levels[-1].item())
-        self._mask_base_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
         self._gen_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
         self.last_l2_loss: torch.Tensor | float = float("nan")
@@ -329,52 +332,10 @@ class _RelfBackbone(nn.Module):
         ``in_win`` 为 ``(B, n_win, W)``：丢掉格不当 key；dummy 只留自注意。
         ``drop_left`` 为 ``(B,)``：切断该样本左段对右段的可见性。
         """
-        device = u.device
-        bsz, n_win = u.shape
-        w_sz = self.window_size
-        right_len = n_win * w_sz
-        two = left_len + right_len
-        key = (left_len, n_win, device)
-        base = self._mask_base_cache.get(key)
-        if base is None:
-            base = u.new_zeros(two, two, dtype=torch.bool)
-            if left_len > 0:
-                q = torch.arange(left_len, device=device)
-                base[:left_len, :left_len] = q[None, :] <= q[:, None]
-            ridx = torch.arange(right_len, device=device)
-            loc = ridx % w_sz
-            win_vis = group_causal_mask(w_sz, self.step_size, device=device)
-            same = (ridx[:, None] // w_sz) == (ridx[None, :] // w_sz)
-            base[left_len:, left_len:] = same & win_vis[loc[:, None], loc[None, :]]
-            if len(self._mask_base_cache) > 16:
-                self._mask_base_cache.pop(next(iter(self._mask_base_cache)))
-            self._mask_base_cache[key] = base
-        vis = base.expand(bsz, two, two).clone()
-        ridx = torch.arange(right_len, device=device)
-        # g=clamp(u+k0)，不要先截 u：u<0 且抽余数时 clamp(u)+k0 会把当前槽干净副本漏给右段。
-        g = u if k0 is None else u + k0
-        kv_end = g.clamp(min=0, max=left_len)[:, ridx // w_sz]
-        if left_len > 0:
-            left_idx = torch.arange(left_len, device=device)
-            vis[:, left_len:, :left_len] = left_idx[None, None, :] < kv_end[:, :, None]
-        act_r = active[:, ridx // w_sz]
-        vis[:, left_len:, :] = vis[:, left_len:, :] & act_r[:, :, None]
-        eye_r = ridx[:, None] == ridx[None, :]
-        vis[:, left_len:, left_len:] = vis[:, left_len:, left_len:] | (
-            (~act_r[:, :, None]) & eye_r
+        vis = relf_windows_visible(
+            left_len, self.window_size, self.step_size, u, active,
+            k0=k0, in_win=in_win, drop_left=drop_left,
         )
-        if in_win is not None:
-            in_flat = in_win.reshape(bsz, right_len)
-            vis[:, left_len:, left_len:] = (
-                vis[:, left_len:, left_len:]
-                & in_flat[:, None, :]
-                & in_flat[:, :, None]
-            )
-            vis[:, left_len:, left_len:] = vis[:, left_len:, left_len:] | (
-                (~in_flat)[:, :, None] & eye_r
-            )
-        if drop_left is not None and left_len > 0:
-            vis[drop_left, left_len:, :left_len] = False
         mask = as_sdpa_mask(vis)
         if mask is None:
             raise RuntimeError("2L mask 不能为空")
@@ -388,8 +349,9 @@ class _RelfBackbone(nn.Module):
         m: torch.Tensor,
         sc: torch.Tensor | None,
         *,
-        attn_mask: torch.Tensor,
+        attn_mask: torch.Tensor | None,
         positions: torch.Tensor,
+        flex_block_mask=None,
     ) -> torch.Tensor:
         if self.sc_proj is not None:
             if sc is None:
@@ -400,6 +362,7 @@ class _RelfBackbone(nn.Module):
         return self.denoiser(
             x, t, w_sc, m, attn_mask=attn_mask, positions=positions,
             return_hidden=self.exit_kind == "linear",
+            flex_block_mask=flex_block_mask,
         )
 
     def prefill_left_kv(
@@ -640,9 +603,18 @@ class _RelfBackbone(nn.Module):
             in_win & valid_pos, tok_g, torch.full_like(tok_g, ignore),
         ).reshape(bsz, right_len)
 
-        attn = self._windows_attn_mask(
-            left_len, u, active, k0, in_win=in_win, drop_left=drop_left,
-        )
+        use_flex = self.attn_backend == "flex"
+        flex_mask = None
+        attn = None
+        if use_flex:
+            flex_mask = build_relf_flex_block_mask(
+                left_len, w_sz, step, u, active,
+                k0=k0, in_win=in_win, drop_left=drop_left,
+            )
+        else:
+            attn = self._windows_attn_mask(
+                left_len, u, active, k0, in_win=in_win, drop_left=drop_left,
+            )
         t_left = h_right.new_ones(bsz, left_len)
         m_left = torch.zeros(bsz, left_len, device=device, dtype=torch.long)
         h = pack_2l(h_left, h_right)
@@ -666,13 +638,14 @@ class _RelfBackbone(nn.Module):
             self.sc_cfg
             and self.training
             and compute_loss
-            and bool((md > 0).any().item())
+            and bool((md > 0).any())
         )
         if need_teacher:
             with torch.no_grad():
                 x_hat_u, _ = self._split_g(self._run_g(
                     h, t_all, w_pos, m_all, torch.zeros_like(h),
                     attn_mask=attn, positions=positions,
+                    flex_block_mask=flex_mask,
                 ))
                 x_u_r = x_hat_u[:, left_len:] if left_len > 0 else x_hat_u
                 v_u = x_to_v(x_u_r, z_right, t_right, vel_eps)
@@ -688,6 +661,7 @@ class _RelfBackbone(nn.Module):
                 x_hat_c, _ = self._split_g(self._run_g(
                     h, t_all, w_pos, m_all, sc_teacher,
                     attn_mask=attn, positions=positions,
+                    flex_block_mask=flex_mask,
                 ))
                 x_c_r = x_hat_c[:, left_len:] if left_len > 0 else x_hat_c
                 v_c = x_to_v(x_c_r, z_right, t_right, vel_eps)
@@ -702,6 +676,7 @@ class _RelfBackbone(nn.Module):
             h, t_all, w_pos if self.sc_cfg else None, m_all,
             sc if self.sc_cfg else None,
             attn_mask=attn, positions=positions,
+            flex_block_mask=flex_mask,
         ))
         x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
         v_hat = x_to_v(x_right, z_right, t_right, vel_eps)
@@ -723,7 +698,7 @@ class _RelfBackbone(nn.Module):
             reduction="none",
         ).view(bsz, right_len)
         ce = (ce_tok * mc).sum() / mc.sum().clamp(min=1.0)
-        if float(mc.sum().detach().item()) <= 0:
+        if not mc.any():
             ce = ce * 0.0
             last_ce: torch.Tensor | float = float("nan")
         else:

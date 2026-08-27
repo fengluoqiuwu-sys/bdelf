@@ -12,6 +12,12 @@ from .cfg import (
 )
 from .exit import CausalExit, ExitMap
 from .flow import interpolate, v_star, x_to_v
+from .flex_mask import (
+    FLEX_ATTN_AVAILABLE,
+    build_belf_flex_block_mask,
+    build_relf_flex_block_mask,
+    relf_windows_visible,
+)
 from .layers import (
     AdaLNZeroStack,
     LeftKVCache,
@@ -37,7 +43,11 @@ __all__ = [
     "LatentBundle",
     "ScaleEmbedder",
     "TimestepEmbedder",
+    "FLEX_ATTN_AVAILABLE",
     "as_sdpa_mask",
+    "build_belf_flex_block_mask",
+    "build_relf_flex_block_mask",
+    "relf_windows_visible",
     "blend_v_tgt",
     "hide_left_keys",
     "hide_right_pad_from_unknown",
