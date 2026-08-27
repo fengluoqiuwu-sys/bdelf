@@ -24,10 +24,8 @@ class TokenChunkDataset(Dataset):
 
 
 def collate_input_ids(batch: list[torch.Tensor]) -> torch.Tensor:
-    out = torch.stack(batch)
-    if torch.cuda.is_available() and not out.is_cuda:
-        out = out.pin_memory()
-    return out
+    # worker 内禁止碰 CUDA / pin_memory，否则每个进程各占一份 CUDA context
+    return torch.stack(batch)
 
 
 def build_eval_subset(
@@ -122,4 +120,5 @@ def fetch_train_batch(
     start = rank * batch_size
     rank_indices = indices[start : start + batch_size]
     rows = [dataset[int(i)] for i in rank_indices]
-    return collate_input_ids(rows)
+    # 主进程取 batch：pin 后 loop 里 ``.to(device, non_blocking=True)`` 才有效
+    return collate_input_ids(rows).pin_memory()

@@ -545,11 +545,16 @@ def _run_training_body(
         eval_ds_local = shard_eval_dataset(
             eval_ds, rank=rank, world_size=world_size,
         )
+        # 在线 held-out 必须主进程取数。训练已用 fetch_train_batch（无 worker）；
+        # eval DataLoader 若 num_workers>0，会在首次 iterate（往往已 CUDA/compile）
+        # 时 fork，子进程继承 CUDA context，rank0 卡 futex、其余 rank 在
+        # allreduce 空转。held-out 只有十几 batch、tensor 已在内存，worker 无收益。
+        # 与 train/latent_eval.py 的 seg512_loader 对齐。
         eval_loader = DataLoader(
             eval_ds_local,
             batch_size=cfg.batch_size,
             shuffle=False,
-            num_workers=cfg.num_workers,
+            num_workers=0,
             pin_memory=torch.cuda.is_available(),
             collate_fn=collate_input_ids,
         )
