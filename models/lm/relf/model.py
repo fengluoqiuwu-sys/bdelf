@@ -448,7 +448,7 @@ class _RelfBackbone(nn.Module):
             h_right = hidden[:, left_len:] if hidden is not None and left_len > 0 else hidden
             return self._exit_logits(x_right, h_right)
         g = (u + k0).clamp(min=0, max=left_len)
-        out = x_hat.new_zeros(bsz, n_win * w_sz, vocab)
+        chunks: list[torch.Tensor] = []
         win_idx = torch.arange(w_sz, device=x_hat.device)
         pad_id = int(self.token_layout.pad_token_id)
         tok_len = int(tokens.size(1)) if tokens is not None else 0
@@ -457,23 +457,33 @@ class _RelfBackbone(nn.Module):
             max_g = int(g_w.max().item()) if left_len > 0 else 0
             win = x_right[:, wi * w_sz : (wi + 1) * w_sz]
             seq = max_g + w_sz
-            dec_in = x_hat.new_zeros(bsz, seq, x_dim)
+            pos = g_w[:, None] + win_idx
+            idx = pos.unsqueeze(-1).expand(-1, -1, x_dim)
             if max_g > 0:
                 pref = x_left[:, :max_g]
                 keep = torch.arange(max_g, device=x_hat.device)[None, :] < g_w[:, None]
-                dec_in[:, :max_g] = torch.where(keep.unsqueeze(-1), pref, torch.zeros_like(pref))
-            pos = g_w[:, None] + win_idx
-            cur = dec_in.gather(1, pos.unsqueeze(-1).expand(-1, -1, x_dim))
+                base = torch.where(
+                    keep.unsqueeze(-1), pref, torch.zeros_like(pref),
+                )
+                if seq > max_g:
+                    base = torch.cat(
+                        [base, x_hat.new_zeros(bsz, seq - max_g, x_dim)], dim=1,
+                    )
+            else:
+                base = x_hat.new_zeros(bsz, seq, x_dim)
+            cur = base.gather(1, idx)
             if in_win is not None:
                 src = torch.where(in_win[:, wi].unsqueeze(-1), win, cur)
             else:
                 src = win
-            dec_in.scatter_(1, pos.unsqueeze(-1).expand(-1, -1, x_dim), src)
+            # 禁止 scatter_：base 已接 x̂₀ 图，原地写会在 backward 时 version 对不上。
+            dec_in = base.scatter(1, idx, src)
             dec_tok = None
             if tokens is not None and tok_len > 0:
                 dec_tok = tokens.new_full((bsz, seq), pad_id)
                 if max_g > 0:
                     pref_tok = tokens[:, :max_g]
+                    dec_tok = dec_tok.clone()
                     dec_tok[:, :max_g] = torch.where(
                         keep, pref_tok, pref_tok.new_full((), pad_id),
                     )
@@ -482,12 +492,12 @@ class _RelfBackbone(nn.Module):
                 cur_tok = dec_tok.gather(1, pos)
                 if in_win is not None:
                     win_tok = torch.where(in_win[:, wi], win_tok, cur_tok)
-                dec_tok.scatter_(1, pos, win_tok)
+                dec_tok = dec_tok.scatter(1, pos, win_tok)
             logits = self._exit_logits(dec_in, tokens=dec_tok)
-            out[:, wi * w_sz : (wi + 1) * w_sz] = logits.gather(
-                1, pos.unsqueeze(-1).expand(-1, -1, vocab),
+            chunks.append(
+                logits.gather(1, pos.unsqueeze(-1).expand(-1, -1, vocab)),
             )
-        return out
+        return torch.cat(chunks, dim=1)
 
     def _pack_forward(
         self,
