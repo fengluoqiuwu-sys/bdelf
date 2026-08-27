@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.lm.belf_relf_core.flex_mask import fused_flex_attention, require_flex
+from models.lm.belf_relf_core.gen_buf import alloc_capacity, ensure_seq_buf
 from models.lm.belf_relf_core.pack import group_causal_mask
 from models.rope import RotaryEmbedding
 
@@ -25,21 +26,65 @@ _MODE_DECODE = 2
 
 @dataclass
 class LeftKVCache:
-    """生成用左段 KV：每层 ``(K, V)``，形状 ``(B, H, L, Dh)``，已施加 RoPE。
+    """生成用左段 KV：每层 ``(K, V)`` 的 L 维是 **capacity**，``filled`` 才是有效长。
 
-    ``x_hat`` / ``hidden`` 是左段过完栈+Final 的结果（``m=none``），
-    RELF decoder 读出仍要拼 ``[left_x_hat | right_x_hat]``。
+    ``x_hat`` / ``hidden`` 同样 pad 到 capacity；读出须用 ``x_hat_filled``。
+    不要用 ``size(2)`` 当有效左长度。
     """
 
     layers: list[tuple[torch.Tensor, torch.Tensor]]
     x_hat: torch.Tensor | None = None
     hidden: torch.Tensor | None = None
+    filled: int = 0
+    known_max: int | None = None
 
     @property
     def left_len(self) -> int:
-        if not self.layers:
-            return 0
-        return int(self.layers[0][0].size(2))
+        return int(self.filled)
+
+    @property
+    def capacity(self) -> int:
+        if self.layers:
+            return int(self.layers[0][0].size(2))
+        if self.x_hat is not None:
+            return int(self.x_hat.size(1))
+        return 0
+
+    @property
+    def x_hat_filled(self) -> torch.Tensor | None:
+        if self.x_hat is None:
+            return None
+        return self.x_hat[:, : self.filled]
+
+    @property
+    def hidden_filled(self) -> torch.Tensor | None:
+        if self.hidden is None:
+            return None
+        return self.hidden[:, : self.filled]
+
+
+def _copy_into_cap(
+    src: torch.Tensor,
+    *,
+    filled: int,
+    known_max: int | None,
+    seq_dim: int,
+) -> torch.Tensor:
+    """把 ``src`` 的有效前缀写进按 ``known_max`` / ×2 规则分配的缓冲。"""
+    n = int(src.size(seq_dim))
+    if filled < 0 or filled > n:
+        raise ValueError(f"filled={filled} 超出 src 序列长 {n}")
+    cap = alloc_capacity(max(filled, 1) if filled > 0 else 0, known_max)
+    buf = ensure_seq_buf(
+        None, max(cap, filled), known_max=known_max, seq_dim=seq_dim, like=src,
+    )
+    if filled > 0:
+        sl_s = [slice(None)] * src.ndim
+        sl_d = [slice(None)] * buf.ndim
+        sl_s[seq_dim] = slice(0, filled)
+        sl_d[seq_dim] = slice(0, filled)
+        buf[tuple(sl_d)].copy_(src[tuple(sl_s)])
+    return buf
 
 
 def as_sdpa_mask(attn_mask: torch.Tensor | None) -> torch.Tensor | None:
@@ -547,14 +592,16 @@ class AdaLNZeroStack(nn.Module):
         *,
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
+        known_max: int | None = None,
     ) -> LeftKVCache:
         """左段独立过栈（``m=none, t=1``），收集每层已 RoPE 的 K/V。
 
         2L 掩码下左不看右，故左表示与右段无关；生成 hop 可复用本 cache。
+        ``known_max`` 有则一次预扩到该长，否则从 1024 起 ×2。
         """
         bsz, seq_len, _ = x.shape
         if seq_len == 0:
-            return LeftKVCache(layers=[])
+            return LeftKVCache(layers=[], filled=0, known_max=known_max)
         if x.size(-1) != self.n_embd:
             raise ValueError(
                 f"AdaLNZeroStack 入口宽 {x.size(-1)} 须等于 n_embd={self.n_embd}"
@@ -570,10 +617,20 @@ class AdaLNZeroStack(nn.Module):
             x, kv = block.forward_prefill(
                 x, cond, attn_mask=attn_mask, positions=positions,
             )
-            layers.append(kv)
+            k, v = kv
+            layers.append((
+                _copy_into_cap(k, filled=seq_len, known_max=known_max, seq_dim=2),
+                _copy_into_cap(v, filled=seq_len, known_max=known_max, seq_dim=2),
+            ))
         hidden = x
         x_hat = self.final(x, cond)
-        return LeftKVCache(layers=layers, x_hat=x_hat, hidden=hidden)
+        return LeftKVCache(
+            layers=layers,
+            x_hat=_copy_into_cap(x_hat, filled=seq_len, known_max=known_max, seq_dim=1),
+            hidden=_copy_into_cap(hidden, filled=seq_len, known_max=known_max, seq_dim=1),
+            filled=seq_len,
+            known_max=known_max,
+        )
 
     def forward_right(
         self,
@@ -604,9 +661,10 @@ class AdaLNZeroStack(nn.Module):
         if positions is None:
             positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
         attn_mask = as_sdpa_mask(attn_mask)
+        filled = int(left_kv.filled)
         for block, (left_k, left_v) in zip(self.blocks, left_kv.layers):
             x = block.forward_right(
-                x, cond, left_k, left_v,
+                x, cond, left_k[:, :, :filled], left_v[:, :, :filled],
                 attn_mask=attn_mask, positions=positions,
             )
         x_hat = self.final(x, cond)
@@ -622,15 +680,19 @@ class AdaLNZeroStack(nn.Module):
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         left_group: int = 1,
+        known_max: int | None = None,
     ) -> LeftKVCache:
-        """把新增左段接到已有 KV 上（组间因果，旧 K/V 不用重算）。"""
+        """把新增左段原地写入已有 KV（组间因果，旧 K/V 不用重算）。"""
+        km = known_max if known_max is not None else cache.known_max
         if cache.left_len == 0 or not cache.layers:
             mask = attn_mask
             if mask is None:
                 mask = group_causal_mask(
                     int(x_new.size(1)), left_group, device=x_new.device,
                 )
-            return self.prefill_left(x_new, attn_mask=mask, positions=positions)
+            return self.prefill_left(
+                x_new, attn_mask=mask, positions=positions, known_max=km,
+            )
         if len(cache.layers) != len(self.blocks):
             raise ValueError(
                 f"left_kv 层数 {len(cache.layers)} 须等于 n_layer={len(self.blocks)}"
@@ -639,6 +701,7 @@ class AdaLNZeroStack(nn.Module):
         if new_len == 0:
             return cache
         old_len = cache.left_len
+        need = old_len + new_len
         t = torch.ones(bsz, new_len, device=x_new.device, dtype=x_new.dtype)
         m = torch.zeros(bsz, new_len, device=x_new.device, dtype=torch.long)
         cond = self._cond(t, None, m, batch=bsz, seq_len=new_len)
@@ -656,21 +719,42 @@ class AdaLNZeroStack(nn.Module):
         x = x_new
         for block, (left_k, left_v) in zip(self.blocks, cache.layers):
             got = block.forward_right(
-                x, cond, left_k, left_v,
+                x, cond, left_k[:, :, :old_len], left_v[:, :, :old_len],
                 attn_mask=attn_mask, positions=positions, return_kv=True,
             )
             x, (k, v) = got  # type: ignore[misc]
-            layers.append((torch.cat([left_k, k], dim=2), torch.cat([left_v, v], dim=2)))
+            k_buf = ensure_seq_buf(
+                left_k, need, known_max=km, seq_dim=2, filled=old_len,
+            )
+            v_buf = ensure_seq_buf(
+                left_v, need, known_max=km, seq_dim=2, filled=old_len,
+            )
+            k_buf[:, :, old_len:need].copy_(k)
+            v_buf[:, :, old_len:need].copy_(v)
+            layers.append((k_buf, v_buf))
         hidden_new = x
         x_hat_new = self.final(x, cond)
-        hidden = (
-            torch.cat([cache.hidden, hidden_new], dim=1)
-            if cache.hidden is not None
-            else hidden_new
-        )
-        x_hat = (
-            torch.cat([cache.x_hat, x_hat_new], dim=1)
-            if cache.x_hat is not None
-            else x_hat_new
-        )
-        return LeftKVCache(layers=layers, x_hat=x_hat, hidden=hidden)
+        if cache.hidden is None:
+            hidden = _copy_into_cap(
+                hidden_new, filled=new_len, known_max=km, seq_dim=1,
+            )
+        else:
+            hidden = ensure_seq_buf(
+                cache.hidden, need, known_max=km, seq_dim=1, filled=old_len,
+            )
+            hidden[:, old_len:need].copy_(hidden_new)
+        if cache.x_hat is None:
+            x_hat = _copy_into_cap(
+                x_hat_new, filled=new_len, known_max=km, seq_dim=1,
+            )
+        else:
+            x_hat = ensure_seq_buf(
+                cache.x_hat, need, known_max=km, seq_dim=1, filled=old_len,
+            )
+            x_hat[:, old_len:need].copy_(x_hat_new)
+        cache.layers = layers
+        cache.x_hat = x_hat
+        cache.hidden = hidden
+        cache.filled = need
+        cache.known_max = km
+        return cache

@@ -163,7 +163,13 @@ class _ColaVAEBackbone(nn.Module):
             z0 = mu
         return z0, mu, logvar
 
-    def decode_logits(self, z0: torch.Tensor) -> torch.Tensor:
+    def decode_logits(
+        self,
+        z0: torch.Tensor,
+        *,
+        last_n: int | None = None,
+        **_kwargs: object,
+    ) -> torch.Tensor:
         x = self.drop(self.from_latent(z0))
         for block in self.decoder:
             x = block(x)
@@ -174,6 +180,12 @@ class _ColaVAEBackbone(nn.Module):
                 bsz, n_lat * self.patch_size, self.n_embd,
             )
         x = self.dec_ln(x)
+        if last_n is not None:
+            n = int(last_n)
+            if n < 0:
+                raise ValueError(f"last_n 须非负，收到 {n}")
+            if n < int(x.size(1)):
+                x = x[:, -n:]
         return self.lm_head(x)
 
     def bert_mask_loss(self, tokens: torch.Tensor) -> torch.Tensor:

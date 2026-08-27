@@ -240,14 +240,19 @@ class _BelfBackbone(nn.Module):
         hidden: torch.Tensor | None = None,
         tokens: torch.Tensor | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        last_n: int | None = None,
     ) -> torch.Tensor:
         if self.exit_kind == "decoder":
             kwargs: dict[str, Any] = {}
             if key_padding_mask is not None:
                 kwargs["key_padding_mask"] = key_padding_mask
+            if last_n is not None:
+                kwargs["last_n"] = last_n
             return self.bundle.decode_logits(x_hat, tokens=tokens, **kwargs)
         if hidden is None:
             raise ValueError("exit=linear 须传入 G 隐状态")
+        if last_n is not None and int(hidden.size(1)) > int(last_n):
+            hidden = hidden[:, -int(last_n):]
         return self.exit_head(hidden)
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
@@ -328,7 +333,12 @@ class _BelfBackbone(nn.Module):
             return h
         return self.sc_proj(torch.cat([h, torch.zeros_like(h)], dim=-1))
 
-    def prefill_left_kv(self, h_left: torch.Tensor) -> LeftKVCache | None:
+    def prefill_left_kv(
+        self,
+        h_left: torch.Tensor,
+        *,
+        known_max: int | None = None,
+    ) -> LeftKVCache | None:
         """生成：对当前左上下文做一次 G prefill，供后续 hop 复用 KV。"""
         if h_left.size(1) == 0:
             return None
@@ -336,20 +346,26 @@ class _BelfBackbone(nn.Module):
         left_len = int(x.size(1))
         mask = group_causal_mask(left_len, self.block_size, device=x.device)
         pos = torch.arange(left_len, device=x.device, dtype=torch.long)
-        return self.g.prefill_left(x, attn_mask=mask, positions=pos)
+        return self.g.prefill_left(
+            x, attn_mask=mask, positions=pos, known_max=known_max,
+        )
 
     def extend_left_kv(
         self,
         cache: LeftKVCache | None,
         h_new: torch.Tensor,
+        *,
+        known_max: int | None = None,
     ) -> LeftKVCache | None:
         """生成：把新提交的左块增量写入 KV（``commit_x0hat`` 路径）。"""
         if h_new.size(1) == 0:
             return cache
         if cache is None or cache.left_len == 0:
-            return self.prefill_left_kv(h_new)
+            return self.prefill_left_kv(h_new, known_max=known_max)
         x = self._stem_left_for_cache(h_new)
-        return self.g.extend_left(x, cache, left_group=self.block_size)
+        return self.g.extend_left(
+            x, cache, left_group=self.block_size, known_max=known_max,
+        )
 
     def _g_right_cached(
         self,

@@ -18,6 +18,7 @@ from .flex_mask import (
     build_relf_flex_block_mask,
     relf_windows_visible,
 )
+from .gen_buf import SeqBuf, alloc_capacity, ensure_seq_buf
 from .layers import (
     AdaLNZeroStack,
     LeftKVCache,
@@ -44,6 +45,9 @@ __all__ = [
     "ScaleEmbedder",
     "TimestepEmbedder",
     "FLEX_ATTN_AVAILABLE",
+    "SeqBuf",
+    "alloc_capacity",
+    "ensure_seq_buf",
     "as_sdpa_mask",
     "build_belf_flex_block_mask",
     "build_relf_flex_block_mask",

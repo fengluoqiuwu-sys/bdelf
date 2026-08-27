@@ -139,12 +139,19 @@ class _LatentVAEBackbone(nn.Module):
         z: torch.Tensor,
         *,
         key_padding_mask: torch.Tensor | None = None,
+        last_n: int | None = None,
     ) -> torch.Tensor:
         x = self.from_latent(z)
         mode = self.encoder.attn_mode()
         for block in self.decoder:
             x = block(x, attn_mode=mode, key_padding_mask=key_padding_mask)
         x = self.dec_ln(x)
+        if last_n is not None:
+            n = int(last_n)
+            if n < 0:
+                raise ValueError(f"last_n 须非负，收到 {n}")
+            if n < int(x.size(1)):
+                x = x[:, -n:]
         return self.lm_head(x)
 
     def bert_mask_loss(self, tokens: torch.Tensor) -> torch.Tensor:

@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from models.lm.belf_relf_core import pad_after_first_eos, x_to_v
+from models.lm.belf_relf_core.gen_buf import SeqBuf
 from models.model import sample_from_logits
 
 # 与 AdaLNZeroStack 逐列模式一致。
@@ -115,15 +116,16 @@ def block_generate(
     if prefix is not None and prefix_len > 0:
         tokens[:, :prefix_len] = prefix
 
+    clean_like = torch.zeros(
+        num_samples, 1, backbone.latent_dim, device=device, dtype=dtype,
+    )
+    clean_buf = SeqBuf(known_max=seqlen, seq_dim=1, like=clean_like)
     if n_full > 0:
         z_pref, mu_pref, _ = backbone.bundle.encode(
             prefix[:, : n_full * w], sample=False,
         )
-        clean = _mapped(z_pref, mu_pref, ctx_src)
-    else:
-        clean = torch.zeros(
-            num_samples, 0, backbone.latent_dim, device=device, dtype=dtype,
-        )
+        clean_buf.replace(_mapped(z_pref, mu_pref, ctx_src))
+    clean = clean_buf.view()
 
     w_sc = None
     if backbone.sc_cfg:
@@ -136,7 +138,11 @@ def block_generate(
     if prefix_len > 0:
         alive = alive & ~(tokens[:, :prefix_len] == eos_id).any(dim=1)
 
-    left_kv = backbone.prefill_left_kv(clean) if clean.size(1) > 0 else None
+    left_kv = (
+        backbone.prefill_left_kv(clean, known_max=seqlen)
+        if clean.size(1) > 0
+        else None
+    )
 
     for b_idx in range(start_block, n_blocks):
         if not bool(alive.any().item()):
@@ -244,10 +250,12 @@ def block_generate(
                 if bool(pad.any().item()):
                     extra = pad.new_zeros(num_samples, w_cur)
                     kpm = torch.cat([pad, extra], dim=1)
-            logits = backbone.exit_logits(dec_in, key_padding_mask=kpm)
-            block_logits = logits[:, -w_cur:]
+            logits = backbone.exit_logits(
+                dec_in, key_padding_mask=kpm, last_n=w_cur,
+            )
+            block_logits = logits
         else:
-            logits = backbone.exit_logits(x_hat, hidden)
+            logits = backbone.exit_logits(x_hat, hidden, last_n=w_cur)
             block_logits = logits
         if temperature <= 0:
             blk_tok = block_logits.argmax(dim=-1)
@@ -273,11 +281,13 @@ def block_generate(
                 tokens[:, : start + w_cur], sample=(x0_src == "z"),
             )
             committed = _mapped(z_c, mu_c, x0_src)[:, start : start + w_cur]
-        clean = torch.cat([clean, committed], dim=1)
+        clean = clean_buf.append(committed)
         if commit_x0hat:
-            left_kv = backbone.extend_left_kv(left_kv, committed)
+            left_kv = backbone.extend_left_kv(
+                left_kv, committed, known_max=seqlen,
+            )
         else:
-            left_kv = backbone.prefill_left_kv(clean)
+            left_kv = backbone.prefill_left_kv(clean, known_max=seqlen)
         known_rem = 0
         alive = alive & ~(tokens[:, : start + w_cur] == eos_id).any(dim=1)
 
