@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 供 sync.sh / web.sh 共用：从 scripts/servers.csv 解析服务行。
+# 供 sync.sh / sync_web.sh / web.sh 共用：从 scripts/servers.csv 解析服务行。
 # 用法：SCRIPT_DIR 已指向 scripts/ 后 source 本文件；再 load_server <名字>。
 # SSH：一律系统 ssh，目标即「名字」（须已可 ssh <名字>）。
 

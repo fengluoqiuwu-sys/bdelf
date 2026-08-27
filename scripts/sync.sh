@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 按 scripts/servers.csv 中的服务名，与远端同步 bdelf：push 推代码 + models/tokenizers；pull 拉 checkpoints。
 # 用法: bash scripts/sync.sh <服务名> {push|pull|pull-file} ...
+# web / monitor 图表由 scripts/sync_web.sh 处理（主脚本调用）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,19 +76,19 @@ usage() {
       默认不推：datasets/、huggingface/、preprocessed_datasets/、checkpoints/、compile*
       --with-datasets            额外推 datasets/
       --checksum                 cache 内容（含指定 checkpoint 文件）整文件校验后再传（慢，慎用）
-      --code-only                只推代码，跳过 models/tokenizers（不影响 --checkpoints；仍推 cache/monitor/）
+      --code-only                只推代码，跳过 models/tokenizers（不影响 --checkpoints；仍合并 cache/monitor/）
       --checkpoints NAME FILE    额外推单个文件：cache/checkpoints/NAME/FILE（可重复）
                                  NAME 形如 full/odar/<hash>；FILE 如 checkpoint_latest.pt
                                  同时增量推对应 cache/eval/<model>/<hash>/（若本地有；避免远端重复评测）
       temp/ 不同步；logs/ gitignore，push 不覆盖/不删除远端，由 pull 拉取
-      cache/monitor/ 监控图表配置：push 上传（含 --code-only）；pull 永不拉取
-      cache/monitor/instance.json 不推；push 时在远端写成 remote（本机缺省生成本地 local）
+      cache/monitor/ 由 scripts/sync_web.sh 按 hash 合并 charts.json（push/pull 均调用）
+      push 不覆盖远端已有 hash 的图表，只补远端没有的；instance.json 不推，远端写成 remote
       cache/checkpoints/hash_guide.csv 仅本地（push/pull 均排除）
 
   pull [--mode MODE] [NAME]
       从远端增量同步 cache/checkpoints/[NAME]/（排除 hash_guide.csv）
       并增量拉取 logs/（作业 .out/.err/gpu.log）与 cache/eval/（体量小）
-      不拉取 cache/monitor/（只推不拉）
+      cache/monitor/charts.json：远端有而本机没有的 hash 才添加，本机已有的忽略
       --mode fast（默认）| common | full
 
   pull-file NAME FILE
@@ -111,20 +112,9 @@ ensure_remote_cache_dir() {
   remote_ssh "mkdir -p ${REMOTE_DIR}/cache"
 }
 
-push_monitor_cache() {
-  # 图表配置只推不拉；instance.json 不推，远端写成 remote
-  echo "==> 推送 cache/monitor/（只推不拉；instance.json 标为 remote）..."
-  ensure_remote_cache_dir
-  remote_ssh "mkdir -p ${REMOTE_DIR}/cache/monitor"
-  local local_src="${LOCAL_DIR}/cache/monitor"
-  if [[ -e "${local_src}" ]]; then
-    rsync_to "${RSYNC_CACHE_OPTS[@]}" \
-      --exclude='instance.json' \
-      "${local_src}/" "${REMOTE_SSH_TARGET}:${REMOTE_DIR}/cache/monitor/"
-  else
-    echo "    （本地尚无图表配置目录，只写远端 instance.json）"
-  fi
-  remote_ssh "printf '%s\n' '{\"role\": \"remote\"}' > ${REMOTE_DIR}/cache/monitor/instance.json"
+sync_web() {
+  # web / monitor 图表合并：见 scripts/sync_web.sh（push 不覆盖远端已有 hash，pull 只补本机缺失）
+  bash "${SCRIPT_DIR}/sync_web.sh" "${SERVER_NAME}" "$1"
 }
 
 push_cache_content() {
@@ -432,7 +422,7 @@ case "${cmd}" in
       esac
     done
     push_code
-    push_monitor_cache
+    sync_web push
     if [[ "${code_only}" -eq 1 ]]; then
       echo "==> 跳过 cache 内容（--code-only）"
     else
@@ -460,6 +450,7 @@ case "${cmd}" in
   pull)
     shift
     pull_checkpoints "$@"
+    sync_web pull
     echo "==> pull 完成（${SERVER_NAME}）"
     ;;
   pull-file)

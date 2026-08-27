@@ -6,8 +6,8 @@ from pathlib import Path
 
 CHECKPOINT_ROOT = Path("cache/checkpoints")
 EVAL_ROOT = Path("cache/eval")
-MONITOR_STORE = Path("cache/monitor/charts.json")  # 只推不拉（见 skill sync）
-MONITOR_INSTANCE = Path("cache/monitor/instance.json")  # 不进 git；push 排除，远端另写 remote
+MONITOR_STORE = Path("cache/monitor/charts.json")  # 由 scripts/sync_web.sh 按 hash 合并（见 skill sync）
+MONITOR_INSTANCE = Path("cache/monitor/instance.json")  # 不进 git；不推不拉，push 后远端另写 remote
 HASH_GUIDE_NAME = "hash_guide.csv"
 
 LIVE_THRESHOLD_SEC = 60.0

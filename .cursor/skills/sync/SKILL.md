@@ -35,7 +35,10 @@ bash scripts/sync.sh ovan-server push \
 
 - 代码镜像（`--delete`）；排除 `.venv` / `cache` 链接 / `temp/` / `.git` / `.cursor/` / `.claude/` 等。
 - `logs/`：gitignore；**push 不传、且 `--delete` 不删远端**；由 **pull** 增量拉取。
-- `cache/monitor/`：监控图表配置，**只推不拉**（push 含 `--code-only`；pull 永不拉取，避免覆盖本机配置）。`instance.json` **不推**；push 后在远端写成 `remote`。本机首次启动若无该文件则生成 `local`。
+- `cache/monitor/`：由 `scripts/sync_web.sh` 处理（`sync.sh` 的 push/pull 都会调用；`--code-only` 同样合并）。`charts.json` **按 hash 合并**：已有 hash 的图表不覆盖。
+  - **push**：不覆盖远端已保存的 hash 图表，只补远端没有的。
+  - **pull**：远端有而本机没有的 hash 才写入本机，本机已有的忽略。
+  - `instance.json` **不推不拉**；push 后在远端写成 `remote`。本机首次启动若无该文件则生成 `local`。
 - 默认再推 cache **内容**目录：`models/` `tokenizers/`。
   - `--checksum`：先比对校验和，相同则不传。
   - **不**用 `-L`（保留 HF `snapshots→blobs` 软链）。
@@ -56,7 +59,7 @@ bash scripts/sync.sh ovan-server pull [--mode fast|common] [NAME]
 | `common` | 另含 `checkpoint_latest.pt` |
 | `full` | 全部 `.pt` — AI 默认禁止 |
 
-另：每次 `pull` 都会增量同步远端 `logs/` → 本地（作业 `.out` / `.err` / `gpu.log`），以及 `cache/eval/` → 本地（评测产物；体量小）。**不**拉取 `cache/monitor/`。
+另：每次 `pull` 都会增量同步远端 `logs/` → 本地（作业 `.out` / `.err` / `gpu.log`），以及 `cache/eval/` → 本地（评测产物；体量小）。`cache/monitor/charts.json` 按 hash 合并（只补本机没有的）。
 
 `NAME`：`{fast|full}/{model}/{hash}`（用 `scripts/resolve_checkpoint.py` 解析）。省略则同步全部 run 的过滤结果。
 
