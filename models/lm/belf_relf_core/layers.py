@@ -7,17 +7,38 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.lm.belf_relf_core.pack import group_causal_mask
 from models.rope import RotaryEmbedding
 
 # 每列模式：0=none（左/已知/PAD），1=denoise，2=decode。
 _MODE_NONE = 0
 _MODE_DENOISE = 1
 _MODE_DECODE = 2
+
+
+@dataclass
+class LeftKVCache:
+    """生成用左段 KV：每层 ``(K, V)``，形状 ``(B, H, L, Dh)``，已施加 RoPE。
+
+    ``x_hat`` / ``hidden`` 是左段过完栈+Final 的结果（``m=none``），
+    RELF decoder 读出仍要拼 ``[left_x_hat | right_x_hat]``。
+    """
+
+    layers: list[tuple[torch.Tensor, torch.Tensor]]
+    x_hat: torch.Tensor | None = None
+    hidden: torch.Tensor | None = None
+
+    @property
+    def left_len(self) -> int:
+        if not self.layers:
+            return 0
+        return int(self.layers[0][0].size(2))
 
 
 def as_sdpa_mask(attn_mask: torch.Tensor | None) -> torch.Tensor | None:
@@ -167,13 +188,12 @@ class _AdaLNAttention(nn.Module):
             self.k_norm = _RMSNorm(self.head_dim)
         self.rope = RotaryEmbedding(self.rope_dim, base=rope_theta)
 
-    def forward(
+    def _project_qkv(
         self,
         x: torch.Tensor,
-        *,
-        attn_mask: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``x`` → 已 RoPE 的 ``(q, k, v)``，形状 ``(B, H, L, Dh)``。"""
         bsz, seq_len, _ = x.shape
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
@@ -195,7 +215,18 @@ class _AdaLNAttention(nn.Module):
             k = torch.cat([k_rot, k_pass], dim=-1)
         else:
             q, k = self.rope.apply_qk(q, k, positions)
+        return q, k, v
 
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        *,
+        bsz: int,
+        seq_len: int,
+    ) -> torch.Tensor:
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
@@ -203,6 +234,17 @@ class _AdaLNAttention(nn.Module):
         )
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_embd)
         return self.resid_dropout(self.c_proj(y))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = x.shape
+        q, k, v = self._project_qkv(x, positions)
+        return self._attend(q, k, v, attn_mask, bsz=bsz, seq_len=seq_len)
 
 
 class _DiTBlock(nn.Module):
@@ -253,6 +295,59 @@ class _DiTBlock(nn.Module):
         x = x + gate_msa * self.attn(h, attn_mask=attn_mask, positions=positions)
         h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
         x = x + gate_mlp * self.mlp(h)
+        return x
+
+    def _split_mod(
+        self, cond: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mod = self.adaLN_modulation(cond)
+        if mod.ndim == 2:
+            mod = mod.unsqueeze(1)
+        return mod.chunk(6, dim=-1)
+
+    def forward_prefill(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """左段 prefill：与 ``forward`` 同构，并返回本层已 RoPE 的 ``(K, V)``。"""
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_mod(cond)
+        h = self.norm1(x) * (1.0 + scale_msa) + shift_msa
+        bsz, seq_len, _ = h.shape
+        q, k, v = self.attn._project_qkv(h, positions)
+        y = self.attn._attend(q, k, v, attn_mask, bsz=bsz, seq_len=seq_len)
+        x = x + gate_msa * y
+        h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
+        x = x + gate_mlp * self.mlp(h)
+        return x, (k, v)
+
+    def forward_right(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        left_k: torch.Tensor,
+        left_v: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        return_kv: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """右段增量：Q 来自 ``x``，K/V 拼 ``(left_kv, 本层右段)``。"""
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_mod(cond)
+        h = self.norm1(x) * (1.0 + scale_msa) + shift_msa
+        bsz, seq_len, _ = h.shape
+        q, k, v = self.attn._project_qkv(h, positions)
+        k_all = torch.cat([left_k, k], dim=2)
+        v_all = torch.cat([left_v, v], dim=2)
+        y = self.attn._attend(q, k_all, v_all, attn_mask, bsz=bsz, seq_len=seq_len)
+        x = x + gate_msa * y
+        h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
+        x = x + gate_mlp * self.mlp(h)
+        if return_kv:
+            return x, (k, v)
         return x
 
 
@@ -423,3 +518,137 @@ class AdaLNZeroStack(nn.Module):
         if return_hidden:
             return x_hat, x
         return x_hat
+
+    def prefill_left(
+        self,
+        x: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> LeftKVCache:
+        """左段独立过栈（``m=none, t=1``），收集每层已 RoPE 的 K/V。
+
+        2L 掩码下左不看右，故左表示与右段无关；生成 hop 可复用本 cache。
+        """
+        bsz, seq_len, _ = x.shape
+        if seq_len == 0:
+            return LeftKVCache(layers=[])
+        if x.size(-1) != self.n_embd:
+            raise ValueError(
+                f"AdaLNZeroStack 入口宽 {x.size(-1)} 须等于 n_embd={self.n_embd}"
+            )
+        t = torch.ones(bsz, seq_len, device=x.device, dtype=x.dtype)
+        m = torch.zeros(bsz, seq_len, device=x.device, dtype=torch.long)
+        cond = self._cond(t, None, m, batch=bsz, seq_len=seq_len)
+        if positions is None:
+            positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
+        attn_mask = as_sdpa_mask(attn_mask)
+        layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for block in self.blocks:
+            x, kv = block.forward_prefill(
+                x, cond, attn_mask=attn_mask, positions=positions,
+            )
+            layers.append(kv)
+        hidden = x
+        x_hat = self.final(x, cond)
+        return LeftKVCache(layers=layers, x_hat=x_hat, hidden=hidden)
+
+    def forward_right(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        w_sc: torch.Tensor | None,
+        m: torch.Tensor,
+        left_kv: LeftKVCache,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """只跑右段：每层 Q 看 ``cat(K_left, K_right)``。
+
+        ``attn_mask`` 须为右 Q × (左+右) K，形状 ``(W, L+W)`` 或带 batch 维。
+        """
+        bsz, seq_len, _ = x.shape
+        if x.size(-1) != self.n_embd:
+            raise ValueError(
+                f"AdaLNZeroStack 入口宽 {x.size(-1)} 须等于 n_embd={self.n_embd}"
+            )
+        if len(left_kv.layers) != len(self.blocks):
+            raise ValueError(
+                f"left_kv 层数 {len(left_kv.layers)} 须等于 n_layer={len(self.blocks)}"
+            )
+        cond = self._cond(t, w_sc, m, batch=bsz, seq_len=seq_len)
+        if positions is None:
+            positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
+        attn_mask = as_sdpa_mask(attn_mask)
+        for block, (left_k, left_v) in zip(self.blocks, left_kv.layers):
+            x = block.forward_right(
+                x, cond, left_k, left_v,
+                attn_mask=attn_mask, positions=positions,
+            )
+        x_hat = self.final(x, cond)
+        if return_hidden:
+            return x_hat, x
+        return x_hat
+
+    def extend_left(
+        self,
+        x_new: torch.Tensor,
+        cache: LeftKVCache,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        left_group: int = 1,
+    ) -> LeftKVCache:
+        """把新增左段接到已有 KV 上（组间因果，旧 K/V 不用重算）。"""
+        if cache.left_len == 0 or not cache.layers:
+            mask = attn_mask
+            if mask is None:
+                mask = group_causal_mask(
+                    int(x_new.size(1)), left_group, device=x_new.device,
+                )
+            return self.prefill_left(x_new, attn_mask=mask, positions=positions)
+        if len(cache.layers) != len(self.blocks):
+            raise ValueError(
+                f"left_kv 层数 {len(cache.layers)} 须等于 n_layer={len(self.blocks)}"
+            )
+        bsz, new_len, _ = x_new.shape
+        if new_len == 0:
+            return cache
+        old_len = cache.left_len
+        t = torch.ones(bsz, new_len, device=x_new.device, dtype=x_new.dtype)
+        m = torch.zeros(bsz, new_len, device=x_new.device, dtype=torch.long)
+        cond = self._cond(t, None, m, batch=bsz, seq_len=new_len)
+        if positions is None:
+            positions = torch.arange(
+                old_len, old_len + new_len, device=x_new.device, dtype=torch.long,
+            )
+        if attn_mask is None:
+            full = group_causal_mask(
+                old_len + new_len, left_group, device=x_new.device,
+            )
+            attn_mask = full[old_len:, :]
+        attn_mask = as_sdpa_mask(attn_mask)
+        layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+        x = x_new
+        for block, (left_k, left_v) in zip(self.blocks, cache.layers):
+            got = block.forward_right(
+                x, cond, left_k, left_v,
+                attn_mask=attn_mask, positions=positions, return_kv=True,
+            )
+            x, (k, v) = got  # type: ignore[misc]
+            layers.append((torch.cat([left_k, k], dim=2), torch.cat([left_v, v], dim=2)))
+        hidden_new = x
+        x_hat_new = self.final(x, cond)
+        hidden = (
+            torch.cat([cache.hidden, hidden_new], dim=1)
+            if cache.hidden is not None
+            else hidden_new
+        )
+        x_hat = (
+            torch.cat([cache.x_hat, x_hat_new], dim=1)
+            if cache.x_hat is not None
+            else x_hat_new
+        )
+        return LeftKVCache(layers=layers, x_hat=x_hat, hidden=hidden)

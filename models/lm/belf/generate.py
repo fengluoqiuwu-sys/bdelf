@@ -83,8 +83,8 @@ def block_generate(
         src = mu if source == "mu" else z
         return backbone.map_x(src)
 
-    def _g_right(*args: Any, **kwargs: Any):
-        got = backbone.forward_g(*args, **kwargs)
+    def _g_right(*args: Any, left_kv: Any = None, **kwargs: Any):
+        got = backbone.forward_g(*args, left_kv=left_kv, **kwargs)
         if isinstance(got, tuple):
             return got
         return got, None
@@ -136,6 +136,8 @@ def block_generate(
     if prefix_len > 0:
         alive = alive & ~(tokens[:, :prefix_len] == eos_id).any(dim=1)
 
+    left_kv = backbone.prefill_left_kv(clean) if clean.size(1) > 0 else None
+
     for b_idx in range(start_block, n_blocks):
         if not bool(alive.any().item()):
             break
@@ -174,6 +176,7 @@ def block_generate(
                 left, z_cur, t_scalar, MODE_DENOISE, w_sc,
                 known_right=known_n,
                 sc_right=sc_right,
+                left_kv=left_kv,
             )
             t_tok = z_cur.new_full((z_cur.size(0), z_cur.size(1)), float(t_scalar))
             if known_n > 0:
@@ -227,6 +230,7 @@ def block_generate(
             left, z_block, t_dec, MODE_DECODE, w_sc_dec,
             known_right=known_n,
             sc_right=sc_right,
+            left_kv=left_kv,
         )
         start = b_idx * w
         if getattr(backbone, "exit_kind", "decoder") == "decoder":
@@ -270,6 +274,10 @@ def block_generate(
             )
             committed = _mapped(z_c, mu_c, x0_src)[:, start : start + w_cur]
         clean = torch.cat([clean, committed], dim=1)
+        if commit_x0hat:
+            left_kv = backbone.extend_left_kv(left_kv, committed)
+        else:
+            left_kv = backbone.prefill_left_kv(clean)
         known_rem = 0
         alive = alive & ~(tokens[:, : start + w_cur] == eos_id).any(dim=1)
 

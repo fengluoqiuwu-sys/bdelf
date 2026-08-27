@@ -12,6 +12,7 @@ from models.lm.belf_relf_core import (
     AdaLNZeroStack,
     ExitMap,
     LatentBundle,
+    LeftKVCache,
     as_sdpa_mask,
     blend_v_tgt,
     check_time_step,
@@ -399,6 +400,39 @@ class _RelfBackbone(nn.Module):
         return self.denoiser(
             x, t, w_sc, m, attn_mask=attn_mask, positions=positions,
             return_hidden=self.exit_kind == "linear",
+        )
+
+    def prefill_left_kv(
+        self,
+        h_left: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> LeftKVCache | None:
+        """生成：左段已是茎后 D，补零 sc 后 prefill KV。"""
+        if h_left.size(1) == 0:
+            return None
+        x = h_left
+        if self.sc_proj is not None:
+            x = self.sc_proj(torch.cat([x, torch.zeros_like(x)], dim=-1))
+        left_len = int(x.size(1))
+        mask = group_causal_mask(left_len, 1, device=x.device)
+        return self.denoiser.prefill_left(x, attn_mask=mask, positions=positions)
+
+    def extend_left_kv(
+        self,
+        cache: LeftKVCache | None,
+        h_new: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> LeftKVCache | None:
+        """生成：把新 pop 的左段（已茎）增量写入 KV。"""
+        if h_new.size(1) == 0:
+            return cache
+        if cache is None or cache.left_len == 0:
+            return self.prefill_left_kv(h_new, positions)
+        x = h_new
+        if self.sc_proj is not None:
+            x = self.sc_proj(torch.cat([x, torch.zeros_like(x)], dim=-1))
+        return self.denoiser.extend_left(
+            x, cache, positions=positions, left_group=1,
         )
 
     def _split_g(self, out: torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
@@ -881,6 +915,7 @@ class _RelfBackbone(nn.Module):
             *,
             drop_left: bool,
             in_win: torch.Tensor | None = None,
+            left_kv: LeftKVCache | None = None,
         ) -> torch.Tensor:
             nonlocal nfe
             bsz = z_win.size(0)
@@ -906,9 +941,14 @@ class _RelfBackbone(nn.Module):
                 vis[:, left_len:, left_len:] = vis[:, left_len:, left_len:] | (
                     (~in_win)[:, :, None] & eye
                 )
-            attn = as_sdpa_mask(vis)
-            if attn is None:
-                raise RuntimeError("2L mask 不能为空")
+            use_cache = (
+                left_kv is not None
+                and not drop_left
+                and left_len > 0
+                and left_kv.left_len == left_len
+                and left_kv.x_hat is not None
+                and left_len >= max(64, 4 * w_sz)
+            )
             if drop_left and left_len > 0:
                 h_left = torch.zeros_like(h_left)
                 two = left_len + w_sz
@@ -917,9 +957,41 @@ class _RelfBackbone(nn.Module):
                 else:
                     vis = vis.clone()
                 vis[:, left_len:, :left_len] = False
-                attn = as_sdpa_mask(vis)
-                if attn is None:
+            if use_cache:
+                assert left_kv is not None and left_kv.x_hat is not None
+                h_right = self._stem(z_win)
+                if self.sc_proj is not None:
+                    sc_r = torch.zeros_like(h_right)
+                    if self.sc_cfg and sc_win is not None:
+                        sc_r = self._stem(sc_win)
+                    x_r = self.sc_proj(torch.cat([h_right, sc_r], dim=-1))
+                else:
+                    x_r = h_right
+                if vis.ndim == 2:
+                    vis_r = vis[left_len:, :]
+                else:
+                    vis_r = vis[:, left_len:, :]
+                attn_r = as_sdpa_mask(vis_r)
+                if attn_r is None:
                     raise RuntimeError("2L mask 不能为空")
+                w_r = None
+                if self.sc_cfg:
+                    w_r = (m_win == _MODE_DENOISE).to(dtype=dtype) * w_sc_val
+                out = self.denoiser.forward_right(
+                    x_r, t_win, w_r, m_win, left_kv,
+                    attn_mask=attn_r, positions=pos_win,
+                    return_hidden=self.exit_kind == "linear",
+                )
+                x_right, hidden_r = self._split_g(out)
+                x_hat = torch.cat([left_kv.x_hat, x_right], dim=1)
+                hidden = None
+                if hidden_r is not None and left_kv.hidden is not None:
+                    hidden = torch.cat([left_kv.hidden, hidden_r], dim=1)
+                nfe += 1
+                return x_hat, hidden
+            attn = as_sdpa_mask(vis)
+            if attn is None:
+                raise RuntimeError("2L mask 不能为空")
             h = pack_2l(h_left, self._stem(z_win))
             t = torch.cat(
                 [
@@ -962,6 +1034,7 @@ class _RelfBackbone(nn.Module):
             *,
             in_win: torch.Tensor | None,
             apply_ctx: bool,
+            left_kv: LeftKVCache | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """回噪后前向，再从评估点 Euler。返回 ``(x_hat, x_right, z_next)``。"""
             den = m_w == _MODE_DENOISE
@@ -977,7 +1050,7 @@ class _RelfBackbone(nn.Module):
                 )
             x_hat, hidden = _one_g(
                 h_left, z_eval, t_eval, m_w, sc_in, pos_left, pos_win,
-                drop_left=False, in_win=in_win,
+                drop_left=False, in_win=in_win, left_kv=left_kv,
             )
             left_len = int(h_left.size(1))
             x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
@@ -1094,6 +1167,37 @@ class _RelfBackbone(nn.Module):
         h_left_cache: torch.Tensor | None = _encode_h(tokens) if tokens.size(1) > 0 else None
         z_carry: torch.Tensor | None = None
         sc_carry: torch.Tensor | None = None
+        left_kv: LeftKVCache | None = None
+        left_kv_key: tuple[int, int] | None = None
+
+        def _ensure_left_kv(
+            h_left: torch.Tensor, pos_left: torch.Tensor,
+        ) -> LeftKVCache | None:
+            nonlocal left_kv, left_kv_key
+            left_len = int(h_left.size(1))
+            if left_len == 0:
+                left_kv = None
+                left_kv_key = None
+                return None
+            key = (left_len, int(h_left.data_ptr()))
+            if left_kv is not None and left_kv_key == key:
+                return left_kv
+            left_kv = self.prefill_left_kv(h_left, pos_left)
+            left_kv_key = key
+            return left_kv
+
+        def _note_left_kv(h_left: torch.Tensor | None, kv: LeftKVCache | None) -> None:
+            nonlocal left_kv, left_kv_key
+            left_kv = kv
+            if h_left is None or kv is None or int(h_left.size(1)) == 0:
+                left_kv_key = None
+            else:
+                left_kv_key = (int(h_left.size(1)), int(h_left.data_ptr()))
+
+        def _invalidate_left_kv() -> None:
+            nonlocal left_kv, left_kv_key
+            left_kv = None
+            left_kv_key = None
 
         while tokens.size(1) < seqlen:
             L = int(tokens.size(1))
@@ -1166,8 +1270,10 @@ class _RelfBackbone(nn.Module):
                                 h_left_cache = tokens.new_zeros(
                                     num_samples, 0, self.n_embd,
                                 ).to(dtype=dtype)
+                            _invalidate_left_kv()
                         else:
                             h_left_cache = _commit_left(tokens)
+                            _invalidate_left_kv()
                         z_carry = torch.cat(
                             [
                                 z_win[:, step:],
@@ -1239,6 +1345,8 @@ class _RelfBackbone(nn.Module):
                     t_w = torch.where(known, torch.ones_like(t_w), t_w)
                     m_w = torch.where(in_win & (~known), m_w, torch.zeros_like(m_w))
                     h_left = h_all[:, :g] if g > 0 else h_all[:, :0]
+                    pos_left = torch.arange(h_left.size(1), device=device)
+                    kv = _ensure_left_kv(h_left, pos_left)
                     gathered_x0: torch.Tensor | None = None
                     if h_x0_pref.size(1) > 0:
                         safe = jj.clamp(0, h_x0_pref.size(1) - 1)
@@ -1253,7 +1361,6 @@ class _RelfBackbone(nn.Module):
                             z_win = torch.where(unk.unsqueeze(-1), mixed, z_win)
                             hop0 = False
                         z_win = torch.where(known.unsqueeze(-1), gathered_x0, z_win)
-                    pos_left = torch.arange(h_left.size(1), device=device)
                     pos_win = torch.arange(u, u + w_sz, device=device).clamp(
                         min=0, max=self.max_seq_len - 1,
                     )
@@ -1262,7 +1369,7 @@ class _RelfBackbone(nn.Module):
                     sc_in = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_in), sc_in)
                     x_hat, x_right, z_win, hidden = _predict_and_euler(
                         h_left, z_win, t_w, m_w, sc_in, pos_left, pos_win,
-                        in_win=in_win, apply_ctx=True,
+                        in_win=in_win, apply_ctx=True, left_kv=kv,
                     )
                     if gathered_x0 is not None:
                         z_win = torch.where(known.unsqueeze(-1), gathered_x0, z_win)
@@ -1316,13 +1423,22 @@ class _RelfBackbone(nn.Module):
                                         pop[:, r:],
                                         torch.zeros_like(pop[:, r:]),
                                     )
-                                h_left_cache = torch.cat(
-                                    [left_pref, self._stem(pop)], dim=1,
+                                h_new = self._stem(pop)
+                                h_left_cache = torch.cat([left_pref, h_new], dim=1)
+                                pos_new = torch.arange(
+                                    int(left_pref.size(1)),
+                                    int(h_left_cache.size(1)),
+                                    device=device,
+                                )
+                                _note_left_kv(
+                                    h_left_cache,
+                                    self.extend_left_kv(left_kv, h_new, pos_new),
                                 )
                             else:
                                 h_left_cache = left_pref
                         else:
                             h_left_cache = _commit_left(tokens)
+                            _invalidate_left_kv()
                         z_carry = torch.cat([z_win[:, step:], extra], dim=1)
                         sc_carry = torch.cat(
                             [x_right[:, step:], torch.zeros_like(x_right[:, :step])], dim=1,
@@ -1348,9 +1464,10 @@ class _RelfBackbone(nn.Module):
             sc_win[:, w_sz - step :] = 0
             pos_left = torch.arange(h_left.size(1), device=device)
             pos_win = torch.arange(u, u + w_sz, device=device).clamp(max=self.max_seq_len - 1)
+            kv = _ensure_left_kv(h_left, pos_left)
             x_hat, x_right, z_win, hidden = _predict_and_euler(
                 h_left, z_win, t_w, m_w, sc_win, pos_left, pos_win,
-                in_win=in_win, apply_ctx=True,
+                in_win=in_win, apply_ctx=True, left_kv=kv,
             )
             logits = self._exit_logits(
                 x_hat, hidden, tokens=_exit_tok(x_hat, int(h_left.size(1))),
@@ -1372,11 +1489,21 @@ class _RelfBackbone(nn.Module):
                     pop = torch.where(
                         valid.unsqueeze(-1), pop, torch.zeros_like(pop),
                     )
-                    h_left_cache = torch.cat([h_left, self._stem(pop)], dim=1)
+                    h_new = self._stem(pop)
+                    h_left_cache = torch.cat([h_left, h_new], dim=1)
+                    pos_new = torch.arange(
+                        int(h_left.size(1)), int(h_left_cache.size(1)),
+                        device=device,
+                    )
+                    _note_left_kv(
+                        h_left_cache,
+                        self.extend_left_kv(left_kv, h_new, pos_new),
+                    )
                 else:
                     h_left_cache = h_left
             else:
                 h_left_cache = _commit_left(tokens)
+                _invalidate_left_kv()
             past_end = (not bool(alive.any().item())) or (u + step >= seqlen)
             extra = (
                 torch.zeros(

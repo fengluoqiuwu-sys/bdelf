@@ -19,9 +19,11 @@ from models.lm.belf_relf_core import (
     AdaLNZeroStack,
     ExitMap,
     LatentBundle,
+    LeftKVCache,
     as_sdpa_mask,
     blend_v_tgt,
     check_time_step,
+    group_causal_mask,
     hide_left_keys,
     hide_right_pad_from_unknown,
     interpolate,
@@ -318,6 +320,70 @@ class _BelfBackbone(nn.Module):
             )
         return self.sc_proj(torch.cat([packed, sc], dim=-1))
 
+    def _stem_left_for_cache(self, h_left: torch.Tensor) -> torch.Tensor:
+        """左段茎 + 零 sc（与 ``_apply_sc`` 左列同构）。"""
+        h = self.stem(h_left.detach())
+        if self.sc_proj is None:
+            return h
+        return self.sc_proj(torch.cat([h, torch.zeros_like(h)], dim=-1))
+
+    def prefill_left_kv(self, h_left: torch.Tensor) -> LeftKVCache | None:
+        """生成：对当前左上下文做一次 G prefill，供后续 hop 复用 KV。"""
+        if h_left.size(1) == 0:
+            return None
+        x = self._stem_left_for_cache(h_left)
+        left_len = int(x.size(1))
+        mask = group_causal_mask(left_len, self.block_size, device=x.device)
+        pos = torch.arange(left_len, device=x.device, dtype=torch.long)
+        return self.g.prefill_left(x, attn_mask=mask, positions=pos)
+
+    def extend_left_kv(
+        self,
+        cache: LeftKVCache | None,
+        h_new: torch.Tensor,
+    ) -> LeftKVCache | None:
+        """生成：把新提交的左块增量写入 KV（``commit_x0hat`` 路径）。"""
+        if h_new.size(1) == 0:
+            return cache
+        if cache is None or cache.left_len == 0:
+            return self.prefill_left_kv(h_new)
+        x = self._stem_left_for_cache(h_new)
+        return self.g.extend_left(x, cache, left_group=self.block_size)
+
+    def _g_right_cached(
+        self,
+        h_right: torch.Tensor,
+        t_r: torch.Tensor,
+        m_r: torch.Tensor,
+        w_sc: torch.Tensor | None,
+        left_kv: LeftKVCache,
+        *,
+        left_len: int,
+        sc_right: torch.Tensor | None,
+        known_right: int,
+        want_h: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """右段增量前向：只算 W，注意力看 cached 左 KV。"""
+        h_r = self.stem(h_right)
+        if self.sc_proj is not None:
+            sc = torch.zeros_like(h_r)
+            if sc_right is not None:
+                sc = self.stem(sc_right)
+            if known_right > 0:
+                sc = sc.clone()
+                sc[:, :known_right] = 0
+            h_r = self.sc_proj(torch.cat([h_r, sc], dim=-1))
+        raw = self._raw_2l_mask(left_len, int(h_r.size(1)), h_r.device)
+        mask_r = raw[left_len:, :]
+        pos_r = torch.arange(
+            left_len, left_len + int(h_r.size(1)),
+            device=h_r.device, dtype=torch.long,
+        )
+        return self.g.forward_right(
+            h_r, t_r, w_sc, m_r, left_kv,
+            attn_mask=mask_r, positions=pos_r, return_hidden=want_h,
+        )
+
     def forward_g(
         self,
         h_left: torch.Tensor,
@@ -329,18 +395,19 @@ class _BelfBackbone(nn.Module):
         known_right: int = 0,
         drop_left: bool = False,
         sc_right: torch.Tensor | None = None,
+        left_kv: LeftKVCache | None = None,
     ) -> torch.Tensor:
-        """2L G：左右均为流空间 X，茎升到 D；返回右段 x-pred（X）。"""
+        """2L G：左右均为流空间 X，茎升到 D；返回右段 x-pred（X）。
+
+        ``left_kv`` 仅生成路径使用：左段已 prefill 时只跑右段。训练勿传。
+        """
+        h_right_x = h_right
         h_right = self.stem(h_right)
         h_left = self.stem(h_left)
         bsz, right_len, _ = h_right.shape
         left_len = int(h_left.size(1))
         device = h_right.device
         dtype = h_right.dtype
-        left = h_left
-        if drop_left:
-            left = maybe_drop_left(left, self.ctx_drop_prob)
-        packed = pack_2l(left, h_right)
         if isinstance(t_right, torch.Tensor):
             t_r = t_right.to(device=device, dtype=dtype)
             if t_r.ndim == 1:
@@ -354,6 +421,27 @@ class _BelfBackbone(nn.Module):
             t_r = t_r.clone()
             t_r[:, :known_right] = 1.0
             m_r[:, :known_right] = MODE_NONE
+        want_h = self.exit_kind == "linear"
+        use_cache = (
+            left_kv is not None
+            and not drop_left
+            and left_len > 0
+            and left_kv.left_len == left_len
+            and len(left_kv.layers) == len(self.g.blocks)
+            # 左太短时 W×(L+W) 的瘦 SDPA 不如一次 (L+W)²，只在左够长时切 cache。
+            and left_len >= max(64, 4 * right_len)
+        )
+        if use_cache:
+            assert left_kv is not None
+            return self._g_right_cached(
+                h_right_x, t_r, m_r, w_sc, left_kv,
+                left_len=left_len, sc_right=sc_right,
+                known_right=known_right, want_h=want_h,
+            )
+        left = h_left
+        if drop_left:
+            left = maybe_drop_left(left, self.ctx_drop_prob)
+        packed = pack_2l(left, h_right)
         t_l = packed.new_ones(bsz, left_len)
         m_l = torch.zeros(bsz, left_len, device=device, dtype=torch.long)
         t_all = torch.cat([t_l, t_r], dim=1) if left_len > 0 else t_r
@@ -368,7 +456,6 @@ class _BelfBackbone(nn.Module):
         packed = self._apply_sc(
             packed, sc_right, left_len, known_right=known_right,
         )
-        want_h = self.exit_kind == "linear"
         out = self.g(
             packed, t_all, w_all, m_all, attn_mask=mask, positions=positions,
             return_hidden=want_h,

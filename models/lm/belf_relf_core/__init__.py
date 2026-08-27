@@ -12,7 +12,13 @@ from .cfg import (
 )
 from .exit import CausalExit, ExitMap
 from .flow import interpolate, v_star, x_to_v
-from .layers import AdaLNZeroStack, ScaleEmbedder, TimestepEmbedder, as_sdpa_mask
+from .layers import (
+    AdaLNZeroStack,
+    LeftKVCache,
+    ScaleEmbedder,
+    TimestepEmbedder,
+    as_sdpa_mask,
+)
 from .latent import LatentBundle, validate_joint_tune, validate_loaded_block
 from .pack import (
     group_causal_mask,
@@ -25,6 +31,7 @@ from .time import check_time_step, ladder_levels
 
 __all__ = [
     "AdaLNZeroStack",
+    "LeftKVCache",
     "CausalExit",
     "ExitMap",
     "LatentBundle",
