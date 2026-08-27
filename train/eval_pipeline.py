@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from eval.gen_ppl import (
+    decode_eval_texts,
     get_src_tokenizer as _get_src_tokenizer,
     prepare_gpt2_eval_texts,
     score_texts,
@@ -26,6 +27,7 @@ from train.checkpoint import unwrap_model
 from train.eval import (
     _gen_eval_local_count,
     _gen_eval_sampling_cfg,
+    eval_gen_seqlen,
     eval_model_ppl,
     get_amp_dtype,
     release_eval_cuda_scratch,
@@ -110,6 +112,7 @@ class SharedGenBatch:
 
     texts: list[str]
     uniq_counts: list[float]
+    lengths: list[int]
     seed: int
     seqlen: int
 
@@ -154,6 +157,9 @@ def generate_shared_samples(
 ) -> SharedGenBatch:
     """各卡分担生成，再汇总 texts / uniq（顺序：rank0, rank1, …）。
 
+    长度上限为 preprocess ``chunk_length``（s1=512 / s2=2048）；模型在 EOS
+    处提前停。BOS/EOS/PAD 不计入 uniq 与后续 gen_ppl / entropy / dist1。
+
     只切 unwrap 后原模块的 ``eval()``，不动 DDP/compile 外壳，避免 Dynamo
     为 eval 模式另编一张图。
     """
@@ -161,7 +167,7 @@ def generate_shared_samples(
     was_training = raw.training
     raw.eval()
     try:
-        seqlen = int(cfg.extra.get("chunk_length", 1024))
+        seqlen = eval_gen_seqlen(cfg)
         n_total = int(cfg.gen_eval_samples)
         n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
         micro_bs = max(1, int(cfg.batch_size))
@@ -179,6 +185,7 @@ def generate_shared_samples(
         devices = [train_device] if train_device.type == "cuda" else []
         local_texts: list[str] = []
         local_uniq: list[float] = []
+        local_lens: list[int] = []
 
         if n_local > 0:
             chunks: list[torch.Tensor] = []
@@ -202,22 +209,24 @@ def generate_shared_samples(
                         chunks.append(generated.detach())
                         remaining -= this_bs
             generated = torch.cat(chunks, dim=0)
-            local_uniq = [
-                float(row.unique().numel()) for row in generated.detach().cpu()
-            ]
             src_tok_name = get_preprocess(cfg.preprocess).tokenizer
             src_tok = _get_src_tokenizer(src_tok_name)
-            local_texts = [
-                src_tok.decode(row.tolist(), skip_special_tokens=True)
-                for row in generated.detach().cpu()
-            ]
+            local_texts, local_uniq, local_lens = decode_eval_texts(
+                generated.detach().cpu(), src_tok,
+            )
 
         texts = _gather_object_list(local_texts, is_distributed=is_distributed)
         uniq_counts = _gather_object_list(local_uniq, is_distributed=is_distributed)
+        lengths = _gather_object_list(local_lens, is_distributed=is_distributed)
         texts = texts[:n_total]
         uniq_counts = uniq_counts[:n_total]
+        lengths = lengths[:n_total]
         return SharedGenBatch(
-            texts=texts, uniq_counts=uniq_counts, seed=seed, seqlen=seqlen,
+            texts=texts,
+            uniq_counts=uniq_counts,
+            lengths=lengths,
+            seed=seed,
+            seqlen=seqlen,
         )
     finally:
         if was_training:
@@ -324,11 +333,18 @@ def write_sample_dir(
     """落盘 ``eval_samples/step_*/{meta.json,samples.csv}``。"""
     out_dir = sample_step_dir(run_dir, step)
     out_dir.mkdir(parents=True, exist_ok=True)
+    n = len(batch.texts)
+    len_mean = (
+        float(sum(batch.lengths) / n) if batch.lengths and n else float("nan")
+    )
     meta = {
         "step": step,
-        "n": len(batch.texts),
+        "n": n,
         "seed": batch.seed,
         "seqlen": batch.seqlen,
+        "gen_len_mean": (
+            round(len_mean, 2) if len_mean == len_mean else ""
+        ),
         **(meta_extra or {}),
     }
     (out_dir / "meta.json").write_text(
@@ -357,6 +373,7 @@ def write_sample_dir(
                     if i < len(scores.entropy) and scores.entropy[i] == scores.entropy[i]
                     else ""
                 ),
+                "gen_len": batch.lengths[i] if i < len(batch.lengths) else "",
             }
             for k in extra_keys:
                 col = scores.extra_columns[k]
@@ -531,6 +548,11 @@ def run_online_eval(
                         if batch.uniq_counts
                         else float("nan")
                     )
+                    len_mean = (
+                        float(sum(batch.lengths) / max(n, 1))
+                        if batch.lengths
+                        else float("nan")
+                    )
                     nonempty_frac = nonempty / max(n, 1)
 
                     if "gen_ppl" in due_names:
@@ -540,6 +562,8 @@ def run_online_eval(
                             off["gen_ppl"] = round(scores.gen_ppl_corpus, 4)
                         if uniq_mean == uniq_mean:
                             off["gen_uniq_mean"] = round(uniq_mean, 2)
+                        if len_mean == len_mean:
+                            off["gen_len_mean"] = round(len_mean, 2)
                         off["gen_nonempty_frac"] = round(nonempty_frac, 4)
                         wrote_official = True
                     if "entropy" in due_names:
@@ -560,6 +584,8 @@ def run_online_eval(
                     summary_bits = []
                     if off.get("gen_ppl") != "":
                         summary_bits.append(f"gen_ppl {off['gen_ppl']}")
+                    if off.get("gen_len_mean") != "":
+                        summary_bits.append(f"gen_len_mean {off['gen_len_mean']}")
                     if off.get("entropy") != "":
                         summary_bits.append(f"entropy {off['entropy']}")
                     if off.get("dist1") != "":

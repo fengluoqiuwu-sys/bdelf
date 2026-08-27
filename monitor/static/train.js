@@ -327,6 +327,7 @@ const DEFAULT_CHARTS = {
         { source: "eval", metric: "eval_loss", y_min: "0" },
         { source: "eval", metric: "gen_ppl", y_min: "0", y_max: "100" },
         { source: "eval", metric: "gen_uniq_mean", y_min: "0", y_max: "500" },
+        { source: "eval_official", metric: "gen_len_mean", y_min: "0", y_max: "2048" },
         { source: "train", metric: "lr", y_min: "0", y_max: "0.2" },
       ],
     },
@@ -750,6 +751,24 @@ function tokensToB(x) {
   const n = Number(x);
   if (!Number.isFinite(n)) return null;
   return n / BILLION;
+}
+
+function finiteMetricY(raw) {
+  if (raw === "" || raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pointsToXY(points, metric) {
+  const out = [];
+  for (const pt of points || []) {
+    const y = finiteMetricY(pt[metric]);
+    if (y == null) continue;
+    const x = tokensToB(pt.x);
+    if (x == null) continue;
+    out.push({ x, y });
+  }
+  return out;
 }
 
 function buildSeriesUrl(panel, trace, run, after) {
@@ -1628,7 +1647,7 @@ async function refreshPanel(idx, { full = false } = {}) {
       window.__seriesCache[key][tkey] = { lastX, points, n_raw: nRaw, downsampled };
       datasets.push({
         label: `${trace.source} · ${metric}`,
-        data: points.map((pt) => ({ x: tokensToB(pt.x), y: pt[metric] })),
+        data: pointsToXY(points, metric),
         borderColor: trace.color || TRACE_COLORS[i % TRACE_COLORS.length],
         backgroundColor: "transparent",
         tension: 0.1,
@@ -1643,7 +1662,7 @@ async function refreshPanel(idx, { full = false } = {}) {
       if (fallback?.points?.length) {
         datasets.push({
           label: `${trace.source} · ${trace.metric}`,
-          data: fallback.points.map((pt) => ({ x: tokensToB(pt.x), y: pt[trace.metric] })),
+          data: pointsToXY(fallback.points, trace.metric),
           borderColor: trace.color || TRACE_COLORS[i % TRACE_COLORS.length],
           backgroundColor: "transparent",
           tension: 0.1,

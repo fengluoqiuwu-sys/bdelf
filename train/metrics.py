@@ -79,6 +79,7 @@ EVAL_OFFICIAL_FIELDS = [
     "gen_loss",
     "gen_ppl",
     "gen_uniq_mean",
+    "gen_len_mean",
     "gen_nonempty_frac",
     "entropy",
     "dist1",
@@ -90,6 +91,7 @@ EVAL_SAMPLE_BASE_FIELDS = [
     "text",
     "gen_ppl",
     "entropy",
+    "gen_len",
 ]
 
 _TRAIN_LOG = "[train]"

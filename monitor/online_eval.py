@@ -87,6 +87,8 @@ def _lm_item_summaries(sample_dir: Path) -> list[dict[str, Any]]:
                 "id": str(sid),
                 "gen_ppl": row.get("gen_ppl"),
                 "entropy": row.get("entropy"),
+                "gen_len": row.get("gen_len"),
+                "length": row.get("gen_len"),
             },
         )
     return items

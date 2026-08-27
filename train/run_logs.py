@@ -40,6 +40,7 @@ _OLD_EVAL_EXT = {
     "gen_loss",
     "gen_ppl",
     "gen_uniq_mean",
+    "gen_len_mean",
     "gen_nonempty_frac",
     "entropy",
     "dist1",

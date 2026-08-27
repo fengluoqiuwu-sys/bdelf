@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -17,6 +17,56 @@ from train.metrics import loss_to_ppl
 # 进程内 tokenizer 缓存
 _SRC_TOKENIZER_CACHE: dict[str, Any] = {}
 _GPT2_TOKENIZER: Any | None = None
+
+
+def content_ids_for_eval(
+    token_ids: Sequence[int],
+    *,
+    bos_id: int,
+    eos_id: int,
+    pad_id: int,
+) -> list[int]:
+    """首个 EOS 截断（不含 EOS）；丢掉 BOS / PAD。
+
+    在线 gen-eval 的 uniq / 解码 / GPT-2 打分都走这条内容序列，
+    避免停机后的 PAD 或首尾特殊符灌进指标。
+    """
+    skip = {int(bos_id), int(pad_id)}
+    eos = int(eos_id)
+    out: list[int] = []
+    for raw in token_ids:
+        tid = int(raw)
+        if tid == eos:
+            break
+        if tid in skip:
+            continue
+        out.append(tid)
+    return out
+
+
+def decode_eval_texts(
+    rows: Sequence[Any],
+    src_tok: Any,
+) -> tuple[list[str], list[float], list[int]]:
+    """按内容 token 解码；返回 uniq 与内容长度（均不含 BOS/EOS/PAD）。"""
+    layout = src_tok.get_token_layout()
+    bos_id = int(layout.bos_token_id)
+    eos_id = int(layout.eos_token_id)
+    pad_id = int(layout.pad_token_id)
+    texts: list[str] = []
+    uniq: list[float] = []
+    lengths: list[int] = []
+    for row in rows:
+        ids = row.tolist() if hasattr(row, "tolist") else list(row)
+        content = content_ids_for_eval(
+            ids, bos_id=bos_id, eos_id=eos_id, pad_id=pad_id,
+        )
+        lengths.append(len(content))
+        uniq.append(float(len(set(content))) if content else 0.0)
+        texts.append(
+            src_tok.decode(content, skip_special_tokens=True) if content else ""
+        )
+    return texts, uniq, lengths
 
 
 def get_src_tokenizer(name: str) -> Any:
@@ -56,7 +106,9 @@ def prepare_gpt2_eval_texts(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """将解码文本用 GPT-2 重分词，供 Gen.PPL 打分。
 
-    返回 ``(input_ids, labels, attention_mask)``；pad 位置 label=-100。
+    调用方应已去掉源侧 BOS/EOS/PAD。此处 ``add_special_tokens=False``，
+    且 pad 位 label=-100（GPT-2 的 pad_id 等于 eos_id，不能按 id 掩）。
+    返回 ``(input_ids, labels, attention_mask)``。
     """
     gpt2_tok = get_gpt2_tokenizer()
     encoded = gpt2_tok(
@@ -88,10 +140,7 @@ def prepare_gpt2_eval_batch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """训练 tokenizer 解码后再 GPT-2 编码（在线 gen-eval 路径）。"""
     src_tok = get_src_tokenizer(src_tokenizer_name)
-    texts = [
-        src_tok.decode(row.tolist(), skip_special_tokens=True)
-        for row in batch.detach().cpu()
-    ]
+    texts, _uniq, _lens = decode_eval_texts(batch.detach().cpu(), src_tok)
     return prepare_gpt2_eval_texts(
         texts,
         gpt2_vocab_size=gpt2_vocab_size,

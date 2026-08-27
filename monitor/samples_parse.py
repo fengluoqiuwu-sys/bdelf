@@ -108,5 +108,7 @@ def load_online_lm_samples(samples_dir: Path) -> list[dict[str, Any]]:
             for key in ("gen_ppl", "entropy"):
                 if key in item:
                     item[key] = _pf(str(item[key]))
+            if "gen_len" in item:
+                item["gen_len"] = _pi(str(item["gen_len"]))
             out.append(item)
         return out

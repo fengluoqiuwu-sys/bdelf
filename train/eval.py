@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from eval.gen_ppl import (
+    decode_eval_texts,
     get_gpt2_tokenizer as _get_gpt2_tokenizer,
     get_src_tokenizer as _get_src_tokenizer,
     prepare_gpt2_eval_texts,
@@ -204,6 +205,14 @@ def eval_model_ppl(
     return avg_loss, avg_ppl
 
 
+def eval_gen_seqlen(cfg: FL_TrainConfig) -> int:
+    """在线生成上限：preprocess ``chunk_length``（belf-relf s1=512 / s2=2048）。
+
+    模型在首个 EOS 处提前停；右侧 PAD 只对齐张量，不计入指标。
+    """
+    return max(1, int(cfg.extra.get("chunk_length", 1024)))
+
+
 def _gen_eval_sampling_cfg(cfg: FL_TrainConfig) -> dict[str, Any]:
     """在线 gen-eval 采样参数来自 ``--generate`` 指定的 generate 配置。"""
     return dict(cfg.generate_sampling)
@@ -254,7 +263,7 @@ def eval_one_batch_gen_ppl(
     fill_token_id = int(
         getattr(gpt2_model.config, "eos_token_id", None) or 50256,
     )
-    seqlen = int(cfg.extra.get("chunk_length", 1024))
+    seqlen = eval_gen_seqlen(cfg)
     use_train_amp = train_device.type == "cuda"
     use_gpt2_amp = gpt2_device.type == "cuda"
     gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
@@ -304,18 +313,12 @@ def eval_one_batch_gen_ppl(
         generated = torch.cat(chunks, dim=0)
         assert generated.size(0) == n_local
 
-        # Collapse diagnostics on token ids (before skip_special decode).
-        uniq_counts = [
-            float(row.unique().numel()) for row in generated.detach().cpu()
-        ]
-        uniq_sum = float(sum(uniq_counts))
-
         src_tok_name = get_preprocess(cfg.preprocess).tokenizer
         src_tok = _get_src_tokenizer(src_tok_name)
-        texts = [
-            src_tok.decode(row.tolist(), skip_special_tokens=True)
-            for row in generated.detach().cpu()
-        ]
+        texts, uniq_counts, _lens = decode_eval_texts(
+            generated.detach().cpu(), src_tok,
+        )
+        uniq_sum = float(sum(uniq_counts))
         # Match official ELF: score only nonempty decoded strings.
         nonempty = [t for t in texts if isinstance(t, str) and t.strip()]
         skipped_local = len(texts) - len(nonempty)
