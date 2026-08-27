@@ -7,13 +7,20 @@ from .cfg import (
     hide_left_keys,
     keep_params_in_graph,
     maybe_drop_left,
+    pad_after_first_eos,
     sample_w_sc,
 )
 from .exit import CausalExit, ExitMap
 from .flow import interpolate, v_star, x_to_v
 from .layers import AdaLNZeroStack, ScaleEmbedder, TimestepEmbedder, as_sdpa_mask
-from .latent import LatentBundle, validate_loaded_block
-from .pack import group_causal_mask, pack_2l, pack_2l_mask, pack_2l_parallel_blocks_mask
+from .latent import LatentBundle, validate_joint_tune, validate_loaded_block
+from .pack import (
+    group_causal_mask,
+    hide_right_pad_from_unknown,
+    pack_2l,
+    pack_2l_mask,
+    pack_2l_parallel_blocks_mask,
+)
 from .time import check_time_step, ladder_levels
 
 __all__ = [
@@ -26,17 +33,20 @@ __all__ = [
     "as_sdpa_mask",
     "blend_v_tgt",
     "hide_left_keys",
+    "hide_right_pad_from_unknown",
     "keep_params_in_graph",
     "check_time_step",
     "group_causal_mask",
     "interpolate",
     "ladder_levels",
     "maybe_drop_left",
+    "pad_after_first_eos",
     "pack_2l",
     "pack_2l_mask",
     "pack_2l_parallel_blocks_mask",
     "sample_w_sc",
     "v_star",
+    "validate_joint_tune",
     "validate_loaded_block",
     "x_to_v",
 ]

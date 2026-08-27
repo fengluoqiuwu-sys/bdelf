@@ -193,6 +193,47 @@ class FL_CombinedOptimizer:
         self.muon.load_state_dict(state_dict["muon"])
         self.adamw.load_state_dict(state_dict["adamw"])
 
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        """承接解冻参数：一律进 AdamW（按维拆 decay / nodecay），禁止进 Muon。
+
+        ``latent_tune=mid`` 解冻的入口含 1D 项；Muon 只接受 2D。调用方可能把
+        ``param_groups[0]``（Muon 组）的超参一并传来，这里忽略，改用 AdamW 原型。
+        """
+        params = [p for p in param_group.get("params", []) if p is not None]
+        if not params:
+            return
+        seen = {id(p) for g in self.param_groups for p in g["params"]}
+        fresh = [p for p in params if id(p) not in seen]
+        if not fresh:
+            return
+        if not self.adamw.param_groups:
+            raise RuntimeError(
+                "FL_CombinedOptimizer.add_param_group：AdamW 无已有组，无法承接解冻参数"
+            )
+        proto = {k: v for k, v in self.adamw.param_groups[0].items() if k != "params"}
+        proto["optim_kind"] = "adamw"
+        decay = [p for p in fresh if p.dim() >= 2]
+        nodecay = [p for p in fresh if p.dim() < 2]
+        if decay:
+            g = dict(proto)
+            g["params"] = decay
+            wd = 0.0
+            lr = g.get("lr")
+            for ag in self.adamw.param_groups:
+                if float(ag.get("weight_decay", 0.0)) > 0:
+                    wd = ag["weight_decay"]
+                    lr = ag.get("lr", lr)
+                    break
+            g["weight_decay"] = wd
+            if lr is not None:
+                g["lr"] = lr
+            self.adamw.add_param_group(g)
+        if nodecay:
+            g = dict(proto)
+            g["params"] = nodecay
+            g["weight_decay"] = 0.0
+            self.adamw.add_param_group(g)
+
 
 def _vae_lr_ratio(model: nn.Module) -> float:
     config = getattr(model, "config", None)

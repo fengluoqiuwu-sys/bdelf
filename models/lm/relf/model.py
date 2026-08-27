@@ -19,10 +19,12 @@ from models.lm.belf_relf_core import (
     interpolate,
     ladder_levels,
     maybe_drop_left,
+    pad_after_first_eos,
     pack_2l,
     pack_2l_mask,
     sample_w_sc,
     v_star,
+    validate_joint_tune,
     validate_loaded_block,
     x_to_v,
 )
@@ -39,19 +41,6 @@ from models.tokens import apply_token_layout_to_config, token_layout_from_cfg
 _MODE_NONE = 0
 _MODE_DENOISE = 1
 _MODE_DECODE = 2
-
-
-def _tile_window_starts(seq_len: int, offset: int, window_size: int) -> list[int]:
-    """按 ``W`` 铺不重叠窗；``offset>0`` 时在 ``offset-W`` 补一扇余段窗。"""
-    if window_size < 1:
-        raise ValueError(f"window_size 须 >= 1，收到 {window_size}")
-    if offset < 0 or offset >= window_size:
-        raise ValueError(f"offset 须在 [0, W)，收到 {offset} (W={window_size})")
-    starts: list[int] = []
-    if offset > 0:
-        starts.append(offset - window_size)
-    starts.extend(range(offset, seq_len, window_size))
-    return starts
 
 
 class _RMSNorm(nn.Module):
@@ -74,6 +63,7 @@ class _RelfBackbone(nn.Module):
     # 一次 forward 按槽拆 MSE/CE；不要 ELF decoder_prob 抽支。
     dual_branch_logging = False
     mixed_branch_training = False
+    eval_ppl_from_ce = True
 
     def __init__(self, config: FL_RelfConfig, bundle: LatentBundle) -> None:
         super().__init__()
@@ -95,8 +85,6 @@ class _RelfBackbone(nn.Module):
             raise ValueError(f"n_embd={self.n_embd} 须能被 n_head={self.n_head} 整除")
         if str(config.exit).lower() not in ("decoder", "linear"):
             raise ValueError(f"exit 须为 decoder|linear，收到 {config.exit!r}")
-        if str(config.proj_type).lower() not in ("linear", "bottleneck"):
-            raise ValueError(f"proj_type 须为 linear|bottleneck，收到 {config.proj_type!r}")
         if str(config.attn_backend).lower() != "sdpa":
             raise ValueError(f"relf attn_backend 仅支持 sdpa，收到 {config.attn_backend!r}")
         if str(config.train_t_schedule).strip().lower() != "mixed":
@@ -110,9 +98,14 @@ class _RelfBackbone(nn.Module):
 
         self.latent = bundle
         validate_loaded_block(family="relf", loaded_block=bundle.block_size)
+        validate_joint_tune(loaded_block=bundle.block_size, tune=bundle.tune)
         self.latent_dim = int(bundle.latent_dim)
         if self.latent_dim <= 0:
             raise ValueError("LatentBundle.latent_dim 无效")
+        if int(config.latent_dim) != self.latent_dim:
+            raise ValueError(
+                f"relf latent_dim={config.latent_dim} != artifact.X={self.latent_dim}"
+            )
         if str(config.exit).strip().lower() == "decoder":
             bundle.require_vae_dec(reason="exit=decoder")
 
@@ -144,15 +137,7 @@ class _RelfBackbone(nn.Module):
         x_dim = self.latent_dim
         d_dim = self.n_embd
         bias = bool(config.proj_bias)
-        if str(config.proj_type).lower() == "bottleneck":
-            bdim = int(config.bottleneck_dim)
-            self.in_proj = nn.Sequential(
-                nn.Linear(x_dim, bdim, bias=bias),
-                nn.GELU(),
-                nn.Linear(bdim, d_dim, bias=bias),
-            )
-        else:
-            self.in_proj = nn.Linear(x_dim, d_dim, bias=bias)
+        self.in_proj = nn.Linear(x_dim, d_dim, bias=bias)
         self.proj_norm = (
             _RMSNorm(d_dim) if str(config.proj_norm).lower() == "rmsnorm" else nn.Identity()
         )
@@ -163,7 +148,7 @@ class _RelfBackbone(nn.Module):
             d_dim,
             int(config.n_layer),
             self.n_head,
-            out_dim=d_dim,
+            out_dim=x_dim,
             dropout=float(config.dropout),
             mlp_ratio=float(config.mlp_ratio),
             rope_theta=float(config.rope_theta),
@@ -177,12 +162,7 @@ class _RelfBackbone(nn.Module):
         self.exit_kind = str(config.exit).strip().lower()
         self.use_decoder_exit = self.exit_kind == "decoder"
         if self.use_decoder_exit:
-            self.exit_head = ExitMap(
-                kind="decoder",
-                n_embd=d_dim,
-                out_dim=x_dim,
-                bias=bias,
-            )
+            self.exit_head = None
         else:
             self.exit_head = ExitMap(
                 kind="linear",
@@ -229,8 +209,13 @@ class _RelfBackbone(nn.Module):
         mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
         return (z - mean) / std
 
+    def _stem(self, x: torch.Tensor) -> torch.Tensor:
+        """已白化的 X→D。"""
+        return self.proj_norm(self.in_proj(x))
+
     def _map_h(self, z: torch.Tensor) -> torch.Tensor:
-        return self.proj_norm(self.in_proj(self._whiten(z)))
+        """白化后的流空间 X（不再抬到 D）。"""
+        return self._whiten(z)
 
     def _bos_eos(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """每条样本的 BOS / EOS 下标（含该 token）；无 EOS 则落到最后一个非 PAD。"""
@@ -304,13 +289,13 @@ class _RelfBackbone(nn.Module):
         k0 = torch.zeros(bsz, n_win, device=device, dtype=torch.long)
         known_r = torch.zeros(bsz, n_win, device=device, dtype=torch.long)
         if use_clean and p_clean > 0:
-            bos_cut = u < bos[:, None]
+            h = torch.randint(0, t_steps, (bsz, n_win), device=device)
+            k0_h = step * (t_steps - 1 - h)
+            bos_cut = (u + k0_h) < bos[:, None]
             draw = (
                 active & (~bos_cut)
                 & (torch.rand(bsz, n_win, device=device) < p_clean)
             )
-            h = torch.randint(0, t_steps, (bsz, n_win), device=device)
-            k0_h = step * (t_steps - 1 - h)
             n_prime = (
                 (k >= k0_h[:, :, None]) & valid & not_pad
             ).sum(dim=-1)
@@ -365,12 +350,9 @@ class _RelfBackbone(nn.Module):
             self._mask_base_cache[key] = base
         vis = base.expand(bsz, two, two).clone()
         ridx = torch.arange(right_len, device=device)
-        u_clamped = u.clamp(min=0, max=left_len)
-        u_of_r = u_clamped[:, ridx // w_sz]
-        kv_end = u_of_r
-        if k0 is not None:
-            k0_of_r = k0[:, ridx // w_sz].clamp(min=0)
-            kv_end = (u_of_r + k0_of_r).clamp(max=left_len)
+        # g=clamp(u+k0)，不要先截 u：u<0 且抽余数时 clamp(u)+k0 会把当前槽干净副本漏给右段。
+        g = u if k0 is None else u + k0
+        kv_end = g.clamp(min=0, max=left_len)[:, ridx // w_sz]
         if left_len > 0:
             left_idx = torch.arange(left_len, device=device)
             vis[:, left_len:, :left_len] = left_idx[None, None, :] < kv_end[:, :, None]
@@ -383,7 +365,9 @@ class _RelfBackbone(nn.Module):
         if in_win is not None:
             in_flat = in_win.reshape(bsz, right_len)
             vis[:, left_len:, left_len:] = (
-                vis[:, left_len:, left_len:] & in_flat[:, None, :]
+                vis[:, left_len:, left_len:]
+                & in_flat[:, None, :]
+                & in_flat[:, :, None]
             )
             vis[:, left_len:, left_len:] = vis[:, left_len:, left_len:] | (
                 (~in_flat)[:, :, None] & eye_r
@@ -414,15 +398,29 @@ class _RelfBackbone(nn.Module):
             x = h
         return self.denoiser(
             x, t, w_sc, m, attn_mask=attn_mask, positions=positions,
+            return_hidden=self.exit_kind == "linear",
         )
 
-    def _exit_logits(self, x_hat: torch.Tensor) -> torch.Tensor:
-        if self.config.ce_detach_g:
-            x_hat = x_hat.detach()
-        mapped = self.exit_head(x_hat)
+    def _split_g(self, out: torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
+        if isinstance(out, tuple):
+            return out
+        return out, None
+
+    def _exit_logits(
+        self,
+        x_hat: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+        tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.use_decoder_exit:
-            return self.latent.decode_logits(mapped)
-        return mapped
+            if self.config.ce_detach_g:
+                x_hat = x_hat.detach()
+            return self.latent.decode_logits(x_hat, tokens=tokens)
+        if hidden is None:
+            raise ValueError("exit=linear 须传入 G 隐状态")
+        if self.config.ce_detach_g:
+            hidden = hidden.detach()
+        return self.exit_head(hidden)
 
     def _exit_right_windows(
         self,
@@ -430,30 +428,65 @@ class _RelfBackbone(nn.Module):
         left_len: int,
         u: torch.Tensor,
         k0: torch.Tensor,
+        *,
+        in_win: torch.Tensor | None = None,
+        hidden: torch.Tensor | None = None,
+        tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """每个窗 ``cat(x̂_left[<g], x̂_win)`` 再因果读出；``g=u+k0``。"""
-        bsz, _, d_dim = x_hat.shape
+        """每个窗 ``cat(x̂_left[:g], x̂_win)`` 再因果读出；``g=u+k0``。
+
+        变长前缀左对齐、右侧 pad：窗 logits 落在 ``[g, g+W)``，RoPE 从 0 起。
+        丢掉格不 scatter 进因果前缀。
+        """
+        bsz, _, x_dim = x_hat.shape
         n_win = int(u.size(1))
         w_sz = self.window_size
         x_left = x_hat[:, :left_len] if left_len > 0 else x_hat[:, :0]
         x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
         vocab = int(self.token_layout.vocab_size)
         if not self.use_decoder_exit:
-            return self._exit_logits(x_right)
+            h_right = hidden[:, left_len:] if hidden is not None and left_len > 0 else hidden
+            return self._exit_logits(x_right, h_right)
         g = (u + k0).clamp(min=0, max=left_len)
         out = x_hat.new_zeros(bsz, n_win * w_sz, vocab)
+        win_idx = torch.arange(w_sz, device=x_hat.device)
+        pad_id = int(self.token_layout.pad_token_id)
+        tok_len = int(tokens.size(1)) if tokens is not None else 0
         for wi in range(n_win):
             g_w = g[:, wi]
             max_g = int(g_w.max().item()) if left_len > 0 else 0
             win = x_right[:, wi * w_sz : (wi + 1) * w_sz]
-            dec_in = x_hat.new_zeros(bsz, max_g + w_sz, d_dim)
+            seq = max_g + w_sz
+            dec_in = x_hat.new_zeros(bsz, seq, x_dim)
             if max_g > 0:
-                for b in range(bsz):
-                    gi = int(g_w[b].item())
-                    if gi > 0:
-                        dec_in[b, max_g - gi : max_g] = x_left[b, :gi]
-            dec_in[:, max_g:] = win
-            out[:, wi * w_sz : (wi + 1) * w_sz] = self._exit_logits(dec_in)[:, max_g:]
+                pref = x_left[:, :max_g]
+                keep = torch.arange(max_g, device=x_hat.device)[None, :] < g_w[:, None]
+                dec_in[:, :max_g] = torch.where(keep.unsqueeze(-1), pref, torch.zeros_like(pref))
+            pos = g_w[:, None] + win_idx
+            cur = dec_in.gather(1, pos.unsqueeze(-1).expand(-1, -1, x_dim))
+            if in_win is not None:
+                src = torch.where(in_win[:, wi].unsqueeze(-1), win, cur)
+            else:
+                src = win
+            dec_in.scatter_(1, pos.unsqueeze(-1).expand(-1, -1, x_dim), src)
+            dec_tok = None
+            if tokens is not None and tok_len > 0:
+                dec_tok = tokens.new_full((bsz, seq), pad_id)
+                if max_g > 0:
+                    pref_tok = tokens[:, :max_g]
+                    dec_tok[:, :max_g] = torch.where(
+                        keep, pref_tok, pref_tok.new_full((), pad_id),
+                    )
+                j = (u[:, wi, None] + win_idx).clamp(0, tok_len - 1)
+                win_tok = tokens.gather(1, j)
+                cur_tok = dec_tok.gather(1, pos)
+                if in_win is not None:
+                    win_tok = torch.where(in_win[:, wi], win_tok, cur_tok)
+                dec_tok.scatter_(1, pos, win_tok)
+            logits = self._exit_logits(dec_in, tokens=dec_tok)
+            out[:, wi * w_sz : (wi + 1) * w_sz] = logits.gather(
+                1, pos.unsqueeze(-1).expand(-1, -1, vocab),
+            )
         return out
 
     def _pack_forward(
@@ -473,7 +506,8 @@ class _RelfBackbone(nn.Module):
         """一次 2L：``[n | n_win·W]``，与 BELF 同形的单次 G。"""
         device = tokens.device
         dtype = h_x0.dtype
-        bsz, seq_len, d_dim = h_x0.shape
+        bsz, seq_len, x_dim = h_x0.shape
+        d_dim = self.n_embd
         n_win = int(u.size(1))
         w_sz = self.window_size
         step = self.step_size
@@ -484,7 +518,7 @@ class _RelfBackbone(nn.Module):
         right_len = n_win * w_sz
 
         h_left, drop_left = maybe_drop_left(
-            h_ctx[:, :seq_len].detach(),
+            self._stem(h_ctx[:, :seq_len].detach()),
             float(self.config.ctx_p_drop) if (self.training and compute_loss) else 0.0,
             return_drop=True,
         )
@@ -539,17 +573,18 @@ class _RelfBackbone(nn.Module):
         m_w = torch.where(is_dec, torch.full_like(m_w, _MODE_DECODE), m_w)
 
         valid_pos = (j >= 0) & (j < seq_len)
-        idx = safe_j.reshape(bsz, right_len, 1).expand(bsz, right_len, d_dim)
-        x0 = h_x0.gather(1, idx).reshape(bsz, n_win, w_sz, d_dim)
-        nse = noise.gather(1, idx).reshape(bsz, n_win, w_sz, d_dim)
+        idx = safe_j.reshape(bsz, right_len, 1).expand(bsz, right_len, x_dim)
+        x0 = h_x0.gather(1, idx).reshape(bsz, n_win, w_sz, x_dim)
+        nse = noise.gather(1, idx).reshape(bsz, n_win, w_sz, x_dim)
         x0 = torch.where(valid_pos.unsqueeze(-1), x0, torch.zeros_like(x0))
         nse = torch.where(valid_pos.unsqueeze(-1), nse, torch.zeros_like(nse))
         z = interpolate(x0, t_w, nse)
         z = torch.where(known.unsqueeze(-1), x0, z)
-        z = torch.where(in_win.unsqueeze(-1), z, torch.zeros_like(z))
+        z = torch.where(in_win.unsqueeze(-1), z, x0)
 
-        h_right = z.reshape(bsz, right_len, d_dim)
-        x0_right = x0.reshape(bsz, right_len, d_dim)
+        z_right = z.reshape(bsz, right_len, x_dim)
+        h_right = self._stem(z_right)
+        x0_right = x0.reshape(bsz, right_len, x_dim)
         t_right = t_w.reshape(bsz, right_len)
         m_right = m_w.reshape(bsz, right_len)
         md = is_den.to(dtype).reshape(bsz, right_len)
@@ -579,7 +614,7 @@ class _RelfBackbone(nn.Module):
             den = (m_all == _MODE_DENOISE).to(dtype)
             w_pos = w_vec[:, None] * den
 
-        v_z = v_star(x0_right, h_right, t_right, vel_eps)
+        v_z = v_star(x0_right, z_right, t_right, vel_eps)
         sc = torch.zeros_like(h) if self.sc_cfg else None
         v_u: torch.Tensor | None = None
         v_c: torch.Tensor | None = None
@@ -591,13 +626,13 @@ class _RelfBackbone(nn.Module):
         )
         if need_teacher:
             with torch.no_grad():
-                x_hat_u = self._run_g(
+                x_hat_u, _ = self._split_g(self._run_g(
                     h, t_all, w_pos, m_all, torch.zeros_like(h),
                     attn_mask=attn, positions=positions,
-                )
+                ))
                 x_u_r = x_hat_u[:, left_len:] if left_len > 0 else x_hat_u
-                v_u = x_to_v(x_u_r, h_right, t_right, vel_eps)
-                sc_cond = x_u_r.detach().clone().reshape(bsz, n_win, w_sz, d_dim)
+                v_u = x_to_v(x_u_r, z_right, t_right, vel_eps)
+                sc_cond = self._stem(x_u_r.detach()).reshape(bsz, n_win, w_sz, d_dim)
                 sc_cond[:, :, w_sz - step :, :] = 0
                 sc_cond = sc_cond * is_den.unsqueeze(-1)
                 sc_r_cond = sc_cond.reshape(bsz, right_len, d_dim)
@@ -606,12 +641,12 @@ class _RelfBackbone(nn.Module):
                     sc_teacher[:, left_len:] = sc_r_cond
                 else:
                     sc_teacher = sc_r_cond
-                x_hat_c = self._run_g(
+                x_hat_c, _ = self._split_g(self._run_g(
                     h, t_all, w_pos, m_all, sc_teacher,
                     attn_mask=attn, positions=positions,
-                )
+                ))
                 x_c_r = x_hat_c[:, left_len:] if left_len > 0 else x_hat_c
-                v_c = x_to_v(x_c_r, h_right, t_right, vel_eps)
+                v_c = x_to_v(x_c_r, z_right, t_right, vel_eps)
             sc_stu = sc_r_cond * guided[:, None, None]
             sc = torch.zeros_like(h)
             if left_len > 0:
@@ -619,13 +654,13 @@ class _RelfBackbone(nn.Module):
             else:
                 sc = sc_stu
 
-        x_hat = self._run_g(
+        x_hat, hidden = self._split_g(self._run_g(
             h, t_all, w_pos if self.sc_cfg else None, m_all,
             sc if self.sc_cfg else None,
             attn_mask=attn, positions=positions,
-        )
+        ))
         x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
-        v_hat = x_to_v(x_right, h_right, t_right, vel_eps)
+        v_hat = x_to_v(x_right, z_right, t_right, vel_eps)
         if v_u is not None and v_c is not None:
             v_tgt = blend_v_tgt(v_z, v_u, v_c, w_vec, guided)
             v_tgt = torch.where(md.unsqueeze(-1) > 0, v_tgt, v_z)
@@ -634,7 +669,9 @@ class _RelfBackbone(nn.Module):
         mse_tok = (v_hat - v_tgt).pow(2).mean(dim=-1)
         mse = (mse_tok * md).sum() / md.sum().clamp(min=1.0)
 
-        log_r = self._exit_right_windows(x_hat, left_len, u, k0)
+        log_r = self._exit_right_windows(
+            x_hat, left_len, u, k0, in_win=in_win, hidden=hidden, tokens=tokens,
+        )
         ce_tok = F.cross_entropy(
             log_r.reshape(-1, log_r.size(-1)),
             tgt_right.reshape(-1),
@@ -642,6 +679,12 @@ class _RelfBackbone(nn.Module):
             reduction="none",
         ).view(bsz, right_len)
         ce = (ce_tok * mc).sum() / mc.sum().clamp(min=1.0)
+        if float(mc.sum().detach().item()) <= 0:
+            ce = ce * 0.0
+            last_ce: torch.Tensor | float = float("nan")
+        else:
+            last_ce = ce.detach()
+        self.last_ce_loss = last_ce
         loss = float(self.config.lambda_mse) * mse + float(self.config.lambda_ce) * ce
         return loss, mse, ce
 
@@ -675,9 +718,10 @@ class _RelfBackbone(nn.Module):
         )
         s1 = self.latent.s1_loss(tokens, z=z, mu=mu, logvar=logvar)
         self.last_l2_loss = mse.detach()
-        self.last_ce_loss = ce.detach()
+        # last_ce_loss 已在 _pack_forward 按 mc 写入（无 decode 槽为 nan）
         self.last_s1_loss = s1.detach()
-        total = loss + self.lambda_s1 * s1
+        # 规格总目标为 L+L_s1，无外层 λ_s1；lambda_s1 仅留配置以免换哈希。
+        total = loss + s1
         empty = torch.zeros(
             tokens.size(0), 0, int(self.token_layout.vocab_size),
             device=tokens.device,
@@ -693,29 +737,45 @@ class _RelfBackbone(nn.Module):
         nxt = (idx + 1).clamp(max=int(self.time_step) - 1)
         return levels[nxt]
 
-    def _sde_or_ode(
+    def _churn_eval_state(
         self,
         z: torch.Tensor,
         t: torch.Tensor,
         t_next: torch.Tensor,
-        v: torch.Tensor,
         *,
+        denoise: torch.Tensor,
         method: str,
         gamma: float,
         last_flow: torch.Tensor,
-    ) -> torch.Tensor:
-        """``last_flow`` 槽关 churn（ODE）；其余 SDE。decode 槽调用方不更新。"""
-        h = t_next - t
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ELF / BELF 风格：先回噪，调用方在 ``(z_eval, t_eval)`` 上再前向。
+
+        仅 denoise 且非末流槽 churn；decode / 已知 / 末流保持原 ``(z, t)``。
+        """
         if method != "sde":
-            return z + h.unsqueeze(-1) * v
+            return z, t
+        h = t_next - t
         alpha = (1.0 - float(gamma) * h).clamp(0.0, 1.0)
         t_back = alpha * t
         eps = torch.randn_like(z) * float(self.config.noise_sigma)
         z_back = alpha.unsqueeze(-1) * z + (1.0 - alpha).unsqueeze(-1) * eps
-        z_sde = z_back + (t_next - t_back).unsqueeze(-1) * v
-        z_ode = z + h.unsqueeze(-1) * v
-        use_sde = (~last_flow).unsqueeze(-1).to(dtype=z.dtype)
-        return use_sde * z_sde + (1.0 - use_sde) * z_ode
+        use = denoise & (~last_flow)
+        z_eval = torch.where(use.unsqueeze(-1), z_back, z)
+        t_eval = torch.where(use, t_back, t)
+        return z_eval, t_eval
+
+    def _euler_from_eval(
+        self,
+        z: torch.Tensor,
+        z_eval: torch.Tensor,
+        t_eval: torch.Tensor,
+        t_next: torch.Tensor,
+        v: torch.Tensor,
+        denoise: torch.Tensor,
+    ) -> torch.Tensor:
+        """从评估点 Euler 到 ``t_next``；非 denoise 槽不动。"""
+        stepped = z_eval + (t_next - t_eval).unsqueeze(-1) * v
+        return torch.where(denoise.unsqueeze(-1), stepped, z)
 
     def _sample_tokens(
         self,
@@ -735,7 +795,7 @@ class _RelfBackbone(nn.Module):
         num_samples: int = 1,
         seqlen: int | None = None,
         *,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_k: int | None = None,
         bos_token_id: int | None = None,
         prefix_tokens: torch.Tensor | None = None,
@@ -749,6 +809,8 @@ class _RelfBackbone(nn.Module):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         method = str(cfg.get("sampling_method", "sde")).lower()
+        if method not in ("sde", "ode"):
+            raise ValueError(f"relf 未知 sampling_method={method!r}")
         gamma = float(cfg.get("sde_gamma", 1.5))
         temperature = float(cfg.get("temperature", temperature))
         top_k = cfg.get("top_k", top_k)
@@ -779,10 +841,24 @@ class _RelfBackbone(nn.Module):
         if tokens.size(1) > 0:
             alive = alive & ~(tokens == eos_id).any(dim=1)
 
-        def _encode_h(tok: torch.Tensor) -> torch.Tensor:
-            z, mu, _ = self.latent.encode(tok, sample=False)
-            src = mu if str(self.config.x0_source).lower() == "mu" else z
+        def _encode_mapped(
+            tok: torch.Tensor, source: str, *, sample: bool = False,
+        ) -> torch.Tensor:
+            z, mu, _ = self.latent.encode(tok, sample=sample)
+            src = mu if str(source).lower() == "mu" else z
             return self._map_h(src)
+
+        def _encode_h(tok: torch.Tensor) -> torch.Tensor:
+            """左段 KV：茎后的 D，码来自 ``ctx_source``。"""
+            return self._stem(_encode_mapped(tok, self.config.ctx_source))
+
+        def _encode_x0(tok: torch.Tensor) -> torch.Tensor:
+            """已知余数：encoder 干净码（X），与训练 ``x0_source`` 同一空间。"""
+            return _encode_mapped(tok, self.config.x0_source)
+
+        def _commit_left(tok: torch.Tensor) -> torch.Tensor:
+            src = str(self.config.x0_source)
+            return self._stem(_encode_mapped(tok, src, sample=(src == "z")))
 
         def _one_g(
             h_left: torch.Tensor,
@@ -811,7 +887,9 @@ class _RelfBackbone(nn.Module):
                 two = left_len + w_sz
                 vis = raw.expand(bsz, two, two).clone()
                 vis[:, left_len:, left_len:] = (
-                    vis[:, left_len:, left_len:] & in_win[:, None, :]
+                    vis[:, left_len:, left_len:]
+                    & in_win[:, None, :]
+                    & in_win[:, :, None]
                 )
                 ridx = torch.arange(w_sz, device=device)
                 eye = ridx[:, None] == ridx[None, :]
@@ -832,7 +910,7 @@ class _RelfBackbone(nn.Module):
                 attn = as_sdpa_mask(vis)
                 if attn is None:
                     raise RuntimeError("2L mask 不能为空")
-            h = pack_2l(h_left, z_win)
+            h = pack_2l(h_left, self._stem(z_win))
             t = torch.cat(
                 [
                     torch.ones(bsz, left_len, device=device, dtype=dtype),
@@ -854,14 +932,61 @@ class _RelfBackbone(nn.Module):
                 # decode 列 AdaLN 不吃 w；栈内已按 m 屏蔽。
             sc = torch.zeros_like(h)
             if self.sc_cfg and sc_win is not None:
-                sc[:, left_len:] = sc_win
+                sc[:, left_len:] = self._stem(sc_win)
             positions = torch.cat([pos_left, pos_win], dim=0)
-            x_hat = self._run_g(
+            x_hat, hidden = self._split_g(self._run_g(
                 h, t, w_pos if self.sc_cfg else None, m, sc if self.sc_cfg else None,
                 attn_mask=attn, positions=positions,
-            )
+            ))
             nfe += 1
-            return x_hat
+            return x_hat, hidden
+
+        def _predict_and_euler(
+            h_left: torch.Tensor,
+            z_win: torch.Tensor,
+            t_w: torch.Tensor,
+            m_w: torch.Tensor,
+            sc_in: torch.Tensor,
+            pos_left: torch.Tensor,
+            pos_win: torch.Tensor,
+            *,
+            in_win: torch.Tensor | None,
+            apply_ctx: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """回噪后前向，再从评估点 Euler。返回 ``(x_hat, x_right, z_next)``。"""
+            den = m_w == _MODE_DENOISE
+            t_next = self._slot_next_t(t_w)
+            last_flow = den & (t_next >= cap - 1e-8)
+            z_eval, t_eval = self._churn_eval_state(
+                z_win, t_w, t_next,
+                denoise=den, method=method, gamma=gamma, last_flow=last_flow,
+            )
+            if in_win is not None:
+                z_eval = torch.where(
+                    in_win.unsqueeze(-1), z_eval, torch.zeros_like(z_eval),
+                )
+            x_hat, hidden = _one_g(
+                h_left, z_eval, t_eval, m_w, sc_in, pos_left, pos_win,
+                drop_left=False, in_win=in_win,
+            )
+            left_len = int(h_left.size(1))
+            x_right = x_hat[:, left_len:] if left_len > 0 else x_hat
+            vel_eps = float(self.config.vel_eps)
+            if apply_ctx and abs(float(w_ctx) - 1.0) > 1e-8 and left_len > 0:
+                x_u, _ = _one_g(
+                    h_left, z_eval, t_eval, m_w, sc_in, pos_left, pos_win,
+                    drop_left=True, in_win=in_win,
+                )
+                v_u = x_to_v(x_u[:, left_len:], z_eval, t_eval, vel_eps)
+                v = v_u + float(w_ctx) * (
+                    x_to_v(x_right, z_eval, t_eval, vel_eps) - v_u
+                )
+            else:
+                v = x_to_v(x_right, z_eval, t_eval, vel_eps)
+            z_next = self._euler_from_eval(
+                z_win, z_eval, t_eval, t_next, v, den,
+            )
+            return x_hat, x_right, z_next, hidden
 
         def _fields_for_u(u: int, tok: torch.Tensor, *, target_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """推理窗：BOS 左切、EOS/目标长右切，其余铺 ``F``。"""
@@ -907,7 +1032,15 @@ class _RelfBackbone(nn.Module):
             sampled: torch.Tensor,
             dec: torch.Tensor,
             alive: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+            *,
+            n_write: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+            """追加 decode token；返回 ``(tokens, hit, n_out, valid)``。
+
+            批内较短样本用 PAD 对齐矩形，调用方须 ``pad_after_first_eos``，
+            且 commit 只收 ``valid`` 为真的槽。
+            """
+            empty_v = tok.new_zeros(tok.size(0), 0, dtype=torch.bool)
             is_eos = dec & (sampled == eos_id)
             prev_eos = is_eos.cumsum(dim=1) - is_eos.long()
             already = (
@@ -917,17 +1050,36 @@ class _RelfBackbone(nn.Module):
             )
             keep = dec & (prev_eos == 0) & alive[:, None] & (~already)[:, None]
             hit = already | is_eos.any(dim=1)
-            counts = keep.sum(dim=1)
-            max_n = int(counts.max().item())
-            if max_n == 0:
-                return tok, hit
+            if int(n_write) < 1 or not bool(keep.any().item()):
+                return tok, hit, 0, empty_v
             idx = torch.arange(w_sz, device=device).expand_as(keep)
             order = torch.where(keep, idx, torch.full_like(idx, w_sz)).sort(dim=1).values
-            take = order[:, :max_n]
+            n_real = int((order < w_sz).sum(dim=1).max().item())
+            n_out = min(int(n_write), n_real)
+            if n_out < 1:
+                return tok, hit, 0, empty_v
+            take = order[:, :n_out]
             valid = take < w_sz
             gathered = sampled.gather(1, take.clamp(max=w_sz - 1))
             add = torch.where(valid, gathered, torch.full_like(gathered, pad_id))
-            return torch.cat([tok, add], dim=1), hit
+            return torch.cat([tok, add], dim=1), hit, n_out, valid
+
+        def _exit_tok(x_hat: torch.Tensor, left_len: int) -> torch.Tensor | None:
+            """与 2L ``x_hat`` 对齐的 token：左段用已写前缀，右段用非 PAD 占位。"""
+            if not self.use_decoder_exit:
+                return None
+            bsz = int(x_hat.size(0))
+            two = int(x_hat.size(1))
+            dummy = eos_id if int(eos_id) != int(pad_id) else int(pad_id) + 1
+            out = torch.full((bsz, two), dummy, device=device, dtype=torch.long)
+            if left_len > 0 and tokens.size(1) > 0:
+                have = min(left_len, int(tokens.size(1)))
+                out[:, :have] = tokens[:, :have]
+                if have < left_len:
+                    out[:, have:left_len] = pad_id
+            elif left_len > 0:
+                out[:, :left_len] = pad_id
+            return out
 
         h_left_cache: torch.Tensor | None = _encode_h(tokens) if tokens.size(1) > 0 else None
         z_carry: torch.Tensor | None = None
@@ -944,11 +1096,11 @@ class _RelfBackbone(nn.Module):
 
             if L == 0:
                 # preroll：BOS 自己爬梯，空前缀不注入已写 BOS。
-                sc_win = torch.zeros(num_samples, w_sz, self.n_embd, device=device, dtype=dtype)
+                sc_win = torch.zeros(num_samples, w_sz, self.latent_dim, device=device, dtype=dtype)
                 z_win = torch.randn(
-                    num_samples, w_sz, self.n_embd, device=device, dtype=dtype,
+                    num_samples, w_sz, self.latent_dim, device=device, dtype=dtype,
                 ) * float(self.config.noise_sigma)
-                h_left = z_win.new_zeros(num_samples, 0, self.n_embd)
+                h_left = tokens.new_zeros(num_samples, 0, self.n_embd).to(dtype=dtype)
                 for hop in range(self.time_step):
                     k_bos = step * (self.time_step - hop - 1)
                     u = -k_bos
@@ -960,22 +1112,9 @@ class _RelfBackbone(nn.Module):
                     )
                     sc_in = sc_win.clone()
                     sc_in[:, w_sz - step :] = 0
-                    x_hat = _one_g(
+                    x_hat, x_right, z_win, hidden = _predict_and_euler(
                         h_left, z_win, t_w, m_w, sc_in, pos_left, pos_win,
-                        drop_left=False, in_win=in_win,
-                    )
-                    x_right = x_hat[:, :w_sz]
-                    v = x_to_v(x_right, z_win, t_w, float(self.config.vel_eps))
-                    den = m_w == _MODE_DENOISE
-                    t_next = self._slot_next_t(t_w)
-                    last_flow = den & (t_next >= cap - 1e-8)
-                    z_win = torch.where(
-                        den.unsqueeze(-1),
-                        self._sde_or_ode(
-                            z_win, t_w, t_next, v,
-                            method=method, gamma=gamma, last_flow=last_flow,
-                        ),
-                        z_win,
+                        in_win=in_win, apply_ctx=False,
                     )
                     sc_win = x_right.detach()
                     sc_win[:, w_sz - step :] = 0
@@ -984,7 +1123,7 @@ class _RelfBackbone(nn.Module):
                             [
                                 z_win[:, step:],
                                 torch.randn(
-                                    num_samples, step, self.n_embd, device=device, dtype=dtype,
+                                    num_samples, step, self.latent_dim, device=device, dtype=dtype,
                                 ) * float(self.config.noise_sigma),
                             ],
                             dim=1,
@@ -994,23 +1133,36 @@ class _RelfBackbone(nn.Module):
                             dim=1,
                         )
                     else:
-                        logits = self._exit_logits(x_hat)[:, :w_sz]
+                        logits = self._exit_logits(
+                            x_hat, hidden, tokens=_exit_tok(x_hat, 0),
+                        )[:, :w_sz]
                         sampled = self._sample_tokens(
                             logits, temperature=temperature, top_k=top_k,
                         )
-                        tokens, hit = _append_decoded(
+                        tokens, hit, n_out, valid = _append_decoded(
                             tokens, sampled, m_w == _MODE_DECODE, alive,
+                            n_write=step,
                         )
+                        tokens = pad_after_first_eos(tokens, eos_id, pad_id)
                         alive = alive & ~hit
                         if commit_x0:
-                            h_left_cache = x_right[:, :step]
+                            if n_out > 0:
+                                pop = x_right[:, :n_out]
+                                pop = torch.where(
+                                    valid.unsqueeze(-1), pop, torch.zeros_like(pop),
+                                )
+                                h_left_cache = self._stem(pop)
+                            else:
+                                h_left_cache = tokens.new_zeros(
+                                    num_samples, 0, self.n_embd,
+                                ).to(dtype=dtype)
                         else:
-                            h_left_cache = _encode_h(tokens)
+                            h_left_cache = _commit_left(tokens)
                         z_carry = torch.cat(
                             [
                                 z_win[:, step:],
                                 torch.randn(
-                                    num_samples, step, self.n_embd, device=device, dtype=dtype,
+                                    num_samples, step, self.latent_dim, device=device, dtype=dtype,
                                 ) * float(self.config.noise_sigma),
                             ],
                             dim=1,
@@ -1021,14 +1173,15 @@ class _RelfBackbone(nn.Module):
                         )
                 continue
 
-            if L > 0 and r > 0:
+            if L > 0 and (r > 0 or z_carry is None):
                 # 余数爬梯：与训练单帧 (h,r) 同构。完整 pop [0,g) 进 KV。
                 # hop0 按 F 初始化；之后只钉已知、不重插值；中间 hop 不 pop。
-                sc_win = torch.zeros(num_samples, w_sz, self.n_embd, device=device, dtype=dtype)
+                sc_win = torch.zeros(num_samples, w_sz, self.latent_dim, device=device, dtype=dtype)
                 z_win = torch.randn(
-                    num_samples, w_sz, self.n_embd, device=device, dtype=dtype,
+                    num_samples, w_sz, self.latent_dim, device=device, dtype=dtype,
                 ) * float(self.config.noise_sigma)
                 h_all = h_left_cache if h_left_cache is not None else _encode_h(tokens)
+                h_x0_pref = _encode_x0(tokens)
                 hop0 = True
                 for hop in range(self.time_step):
                     k0 = step * (self.time_step - hop - 1)
@@ -1063,25 +1216,33 @@ class _RelfBackbone(nn.Module):
                         torch.zeros(tokens.size(0), w_sz, device=device, dtype=torch.long),
                     )
                     jj = u + kk
-                    known = (
-                        (kk >= k0) & (kk < k0 + r) & (jj >= 0) & (jj < L)
-                    ).expand(tokens.size(0), -1)
+                    known = (kk >= k0) & (kk < k0 + r) & (jj >= 0) & (jj < L)
+                    known = known.expand(tokens.size(0), -1)
+                    if L > 0:
+                        tok_at = tokens.gather(
+                            1, jj.clamp(0, L - 1).expand(tokens.size(0), -1),
+                        )
+                        known = known & ~(
+                            (jj >= 0) & (jj < L) & (tok_at == eos_id)
+                        )
                     m_w = torch.where(known, torch.zeros_like(m_w), m_w)
                     t_w = torch.where(known, torch.ones_like(t_w), t_w)
                     m_w = torch.where(in_win & (~known), m_w, torch.zeros_like(m_w))
                     h_left = h_all[:, :g] if g > 0 else h_all[:, :0]
-                    gathered: torch.Tensor | None = None
-                    if h_all.size(1) > 0:
-                        safe = jj.clamp(0, h_all.size(1) - 1)
-                        gathered = h_all[:, safe]
+                    gathered_x0: torch.Tensor | None = None
+                    if h_x0_pref.size(1) > 0:
+                        safe = jj.clamp(0, h_x0_pref.size(1) - 1)
+                        gathered_x0 = h_x0_pref[:, safe]
                         if hop0:
                             valid = ((jj >= 0) & (jj < L)).expand(tokens.size(0), -1)
                             unk = in_win & (~known) & valid
-                            nse = torch.randn_like(gathered) * float(self.config.noise_sigma)
-                            mixed = interpolate(gathered, t_w, nse)
+                            nse = torch.randn_like(gathered_x0) * float(
+                                self.config.noise_sigma,
+                            )
+                            mixed = interpolate(gathered_x0, t_w, nse)
                             z_win = torch.where(unk.unsqueeze(-1), mixed, z_win)
                             hop0 = False
-                        z_win = torch.where(known.unsqueeze(-1), gathered, z_win)
+                        z_win = torch.where(known.unsqueeze(-1), gathered_x0, z_win)
                     pos_left = torch.arange(h_left.size(1), device=device)
                     pos_win = torch.arange(u, u + w_sz, device=device).clamp(
                         min=0, max=self.max_seq_len - 1,
@@ -1089,46 +1250,23 @@ class _RelfBackbone(nn.Module):
                     sc_in = sc_win.clone()
                     sc_in[:, w_sz - step :] = 0
                     sc_in = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_in), sc_in)
-                    x_hat = _one_g(
+                    x_hat, x_right, z_win, hidden = _predict_and_euler(
                         h_left, z_win, t_w, m_w, sc_in, pos_left, pos_win,
-                        drop_left=False, in_win=in_win,
+                        in_win=in_win, apply_ctx=True,
                     )
-                    x_right = x_hat[:, h_left.size(1) :]
-                    if w_ctx != 1.0 and h_left.size(1) > 0:
-                        x_u = _one_g(
-                            h_left, z_win, t_w, m_w, sc_in, pos_left, pos_win,
-                            drop_left=True, in_win=in_win,
-                        )
-                        v = x_to_v(x_u[:, h_left.size(1) :], z_win, t_w, float(self.config.vel_eps))
-                        v = v + w_ctx * (
-                            x_to_v(x_right, z_win, t_w, float(self.config.vel_eps)) - v
-                        )
-                    else:
-                        v = x_to_v(x_right, z_win, t_w, float(self.config.vel_eps))
-                    den = m_w == _MODE_DENOISE
-                    t_next = self._slot_next_t(t_w)
-                    last_flow = den & (t_next >= cap - 1e-8)
-                    z_win = torch.where(
-                        den.unsqueeze(-1),
-                        self._sde_or_ode(
-                            z_win, t_w, t_next, v,
-                            method=method, gamma=gamma, last_flow=last_flow,
-                        ),
-                        z_win,
-                    )
-                    if gathered is not None:
-                        z_win = torch.where(known.unsqueeze(-1), gathered, z_win)
+                    if gathered_x0 is not None:
+                        z_win = torch.where(known.unsqueeze(-1), gathered_x0, z_win)
                     sc_win = x_right.detach()
                     sc_win[:, w_sz - step :] = 0
                     sc_win = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_win), sc_win)
                     past_end = bool((tokens == eos_id).any(dim=1).all()) or (g + step >= seqlen)
                     extra = (
                         torch.zeros(
-                            num_samples, step, self.n_embd, device=device, dtype=dtype,
+                            num_samples, step, self.latent_dim, device=device, dtype=dtype,
                         )
                         if past_end
                         else torch.randn(
-                            num_samples, step, self.n_embd, device=device, dtype=dtype,
+                            num_samples, step, self.latent_dim, device=device, dtype=dtype,
                         ) * float(self.config.noise_sigma)
                     )
                     if hop < self.time_step - 1:
@@ -1138,26 +1276,43 @@ class _RelfBackbone(nn.Module):
                             dim=1,
                         )
                     else:
-                        logits = self._exit_logits(x_hat)[:, h_left.size(1) :]
+                        logits = self._exit_logits(
+                            x_hat, hidden, tokens=_exit_tok(x_hat, int(h_left.size(1))),
+                        )[:, h_left.size(1) :]
                         sampled = self._sample_tokens(
                             logits, temperature=temperature, top_k=top_k,
                         )
-                        tokens, hit = _append_decoded(
+                        tokens, hit, n_out, valid = _append_decoded(
                             tokens, sampled, m_w == _MODE_DECODE, alive,
+                            n_write=step - r,
                         )
+                        tokens = pad_after_first_eos(tokens, eos_id, pad_id)
                         alive = alive & ~hit
                         if commit_x0:
-                            pop = x_right[:, :step]
-                            if gathered is not None:
-                                pop = torch.where(
-                                    known[:, :step].unsqueeze(-1),
-                                    gathered[:, :step],
-                                    pop,
-                                )
+                            n_pop = int(r) + n_out
                             left_pref = h_all[:, :g] if g > 0 else h_all[:, :0]
-                            h_left_cache = torch.cat([left_pref, pop], dim=1)
+                            if n_pop > 0:
+                                pop = x_right[:, :n_pop]
+                                if gathered_x0 is not None:
+                                    pop = torch.where(
+                                        known[:, :n_pop].unsqueeze(-1),
+                                        gathered_x0[:, :n_pop],
+                                        pop,
+                                    )
+                                if n_out > 0:
+                                    pop = pop.clone()
+                                    pop[:, r:] = torch.where(
+                                        valid.unsqueeze(-1),
+                                        pop[:, r:],
+                                        torch.zeros_like(pop[:, r:]),
+                                    )
+                                h_left_cache = torch.cat(
+                                    [left_pref, self._stem(pop)], dim=1,
+                                )
+                            else:
+                                h_left_cache = left_pref
                         else:
-                            h_left_cache = _encode_h(tokens)
+                            h_left_cache = _commit_left(tokens)
                         z_carry = torch.cat([z_win[:, step:], extra], dim=1)
                         sc_carry = torch.cat(
                             [x_right[:, step:], torch.zeros_like(x_right[:, :step])], dim=1,
@@ -1170,12 +1325,12 @@ class _RelfBackbone(nn.Module):
             m_w = torch.where(in_win, m_w, torch.zeros_like(m_w))
             if z_carry is None:
                 z_win = torch.randn(
-                    num_samples, w_sz, self.n_embd, device=device, dtype=dtype,
+                    num_samples, w_sz, self.latent_dim, device=device, dtype=dtype,
                 ) * float(self.config.noise_sigma)
             else:
                 z_win = z_carry
             if h_left_cache is None:
-                h_left = z_win.new_zeros(num_samples, 0, self.n_embd)
+                h_left = tokens.new_zeros(num_samples, 0, self.n_embd).to(dtype=dtype)
             else:
                 h_left = h_left_cache
             sc_win = sc_carry if sc_carry is not None else torch.zeros_like(z_win)
@@ -1183,53 +1338,43 @@ class _RelfBackbone(nn.Module):
             sc_win[:, w_sz - step :] = 0
             pos_left = torch.arange(h_left.size(1), device=device)
             pos_win = torch.arange(u, u + w_sz, device=device).clamp(max=self.max_seq_len - 1)
-            x_hat = _one_g(
+            x_hat, x_right, z_win, hidden = _predict_and_euler(
                 h_left, z_win, t_w, m_w, sc_win, pos_left, pos_win,
-                drop_left=False, in_win=in_win,
+                in_win=in_win, apply_ctx=True,
             )
-            x_right = x_hat[:, h_left.size(1) :]
-            if w_ctx != 1.0 and h_left.size(1) > 0:
-                x_u = _one_g(
-                    h_left, z_win, t_w, m_w, sc_win, pos_left, pos_win,
-                    drop_left=True, in_win=in_win,
-                )
-                v = x_to_v(x_u[:, h_left.size(1) :], z_win, t_w, float(self.config.vel_eps))
-                v = v + w_ctx * (
-                    x_to_v(x_right, z_win, t_w, float(self.config.vel_eps)) - v
-                )
-            else:
-                v = x_to_v(x_right, z_win, t_w, float(self.config.vel_eps))
-            den = m_w == _MODE_DENOISE
-            t_next = self._slot_next_t(t_w)
-            last_flow = den & (t_next >= cap - 1e-8)
-            z_win = torch.where(
-                den.unsqueeze(-1),
-                self._sde_or_ode(
-                    z_win, t_w, t_next, v, method=method, gamma=gamma, last_flow=last_flow,
-                ),
-                z_win,
-            )
-            logits = self._exit_logits(x_hat)[:, h_left.size(1) :]
+            logits = self._exit_logits(
+                x_hat, hidden, tokens=_exit_tok(x_hat, int(h_left.size(1))),
+            )[:, h_left.size(1) :]
             sampled = self._sample_tokens(logits, temperature=temperature, top_k=top_k)
             dec = m_w == _MODE_DECODE
             new_len = int(tokens.size(1))
-            tokens, hit = _append_decoded(tokens, sampled, dec, alive)
+            tokens, hit, n_out, valid = _append_decoded(
+                tokens, sampled, dec, alive, n_write=step,
+            )
+            tokens = pad_after_first_eos(tokens, eos_id, pad_id)
             alive = alive & ~hit
             if int(tokens.size(1)) == new_len:
                 if (not bool(in_win.any())) or u + step >= seqlen:
                     break
             if commit_x0:
-                h_left_cache = torch.cat([h_left, x_right[:, :step]], dim=1)
+                if n_out > 0:
+                    pop = x_right[:, :n_out]
+                    pop = torch.where(
+                        valid.unsqueeze(-1), pop, torch.zeros_like(pop),
+                    )
+                    h_left_cache = torch.cat([h_left, self._stem(pop)], dim=1)
+                else:
+                    h_left_cache = h_left
             else:
-                h_left_cache = _encode_h(tokens)
+                h_left_cache = _commit_left(tokens)
             past_end = (not bool(alive.any().item())) or (u + step >= seqlen)
             extra = (
                 torch.zeros(
-                    num_samples, step, self.n_embd, device=device, dtype=dtype,
+                    num_samples, step, self.latent_dim, device=device, dtype=dtype,
                 )
                 if past_end
                 else torch.randn(
-                    num_samples, step, self.n_embd, device=device, dtype=dtype,
+                    num_samples, step, self.latent_dim, device=device, dtype=dtype,
                 ) * float(self.config.noise_sigma)
             )
             z_carry = torch.cat([z_win[:, step:], extra], dim=1)
@@ -1253,6 +1398,7 @@ class _RelfBackbone(nn.Module):
 
 class FL_RelfModel(FL_PreTrainedModel):
     config_class = FL_RelfConfig
+    eval_ppl_from_ce = True
 
     def __init__(self, config: FL_RelfConfig, bundle: LatentBundle) -> None:
         super().__init__(config)

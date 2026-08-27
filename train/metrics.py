@@ -69,6 +69,7 @@ TRAIN_OFFICIAL_FIELDS_LM = [
     "attr_rho",
     "chart_ce",
     "commit",
+    "s1",
 ]
 TRAIN_OFFICIAL_FIELDS = TRAIN_OFFICIAL_FIELDS_LM
 
@@ -404,7 +405,11 @@ def build_train_core_row(
                 f"'denoise', 'decode', or 'mixed', got {loss_branch!r}"
             )
     else:
-        if train_loss == train_loss:
+        # BELF/RELF：PPL 对齐 HeldOut，用 decode CE，不用合计（含 L_s1）。
+        ce = _as_optional_float(metrics.get("decode_ce"))
+        if ce is not None:
+            row["train_ppl"] = round(loss_to_ppl(ce), 4)
+        elif "decode_ce" not in metrics and train_loss == train_loss:
             row["train_ppl"] = round(loss_to_ppl(train_loss), 4)
     return row
 
@@ -490,6 +495,7 @@ def build_train_official_row(
         "attr_rho",
         "chart_ce",
         "commit",
+        "s1",
         "denoise_mse",
         "decode_ce",
     ):

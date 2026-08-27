@@ -30,7 +30,7 @@
 
 \begin{abstract}
 本文档完整说明 bdelf 中两族半自回归连续语言模型 BELF 与 RELF 的动机、流几何、时间场、损失、CFG、训练接口与推理循环。
-二者实现上可共享模块代码，但须分别描述、分别训练，且不共享参数。共用 ELF 约定的 rectified flow（\(t=1\) 为干净端）、token 对齐 VAE、2L pack、去噪器 \(G\)，以及 \(G\) 之后的出口读 token。默认出口为 \(D\to X\) 再走 VAE-dec（Cola）；对照为 \(D\to V\) 直接出 logits（ELF）。默认 CE 对 \(G\) 反向传播。
+二者实现上可共享模块代码，但须分别描述、分别训练，且不共享参数。共用 ELF 约定的 rectified flow（\(t=1\) 为干净端）、token 对齐 VAE、2L pack、去噪器 \(G\)，以及 \(G\) 之后的出口读 token。流空间是入口输出维 \(X=\) \texttt{latent\_dim}（须与 artifact 一致）；\(D=\) \texttt{n\_embd} 只是 \(G\) 隐层。默认出口为 \(\hat x_0\in X\) 再走 VAE-dec（Cola）；对照从隐状态 \(D\to V\) 直接出 logits（ELF）。默认 CE 对 \(G\) 反向传播。
 \textbf{BELF} 在块内未知槽共享同一标量 \(t\)，已知余数钉干净条件，块间将提交结果写入 KV cache。
 \textbf{RELF} 在窗内使用降序局部时间梯子，每步自窗左端移出（pop）\(S\) 个槽；当前窗已知余数钉干净条件。
 每一族、每一档 \texttt{latent\_tune} 均须完成主训与扩展 token 预算；生成长度上限为 \texttt{max\_seq\_len}。
@@ -87,9 +87,9 @@ Rolling Diffusion~\cite{rolling2024} 将全局 \(t\) 映射为帧局部 \(t_k\)�
 超参数划分为模型、训练、推理三类。\texttt{latent\_model} 与 \texttt{tag} 属模型类：二者指定入口自编码器，因而决定入口结构，不再单列「加载」类。
 
 \paragraph{模型。}
-网络结构。必填 \texttt{latent\_model} 与 \texttt{tag}，无默认，用于调用已有加载器 \texttt{load\_latent\_artifact}。入口 encoder / decoder 在参数表里只记这两项；隐维 \(X\)、词表、VAE 层数、s1 系数以加载结果为准，不列表。入口 encoder 的注意力块长以加载结果为准，不随本规格改写。\texttt{block\_size} 仅 BELF：\(G\) 去噪块长，100m 默认 16，主跑 \(W=T\)。加载入口块长须为 \(1\)（逐 token 因果）或等于本题 BELF \(W\)。RELF 无此字段；加载入口块长必须为 \(1\)；窗长 \texttt{window\_size} 与入口无关。
+网络结构。必填 \texttt{latent\_model} 与 \texttt{tag}，无默认，用于调用已有加载器 \texttt{load\_latent\_artifact}。入口 encoder / decoder 在参数表里只记这两项与流维 \texttt{latent\_dim}（\(X\)，须等于 artifact 输出维）；词表、VAE 层数、s1 系数以加载结果为准，不列表。入口 encoder 的注意力块长以加载结果为准，不随本规格改写。\texttt{block\_size} 仅 BELF：\(G\) 去噪块长，100m 默认 16，主跑 \(W=T\)。加载入口块长须为 \(1\)（逐 token 因果）或等于本题 BELF \(W\)。可训档（\texttt{full} / \texttt{mid}）另要求入口块长为 \(1\)；块因果入口只允许 \texttt{frozen}。RELF 无此字段；加载入口块长必须为 \(1\)；窗长 \texttt{window\_size} 与入口无关。
 
-\texttt{n\_embd}（记 \(D\)）是 \(G\) 的隐层宽度，须整除 \texttt{n\_head}，全文只声明一次。\texttt{max\_seq\_len} 是位置编码与生成长度上限。出口 \texttt{exit} 只有一层线性，映射目标不同：默认 \texttt{decoder}（Cola）为 \(D\to X\) 再走加载的 VAE-dec 得 logits；对照 \texttt{linear}（ELF）为 \(D\to V\) 直接得 logits。两类只改 \(\hat x_0\to\mathrm{logits}\) 这一段；CE 施加于哪些位置由本族规定。无出口层数键。
+\texttt{n\_embd}（记 \(D\)）是 \(G\) 的隐层宽度，与 \(X\) 无关，须整除 \texttt{n\_head}，全文只声明一次。\texttt{max\_seq\_len} 是位置编码与生成长度上限。出口无层数键：默认 \texttt{decoder}（Cola）时 \(\hat x_0\) 已在 \(X\)，直接走加载的 VAE-dec 得 logits；对照 \texttt{linear}（ELF）从隐状态 \(D\to V\) 得 logits。两类只改 \(\hat x_0\to\mathrm{logits}\) 这一段；CE 施加于哪些位置由本族规定。
 
 \texttt{sc\_cfg} 决定网络是否包含 ScaleEmbedder 与 self-cond 通道，因此进入模型指纹。
 
@@ -113,21 +113,21 @@ Rolling Diffusion~\cite{rolling2024} 将全局 \(t\) 映射为帧局部 \(t_k\)�
 
 第二阶段（s2）始终训练映射、\(G\) 与出口。冻结档不计算 \(\mathcal{L}_{\mathrm{s1}}\)。
 \texttt{full} 与解冻后的 \texttt{mid}：只要更新 latent 的任一侧（encoder、VAE-dec、或两侧），就必须计算完整的 \(\mathcal{L}_{\mathrm{s1}}\)（重建 + \(\mathrm{KL}(q\|N(0,I))\) + BERT-mask + ref-KL）。\(\mathcal{L}_{\mathrm{s1}}\) 与 \(\mathcal{L}\) 分开相加。
-出口 CE 计入 \(\mathcal{L}\)。\texttt{exit=decoder} 时 CE 经 \(D\to X\) 与 VAE-dec 回传；VAE-dec 参数是否更新仍只由 \texttt{latent\_tune} 决定（frozen 时参数冻结，梯度仍可回到 \(G\)）。可训档的 \(\mathcal{L}_{\mathrm{s1}}\) 仍经同一 VAE-dec。\texttt{exit=decoder} 或可训档启动时须具备 VAE-dec。\texttt{mid} 解冻前仍不计算 \(\mathcal{L}_{\mathrm{s1}}\)。
+出口 CE 计入 \(\mathcal{L}\)。\texttt{exit=decoder} 时 CE 经已在 \(X\) 的 \(\hat x_0\) 与 VAE-dec 回传；VAE-dec 参数是否更新仍只由 \texttt{latent\_tune} 决定（frozen 时参数冻结，梯度仍可回到 \(G\)）。可训档的 \(\mathcal{L}_{\mathrm{s1}}\) 仍经同一 VAE-dec。\texttt{exit=decoder} 或可训档启动时须具备 VAE-dec。\texttt{mid} 解冻前仍不计算 \(\mathcal{L}_{\mathrm{s1}}\)。
 速度误差仍可反向传播到 encoder；2L 左段的 \texttt{sg} 只切断 pack 左半，不切断该梯度。默认 CE 对 \(G\) 反向传播。
 
 \paragraph{启动校验。}
-加载结果的 \(X\) 须与映射一致；入口 encoder 块长以加载结果为准，不随 \(W\) 改写。BELF：加载入口 \texttt{encoder.block\_size} \(\in\{1,W\}\)。RELF 无 \texttt{block\_size}；加载入口块长必须为 \(1\)，且 \(S\cdot T=W\)。两族 \texttt{time\_step} \(T\ge 4\)，否则报错。\(G\) 的宽度等于 \(D\)；\texttt{exit} 与实际模块匹配；\texttt{exit=decoder} 或可训档须具备 VAE-dec。各族额外校验见本族章。
+加载结果的 \(X\) 须等于配置的 \texttt{latent\_dim}；入口 encoder 块长以加载结果为准，不随 \(W\) 改写。BELF：加载入口 \texttt{encoder.block\_size} \(\in\{1,W\}\)。RELF 无 \texttt{block\_size}；加载入口块长必须为 \(1\)，且 \(S\cdot T=W\)。可训档（\texttt{full} / \texttt{mid}）要求入口块长为 \(1\)，否则报错拒绝。两族 \texttt{time\_step} \(T\ge 4\)，否则报错。\(G\) 的宽度等于 \(D\)；\texttt{exit} 与实际模块匹配；\texttt{exit=decoder} 或可训档须具备 VAE-dec。各族额外校验见本族章。
 
 \subsection{流、去噪器与出口}
 
-时间：\(t=1\) 干净、\(t=0\) 纯噪。工作空间在映射后的 \(D\) 维上：
+时间：\(t=1\) 干净、\(t=0\) 纯噪。流与 v-MSE 在入口输出维 \(X=\) \texttt{latent\_dim}（须与 artifact 一致）；\(D=\) \texttt{n\_embd} 只是 \(G\) 隐层。白化留在 \(X\)，茎 \(\mathrm{Linear}(X\to D)\)，FinalLayer 回到 \(X\)：
 \[
 z_t=t\,x_0+(1-t)\,\varepsilon,\qquad
 \hat v=\frac{\hat x_0-z_t}{\max(1-t,\,\varepsilon_t)},\qquad
 v^\star=x_0-\varepsilon.
 \]
-\(G\) 输出干净点估计 \(\hat x_0\)，再转换为速度并计算 v-MSE。分母取 \(\max(1-t,\varepsilon_t)\)，其中 \(\varepsilon_t=\) \texttt{vel\_eps}，以避免 \(t\to 1\) 时除零。干净端默认取后验样本经映射后的 \(h=\mathrm{Linear}(z)\)，亦可改用均值 \(\mu\)；推理写入 KV 的对象必须与该干净端处于同一空间。
+\(G\) 输出干净点估计 \(\hat x_0\in\mathbb{R}^{X}\)，再转换为速度并计算 v-MSE。分母取 \(\max(1-t,\varepsilon_t)\)，其中 \(\varepsilon_t=\) \texttt{vel\_eps}，以避免 \(t\to 1\) 时除零。干净端默认取后验样本（对照均值）；推理写入 KV 的对象必须与该干净端处于同一空间 \(X\)。
 
 \(G\) 是一份网络，不含 ELF \texttt{decoder\_prob} 双模式。条件通道为 AdaLN-Zero（DiT），不用 ELF 的 in-context control tokens（\texttt{num\_time\_tokens=0}）。块内 LayerNorm 无仿射；每层调制为 \(\mathrm{SiLU}\circ\mathrm{Linear}:D\to 6D\)，拆成 attn / MLP 的 shift、scale、gate；残差 \(x\leftarrow x+\mathrm{gate}\cdot\mathrm{sub}(\ldots)\)。调制末层权重与偏置零初始化，起步每块为恒等。FinalLayer 同样 AdaLN-Zero（调制 \(D\to 2D\) 的 shift / scale），输出线性零初始化。骨干其余不变：RoPE、qk-RMSNorm、SwiGLU。此为实现默认，不列入设计要点、不列入消融。每一层 AdaLN-Zero \textbf{逐列}以 \((t,\,w_{\mathrm{sc}},\,m)\) 为条件（\(m\) 进入模型指纹；不是序列 token，不改变 2L / 注意力）：未知 denoise 列 \(m=\mathrm{denoise}\)，\texttt{sc\_cfg} 为真时再以 \(w_{\mathrm{sc}}\) 为条件；未知 decode 列 \(m=\mathrm{decode}\)，不以 \(w_{\mathrm{sc}}\) 为条件；左段 / 已知 / PAD 不加 \(m\)、不以 \(w_{\mathrm{sc}}\) 为条件。BOS 前、EOS 后的格不在当前窗，同样不加 \(m\)。读 token 仅发生在 \(G\) 之后的出口。流与出口按槽位拆开：denoise 列只计算 v-MSE，decode 列只计算 CE。两项各自对有效位置取平均，再以 \(\lambda\) 相加。左段与已知槽不进入 \(\mathcal{L}\)。BELF 不引入 \(m_d\)/\(m_c\)（用跳号拆）。RELF 使用 \(m_d\)/\(m_c\)，且 \(m_c=1\) 则 \(m_d=0\)。注意力与 sc 通道见本族掩码节。
 
@@ -153,20 +153,21 @@ v^\star=x_0-\varepsilon.
 tokens
   |  load_latent_artifact(latent_model, tag)
   |  Enc (block-causal) -> z in R^{S x X}
-  |  optional whiten; Linear X -> n_embd
+  |  optional whiten on X
+  |  G stem: Linear X -> D
   v
 pack_2l [sg(h_left)|h_t]
   + per-column (t, [w_sc if denoise], [m if unknown])
   -> AdaLN-Zero
   |  G: n_layer x (AdaLN-Zero -> Attn(RoPE, qk-RMSNorm)
   |                -> AdaLN-Zero -> SwiGLU)
-  |  FinalLayer (AdaLN-Zero) -> x0_hat
+  |  FinalLayer (AdaLN-Zero) D -> X -> x0_hat
   v
-Exit (exactly one linear):  Linear(D->X) + VAE-dec  |  Linear(D->V)
+Exit:  x0_hat in X + VAE-dec  |  hidden D -> V
 \end{verbatim}
 
 \paragraph{出口叠法。}
-两族共用一层线性 \texttt{ExitMap}，不算 \(G\) 的一部分，也无层数键。\texttt{linear}（ELF）：\(\mathrm{Linear}(D\to V)\) 直接出 logits。\texttt{decoder}（Cola）：\(\mathrm{Linear}(D\to X)\) 映回入口隐空间，再调用加载的 VAE-dec 出 logits。VAE-dec 的层数 / 块长以加载结果为准，不在本规格另建。CE 施加于哪些位置仍由本族规定。
+出口无层数键。\texttt{linear}（ELF）：从 \(G\) 隐状态 \(\mathrm{Linear}(D\to V)\) 出 logits。\texttt{decoder}（Cola）：\(\hat x_0\) 已在流空间 \(X\)，直接调用加载的 VAE-dec。VAE-dec 的层数 / 块长以加载结果为准，不在本规格另建。CE 施加于哪些位置仍由本族规定。
 
 喂给出口的序列两族不同。BELF 训练只把右段 \(\hat x_0\)（一批块拼成一条）送进出口，\textbf{不}拼接已提交前缀；推理 \texttt{block\_generate} 把已提交的干净码与当前块 \(\hat x_0\) 拼接后再取末 \(W\) 个 logits。RELF 训练在 \texttt{decoder} 下对每个窗做 \(\mathrm{cat}(\hat x_0^{\mathrm{left}}[{:}g],\,\hat x_0^{\mathrm{win}})\)（\(g=u+k_0\)），再取窗内 logits；\texttt{linear} 只看右段。推理 \texttt{rolling\_generate} 把 \(G\) 的整段 2L 输出送进出口，再切右段窗。因此：BELF 训练出口看不到前缀，推理前缀是提交码而不是 \(G\) 左段输出；RELF 训练与推理的 decoder 前缀都是 \(G\) 左段的 \(\hat x_0\)。
 
@@ -192,11 +193,10 @@ Token 预算：每族 \(\times\) 每一 \texttt{latent\_tune} 各有主训与扩
 \multicolumn{4}{@{}l}{\textit{模型（共用）}} \\
 \texttt{latent\_model} & & 交给 \texttt{load\_latent\_artifact} 的家族名。 & 必填 \\
 \texttt{tag} & & 交给加载器的 tag。 & 必填 \\
-\texttt{n\_embd} & \(D\) & \(G\) 隐层宽。只声明一次。 & \(768\) \\
-\texttt{proj\_type} & & \(X\to D\)：\texttt{linear} 一层线性，或 \texttt{bottleneck} 经 \(b\) 再扩到 \(D\)。 & \texttt{linear} \\
-\texttt{bottleneck\_dim} & \(b\) & 仅 \texttt{proj\_type=bottleneck} 的中间维。 & \(128\) \\
+\texttt{n\_embd} & \(D\) & \(G\) 隐层宽。与流空间 \(X\) 无关。 & \(768\) \\
+\texttt{latent\_dim} & \(X\) & 流空间维；须等于 artifact 输出维。 & \(32\) \\
 \texttt{max\_seq\_len} & & 位置编码与生成长度上限。 & \(4096\) \\
-\texttt{exit} & & \texttt{decoder}：\(D\to X\) 再 VAE-dec（Cola）；\texttt{linear}：\(D\to V\)（ELF）。 & \texttt{decoder} \\
+\texttt{exit} & & \texttt{decoder}：\(\hat x_0\in X\) 再 VAE-dec（Cola）；\texttt{linear}：隐状态 \(D\to V\)（ELF）。 & \texttt{decoder} \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练（共用）}} \\
 \texttt{latent\_tune} & & 加载之后是否训练 latent 本体。三档对应三个训练配置哈希。 & \texttt{mid} \\
@@ -443,7 +443,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \section{BELF}
 \label{sec:belf}
 
-块半自回归。联合分布写成 \(p(z_0)=\prod_b p_G(z_0^{(b)}\mid z_0^{(<b)})\)。每一块是一条条件 rectified flow：\textbf{未知槽共享同一标量 \(t\)}；已知余数钉 \(t=1\)。去噪块长等于本规格 \texttt{block\_size}（\(W\)）：100m 默认 16，主跑 \(W=T\)。加载入口块长须 \(\in\{1,W\}\)；入口 encoder 仍按其加载块长做块因果，不随 \(W\) 改写。若训练均匀采样跳号 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，则满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。对照 \(W=1\) 时 \(T\) 仍见表，不强制 \(T=1\)。若将 \(W\) 与 \(T\) 分开设置，须写入指纹，并声明该期望变为 \(W/T\)。当前块内已知余数如何自生成、如何训，见第~\ref{sec:belf-clean}~节。
+块半自回归。联合分布写成 \(p(z_0)=\prod_b p_G(z_0^{(b)}\mid z_0^{(<b)})\)。每一块是一条条件 rectified flow：\textbf{未知槽共享同一标量 \(t\)}；已知余数钉 \(t=1\)。去噪块长等于本规格 \texttt{block\_size}（\(W\)）：100m 默认 16，主跑 \(W=T\)。加载入口块长须 \(\in\{1,W\}\)；可训档另要求入口块长为 \(1\)。入口 encoder 仍按其加载块长做块因果，不随 \(W\) 改写。若训练均匀采样跳号 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，则满未知块上每次前向施加 CE 的期望 token 数为 \(W/T\)。对照 \(W=1\) 时 \(T\) 仍见表，不强制 \(T=1\)。若将 \(W\) 与 \(T\) 分开设置，须写入指纹，并声明该期望变为 \(W/T\)。当前块内已知余数如何自生成、如何训，见第~\ref{sec:belf-clean}~节。
 
 \subsection{Clean}
 \label{sec:belf-clean}
@@ -464,7 +464,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \end{enumerate}
 
 \paragraph{训练。}
-以概率 \texttt{clean\_block\_prob} 把当前块抽成混合块：有效长 \(W'\)（末块可短），切点 \(r\sim\mathrm{Unif}\{1,\ldots,W'-1\}\)。槽 \([0,r)\) 为已知（encoder 干净码、\(t=1\)、不进损失），\([r,W')\) 为未知（走该跳 \(t=L_i\)）。其余前向整块均为未知。\(W=1\) 或 \(W'\le 1\) 时不抽混合块。已知槽始终是 encoder 码，不用 \(\hat x_0\) 冒充余数。左段 KV 训练时也是 encoder 干净码（教师强制）；推理左段默认是自生成的 \(\hat x_0\)。
+以概率 \texttt{clean\_block\_prob} 把当前块抽成混合块：有效长 \(W'\)（末块可短），切点 \(r\sim\mathrm{Unif}\{1,\ldots,W'-1\}\)。槽 \([0,r)\) 为已知（\(t=1\)、不进损失），\([r,W')\) 为未知（走该跳 \(t=L_i\)）。其余前向整块均为未知。\(W=1\) 或 \(W'\le 1\) 时不抽混合块。已知槽始终是 encoder 码，不用 \(\hat x_0\) 冒充余数。右段 unknown Q 不可见同块 PAD K。可训档硬拒入口块长 \(\neq 1\)，不必二次 encode。仅冻结档且入口块长 \(=W\) 时，余数再 encode 一份条件句（当前块 \([r,W)\) 写成 PAD），已知覆写与 PAD 干净码用这份；插值靶仍来自整句 encode。左段 KV 训练时也是 encoder 干净码（教师强制）；推理左段默认是自生成的 \(\hat x_0\)。
 
 \paragraph{排除项。}
 不随机挪块界。任意位置填空（左右都有干净上下文）须改 2L 可见性，不在本文档范围。
@@ -531,7 +531,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 名称 & 符号 & 释义 & 默认 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型}} \\
-\texttt{block\_size} & \(W\) & \(G\) 去噪块长。默认见表（100m 为 16）；入口块长独立，须 \(\in\{1,W\}\)。 & \(16\) \\
+\texttt{block\_size} & \(W\) & \(G\) 去噪块长。默认见表（100m 为 16）；入口块长独立，须 \(\in\{1,W\}\)；可训档另要求入口块长为 \(1\)。 & \(16\) \\
 \texttt{time\_step} & \(T\) & 每块跳数。须 \(T\ge 4\)，否则报错。主跑 \(W=T\)。 & \(16\) \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练}} \\
@@ -598,8 +598,8 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 \texttt{rolling\_generate}。新词一律从 \(L_0\) 爬到 \(1-\varepsilon\) 才 CE / pop；余数只钉干净，不让新词跳过梯子。
 \begin{itemize}
   \item \(L=0\)：preroll。虚拟窗 \(u<i_{\mathrm{bos}}\)，BOS 落在窗内、\textbf{其左截掉}；\(u\) 每次右移 \(S\)，直到 BOS 落到 \(k=0\) 再 CE 并进入 freeroll。clean 不介入。见图~\ref{fig:relf-emit}。
-  \item \(L>0\) 且 \(r=0\)：跳过 preroll 与爬梯。当前窗整窗未知，\(t\leftarrow F\)，进入 freeroll。
-  \item \(L>0\) 且 \(r>0\)：\textbf{余数爬梯}（与 preroll 同构）。余数是文档 \([g,g+r)\)。共 \(T\) 帧，hop \(h=0,\ldots,T-1\)：
+  \item \(L>0\) 且 \(r=0\) \textbf{且已有} \(z_{\mathrm{carry}}\)：跳过 preroll 与爬梯。当前窗整窗未知，\(t\leftarrow F\)，进入 freeroll。
+  \item \(L>0\) 且（\(r>0\) \textbf{或尚无} \(z_{\mathrm{carry}}\)）：\textbf{余数爬梯}（与 preroll 同构）。对齐前缀冷启动 \(r=0\) 时 known 为空、\(n_{\mathrm{write}}=S\)。余数是文档 \([g,g+r)\)。共 \(T\) 帧，hop \(h=0,\ldots,T-1\)：
   \begin{itemize}
     \item 虚拟下标：余数起点 \(k_0=W-S(h+1)=S(T-h-1)\)。窗原点 \(u=g-k_0\)。\(k<k_0\) 的格丢掉（不在当前窗；已写完整 pop 在 KV）。
     \item 槽 \([k_0,k_0+r)\) 为已知（encoder 干净码，\(t=1\)，不进损失）。其余真槽未知，铺各格 \(F_k\)（\(F\) 不滑）。句尾切：EOS 之后仍丢掉。
@@ -613,8 +613,8 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 \paragraph{训练。}
 先取合法窗起点，再按 BOS 前 / EOS 后截 \(F\)（须保住 BOS / EOS，PAD 不当截断对象）。\(r\) 是截断生成：已知为已经写出的真 token；切点必须在 EOS / PAD 之前，且至少留一个未知真槽；\(r\) 不得 \(\ge S\)。
 \begin{itemize}
-  \item \textbf{不做句首切}：以概率 \texttt{clean\_block\_prob} 抽\textbf{余数爬梯的一帧}（不是只抽末帧）。先抽 \(h\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，再铺该 hop 的左切：\(k_0=S(T-h-1)\)。记该帧切完后真窗长 \(N'\)（从 \(k_0\) 起到 EOS / 右端）。令 \(r_{\mathrm{hi}}=\min(S-1,N'-1)\)。若 \(r_{\mathrm{hi}}\ge 1\)，则 \(r\sim\mathrm{Unif}\{1,\ldots,r_{\mathrm{hi}}\}\)；已知 \([k_0,k_0+r)\)（encoder 干净码、\(t=1\)），其余真槽未知（各格 \(F_k\)，\(F\) 不滑）。\(h=T-1\) 时 \(k_0=0\)，即混合满窗 \(F\)。\(h<T-1\) 时 decode 档已切掉，只监督 MSE。句尾切：EOS 不当已知。\(N'=1\) 或 \(S=1\) 则不抽。
-  \item \textbf{做了句首切}：不抽 \(r\)（那是 preroll，BOS 自己爬梯）。不把切掉的左侧改铺 \(t=0\)，也不在更噪的真窗左端再钉干净。两端都切（含句首切）同此。
+  \item \textbf{不做句首切}：以概率 \texttt{clean\_block\_prob} 抽\textbf{余数爬梯的一帧}（不是只抽末帧）。先抽 \(h\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，再铺该 hop 的左切：\(k_0=S(T-h-1)\)。句首切判定为 \(\mathrm{bos\_cut}=(u+k_0)<i_{\mathrm{bos}}\)（留下的第一格是否仍在 BOS 前），不是 \(u<i_{\mathrm{bos}}\)。记该帧切完后真窗长 \(N'\)（从 \(k_0\) 起到 EOS / 右端）。令 \(r_{\mathrm{hi}}=\min(S-1,N'-1)\)。若 \(r_{\mathrm{hi}}\ge 1\)，则 \(r\sim\mathrm{Unif}\{1,\ldots,r_{\mathrm{hi}}\}\)；已知 \([k_0,k_0+r)\)（encoder 干净码、\(t=1\)），其余真槽未知（各格 \(F_k\)，\(F\) 不滑）。\(h=T-1\) 时 \(k_0=0\)，即混合满窗 \(F\)。\(h<T-1\) 时 decode 档已切掉，只监督 MSE。句尾切：EOS 不当已知。\(N'=1\) 或 \(S=1\) 则不抽。
+  \item \textbf{做了句首切}（留下的格仍有 \(j<i_{\mathrm{bos}}\)）：不抽 \(r\)（那是 preroll，BOS 自己爬梯）。不把切掉的左侧改铺 \(t=0\)，也不在更噪的真窗左端再钉干净。两端都切（含句首切）同此。
 \end{itemize}
 不为凑档截掉 BOS / EOS 或把 PAD 当截断对象。已知槽与左段训练时都是 encoder 码（教师强制）；推理左段默认是自生成的 \(\hat x_0\)。
 
@@ -761,7 +761,7 @@ m_d(k)=\mathbf{1}[F_k<1-\varepsilon].
 
 本节给出两族共用的推理项。这些字段可在同一 checkpoint 上更改，不进入训练指纹。BELF 生成使用 \texttt{block\_generate}，RELF 生成使用 \texttt{rolling\_generate}。CFG 的推理尺度见第~\ref{sec:cfg}~节。
 
-默认 \texttt{commit\_x0hat=true}：将 \(G\) 的 \(\hat x_0\) 写入 \(G\) 的 KV。对照 \texttt{false}：先由出口读出 token，再 encode 采样 \(z\) 写入。写入 KV 的空间必须与 \texttt{x0\_source} 一致，两条策略分开报告。训练时左段仍是 encoder 的干净码。出口是无状态的一层线性（\texttt{decoder} 再接加载的 VAE-dec），不维护 KV。提交时左段 \(t=1\)，AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件，sc 通道为 0。
+默认 \texttt{commit\_x0hat=true}：将 \(G\) 的 \(\hat x_0\)（流空间 \(X\)）写入 \(G\) 的 KV。对照 \texttt{false}：先由出口读出 token，再 encode \textbf{采 \(z\)}（\texttt{sample=(x0\_source==z)}）写入，空间与 \texttt{x0\_source} 一致。外部前缀完整块仍走 encoder、\texttt{sample=false}。两条策略分开报告。训练时左段仍是 encoder 的干净码。出口无状态（\texttt{decoder} 时 \(\hat x_0\in X\) 直接 VAE-dec），不维护 KV。提交时左段 \(t=1\)，AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件，sc 通道为 0。
 
 采样默认 \texttt{sampling\_method=sde}（\(\gamma\) 见表），对照 \texttt{ode}。\texttt{sde} 时 churn 关在最后一次\textbf{流}（BELF 跳 \(T-2\)；RELF 升档侧），decode 前向无速度。\texttt{sc\_cfg} 为真时，仅 denoise 未知槽 AdaLN 以推理 \(w_{\mathrm{sc}}\) 为条件（仅开训 checkpoint 可扫描）；decode 列 \(w_{\mathrm{sc}}=0\)。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 

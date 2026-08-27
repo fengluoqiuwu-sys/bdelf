@@ -10,8 +10,8 @@ import torch
 
 
 def pack_2l(h_left: torch.Tensor, h_right: torch.Tensor) -> torch.Tensor:
-    """沿长度维拼接 ``[h_left | h_right]``。左段 stop-grad 由调用方做。"""
-    return torch.cat([h_left, h_right], dim=1)
+    """沿长度维拼接 ``[sg(h_left) | h_right]``。"""
+    return torch.cat([h_left.detach(), h_right], dim=1)
 
 
 def group_causal_mask(
@@ -95,3 +95,23 @@ def pack_2l_parallel_blocks_mask(
     noisy_q_noisy_k = (~q_clean) & (~k_clean) & (q_blk == k_blk)
     clean_q_clean_k = q_clean & k_clean & (q_blk >= k_blk)
     return noisy_q_clean_k | noisy_q_noisy_k | clean_q_clean_k
+
+
+def hide_right_pad_from_unknown(
+    vis: torch.Tensor,
+    is_pad: torch.Tensor,
+    unknown: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """并行 2L：右段 unknown Q 不可见同块 PAD K。``vis`` 为 True=可见。"""
+    seq_len = int(is_pad.size(-1))
+    w = int(block_size)
+    if vis.ndim == 2:
+        vis = vis.unsqueeze(0).expand(is_pad.size(0), -1, -1).clone()
+    else:
+        vis = vis.clone()
+    pos = torch.arange(seq_len, device=is_pad.device)
+    same_blk = (pos[:, None] // w) == (pos[None, :] // w)
+    hide = unknown.unsqueeze(-1) & is_pad.unsqueeze(1) & same_blk.unsqueeze(0)
+    vis[:, seq_len:, seq_len:] = vis[:, seq_len:, seq_len:] & (~hide)
+    return vis

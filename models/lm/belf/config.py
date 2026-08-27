@@ -40,7 +40,7 @@ class FL_BelfConfig(PretrainedConfig):
             "sc_cfg",
             "latent_tune",
             "time_step",
-            "proj_type",
+            "latent_dim",
             "attn_backend",
             "block_size",
         }
@@ -67,10 +67,9 @@ class FL_BelfConfig(PretrainedConfig):
         sc_cfg: bool = True,
         latent_tune: str = "mid",
         time_step: int = 16,
-        proj_type: str = "linear",
+        latent_dim: int = 32,
         attn_backend: str = "sdpa",
         block_size: int = 16,
-        bottleneck_dim: int = 128,
         proj_bias: bool = True,
         proj_norm: str = "rmsnorm",
         whiten: bool = True,
@@ -110,6 +109,8 @@ class FL_BelfConfig(PretrainedConfig):
             raise ValueError("belf 不设 gen_mode；生成锁死 block_generate")
         if "n_layer_dec" in kwargs or "n_exit_layer" in kwargs:
             raise ValueError("belf 出口无层数；exit=linear 映到 logits，exit=decoder 映到 VAE-dec")
+        if "proj_type" in kwargs or "bottleneck_dim" in kwargs:
+            raise ValueError("belf 不设 proj_type/bottleneck_dim；流维是 latent_dim，G 隐层是 n_embd")
         for old, new in _KEY_ALIASES:
             if old not in kwargs:
                 continue
@@ -152,10 +153,9 @@ class FL_BelfConfig(PretrainedConfig):
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = latent_tune
         self.time_step = int(time_step)
-        self.proj_type = str(proj_type).strip().lower()
+        self.latent_dim = int(latent_dim)
         self.attn_backend = attn_backend
         self.block_size = int(block_size)
-        self.bottleneck_dim = int(bottleneck_dim)
         self.proj_bias = bool(proj_bias)
         self.proj_norm = str(proj_norm).strip().lower()
         self.whiten = bool(whiten)

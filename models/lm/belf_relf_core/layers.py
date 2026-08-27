@@ -370,9 +370,7 @@ class AdaLNZeroStack(nn.Module):
     ) -> torch.Tensor:
         t_pos = self._broadcast_t(t, batch, seq_len)
         if m is None:
-            m = torch.full(
-                (batch, seq_len), _MODE_DENOISE, device=t_pos.device, dtype=torch.long,
-            )
+            raise ValueError("AdaLNZeroStack 须逐列传入 m，禁止默认 denoise")
         else:
             m = m.to(device=t_pos.device, dtype=torch.long)
             if m.ndim == 1:
@@ -387,7 +385,11 @@ class AdaLNZeroStack(nn.Module):
             w_emb = self.w_embedder(w_pos)
             denoise = (m == _MODE_DENOISE).unsqueeze(-1).to(dtype=cond.dtype)
             cond = cond + w_emb * denoise
-        m_emb = self.mode_embed(m.clamp(0, 2))
+        if bool((m < 0).any().item()) or bool((m > 2).any().item()):
+            raise ValueError(
+                f"m 须 ∈ {{0,1,2}}，收到 min={int(m.min().item())} max={int(m.max().item())}"
+            )
+        m_emb = self.mode_embed(m)
         known = (m != _MODE_NONE).unsqueeze(-1).to(dtype=cond.dtype)
         return cond + m_emb * known
 
@@ -400,8 +402,12 @@ class AdaLNZeroStack(nn.Module):
         *,
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """``x`` 为 ``(B, L, D)``；返回 x-pred，形状 ``(B, L, out_dim)``。"""
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """``x`` 为 ``(B, L, D)``；返回 x-pred，形状 ``(B, L, out_dim)``。
+
+        ``return_hidden=True`` 时另返回末层前的 ``D`` 隐状态（``exit=linear``）。
+        """
         bsz, seq_len, _ = x.shape
         if x.size(-1) != self.n_embd:
             raise ValueError(
@@ -413,4 +419,7 @@ class AdaLNZeroStack(nn.Module):
         attn_mask = as_sdpa_mask(attn_mask)
         for block in self.blocks:
             x = block(x, cond, attn_mask=attn_mask, positions=positions)
-        return self.final(x, cond)
+        x_hat = self.final(x, cond)
+        if return_hidden:
+            return x_hat, x
+        return x_hat

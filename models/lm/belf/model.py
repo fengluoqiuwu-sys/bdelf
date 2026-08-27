@@ -23,6 +23,7 @@ from models.lm.belf_relf_core import (
     blend_v_tgt,
     check_time_step,
     hide_left_keys,
+    hide_right_pad_from_unknown,
     interpolate,
     keep_params_in_graph,
     ladder_levels,
@@ -32,6 +33,7 @@ from models.lm.belf_relf_core import (
     pack_2l_parallel_blocks_mask,
     sample_w_sc,
     v_star,
+    validate_joint_tune,
     validate_loaded_block,
     x_to_v,
 )
@@ -78,6 +80,7 @@ class _BelfBackbone(nn.Module):
     # 一次 forward 按槽拆 MSE/CE；不要 ELF decoder_prob 抽支。
     dual_branch_logging = False
     mixed_branch_training = False
+    eval_ppl_from_ce = True
 
     def __init__(self, config: FL_BelfConfig, bundle: LatentBundle) -> None:
         super().__init__()
@@ -96,18 +99,20 @@ class _BelfBackbone(nn.Module):
             loaded_block=bundle.block_size,
             W=self.block_size,
         )
+        validate_joint_tune(loaded_block=bundle.block_size, tune=bundle.tune)
         if self.n_embd % self.n_head != 0:
             raise ValueError(
                 f"n_embd={self.n_embd} 须能被 n_head={self.n_head} 整除"
             )
-        proj = str(config.proj_type).strip().lower()
-        if proj not in ("linear", "bottleneck"):
-            raise ValueError(f"proj_type 须为 linear|bottleneck，收到 {config.proj_type!r}")
 
         self.bundle = bundle
         self.latent_dim = int(bundle.latent_dim)
         if self.latent_dim <= 0:
             raise ValueError("LatentBundle.latent_dim 无效")
+        if int(config.latent_dim) != self.latent_dim:
+            raise ValueError(
+                f"belf latent_dim={config.latent_dim} != artifact.X={self.latent_dim}"
+            )
         self.sc_cfg = bool(config.sc_cfg)
         self.exit_kind = str(config.exit).strip().lower()
         if self.exit_kind not in ("decoder", "linear"):
@@ -157,18 +162,10 @@ class _BelfBackbone(nn.Module):
         self.register_buffer("whiten_std", std, persistent=True)
 
         bias = bool(config.proj_bias)
-        if proj == "bottleneck":
-            bdim = int(config.bottleneck_dim)
-            self.in_proj = nn.Sequential(
-                nn.Linear(x_dim, bdim, bias=bias),
-                nn.GELU(),
-                nn.Linear(bdim, self.n_embd, bias=bias),
-            )
-        else:
-            self.in_proj = nn.Linear(x_dim, self.n_embd, bias=bias)
-            nn.init.xavier_uniform_(self.in_proj.weight)
-            if self.in_proj.bias is not None:
-                nn.init.zeros_(self.in_proj.bias)
+        self.in_proj = nn.Linear(x_dim, self.n_embd, bias=bias)
+        nn.init.xavier_uniform_(self.in_proj.weight)
+        if self.in_proj.bias is not None:
+            nn.init.zeros_(self.in_proj.bias)
         self.proj_norm = (
             _RMSNorm(self.n_embd)
             if str(config.proj_norm).lower() == "rmsnorm"
@@ -184,7 +181,7 @@ class _BelfBackbone(nn.Module):
             self.n_embd,
             int(config.n_layer),
             self.n_head,
-            out_dim=self.n_embd,
+            out_dim=x_dim,
             dropout=float(config.dropout),
             mlp_ratio=float(config.mlp_ratio),
             rope_dim=rope_dim,
@@ -199,12 +196,7 @@ class _BelfBackbone(nn.Module):
             nn.Linear(2 * self.n_embd, self.n_embd, bias=True) if self.sc_cfg else None
         )
         if self.exit_kind == "decoder":
-            self.exit_head = ExitMap(
-                kind="decoder",
-                n_embd=self.n_embd,
-                out_dim=x_dim,
-                bias=bias,
-            )
+            self.exit_head = None
         else:
             self.exit_head = ExitMap(
                 kind="linear",
@@ -223,25 +215,42 @@ class _BelfBackbone(nn.Module):
         self.last_ce_loss = float("nan")
         self.last_s1_loss = float("nan")
 
-    def to_d(self, z: torch.Tensor) -> torch.Tensor:
-        """可选白化后 Linear / bottleneck X→D。"""
-        h = z
-        if self.whiten:
-            std = self.whiten_std.clamp(min=1e-8).to(dtype=z.dtype, device=z.device)
-            mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
-            h = (z - mean) / std
-        return self.proj_norm(self.in_proj(h))
+    def _whiten(self, z: torch.Tensor) -> torch.Tensor:
+        """可选白化，仍在流空间 X。"""
+        if not self.whiten:
+            return z
+        std = self.whiten_std.clamp(min=1e-8).to(dtype=z.dtype, device=z.device)
+        mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
+        return (z - mean) / std
 
-    def exit_logits(self, x: torch.Tensor) -> torch.Tensor:
-        mapped = self.exit_head(x)
+    def stem(self, x: torch.Tensor) -> torch.Tensor:
+        """G 茎：已白化的 X→D。"""
+        return self.proj_norm(self.in_proj(x))
+
+    def map_x(self, z: torch.Tensor) -> torch.Tensor:
+        """白化后的流空间 X。"""
+        return self._whiten(z)
+
+    def exit_logits(
+        self,
+        x_hat: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+        tokens: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.exit_kind == "decoder":
-            return self.bundle.decode_logits(mapped)
-        return mapped
+            kwargs: dict[str, Any] = {}
+            if key_padding_mask is not None:
+                kwargs["key_padding_mask"] = key_padding_mask
+            return self.bundle.decode_logits(x_hat, tokens=tokens, **kwargs)
+        if hidden is None:
+            raise ValueError("exit=linear 须传入 G 隐状态")
+        return self.exit_head(hidden)
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         return self.bundle.on_tokens_seen(n, optimizer)
 
-    def _cached_2l_mask(
+    def _raw_2l_mask(
         self,
         left_len: int,
         right_len: int,
@@ -264,12 +273,26 @@ class _BelfBackbone(nn.Module):
                 raw = pack_2l_mask(
                     left_len, right_len, self.block_size, self.block_size, device,
                 )
-            cached = as_sdpa_mask(raw)
-            if cached is None:
-                raise RuntimeError("2L mask 不能为空")
+            cached = raw
             if len(self._mask_cache) > 16:
                 self._mask_cache.pop(next(iter(self._mask_cache)))
             self._mask_cache[key] = cached
+        return cached
+
+    def _cached_2l_mask(
+        self,
+        left_len: int,
+        right_len: int,
+        device: torch.device,
+        *,
+        parallel: bool = False,
+    ) -> torch.Tensor:
+        raw = self._raw_2l_mask(
+            left_len, right_len, device, parallel=parallel,
+        )
+        cached = as_sdpa_mask(raw)
+        if cached is None:
+            raise RuntimeError("2L mask 不能为空")
         return cached
 
     def _apply_sc(
@@ -286,7 +309,7 @@ class _BelfBackbone(nn.Module):
             return packed
         sc = torch.zeros_like(packed)
         if sc_right is not None:
-            sc[:, left_len:] = sc_right
+            sc[:, left_len:] = self.stem(sc_right)
         if known_right > 0:
             sc[:, left_len : left_len + known_right] = 0
         if known_mask is not None:
@@ -307,7 +330,9 @@ class _BelfBackbone(nn.Module):
         drop_left: bool = False,
         sc_right: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """2L G，返回右段 x-pred。"""
+        """2L G：左右均为流空间 X，茎升到 D；返回右段 x-pred（X）。"""
+        h_right = self.stem(h_right)
+        h_left = self.stem(h_left)
         bsz, right_len, _ = h_right.shape
         left_len = int(h_left.size(1))
         device = h_right.device
@@ -343,9 +368,17 @@ class _BelfBackbone(nn.Module):
         packed = self._apply_sc(
             packed, sc_right, left_len, known_right=known_right,
         )
-        x_hat = self.g(
+        want_h = self.exit_kind == "linear"
+        out = self.g(
             packed, t_all, w_all, m_all, attn_mask=mask, positions=positions,
+            return_hidden=want_h,
         )
+        if want_h:
+            x_hat, hidden = out
+            x_r = x_hat[:, left_len:] if left_len > 0 else x_hat
+            h_r = hidden[:, left_len:] if left_len > 0 else hidden
+            return x_r, h_r
+        x_hat = out
         return x_hat[:, left_len:] if left_len > 0 else x_hat
 
     def _masked_mean(
@@ -390,8 +423,8 @@ class _BelfBackbone(nn.Module):
             )
         src_x0 = mu if self.x0_source == "mu" else z
         src_ctx = mu if self.ctx_source == "mu" else z
-        x0 = self.to_d(src_x0)
-        h_ctx = self.to_d(src_ctx)
+        x0 = self._whiten(src_x0)
+        x_ctx = self._whiten(src_ctx)
         dtype = x0.dtype
         pad_id = int(self.token_layout.pad_token_id)
         not_pad = tokens != pad_id
@@ -433,8 +466,20 @@ class _BelfBackbone(nn.Module):
             x0.new_ones(bsz, seq_len),
             t_hop[:, None].expand(bsz, seq_len),
         )
+        x_known = x0
+        if bool((rem > 0).any().item()):
+            cond_tokens = tokens.clone()
+            leak = (
+                (pos[None, :] // w == b_cur[:, None])
+                & (pos[None, :] % w >= rem[:, None])
+                & (rem[:, None] > 0)
+            )
+            cond_tokens = cond_tokens.masked_fill(leak, pad_id)
+            z_c, mu_c, _ = self.bundle.encode(cond_tokens, sample=self.training)
+            src_c = mu_c if self.x0_source == "mu" else z_c
+            x_known = self._whiten(src_c)
         z_t = interpolate(x0, t_right, noise)
-        z_t = torch.where((known | is_pad).unsqueeze(-1), x0, z_t)
+        z_t = torch.where((known | is_pad).unsqueeze(-1), x_known, z_t)
 
         m_den = torch.full(
             (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
@@ -448,7 +493,7 @@ class _BelfBackbone(nn.Module):
         )
 
         h_left, drop_left = maybe_drop_left(
-            h_ctx.detach(),
+            x_ctx.detach(),
             self.ctx_drop_prob if self.training else 0.0,
             return_drop=True,
         )
@@ -468,9 +513,9 @@ class _BelfBackbone(nn.Module):
         )
         if need_teacher:
             with torch.no_grad():
-                x_u = self._forward_g_m(
+                x_u, _ = self._forward_g_m(
                     h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
-                    drop_left=drop_left,
+                    drop_left=drop_left, is_pad=is_pad, unknown=unknown,
                 )
                 v_u = x_to_v(x_u, z_t, t_right, self.vel_eps)
                 sc_cond = x_u.detach()
@@ -478,9 +523,9 @@ class _BelfBackbone(nn.Module):
                 sc_cond = torch.where(
                     is_decode[:, None, None], torch.zeros_like(sc_cond), sc_cond,
                 )
-                x_c = self._forward_g_m(
+                x_c, _ = self._forward_g_m(
                     h_left, z_t, t_right, m_right, w_sc, sc_right=sc_cond,
-                    drop_left=drop_left,
+                    drop_left=drop_left, is_pad=is_pad, unknown=unknown,
                 )
                 v_c = x_to_v(x_c, z_t, t_right, self.vel_eps)
             g = guided.to(dtype=dtype)[:, None, None]
@@ -489,15 +534,16 @@ class _BelfBackbone(nn.Module):
             sc_stu = torch.where(
                 is_decode[:, None, None], torch.zeros_like(sc_stu), sc_stu,
             )
-            x_hat = self._forward_g_m(
+            x_hat, hidden = self._forward_g_m(
                 h_left, z_t, t_right, m_right, w_sc, sc_right=sc_stu,
-                drop_left=drop_left,
+                drop_left=drop_left, is_pad=is_pad, unknown=unknown,
             )
             v_tgt = blend_v_tgt(v_z, v_u, v_c, w_sc, guided)
+            v_tgt = torch.where(denoise_mask.unsqueeze(-1), v_tgt, v_z)
         else:
-            x_hat = self._forward_g_m(
+            x_hat, hidden = self._forward_g_m(
                 h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
-                drop_left=drop_left,
+                drop_left=drop_left, is_pad=is_pad, unknown=unknown,
             )
             v_tgt = v_z
 
@@ -510,13 +556,19 @@ class _BelfBackbone(nn.Module):
         # 出口按样本因果，只跑 decode hop 行；与整批再 mask 的 CE 相同。
         dec_rows = is_decode.nonzero(as_tuple=True)[0]
         if dec_rows.numel() == 0:
-            ce = zero + keep_params_in_graph(self.exit_head, zero)
+            keep_mod = self.exit_head if self.exit_head is not None else self.g
+            ce = zero + keep_params_in_graph(keep_mod, zero)
             self.last_ce_loss = zero.new_full((), float("nan"))
         else:
             x_ce = x_hat.index_select(0, dec_rows)
+            h_ce = hidden.index_select(0, dec_rows) if hidden is not None else None
             if self.ce_detach_g:
                 x_ce = x_ce.detach()
-            logits = self.exit_logits(x_ce)
+                if h_ce is not None:
+                    h_ce = h_ce.detach()
+            logits = self.exit_logits(
+                x_ce, h_ce, tokens=tokens.index_select(0, dec_rows),
+            )
             ce_tok = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 tokens.index_select(0, dec_rows).reshape(-1),
@@ -534,7 +586,8 @@ class _BelfBackbone(nn.Module):
             self.last_s1_loss = float("nan")
             s1 = zero.to(dtype=x0.dtype)
 
-        loss = self.lambda_mse * mse + self.lambda_ce * ce + self.lambda_s1 * s1
+        # 规格总目标为 L+L_s1，无外层 λ_s1；lambda_s1 仅留配置以免换哈希。
+        loss = self.lambda_mse * mse + self.lambda_ce * ce + s1
         empty = tokens.new_zeros(
             bsz, 0, int(self.token_layout.vocab_size),
         )
@@ -550,8 +603,15 @@ class _BelfBackbone(nn.Module):
         *,
         sc_right: torch.Tensor | None = None,
         drop_left: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """与 ``forward_g`` 相同，但右段 ``m`` 逐列给定；训练走并行块 mask。"""
+        is_pad: torch.Tensor | None = None,
+        unknown: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """与 ``forward_g`` 相同，但右段 ``m`` 逐列给定；训练走并行块 mask。
+
+        ``h_left`` / ``h_right`` 为流空间 X；返回右段 ``(x_hat, hidden)``。
+        """
+        h_left = self.stem(h_left)
+        h_right = self.stem(h_right)
         bsz, right_len, _ = h_right.shape
         left_len = int(h_left.size(1))
         device = h_right.device
@@ -561,7 +621,14 @@ class _BelfBackbone(nn.Module):
         t_all = torch.cat([t_l, t_right], dim=1)
         m_all = torch.cat([m_l, m_right], dim=1)
         parallel = left_len == right_len
-        mask = self._cached_2l_mask(left_len, right_len, device, parallel=parallel)
+        raw = self._raw_2l_mask(left_len, right_len, device, parallel=parallel)
+        if is_pad is not None and unknown is not None:
+            raw = hide_right_pad_from_unknown(
+                raw, is_pad, unknown, self.block_size,
+            )
+        mask = as_sdpa_mask(raw)
+        if mask is None:
+            raise RuntimeError("2L mask 不能为空")
         if drop_left is not None:
             mask = hide_left_keys(mask, drop_left, left_len)
         positions = pair_positions(left_len, device) if left_len == right_len else (
@@ -576,10 +643,15 @@ class _BelfBackbone(nn.Module):
             left_len,
             known_mask=(m_right == MODE_NONE) | (m_right == MODE_DECODE),
         )
-        x_hat = self.g(
+        want_h = self.exit_kind == "linear"
+        out = self.g(
             packed, t_all, w_sc, m_all, attn_mask=mask, positions=positions,
+            return_hidden=want_h,
         )
-        return x_hat[:, left_len:]
+        if want_h:
+            x_hat, hidden = out
+            return x_hat[:, left_len:], hidden[:, left_len:]
+        return out[:, left_len:], None
 
     @torch.compiler.disable
     @torch.no_grad()
@@ -588,7 +660,7 @@ class _BelfBackbone(nn.Module):
         num_samples: int = 1,
         seqlen: int | None = None,
         *,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_k: int | None = None,
         bos_token_id: int | None = None,
         prefix_tokens: torch.Tensor | None = None,
@@ -612,7 +684,7 @@ class _BelfBackbone(nn.Module):
         num_samples: int = 1,
         seqlen: int | None = None,
         *,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_k: int | None = None,
         bos_token_id: int | None = None,
         prefix_tokens: torch.Tensor | None = None,
@@ -631,6 +703,7 @@ class _BelfBackbone(nn.Module):
 
 class FL_BelfModel(FL_PreTrainedModel):
     config_class = FL_BelfConfig
+    eval_ppl_from_ce = True
 
     def __init__(self, config: FL_BelfConfig, bundle: LatentBundle) -> None:
         super().__init__(config)

@@ -76,6 +76,30 @@ def _eval_loss_branch(model: nn.Module) -> str | None:
     return None
 
 
+def _eval_ce_from_metrics(raw: nn.Module) -> float | None:
+    """BELF/RELF：HeldOut PPL 用 decode CE，不用流损失+s1 的合计。"""
+    if not getattr(raw, "eval_ppl_from_ce", False):
+        bb = getattr(raw, "backbone", None)
+        if bb is None or not getattr(bb, "eval_ppl_from_ce", False):
+            return None
+        raw = bb
+    val = getattr(raw, "last_ce_loss", None)
+    if val is None:
+        bb = getattr(raw, "backbone", None)
+        val = getattr(bb, "last_ce_loss", None) if bb is not None else None
+    if val is None:
+        return None
+    if isinstance(val, torch.Tensor):
+        if val.numel() == 0:
+            return None
+        f = float(val.detach().float().reshape(-1)[0].item())
+    else:
+        f = float(val)
+    if f != f:
+        return None
+    return f
+
+
 @torch.compiler.disable
 @torch.no_grad()
 def eval_model_ppl(
@@ -103,6 +127,12 @@ def eval_model_ppl(
     use_amp = device.type == "cuda"
     total_loss = 0.0
     batches = 0
+    total_ce = 0.0
+    ce_batches = 0
+    use_ce_ppl = bool(
+        getattr(raw, "eval_ppl_from_ce", False)
+        or getattr(getattr(raw, "backbone", None), "eval_ppl_from_ce", False)
+    )
 
     batch_iter: DataLoader | tqdm = loader
     show_pbar = log and pbar_parent is not None and len(loader) > 0
@@ -123,6 +153,11 @@ def eval_model_ppl(
                 loss = forward_loss(raw, eval_batch, branch=branch)
             total_loss += float(loss.item())
             batches += 1
+            if use_ce_ppl:
+                ce = _eval_ce_from_metrics(raw)
+                if ce is not None:
+                    total_ce += ce
+                    ce_batches += 1
     finally:
         if isinstance(batch_iter, tqdm):
             batch_iter.close()
@@ -133,20 +168,35 @@ def eval_model_ppl(
 
     if is_distributed:
         stats = torch.tensor(
-            [total_loss, float(batches)], device=device, dtype=torch.float64,
+            [total_loss, float(batches), total_ce, float(ce_batches)],
+            device=device, dtype=torch.float64,
         )
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         total_loss = float(stats[0].item())
         batches = int(stats[1].item())
+        total_ce = float(stats[2].item())
+        ce_batches = int(stats[3].item())
 
     if batches == 0:
         return float("nan"), float("nan")
 
     avg_loss = total_loss / batches
-    avg_ppl = loss_to_ppl(avg_loss)
+    if use_ce_ppl:
+        avg_ppl = (
+            loss_to_ppl(total_ce / ce_batches) if ce_batches > 0 else float("nan")
+        )
+    else:
+        avg_ppl = loss_to_ppl(avg_loss)
     if log:
-        label = "decode ce" if branch == "decode" else "loss"
-        summary = f"eval: {label} {avg_loss:.4f} ppl {avg_ppl:.2f}"
+        if use_ce_ppl:
+            label = "loss"
+            ce_txt = (
+                f" decode_ce {total_ce / ce_batches:.4f}" if ce_batches > 0 else ""
+            )
+            summary = f"eval: {label} {avg_loss:.4f}{ce_txt} ppl {avg_ppl:.2f}"
+        else:
+            label = "decode ce" if branch == "decode" else "loss"
+            summary = f"eval: {label} {avg_loss:.4f} ppl {avg_ppl:.2f}"
         if pbar_parent is not None:
             tqdm.write(f"{_TRAIN_LOG} {summary}")
         else:

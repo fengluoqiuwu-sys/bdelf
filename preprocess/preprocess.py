@@ -181,6 +181,12 @@ def get_preprocessed(
 ) -> "FL_PreprocessedDataset":
     source = get_dataset(dataset) if isinstance(dataset, str) else dataset
     config = get_preprocess(preprocess_name)
+    cur = str((config.extra or {}).get("curriculum") or "").strip()
+    if cur:
+        raise ValueError(
+            f"preprocess {preprocess_name!r} 只是课程指针（curriculum={cur!r}），"
+            "请用 curriculum YAML 里的 seg512_preprocess / bucket_preprocess"
+        )
     if cache_source is not None:
         src = str(cache_source).strip().lower()
         if src not in ("hf", "raw"):

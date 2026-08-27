@@ -35,6 +35,10 @@ def ladder_levels(
     ``Q(0)=0``，``Q(1)=1-eps``；开区间分位再夹到 ``[0, 1-eps]``。
     """
     check_time_step(T)
+    if not (0.0 < float(eps) < 1.0):
+        raise ValueError(f"t_clean_eps 须在 (0, 1)，收到 {eps}")
+    if float(p_std) <= 0.0:
+        raise ValueError(f"denoiser p_std 须 > 0，收到 {p_std}")
     t_int = int(T)
     cap = 1.0 - float(eps)
     out = torch.empty(t_int, dtype=torch.float64)

@@ -28,7 +28,7 @@ class FL_RelfConfig(PretrainedConfig):
             "sc_cfg",
             "latent_tune",
             "time_step",
-            "proj_type",
+            "latent_dim",
             "attn_backend",
             "window_size",
             "step_size",
@@ -56,11 +56,10 @@ class FL_RelfConfig(PretrainedConfig):
         sc_cfg: bool = True,
         latent_tune: str = "mid",
         time_step: int = 16,
-        proj_type: str = "linear",
+        latent_dim: int = 32,
         attn_backend: str = "sdpa",
         window_size: int = 32,
         step_size: int = 2,
-        bottleneck_dim: int = 128,
         proj_bias: bool = True,
         proj_norm: str = "rmsnorm",
         whiten: bool = True,
@@ -100,8 +99,13 @@ class FL_RelfConfig(PretrainedConfig):
             raise ValueError("relf 无 block_size；请用 window_size / step_size")
         if "gen_mode" in kwargs:
             raise ValueError("relf 不设 gen_mode；生成锁死 rolling_generate")
+        for banned in ("p_preroll", "p_freeroll", "p_postroll"):
+            if banned in kwargs:
+                raise ValueError(f"relf 不设 {banned}；截断由 BOS/EOS 给出")
         if "n_exit_layer" in kwargs or "n_layer_dec" in kwargs:
             raise ValueError("relf 出口无层数；exit=linear 映到 logits，exit=decoder 映到 VAE-dec")
+        if "proj_type" in kwargs or "bottleneck_dim" in kwargs:
+            raise ValueError("relf 不设 proj_type/bottleneck_dim；流维是 latent_dim，G 隐层是 n_embd")
         super().__init__(**kwargs)
         self.name = name
         self.tokenizer = tokenizer
@@ -122,11 +126,10 @@ class FL_RelfConfig(PretrainedConfig):
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = str(latent_tune).strip().lower()
         self.time_step = int(time_step)
-        self.proj_type = str(proj_type).strip().lower()
+        self.latent_dim = int(latent_dim)
         self.attn_backend = str(attn_backend).strip().lower()
         self.window_size = int(window_size)
         self.step_size = int(step_size)
-        self.bottleneck_dim = int(bottleneck_dim)
         self.proj_bias = bool(proj_bias)
         self.proj_norm = str(proj_norm).strip().lower()
         self.whiten = bool(whiten)

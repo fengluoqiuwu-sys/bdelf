@@ -12,15 +12,14 @@ latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
 exit: decoder  # 读出：linear 映到 logits（ELF）；decoder 映到 VAE-dec（Cola）
 sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
-latent_tune: mid  # 入口可训档：frozen | full | mid
+latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
 time_step: 16  # 梯子档数 T；须 >= 4
-proj_type: linear  # 白化后 X→D 映射
+latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
 attn_backend: sdpa  # 注意力后端；本族仅 sdpa
 window_size: 32  # 滚动窗长 W；须等于 step_size×time_step
 step_size: 2  # 每步弹出槽数 S
-bottleneck_dim: 128  # 可选瓶颈维；linear 映射可忽略
-proj_bias: true  # 入口投影是否带 bias
-proj_norm: rmsnorm  # 投影后归一化
+proj_bias: true  # G 茎 Linear(X→D) 是否带 bias
+proj_norm: rmsnorm  # 茎后归一化
 whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
 whiten_on: mu  # 白化统计作用对象
 qk_norm: true  # Q/K RMSNorm

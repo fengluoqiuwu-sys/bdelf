@@ -46,6 +46,22 @@ def validate_loaded_block(
     raise ValueError(f"未知 family={family!r}，须为 'belf' 或 'relf'")
 
 
+def validate_joint_tune(*, loaded_block: int, tune: str) -> None:
+    """可训档（``full`` / ``mid``）要求入口块长为 1。
+
+    块因果 encoder（``block_size != 1``）只允许 ``frozen``：
+    否则已知余数会看到同块未来，训推条件不一致。
+    """
+    mode = str(tune).strip().lower()
+    if mode not in (_TUNE_FULL, _TUNE_MID):
+        return
+    loaded = int(loaded_block)
+    if loaded != 1:
+        raise ValueError(
+            f"latent_tune={mode} 联合训练要求入口 block_size==1，收到 {loaded}"
+        )
+
+
 def _try_add_to_optimizer(optimizer: Any, params: list[nn.Parameter]) -> None:
     """把尚未在 param_groups 里的新参加进去；optimizer 可为 None。"""
     if optimizer is None or not params:
@@ -108,14 +124,10 @@ class LatentBundle(nn.Module):
         self.lambda_ref = float(lambda_ref)
         self._thawed = mode == _TUNE_FULL
         self._require_vae_dec_if_needed()
-        # 冻结副本：s2 开始时的 encoder，供 ref-KL。
-        # 不注册进 module 树，避免 .cuda() 时 GPU 上双份 VAE；ref-KL 在 CPU 上算。
-        ref = copy.deepcopy(self.latent)
-        for p in ref.parameters():
-            p.requires_grad_(False)
-        ref.eval()
-        ref.to("cpu")
-        self._ref_cpu: list[nn.Module] = [ref]
+        # 冻结副本供 ref-KL。不注册进 module 树，避免 .cuda() 时 GPU 上双份 VAE。
+        # 新开进程先从刚拷入的 live 冻一份；Stage2 在 Stage1 EMA 写入 live
+        # 之后会再冻（或从 Stage1 checkpoint 的 EMA 重冻），与 artifacts 目录无关。
+        self._ref_cpu: list[nn.Module] = [self._freeze_copy(self.latent)]
         self.set_tune(mode)
 
     def _has_vae_dec(self) -> bool:
@@ -132,9 +144,19 @@ class LatentBundle(nn.Module):
     def decode_logits(
         self,
         z: torch.Tensor,
+        tokens: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """走加载入口的 VAE-dec。参数是否可训由 ``latent_tune`` 决定。"""
+        """走加载入口的 VAE-dec。参数是否可训由 ``latent_tune`` 决定。
+
+        ``tokens`` 与 ``z`` 对齐时补 ``key_padding_mask``（与 ``s1_loss`` 同一条路）。
+        """
+        if tokens is not None and "key_padding_mask" not in kwargs:
+            attn_pad = getattr(self._module(), "_attn_pad_mask", None)
+            if callable(attn_pad):
+                kpm = attn_pad(tokens)
+                if kpm is not None:
+                    kwargs["key_padding_mask"] = kpm
         return self._module().decode_logits(z, **kwargs)
 
     def _require_vae_dec_if_needed(self) -> None:
@@ -166,6 +188,7 @@ class LatentBundle(nn.Module):
         mode = str(tune).strip().lower()
         if mode not in _VALID_TUNE:
             raise ValueError(f"latent_tune 须为 frozen|full|mid，收到 {tune!r}")
+        validate_joint_tune(loaded_block=self.block_size, tune=mode)
         self.tune = mode
         if mode == _TUNE_FULL:
             self._thawed = True
@@ -182,6 +205,49 @@ class LatentBundle(nn.Module):
     def _set_requires_grad(self, enabled: bool) -> None:
         for p in self.latent.parameters():
             p.requires_grad_(enabled)
+
+    @staticmethod
+    def _freeze_copy(src: nn.Module) -> nn.Module:
+        ref = copy.deepcopy(src)
+        for p in ref.parameters():
+            p.requires_grad_(False)
+        ref.eval()
+        ref.to("cpu")
+        return ref
+
+    def snapshot_ref_from_live(self) -> None:
+        """把当前 live encoder 冻成 ``q_ref``（Stage2 首启：EMA 覆盖之后）。"""
+        self._ref_cpu[0] = self._freeze_copy(self.latent)
+
+    def snapshot_ref_from_named_tensors(
+        self,
+        named: dict[str, torch.Tensor],
+        owner: nn.Module,
+    ) -> int:
+        """从整模 ``named``（通常是 Stage1 EMA）抽出本 ``latent`` 子树写入 ref。
+
+        续训时 live 已是本 run 中段权重，不能从 live 重冻，否则 ref-KL 被抹掉。
+        """
+        prefix: str | None = None
+        for name, mod in owner.named_modules():
+            if mod is self.latent:
+                prefix = f"{name}." if name else ""
+                break
+        if prefix is None:
+            raise ValueError("找不到 LatentBundle.latent 在模型中的模块前缀")
+        ref = self._freeze_copy(self.latent)
+        n = 0
+        with torch.no_grad():
+            for pname, param in ref.named_parameters():
+                src = named.get(prefix + pname)
+                if src is None or not isinstance(src, torch.Tensor):
+                    continue
+                param.copy_(src.detach().cpu().to(dtype=param.dtype))
+                n += 1
+        if n < 1:
+            raise ValueError("Stage1 EMA 与当前 latent 没有同名参数，无法重冻 q_ref")
+        self._ref_cpu[0] = ref
+        return n
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         """``mid`` 到达解冻点时解冻一次，并尝试把新参加进 optimizer。"""
@@ -214,11 +280,19 @@ class LatentBundle(nn.Module):
 
     @property
     def block_size(self) -> int:
-        return int(getattr(self._module(), "block_size", 1))
+        mod = self._module()
+        if not hasattr(mod, "block_size"):
+            raise ValueError("入口须暴露 block_size，禁止缺省为 1")
+        return int(mod.block_size)
 
     @property
     def latent_dim(self) -> int:
-        return int(getattr(self._module(), "latent_dim", 0))
+        if not hasattr(self._module(), "latent_dim"):
+            raise ValueError("入口须暴露 latent_dim，禁止缺省为 0")
+        dim = int(self._module().latent_dim)
+        if dim <= 0:
+            raise ValueError(f"入口 latent_dim 须为正，收到 {dim}")
+        return dim
 
     def _ignore_index(self) -> int:
         layout = getattr(self._module(), "token_layout", None)
@@ -233,12 +307,22 @@ class LatentBundle(nn.Module):
     def _lambda_mask(self) -> float:
         return float(getattr(self._module(), "lambda_mask", 0.0))
 
+    def _lambda_vae(self) -> float:
+        """重建项：优先加载入口，缺省回退 YAML（默认 1）。"""
+        return float(getattr(self._module(), "lambda_vae", self.lambda_vae))
+
+    def _lambda_ref(self) -> float:
+        """ref-KL：优先加载入口，缺省回退 YAML（默认 1）。"""
+        return float(getattr(self._module(), "lambda_ref", self.lambda_ref))
+
     def _ref_kl(
         self,
         tokens: torch.Tensor,
         mu: torch.Tensor,
         logvar: torch.Tensor,
+        pad: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``KL(q||q_ref)`` 对有效位平均；PAD 与 prior-KL / CE 一样排除。"""
         with torch.no_grad():
             tok_cpu = tokens.detach().to(device="cpu")
             _, mu_ref, logvar_ref = self._ref_module().encode(tok_cpu, sample=False)
@@ -251,7 +335,12 @@ class LatentBundle(nn.Module):
             + (var + (mu - mu_ref).pow(2)) / var_ref.clamp(min=1e-6)
             - 1.0
         )
-        return kl.mean()
+        per_tok = kl.mean(dim=-1)
+        if pad is None:
+            pad = self._pad_mask(tokens)
+        weight = (~pad).to(dtype=per_tok.dtype)
+        denom = weight.sum().clamp_min(1.0)
+        return (per_tok * weight).sum() / denom
 
     def s1_loss(
         self,
@@ -299,12 +388,13 @@ class LatentBundle(nn.Module):
             mask_loss = self._module().bert_mask_loss(tokens)
 
         ref_loss = zero.to(dtype=ce.dtype)
-        if self.lambda_ref > 0:
-            ref_loss = self._ref_kl(tokens, mu, logvar)
+        lambda_ref = self._lambda_ref()
+        if lambda_ref > 0:
+            ref_loss = self._ref_kl(tokens, mu, logvar, pad=pad)
 
         return (
-            self.lambda_vae * ce
+            self._lambda_vae() * ce
             + self._beta_kl() * kl
             + lambda_mask * mask_loss
-            + self.lambda_ref * ref_loss
+            + lambda_ref * ref_loss
         )

@@ -35,6 +35,8 @@ def x_to_v(
     vel_eps: float,
 ) -> torch.Tensor:
     """x-pred 换速度：``v = (x_hat-z) / max(1-t, vel_eps)``。"""
+    if float(vel_eps) <= 0:
+        raise ValueError(f"vel_eps 须 > 0，收到 {vel_eps}")
     t_exp = _expand_t(t, z)
     denom = (1.0 - t_exp).clamp(min=float(vel_eps))
     return (x_hat - z) / denom

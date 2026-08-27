@@ -131,17 +131,17 @@ def bind_stage_predecessor(
 ) -> str | None:
     """若当前 preprocess 声明前置，校验同参 Stage1 已完成并写入 extra。
 
-    本 Stage2 目录已有 ``checkpoint_latest``（续训）时跳过。失败则 ``SystemExit``。
+    续训也必须写入 ``stage1_tokens_seen`` / ``init_ckpt`` / ``init_from_ema``：
+    ``_thawed`` 与 ``q_ref`` 不进 checkpoint，进程重建后要靠这三项立刻解冻
+    并从 Stage1 EMA 重冻 ``q_ref``。不覆盖本 run 的 live 权重（由
+    ``checkpoint_latest`` 恢复）。失败则 ``SystemExit``。
     """
     pred = predecessor_preprocess_name(cfg.preprocess)
     if not pred:
         return None
 
     self_dir = checkpoint_run_dir_from_cfg(cfg)
-    if cfg.resume and _latest_ckpt(self_dir).is_file():
-        return (
-            f"Stage2 续训 {self_dir.as_posix()}，不再绑定 Stage1"
-        )
+    resuming = bool(cfg.resume and _latest_ckpt(self_dir).is_file())
 
     target = predecessor_target_tokens(cfg.preprocess)
     if target < 1:
@@ -199,6 +199,12 @@ def bind_stage_predecessor(
         or target
     )
     cfg.extra["stage1_run_relpath"] = pred_cfg.extra.get("run_relpath")
+    if resuming:
+        return (
+            f"Stage2 续训 {self_dir.as_posix()}，已重绑 Stage1 extra "
+            f"(不覆盖 live；hash={pred_cfg.name}, "
+            f"tokens_seen={cfg.extra['stage1_tokens_seen']})"
+        )
     return (
         f"Stage2 绑定 Stage1 EMA: {rel_ckpt} "
         f"(hash={pred_cfg.name}, tokens_seen={cfg.extra['stage1_tokens_seen']})"

@@ -27,6 +27,12 @@ def sample_w_sc(
     ``z~N(p_mean, p_std^2)``，``u=sigmoid(z)``，
     ``a=1+w_min``，``b=1+w_max``，``w=a*(b/a)^u-1``。
     """
+    if float(p_std) < 0.0:
+        raise ValueError(f"w_sc p_std 须 >= 0，收到 {p_std}")
+    if float(w_min) <= 0.0 or float(w_max) <= float(w_min):
+        raise ValueError(
+            f"w_sc 须 0 < w_min < w_max，收到 w_min={w_min}, w_max={w_max}"
+        )
     z = torch.randn(int(batch), device=device, dtype=torch.float32)
     z = z * float(p_std) + float(p_mean)
     u = torch.sigmoid(z)
@@ -78,6 +84,18 @@ def maybe_drop_left(
     keep = (~drop).to(dtype=h_left.dtype).reshape(bsz, *([1] * (h_left.ndim - 1)))
     out = h_left * keep
     return (out, drop) if return_drop else out
+
+
+def pad_after_first_eos(
+    tokens: torch.Tensor,
+    eos_id: int,
+    pad_id: int,
+) -> torch.Tensor:
+    """保留首个 EOS，其后写成 PAD，避免停机后仍留下采样词或凑长 PAD。"""
+    is_eos = tokens == int(eos_id)
+    seen = is_eos.to(torch.int32).cumsum(dim=1)
+    keep = (seen == 0) | (is_eos & (seen == 1))
+    return torch.where(keep, tokens, tokens.new_full((), int(pad_id)))
 
 
 def hide_left_keys(

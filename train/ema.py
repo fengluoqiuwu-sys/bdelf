@@ -21,6 +21,36 @@ def init_ema(model: nn.Module) -> Dict[str, torch.Tensor]:
     }
 
 
+def ema_absorb_new(
+    ema_state: Dict[str, torch.Tensor],
+    model: nn.Module,
+) -> int:
+    """把解冻后新出现的可训参数收进 EMA（初值=当前 live）。"""
+    raw = unwrap_model(model)
+    n = 0
+    for name, param in raw.named_parameters():
+        if not param.requires_grad or name in ema_state:
+            continue
+        ema_state[name] = param.detach().clone()
+        n += 1
+    return n
+
+
+def ema_merge_loaded(
+    ema_state: Dict[str, torch.Tensor],
+    loaded_ema: Dict[str, torch.Tensor],
+) -> int:
+    """把 checkpoint 里的 EMA 键写入影子表，含启动时尚未可训、解冻后才有的键。"""
+    n = 0
+    for name, val in loaded_ema.items():
+        if name in ema_state:
+            ema_state[name].copy_(val.to(device=ema_state[name].device))
+        else:
+            ema_state[name] = val.detach().clone()
+        n += 1
+    return n
+
+
 def ema_update(
     ema_state: Dict[str, torch.Tensor],
     model: nn.Module,
@@ -29,6 +59,7 @@ def ema_update(
     """In-place ``ema = decay * ema + (1 - decay) * param`` over trainable params."""
     if decay <= 0.0 or decay >= 1.0:
         raise ValueError(f"ema decay must be in (0, 1), got {decay}")
+    ema_absorb_new(ema_state, model)
     raw = unwrap_model(model)
     for name, param in raw.named_parameters():
         if not param.requires_grad or name not in ema_state:

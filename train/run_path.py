@@ -151,9 +151,21 @@ def build_train_fingerprint(
     if model in ("belf", "relf"):
         cur_name = preprocess_yaml.get("curriculum")
         if cur_name:
-            out["curriculum_cfg"] = _load_yaml_mapping(
+            cur = _load_yaml_mapping(
                 repo / "config" / "train" / "curriculum" / f"{cur_name}.yaml",
             )
+            out["curriculum_cfg"] = cur
+            # 课程只记数据源名字；真正切分在 owt-seg512 / owt-bucket 正文。
+            data_cfg: dict[str, Any] = {}
+            for key in ("seg512_preprocess", "bucket_preprocess"):
+                src = str(cur.get(key) or "").strip()
+                if not src:
+                    continue
+                data_cfg[key] = _load_yaml_mapping(
+                    repo / "config" / "preprocess" / f"{src}.yaml",
+                )
+            if data_cfg:
+                out["curriculum_data_cfg"] = data_cfg
     return out
 
 

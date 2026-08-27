@@ -33,7 +33,7 @@ from train.checkpoint import (
     save_checkpoint,
     unwrap_model,
 )
-from train.ema import ema_update, init_ema, swap_ema_weights
+from train.ema import ema_absorb_new, ema_merge_loaded, ema_update, init_ema, swap_ema_weights
 from train.eval import (
     forward_loss,
     get_amp_dtype,
@@ -370,14 +370,103 @@ def set_seed(seed: int, rank: int) -> None:
         torch.cuda.manual_seed_all(s)
 
 
-def _notify_tokens_seen(model: nn.Module, n: int, optimizer: Any) -> None:
-    """向前兼容：模型若实现 ``on_tokens_seen`` 则通知累计 token，否则 no-op。"""
+def _latent_tokens_seen(cfg: FL_TrainConfig, run_tokens: int) -> int:
+    """解冻用的累计 token：本 run 已见 + Stage2 绑定的 Stage1 已见。
+
+    Stage2 续训的 ``run_tokens`` 只有本阶段（扩展 0–5B）。``_thawed`` 不进
+    checkpoint，进程重建后 mid 从 False 起；若不加上 ``stage1_tokens_seen``，
+    会按 15B 门槛判成未解冻。无前置作业该键为空，行为与只传本 run 相同。
+    """
+    prior = int(cfg.extra.get("stage1_tokens_seen") or 0)
+    return int(run_tokens) + prior
+
+
+def _notify_tokens_seen(model: nn.Module, n: int, optimizer: Any) -> bool:
+    """向前兼容：模型若实现 ``on_tokens_seen`` 则通知累计 token，否则 no-op。
+
+    返回是否刚解冻（``mid`` 首次越过门槛）。
+    """
     raw = unwrap_model(model)
     fn = getattr(raw, "on_tokens_seen", None)
     if not callable(fn):
         fn = getattr(getattr(raw, "backbone", None), "on_tokens_seen", None)
     if callable(fn):
-        fn(int(n), optimizer)
+        return bool(fn(int(n), optimizer))
+    return False
+
+
+def _rewrap_ddp_if_thawed(
+    model: nn.Module,
+    *,
+    thawed: bool,
+    is_distributed: bool,
+    device: torch.device,
+    rank: int,
+) -> nn.Module:
+    """``mid`` 解冻后重建 DDP，让新 ``requires_grad`` 的入口参数进入 reducer。
+
+    DDP 只在构造时登记当时可训参数；解冻前入口全冻，不重建则多卡梯度不会
+    allreduce。只剥 DDP、保留 ``torch.compile``。
+    """
+    if not thawed or not is_distributed:
+        return model
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    inner = model.module if isinstance(model, DDP) else model
+    wrapped = DDP(
+        inner,
+        device_ids=[device.index],
+        output_device=device.index,
+    )
+    if rank == 0:
+        _train_log("latent mid 已解冻，已重建 DDP 以同步入口梯度")
+    return wrapped
+
+
+def _latent_bundle(model: nn.Module) -> Any:
+    """BELF ``bundle`` / RELF ``latent``；其它模型为 ``None``。"""
+    raw = unwrap_model(model)
+    bb = getattr(raw, "backbone", raw)
+    for name in ("bundle", "latent"):
+        obj = getattr(bb, name, None)
+        if obj is not None and hasattr(obj, "snapshot_ref_from_live"):
+            return obj
+    return None
+
+
+def _refresh_s2_ref(
+    model: nn.Module,
+    cfg: FL_TrainConfig,
+    *,
+    from_live: bool,
+) -> None:
+    """Stage2 的 ``q_ref`` 冻成 Stage1 checkpoint EMA，与 artifacts 目录无关。
+
+    首启：EMA 已写入 live，从 live 再冻。
+    续训：live 已是本 run 中段，从 ``extra.init_ckpt`` 的 EMA 重冻。
+    """
+    if not bool(cfg.extra.get("init_from_ema")):
+        return
+    bundle = _latent_bundle(model)
+    if bundle is None:
+        return
+    if from_live:
+        bundle.snapshot_ref_from_live()
+        return
+    spec = str(cfg.extra.get("init_ckpt") or "").strip()
+    if not spec:
+        return
+    repo = Path(__file__).resolve().parents[1]
+    path = Path(spec)
+    if not path.is_absolute():
+        path = (repo / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Stage2 重冻 q_ref：找不到 Stage1 ckpt {path}")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    ema = ck.get("ema")
+    if not isinstance(ema, dict) or not ema:
+        raise ValueError(f"{path}: Stage2 重冻 q_ref 需要 Stage1 EMA")
+    bundle.snapshot_ref_from_named_tensors(ema, unwrap_model(model))
 
 
 def train_loop(
@@ -561,9 +650,7 @@ def train_loop(
         )
         if ema_state is not None:
             if loaded_ema:
-                for k, v in loaded_ema.items():
-                    if k in ema_state:
-                        ema_state[k].copy_(v.to(device=ema_state[k].device))
+                ema_merge_loaded(ema_state, loaded_ema)
             elif rank == 0:
                 _train_log(
                     "Checkpoint has no EMA state; re-initialized EMA from model weights",
@@ -575,7 +662,19 @@ def train_loop(
             seen_n = 0
         else:
             seen_n = cfg.tokens_seen_after_step(step - 1)
-        _notify_tokens_seen(model, seen_n, optimizer)
+        thawed = _notify_tokens_seen(
+            model, _latent_tokens_seen(cfg, seen_n), optimizer,
+        )
+        model = _rewrap_ddp_if_thawed(
+            model,
+            thawed=thawed,
+            is_distributed=is_distributed,
+            device=device,
+            rank=rank,
+        )
+        _refresh_s2_ref(model, cfg, from_live=False)
+        if ema_state is not None:
+            ema_absorb_new(ema_state, model)
         if rank == 0:
             curr_resume = None
             if curriculum_sampler is not None and has_stage_micro:
@@ -629,23 +728,31 @@ def train_loop(
             )
             if from_ema:
                 prior = int(cfg.extra.get("stage1_tokens_seen") or 0)
+                thawed = False
                 if prior > 0:
-                    _notify_tokens_seen(model, prior, optimizer)
+                    thawed = _notify_tokens_seen(
+                        model, _latent_tokens_seen(cfg, 0), optimizer,
+                    )
+                model = _rewrap_ddp_if_thawed(
+                    model,
+                    thawed=thawed,
+                    is_distributed=is_distributed,
+                    device=device,
+                    rank=rank,
+                )
+                _refresh_s2_ref(model, cfg, from_live=True)
                 if ema_state is not None:
                     ema_state = init_ema(model)
                 if rank == 0:
                     _train_log(
                         f"init-ckpt 从 EMA 写入 live 权重 "
                         f"(n_ema_applied={init_info.get('n_ema_applied', 0)})；"
-                        f"stage1_tokens_seen={prior} 已通知解冻并重建 EMA"
+                        f"stage1_tokens_seen={prior} 已通知解冻并重建 EMA；"
+                        f"q_ref 已按 Stage1 EMA 重冻"
                     )
             elif ema_state is not None:
                 if loaded_ema:
-                    n_ema = 0
-                    for k, v in loaded_ema.items():
-                        if k in ema_state:
-                            ema_state[k].copy_(v.to(device=ema_state[k].device))
-                            n_ema += 1
+                    n_ema = ema_merge_loaded(ema_state, loaded_ema)
                     if rank == 0:
                         _train_log(
                             f"init-ckpt EMA 覆盖: {n_ema}/{len(ema_state)} 键"
@@ -890,7 +997,18 @@ def train_loop(
                 if curriculum_sampler is not None
                 else cfg.tokens_seen_after_step(step)
             )
-            _notify_tokens_seen(model, log_tokens, optimizer)
+            thawed = _notify_tokens_seen(
+                model, _latent_tokens_seen(cfg, log_tokens), optimizer,
+            )
+            model = _rewrap_ddp_if_thawed(
+                model,
+                thawed=thawed,
+                is_distributed=is_distributed,
+                device=device,
+                rank=rank,
+            )
+            if ema_state is not None:
+                ema_absorb_new(ema_state, model)
             if is_latent:
                 train_row = build_latent_train_row(
                     log_csv_step,
@@ -1017,6 +1135,9 @@ def train_loop(
                         "lr": f"{lr:.2e}",
                         "tok_s": f"{tokens_per_sec:.0f}",
                     }
+                    decode_ce = m.get("decode_ce", float("nan"))
+                    if decode_ce == decode_ce:
+                        postfix["ppl"] = f"{loss_to_ppl(decode_ce):.1f}"
                 if (
                     curriculum_sampler is not None
                     and pbar is not None

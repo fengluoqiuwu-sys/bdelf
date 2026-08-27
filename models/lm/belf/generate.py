@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from models.lm.belf_relf_core import x_to_v
+from models.lm.belf_relf_core import pad_after_first_eos, x_to_v
 from models.model import sample_from_logits
 
 # 与 AdaLNZeroStack 逐列模式一致。
@@ -42,7 +42,7 @@ def block_generate(
     num_samples: int = 1,
     seqlen: int | None = None,
     *,
-    temperature: float = 1.0,
+        temperature: float = 0.0,
     top_k: int | None = None,
     bos_token_id: int | None = None,
     prefix_tokens: torch.Tensor | None = None,
@@ -53,7 +53,9 @@ def block_generate(
     末流关闭 SDE churn。默认 ``commit_x0hat=true``。末块可短；EOS 后该样本停。
     """
     _ = bos_token_id
-    cfg = sampling_cfg or {}
+    cfg = dict(getattr(getattr(backbone, "config", None), "sampling", None) or {})
+    if sampling_cfg:
+        cfg.update(sampling_cfg)
     seqlen = int(seqlen or backbone.max_seq_len)
     w = int(backbone.block_size)
     if seqlen < 1:
@@ -64,6 +66,8 @@ def block_generate(
         )
 
     method = str(cfg.get("sampling_method", "sde")).lower()
+    if method not in ("sde", "ode"):
+        raise ValueError(f"未知 sampling_method={method!r}")
     sde_gamma = float(cfg.get("sde_gamma", 1.5))
     temperature = float(cfg.get("temperature", temperature))
     top_k = cfg.get("top_k", top_k)
@@ -73,6 +77,17 @@ def block_generate(
     w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 3.0)))
     w_ctx = float(cfg.get("w_ctx", cfg.get("ctx_cfg_scale", 1.0)))
     x0_src = str(getattr(backbone, "x0_source", "z")).strip().lower()
+    ctx_src = str(getattr(backbone, "ctx_source", "z")).strip().lower()
+
+    def _mapped(z: torch.Tensor, mu: torch.Tensor, source: str) -> torch.Tensor:
+        src = mu if source == "mu" else z
+        return backbone.map_x(src)
+
+    def _g_right(*args: Any, **kwargs: Any):
+        got = backbone.forward_g(*args, **kwargs)
+        if isinstance(got, tuple):
+            return got
+        return got, None
 
     device = next(backbone.parameters()).device
     dtype = next(backbone.parameters()).dtype
@@ -104,11 +119,10 @@ def block_generate(
         z_pref, mu_pref, _ = backbone.bundle.encode(
             prefix[:, : n_full * w], sample=False,
         )
-        src_pref = mu_pref if x0_src == "mu" else z_pref
-        clean = backbone.to_d(src_pref)
+        clean = _mapped(z_pref, mu_pref, ctx_src)
     else:
         clean = torch.zeros(
-            num_samples, 0, backbone.n_embd, device=device, dtype=dtype,
+            num_samples, 0, backbone.latent_dim, device=device, dtype=dtype,
         )
 
     w_sc = None
@@ -127,7 +141,7 @@ def block_generate(
             break
         w_cur = min(w, seqlen - b_idx * w)
         z_block = torch.randn(
-            num_samples, w_cur, backbone.n_embd, device=device, dtype=dtype,
+            num_samples, w_cur, backbone.latent_dim, device=device, dtype=dtype,
         ) * float(backbone.denoiser_noise_scale)
 
         known_n = known_rem if b_idx == start_block else 0
@@ -135,11 +149,14 @@ def block_generate(
             known_n = w_cur
         x_known: torch.Tensor | None = None
         if known_n > 0 and prefix is not None:
-            z_k, mu_k, _ = backbone.bundle.encode(
-                prefix[:, :prefix_len], sample=False,
-            )
-            src_k = mu_k if x0_src == "mu" else z_k
-            x_known = backbone.to_d(src_k)[:, n_full * w : prefix_len]
+            cond = prefix[:, :prefix_len]
+            enc_block = int(backbone.bundle.block_size)
+            if enc_block == w and rem > 0:
+                # 与训练二次 encode 同构：当前块 [r,W) 写成 PAD。
+                pad = cond.new_full((cond.size(0), w - rem), pad_id)
+                cond = torch.cat([cond, pad], dim=1)
+            z_k, mu_k, _ = backbone.bundle.encode(cond, sample=False)
+            x_known = _mapped(z_k, mu_k, x0_src)[:, n_full * w : prefix_len]
             z_block = z_block.clone()
             z_block[:, :known_n] = x_known
 
@@ -153,7 +170,7 @@ def block_generate(
         ) -> tuple[torch.Tensor, torch.Tensor]:
             nonlocal nfe
             nfe += 1
-            x_hat = backbone.forward_g(
+            x_hat, _ = _g_right(
                 left, z_cur, t_scalar, MODE_DENOISE, w_sc,
                 known_right=known_n,
                 sc_right=sc_right,
@@ -165,7 +182,7 @@ def block_generate(
             if drop_ctx:
                 nfe += 1
                 empty = left[:, :0]
-                x_u = backbone.forward_g(
+                x_u, _ = _g_right(
                     empty, z_cur, t_scalar, MODE_DENOISE, w_sc,
                     known_right=known_n,
                     sc_right=sc_right,
@@ -206,16 +223,28 @@ def block_generate(
         nfe += 1
         t_dec = float(levels[-1].item())
         w_sc_dec = torch.zeros_like(w_sc) if w_sc is not None else None
-        x_hat = backbone.forward_g(
+        x_hat, hidden = _g_right(
             left, z_block, t_dec, MODE_DECODE, w_sc_dec,
             known_right=known_n,
             sc_right=sc_right,
         )
-        dec_in = x_hat
-        if clean.size(1) > 0:
-            dec_in = torch.cat([clean, x_hat], dim=1)
-        logits = backbone.exit_logits(dec_in)
-        block_logits = logits[:, -w_cur:]
+        start = b_idx * w
+        if getattr(backbone, "exit_kind", "decoder") == "decoder":
+            dec_in = x_hat
+            if clean.size(1) > 0:
+                dec_in = torch.cat([clean, x_hat], dim=1)
+            kpm = None
+            if start > 0:
+                written = tokens[:, :start]
+                pad = written == pad_id
+                if bool(pad.any().item()):
+                    extra = pad.new_zeros(num_samples, w_cur)
+                    kpm = torch.cat([pad, extra], dim=1)
+            logits = backbone.exit_logits(dec_in, key_padding_mask=kpm)
+            block_logits = logits[:, -w_cur:]
+        else:
+            logits = backbone.exit_logits(x_hat, hidden)
+            block_logits = logits
         if temperature <= 0:
             blk_tok = block_logits.argmax(dim=-1)
         else:
@@ -225,22 +254,21 @@ def block_generate(
         if known_n > 0 and prefix is not None:
             blk_tok = blk_tok.clone()
             blk_tok[:, :known_n] = prefix[:, n_full * w : prefix_len][:, :known_n]
-        start = b_idx * w
         write = blk_tok.clone()
         write[~alive] = pad_id
         tokens[:, start : start + w_cur] = write
+        tokens = pad_after_first_eos(tokens, eos_id, pad_id)
 
         if commit_x0hat:
             committed = x_hat
+            if x_known is not None:
+                committed = committed.clone()
+                committed[:, :known_n] = x_known
         else:
             z_c, mu_c, _ = backbone.bundle.encode(
-                tokens[:, : start + w_cur], sample=x0_src != "mu",
+                tokens[:, : start + w_cur], sample=(x0_src == "z"),
             )
-            src_c = mu_c if x0_src == "mu" else z_c
-            committed = backbone.to_d(src_c)[:, start : start + w_cur]
-        if x_known is not None:
-            committed = committed.clone()
-            committed[:, :known_n] = x_known
+            committed = _mapped(z_c, mu_c, x0_src)[:, start : start + w_cur]
         clean = torch.cat([clean, committed], dim=1)
         known_rem = 0
         alive = alive & ~(tokens[:, : start + w_cur] == eos_id).any(dim=1)

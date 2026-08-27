@@ -88,12 +88,13 @@ models/lm/
 ```
 tokens
   → load_latent_artifact(latent_model, tag)
-  → Enc → z ∈ R^{S×X} → 可选 whiten → Linear(X→n_embd)
-  → pack_2l [sg(h_left)|h_t] + 逐列 (t, [w_sc], [m])
+  → Enc → z ∈ R^{S×X} → 可选 whiten（仍在 X）
+  → G 茎 Linear(X→D=n_embd) → pack_2l [sg(h_left)|h_t] + 逐列 (t, [w_sc], [m])
   → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → AdaLN-Zero → SwiGLU）
-  → Exit：一层线性
-     linear（ELF）：Linear(D→V) → logits
-     decoder（Cola）：Linear(D→X) → 加载的 VAE-dec → logits
+  → FinalLayer D→X → x̂₀
+  → Exit
+     linear（ELF）：隐状态 Linear(D→V) → logits
+     decoder（Cola）：x̂₀ 已在 X，直接加载的 VAE-dec → logits
 ```
 
 出口没有层数键。BELF 训练只喂右段 \(\hat x_0\)；推理拼接已提交干净码。RELF decoder 前缀是 \(G\) 左段 \(\hat x_0\)。叠法见 LaTeX「出口叠法」。
@@ -125,11 +126,14 @@ tokens
 
 启动校验（实现时必须硬拒绝）：
 
-- 加载 \(X\) 与映射一致；`n_embd` 整除 `n_head`
+- `latent_dim` 须等于 artifact 输出维 \(X\)；`n_embd` 是 \(G\) 隐层 \(D\)，二者无关
+- `n_embd` 整除 `n_head`
 - 两族 `time_step` \(T\ge 4\)
 - BELF：加载入口 `encoder.block_size` \(\in\{1,W\}\)；**训练** `forward` 要求序列长度被 \(W\) 整除
 - RELF：无 `block_size`；加载入口块长 \(=1\)；\(S\cdot T=W\)，\(T\ge 4\)
+- 可训档（`full` / `mid`）要求入口 `encoder.block_size==1`；块因果入口只允许 `frozen`
 - `exit=decoder` 或可训档（`full` / `mid`）须具备 VAE-dec
+- 100m 默认 `tag: 100m-b32-d1`：若 artifact 块长为 32，BELF \(W=16\) / RELF 入口必须 1 **硬拒**，不放宽校验
 
 ### 100m 默认（规格）
 
@@ -206,7 +210,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 | `full` | step 0 起 | 重建 + \(\mathrm{KL}(q\|N(0,I))\) + BERT-mask + ref-KL |
 | `mid` | 未到解冻点同 frozen；之后同 full | 解冻前不算；解冻后算。新参数新优化器状态 |
 
-\(\mathcal{L}_{\mathrm{s1}}\) 与流/出口损失 \(\mathcal{L}\) 分开相加。`exit=decoder` 时 CE 也经 VAE-dec；其参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。
+\(\mathcal{L}_{\mathrm{s1}}\) 与流/出口损失 \(\mathcal{L}\) 分开相加。`exit=decoder` 时 CE 也经 VAE-dec；其参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
 
 ## 明确不做（工程）
 
