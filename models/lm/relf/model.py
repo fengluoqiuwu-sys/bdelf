@@ -48,6 +48,22 @@ _MODE_DENOISE = 1
 _MODE_DECODE = 2  # 保留常量；训练/推理主体不再设 decode 跳
 
 
+def _first_hit(mask: torch.Tensor, default: torch.Tensor) -> torch.Tensor:
+    """``(B, L)`` 每行第一个 True 的下标；``L=0`` 或全假用 ``default``。
+
+    ``torch.where`` 两支都会算，空序列上 ``argmax(dim=1)`` 会炸；无前缀 preroll 正是 ``(B, 0)``。
+    """
+    if mask.ndim != 2:
+        raise ValueError(f"_first_hit 须为 (B, L)，收到 {tuple(mask.shape)}")
+    if default.shape != (mask.size(0),):
+        raise ValueError(
+            f"_first_hit default 须为 (B,)，mask B={mask.size(0)} default={tuple(default.shape)}"
+        )
+    if mask.size(1) == 0:
+        return default
+    return torch.where(mask.any(dim=1), mask.to(dtype=torch.int32).argmax(dim=1), default)
+
+
 class _RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -232,19 +248,16 @@ class _RelfBackbone(nn.Module):
         bos_id = int(self.token_layout.bos_token_id)
         eos_id = int(self.token_layout.eos_token_id)
         pad_id = int(self.token_layout.pad_token_id)
-        bsz, seq_len = tokens.shape
-        pos = torch.arange(seq_len, device=tokens.device)
+        bsz = int(tokens.size(0))
         bos_hit = tokens == bos_id
         eos_hit = tokens == eos_id
         nonpad = tokens != pad_id
-        bos = torch.where(
-            bos_hit.any(dim=1),
-            bos_hit.float().argmax(dim=1),
+        bos = _first_hit(
+            bos_hit,
             torch.zeros(bsz, device=tokens.device, dtype=torch.long),
         )
         last = nonpad.long().sum(dim=1).clamp(min=1) - 1
-        eos = torch.where(eos_hit.any(dim=1), eos_hit.float().argmax(dim=1), last)
-        del pos
+        eos = _first_hit(eos_hit, last)
         return bos, eos
 
     def _plan_windows(
@@ -1192,10 +1205,8 @@ class _RelfBackbone(nn.Module):
         def _fields_for_u(u: int, tok: torch.Tensor, *, target_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """推理窗：BOS 左切；``commit_x0hat=false`` 时用已读 EOS 右切，否则锁死目标长。"""
             bsz = tok.size(0)
-            bos_hit = tok == bos_id
-            bos_idx = torch.where(
-                bos_hit.any(dim=1),
-                bos_hit.float().argmax(dim=1),
+            bos_idx = _first_hit(
+                tok == bos_id,
                 torch.zeros(bsz, device=device, dtype=torch.long),
             )
             if commit_x0:
@@ -1203,10 +1214,8 @@ class _RelfBackbone(nn.Module):
                     (bsz,), target_len - 1, device=device, dtype=torch.long,
                 )
             else:
-                has_eos = (tok == eos_id).any(dim=1)
-                eos_idx = torch.where(
-                    has_eos,
-                    (tok == eos_id).float().argmax(dim=1),
+                eos_idx = _first_hit(
+                    tok == eos_id,
                     torch.full((bsz,), target_len - 1, device=device, dtype=torch.long),
                 )
             k = torch.arange(w_sz, device=device)
