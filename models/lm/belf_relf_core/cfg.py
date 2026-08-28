@@ -6,6 +6,17 @@ import torch
 import torch.nn as nn
 
 
+def self_left_p(*, tokens_seen: int, thaw_tokens: int, prob: float) -> float:
+    """在 compile 图外根据累计 token 给出 self-left 概率。
+
+    Dynamo 把 ``nn.Module`` 上的 int 当静态量；若在 ``forward`` 里读每步更新的
+    ``_tokens_seen`` 会每步重编译，DDP 下打到 ``recompile_limit`` 即死锁。
+    """
+    if int(thaw_tokens) <= 0 or int(tokens_seen) >= int(thaw_tokens):
+        return float(prob)
+    return 0.0
+
+
 def keep_params_in_graph(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
     """把 ``module`` 参数留在图里（空 CE 支路 / 单卡也安全），不扫全部元素。"""
     acc = like.new_zeros(())

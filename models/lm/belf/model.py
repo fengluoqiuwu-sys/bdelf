@@ -33,12 +33,12 @@ from models.lm.belf_relf_core import (
     pack_2l_parallel_blocks_mask,
     sample_logit_normal_t,
     sample_w_sc,
+    self_left_p,
     v_star,
     validate_joint_tune,
     validate_loaded_block,
     x_to_v,
 )
-from models.lm.belf_relf_core.rows import row_idx, take_rows
 from models.model import (
     FL_PreTrainedModel,
     ensure_token_layout,
@@ -132,6 +132,12 @@ class _BelfBackbone(nn.Module):
         self.self_left_prob = float(config.self_left_prob)
         self.self_left_thaw_tokens = int(config.self_left_thaw_tokens)
         self._tokens_seen = 0
+        # 只在 on_tokens_seen（compile 图外）刷新；forward 当静态 float 读。
+        self._self_left_p = self_left_p(
+            tokens_seen=0,
+            thaw_tokens=self.self_left_thaw_tokens,
+            prob=self.self_left_prob,
+        )
         self.denoiser_p_mean = float(config.denoiser_p_mean)
         self.denoiser_p_std = float(config.denoiser_p_std)
         self.t_clean_eps = float(config.t_clean_eps)
@@ -246,6 +252,11 @@ class _BelfBackbone(nn.Module):
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         self._tokens_seen = int(n)
+        self._self_left_p = self_left_p(
+            tokens_seen=self._tokens_seen,
+            thaw_tokens=self.self_left_thaw_tokens,
+            prob=self.self_left_prob,
+        )
         return self.bundle.on_tokens_seen(n, optimizer)
 
     def _raw_2l_mask(
@@ -625,12 +636,14 @@ class _BelfBackbone(nn.Module):
         rem = torch.zeros(bsz, device=device, dtype=torch.long)
         b_cur = torch.zeros(bsz, device=device, dtype=torch.long)
         n_blocks = seq_len // w
-        if (
+        # 常量门闩：勿用 rem.any()，否则各 rank 控制流分叉 / Dynamo 反复特化。
+        mix_clean = (
             self.cond_mode == "clean"
             and self.clean_block_prob > 0
             and n_blocks > 0
             and w > 1
-        ):
+        )
+        if mix_clean:
             use_mix = torch.rand(bsz, device=device) < self.clean_block_prob
             rem = torch.where(
                 use_mix,
@@ -655,7 +668,7 @@ class _BelfBackbone(nn.Module):
             t_hop[:, None].expand(bsz, seq_len),
         )
         x_known = x0
-        if rem.any():
+        if mix_clean:
             cond_tokens = tokens.clone()
             leak = (
                 (pos[None, :] // w == b_cur[:, None])
@@ -681,45 +694,34 @@ class _BelfBackbone(nn.Module):
             self.ctx_drop_prob if self.training else 0.0,
             return_drop=True,
         )
-        # self-left：先抽样本，仅 use_self 行跑现有 2L G（仍 no_grad、t=1-ε、sc=0）
-        p_left = 0.0
-        if self.training:
-            thaw = int(self.self_left_thaw_tokens)
-            if thaw <= 0 or int(self._tokens_seen) >= thaw:
-                p_left = self.self_left_prob
-        use_self = torch.zeros(bsz, device=device, dtype=torch.bool)
+        # self-left：p 在图外算好；p>0 时整 batch 跑 2L G（no_grad、t=1-ε、sc=0），再用 mask 写回。
+        p_left = float(self._self_left_p) if self.training else 0.0
         if p_left > 0.0:
             use_self = torch.rand(bsz, device=device) < p_left
-            if bool(use_self.any()):
-                idx_sl = row_idx(use_self)
-                t_last = x0.new_full((), 1.0 - self.t_clean_eps)
-                t_commit = torch.where(
-                    known | is_pad,
-                    x0.new_ones(bsz, seq_len),
-                    t_last.expand(bsz, seq_len),
+            t_last = x0.new_full((), 1.0 - self.t_clean_eps)
+            t_commit = torch.where(
+                known | is_pad,
+                x0.new_ones(bsz, seq_len),
+                t_last.expand(bsz, seq_len),
+            )
+            z_commit = interpolate(x0, t_commit, noise)
+            z_commit = torch.where((known | is_pad).unsqueeze(-1), x_known, z_commit)
+            m_commit = torch.full(
+                (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
+            )
+            m_commit = torch.where(
+                known | is_pad, torch.zeros_like(m_commit), m_commit,
+            )
+            with torch.no_grad():
+                x_hat_commit, _ = self._forward_g_m(
+                    x_ctx.detach(), z_commit, t_commit, m_commit, None,
+                    sc_right=torch.zeros_like(z_commit),
+                    drop_left=None, is_pad=is_pad, unknown=unknown,
                 )
-                z_commit = interpolate(x0, t_commit, noise)
-                z_commit = torch.where((known | is_pad).unsqueeze(-1), x_known, z_commit)
-                m_commit = torch.full(
-                    (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
-                )
-                m_commit = torch.where(
-                    known | is_pad, torch.zeros_like(m_commit), m_commit,
-                )
-                x_ctx_s, z_c_s, t_c_s, m_c_s, is_pad_s, unknown_s = take_rows(
-                    idx_sl, x_ctx.detach(), z_commit, t_commit, m_commit, is_pad, unknown,
-                )
-                with torch.no_grad():
-                    x_hat_commit, _ = self._forward_g_m(
-                        x_ctx_s, z_c_s, t_c_s, m_c_s, None,
-                        sc_right=torch.zeros_like(z_c_s),
-                        drop_left=None, is_pad=is_pad_s, unknown=unknown_s,
-                    )
-                h_left = h_left.index_copy(0, idx_sl, x_hat_commit)
-                pin = (known | is_pad).unsqueeze(-1)
-                h_left = torch.where(
-                    use_self[:, None, None] & pin, x_known.detach(), h_left,
-                )
+            sl = use_self[:, None, None]
+            pin = (known | is_pad).unsqueeze(-1)
+            h_left = torch.where(sl, x_hat_commit, h_left)
+            h_left = torch.where(sl & pin, x_known.detach(), h_left)
 
         w_sc = None
         guided = torch.zeros(bsz, device=device, dtype=torch.bool)
@@ -734,34 +736,24 @@ class _BelfBackbone(nn.Module):
         v_z = v_star(x0, z_t, t_right, self.vel_eps)
         sc_zero = torch.zeros_like(z_t)
         left_kv = self._prefill_left_train(h_left)
+        # sc_cfg 训练：整 batch 跑 teacher，勿 bool(guided.any())——各 rank 抽样独立会分叉死锁。
         need_teacher = self.sc_cfg and self.training
-        if need_teacher and bool(guided.any()):
-            idx_g = row_idx(guided)
-            kv_g = left_kv.index_select(idx_g)
-            z_s, t_s, m_s, w_s, sc0_s, drop_s, pad_s, unk_s, known_s = take_rows(
-                idx_g, z_t, t_right, m_right, w_sc, sc_zero,
-                drop_left, is_pad, unknown, known,
-            )
+        if need_teacher:
             with torch.no_grad():
                 x_u, _ = self._forward_g_right(
-                    z_s, t_s, m_s, w_s, kv_g, sc_right=sc0_s,
-                    drop_left=drop_s, is_pad=pad_s, unknown=unk_s,
+                    z_t, t_right, m_right, w_sc, left_kv, sc_right=sc_zero,
+                    drop_left=drop_left, is_pad=is_pad, unknown=unknown,
                 )
-                v_u_s = x_to_v(x_u, z_s, t_s, self.vel_eps)
-                sc_cond = x_u.detach()
-                sc_cond = torch.where(known_s.unsqueeze(-1), torch.zeros_like(sc_cond), sc_cond)
+                v_u = x_to_v(x_u, z_t, t_right, self.vel_eps)
+                sc_cond = torch.where(
+                    known.unsqueeze(-1), torch.zeros_like(x_u), x_u.detach(),
+                )
                 x_c, _ = self._forward_g_right(
-                    z_s, t_s, m_s, w_s, kv_g, sc_right=sc_cond,
-                    drop_left=drop_s, is_pad=pad_s, unknown=unk_s,
+                    z_t, t_right, m_right, w_sc, left_kv, sc_right=sc_cond,
+                    drop_left=drop_left, is_pad=is_pad, unknown=unknown,
                 )
-                v_c_s = x_to_v(x_c, z_s, t_s, self.vel_eps)
-            v_u = v_z.clone()
-            v_c = v_z.clone()
-            v_u = v_u.index_copy(0, idx_g, v_u_s)
-            v_c = v_c.index_copy(0, idx_g, v_c_s)
-            sc_stu = sc_zero.clone()
-            sc_stu = sc_stu.index_copy(0, idx_g, x_u.detach())
-            sc_stu = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_stu), sc_stu)
+                v_c = x_to_v(x_c, z_t, t_right, self.vel_eps)
+            sc_stu = torch.where(guided[:, None, None], sc_cond, sc_zero)
             x_hat, _ = self._forward_g_right(
                 z_t, t_right, m_right, w_sc, left_kv, sc_right=sc_stu,
                 drop_left=drop_left, is_pad=is_pad, unknown=unknown,

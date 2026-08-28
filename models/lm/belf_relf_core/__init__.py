@@ -9,6 +9,7 @@ from .cfg import (
     maybe_drop_left,
     pad_after_first_eos,
     sample_w_sc,
+    self_left_p,
 )
 from .exit import CausalExit, ExitMap
 from .flow import interpolate, v_star, x_to_v
@@ -75,6 +76,7 @@ __all__ = [
     "pack_2l_parallel_blocks_mask",
     "sample_logit_normal_t",
     "sample_w_sc",
+    "self_left_p",
     "v_star",
     "validate_joint_tune",
     "validate_loaded_block",

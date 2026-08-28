@@ -27,13 +27,12 @@ from models.lm.belf_relf_core import (
     pack_2l_mask,
     sample_logit_normal_t,
     sample_w_sc,
+    self_left_p,
     v_star,
     validate_joint_tune,
     validate_loaded_block,
     x_to_v,
 )
-from models.lm.belf_relf_core.rows import row_idx, take_rows
-
 from models.lm.belf_relf_core.gen_buf import SeqBuf
 from models.lm.relf.config import FL_RelfConfig
 from models.model import (
@@ -118,6 +117,12 @@ class _RelfBackbone(nn.Module):
         self.self_left_prob = float(config.self_left_prob)
         self.self_left_thaw_tokens = int(config.self_left_thaw_tokens)
         self._tokens_seen = 0
+        # 只在 on_tokens_seen（compile 图外）刷新；forward 当静态 float 读。
+        self._self_left_p = self_left_p(
+            tokens_seen=0,
+            thaw_tokens=self.self_left_thaw_tokens,
+            prob=self.self_left_prob,
+        )
 
         self.whiten = bool(config.whiten)
         self.whiten_on = str(config.whiten_on).strip().lower()
@@ -191,6 +196,11 @@ class _RelfBackbone(nn.Module):
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         self._tokens_seen = int(n)
+        self._self_left_p = self_left_p(
+            tokens_seen=self._tokens_seen,
+            thaw_tokens=self.self_left_thaw_tokens,
+            prob=self.self_left_prob,
+        )
         return bool(self.latent.on_tokens_seen(n, optimizer))
 
     def train_metrics(self) -> dict[str, Any]:
@@ -674,77 +684,65 @@ class _RelfBackbone(nn.Module):
             torch.cat([pos_left, pos_right], dim=1) if left_len > 0 else pos_right
         )
 
-        # self-left：先抽样本，仅 use_self 行跑完整 2L G（仍 no_grad、t=1-ε、sc=0）
-        p_left = 0.0
-        if self.training and compute_loss:
-            thaw = int(self.self_left_thaw_tokens)
-            if thaw <= 0 or int(self._tokens_seen) >= thaw:
-                p_left = self.self_left_prob
+        # self-left：p 在图外算好；p>0 时整 batch 跑 2L G，再用 mask 写回。
+        p_left = (
+            float(self._self_left_p) if (self.training and compute_loss) else 0.0
+        )
         if p_left > 0.0 and left_len > 0:
             use_self = torch.rand(bsz, device=device) < p_left
-            if bool(use_self.any()):
-                idx_sl = row_idx(use_self)
-                b_s = int(idx_sl.numel())
-                t_last = t_w.new_full((), 1.0 - float(self.config.t_clean_eps))
-                t_commit_w = torch.where(
-                    unknown,
-                    t_last.expand(bsz, n_win, w_sz),
-                    torch.ones(bsz, n_win, w_sz, device=device, dtype=t_w.dtype),
+            t_last = t_w.new_full((), 1.0 - float(self.config.t_clean_eps))
+            t_commit_w = torch.where(
+                unknown,
+                t_last.expand(bsz, n_win, w_sz),
+                torch.ones(bsz, n_win, w_sz, device=device, dtype=t_w.dtype),
+            )
+            z_commit = interpolate(x0, t_commit_w, nse)
+            z_commit = torch.where(known.unsqueeze(-1), x0, z_commit)
+            z_commit = torch.where(in_win.unsqueeze(-1), z_commit, x0)
+            m_commit_w = torch.where(
+                unknown, torch.full_like(m_w, _MODE_DENOISE), torch.zeros_like(m_w),
+            )
+            z_c_right = z_commit.reshape(bsz, right_len, x_dim)
+            t_c_right = t_commit_w.reshape(bsz, right_len)
+            m_c_right = m_commit_w.reshape(bsz, right_len)
+            if use_flex:
+                flex_commit = build_relf_flex_block_mask(
+                    left_len, w_sz, step, u, active,
+                    k0=k0, in_win=in_win, drop_left=None,
                 )
-                z_commit = interpolate(x0, t_commit_w, nse)
-                z_commit = torch.where(known.unsqueeze(-1), x0, z_commit)
-                z_commit = torch.where(in_win.unsqueeze(-1), z_commit, x0)
-                m_commit_w = torch.where(
-                    unknown, torch.full_like(m_w, _MODE_DENOISE), torch.zeros_like(m_w),
+                attn_commit = None
+            else:
+                flex_commit = None
+                attn_commit = self._windows_attn_mask(
+                    left_len, u, active, k0, in_win=in_win, drop_left=None,
                 )
-                z_c_right = z_commit.reshape(bsz, right_len, x_dim)
-                t_c_right = t_commit_w.reshape(bsz, right_len)
-                m_c_right = m_commit_w.reshape(bsz, right_len)
-                (
-                    u_s, active_s, k0_s, in_win_s, h_ctx_s, z_c_s, t_c_s, m_c_s,
-                    t_l_s, m_l_s, pos_s, unk_s, valid_s, j_s,
-                ) = take_rows(
-                    idx_sl, u, active, k0, in_win, h_ctx[:, :seq_len],
-                    z_c_right, t_c_right, m_c_right, t_left, m_left, positions,
-                    unknown, valid_pos, j,
-                )
-                if use_flex:
-                    flex_commit = build_relf_flex_block_mask(
-                        left_len, w_sz, step, u_s, active_s,
-                        k0=k0_s, in_win=in_win_s, drop_left=None,
-                    )
-                    attn_commit = None
-                else:
-                    flex_commit = None
-                    attn_commit = self._windows_attn_mask(
-                        left_len, u_s, active_s, k0_s, in_win=in_win_s, drop_left=None,
-                    )
-                with torch.no_grad():
-                    h_gt = pack_2l(self._stem(h_ctx_s.detach()), self._stem(z_c_s))
-                    t_c_all = torch.cat([t_l_s, t_c_s], dim=1)
-                    m_c_all = torch.cat([m_l_s, m_c_s], dim=1)
-                    x_hat_commit, _ = self._split_g(self._run_g(
-                        h_gt, t_c_all, None, m_c_all, None,
-                        attn_mask=attn_commit, positions=pos_s,
-                        flex_block_mask=flex_commit,
-                    ))
-                x_right_hat = x_hat_commit[:, left_len:].reshape(b_s, n_win, w_sz, x_dim)
-                write = unk_s & valid_s
-                left_commit = h_ctx_s.detach().clone()
-                dummy = seq_len
-                idx_w = torch.where(
-                    write, j_s.clamp(0, seq_len - 1), j_s.new_full(j_s.shape, dummy),
-                )
-                buf = torch.cat(
-                    [left_commit, left_commit.new_zeros(b_s, 1, x_dim)], dim=1,
-                )
-                src = x_right_hat.reshape(b_s, right_len, x_dim).detach().to(dtype=buf.dtype)
-                buf.scatter_(
-                    1,
-                    idx_w.reshape(b_s, right_len, 1).expand(b_s, right_len, x_dim).long(),
-                    src,
-                )
-                h_left_x = h_left_x.index_copy(0, idx_sl, buf[:, :seq_len])
+            with torch.no_grad():
+                h_gt = pack_2l(self._stem(h_ctx[:, :seq_len].detach()), self._stem(z_c_right))
+                t_c_all = torch.cat([t_left, t_c_right], dim=1)
+                m_c_all = torch.cat([m_left, m_c_right], dim=1)
+                x_hat_commit, _ = self._split_g(self._run_g(
+                    h_gt, t_c_all, None, m_c_all, None,
+                    attn_mask=attn_commit, positions=positions,
+                    flex_block_mask=flex_commit,
+                ))
+            x_right_hat = x_hat_commit[:, left_len:].reshape(bsz, n_win, w_sz, x_dim)
+            write = unknown & valid_pos
+            left_commit = h_ctx[:, :seq_len].detach().clone()
+            dummy = seq_len
+            idx_w = torch.where(
+                write, j.clamp(0, seq_len - 1), j.new_full(j.shape, dummy),
+            )
+            buf = torch.cat(
+                [left_commit, left_commit.new_zeros(bsz, 1, x_dim)], dim=1,
+            )
+            src = x_right_hat.reshape(bsz, right_len, x_dim).detach().to(dtype=buf.dtype)
+            buf.scatter_(
+                1,
+                idx_w.reshape(bsz, right_len, 1).expand(bsz, right_len, x_dim).long(),
+                src,
+            )
+            sl = use_self[:, None, None]
+            h_left_x = torch.where(sl, buf[:, :seq_len], h_left_x)
 
         v_z = v_star(x0_right, z_right, t_right, vel_eps)
         w_in = w_vec if self.sc_cfg else None
@@ -768,45 +766,26 @@ class _RelfBackbone(nn.Module):
                 attn = self._windows_attn_mask(
                     0, u, active, k0, in_win=in_win, drop_left=drop_left,
                 )
-            if need_teacher and bool(guided.any()):
-                idx_g = row_idx(guided)
-                (
-                    h_s, t_s, m_s, w_s, pos_s, unk_s, z_s, t_r_s, md_s,
-                    u_s, active_s, k0_s, in_win_s, drop_s,
-                ) = take_rows(
-                    idx_g, h_right, t_right, m_right, w_in, pos_right, unknown,
-                    z_right, t_right, md, u, active, k0, in_win, drop_left,
-                )
-                if use_flex:
-                    flex_g = build_relf_flex_block_mask(
-                        0, w_sz, step, u_s, active_s,
-                        k0=k0_s, in_win=in_win_s, drop_left=drop_s,
-                    )
-                    attn_g = None
-                else:
-                    flex_g = None
-                    attn_g = self._windows_attn_mask(
-                        0, u_s, active_s, k0_s, in_win=in_win_s, drop_left=drop_s,
-                    )
+            # 整 batch teacher；勿 bool(guided.any())，各 rank 抽样独立会分叉死锁。
+            if need_teacher:
                 with torch.no_grad():
                     x_u_r, _ = self._split_g(self._run_g(
-                        h_s, t_s, w_s, m_s, torch.zeros_like(h_s),
-                        attn_mask=attn_g, positions=pos_s, flex_block_mask=flex_g,
+                        h_right, t_right, w_in, m_right, torch.zeros_like(h_right),
+                        attn_mask=attn, positions=pos_right, flex_block_mask=flex_mask,
                     ))
-                    v_u_s = x_to_v(x_u_r, z_s, t_r_s, vel_eps)
-                    sc_cond = self._stem(x_u_r.detach()).reshape(-1, n_win, w_sz, d_dim)
+                    v_u = x_to_v(x_u_r, z_right, t_right, vel_eps)
+                    sc_cond = self._stem(x_u_r.detach()).reshape(bsz, n_win, w_sz, d_dim)
+                    sc_cond = sc_cond.clone()
                     sc_cond[:, :, w_sz - step :, :] = 0
-                    sc_cond = sc_cond * unk_s.unsqueeze(-1)
-                    sc_r_cond = sc_cond.reshape(x_u_r.size(0), right_len, d_dim)
+                    sc_cond = sc_cond * unknown.unsqueeze(-1)
+                    sc_r_cond = sc_cond.reshape(bsz, right_len, d_dim)
                     x_c_r, _ = self._split_g(self._run_g(
-                        h_s, t_s, w_s, m_s, sc_r_cond,
-                        attn_mask=attn_g, positions=pos_s, flex_block_mask=flex_g,
+                        h_right, t_right, w_in, m_right, sc_r_cond,
+                        attn_mask=attn, positions=pos_right, flex_block_mask=flex_mask,
                     ))
-                    v_c_s = x_to_v(x_c_r, z_s, t_r_s, vel_eps)
-                v_u = v_z.clone().index_copy(0, idx_g, v_u_s)
-                v_c = v_z.clone().index_copy(0, idx_g, v_c_s)
+                    v_c = x_to_v(x_c_r, z_right, t_right, vel_eps)
                 assert sc_stu_r is not None
-                sc_stu_r = sc_stu_r.index_copy(0, idx_g, sc_r_cond)
+                sc_stu_r = torch.where(guided[:, None, None], sc_r_cond, sc_stu_r)
             x_hat, _ = self._split_g(self._run_g(
                 h_right, t_right, w_in, m_right, sc_stu_r,
                 attn_mask=attn, positions=pos_right, flex_block_mask=flex_mask,
@@ -818,38 +797,26 @@ class _RelfBackbone(nn.Module):
             attn, flex_mask = self._right_attn(
                 left_len, u, active, k0, in_win, drop_left,
             )
-            if need_teacher and bool(guided.any()):
-                idx_g = row_idx(guided)
-                kv_g = left_kv.index_select(idx_g)
-                (
-                    h_s, t_s, m_s, w_s, pos_s, unk_s, z_s, drop_s,
-                    u_s, active_s, k0_s, in_win_s,
-                ) = take_rows(
-                    idx_g, h_right, t_right, m_right, w_in, pos_right, unknown,
-                    z_right, drop_left, u, active, k0, in_win,
-                )
-                attn_g, flex_g = self._right_attn(
-                    left_len, u_s, active_s, k0_s, in_win_s, drop_s,
-                )
+            if need_teacher:
                 with torch.no_grad():
                     x_u_r, _ = self._split_g(self._run_g_right(
-                        h_s, t_s, w_s, m_s, torch.zeros_like(h_s), kv_g,
-                        attn_mask=attn_g, positions=pos_s, flex_block_mask=flex_g,
+                        h_right, t_right, w_in, m_right, torch.zeros_like(h_right),
+                        left_kv, attn_mask=attn, positions=pos_right,
+                        flex_block_mask=flex_mask,
                     ))
-                    v_u_s = x_to_v(x_u_r, z_s, t_s, vel_eps)
-                    sc_cond = self._stem(x_u_r.detach()).reshape(-1, n_win, w_sz, d_dim)
+                    v_u = x_to_v(x_u_r, z_right, t_right, vel_eps)
+                    sc_cond = self._stem(x_u_r.detach()).reshape(bsz, n_win, w_sz, d_dim)
+                    sc_cond = sc_cond.clone()
                     sc_cond[:, :, w_sz - step :, :] = 0
-                    sc_cond = sc_cond * unk_s.unsqueeze(-1)
-                    sc_r_cond = sc_cond.reshape(x_u_r.size(0), right_len, d_dim)
+                    sc_cond = sc_cond * unknown.unsqueeze(-1)
+                    sc_r_cond = sc_cond.reshape(bsz, right_len, d_dim)
                     x_c_r, _ = self._split_g(self._run_g_right(
-                        h_s, t_s, w_s, m_s, sc_r_cond, kv_g,
-                        attn_mask=attn_g, positions=pos_s, flex_block_mask=flex_g,
+                        h_right, t_right, w_in, m_right, sc_r_cond, left_kv,
+                        attn_mask=attn, positions=pos_right, flex_block_mask=flex_mask,
                     ))
-                    v_c_s = x_to_v(x_c_r, z_s, t_s, vel_eps)
-                v_u = v_z.clone().index_copy(0, idx_g, v_u_s)
-                v_c = v_z.clone().index_copy(0, idx_g, v_c_s)
+                    v_c = x_to_v(x_c_r, z_right, t_right, vel_eps)
                 assert sc_stu_r is not None
-                sc_stu_r = sc_stu_r.index_copy(0, idx_g, sc_r_cond)
+                sc_stu_r = torch.where(guided[:, None, None], sc_r_cond, sc_stu_r)
             x_hat, _ = self._split_g(self._run_g_right(
                 h_right, t_right, w_in, m_right, sc_stu_r, left_kv,
                 attn_mask=attn, positions=pos_right, flex_block_mask=flex_mask,
