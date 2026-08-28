@@ -23,16 +23,15 @@ from models.lm.belf_relf_core import (
     build_belf_flex_block_mask,
     build_belf_flex_left_mask,
     build_belf_flex_right_mask,
-    check_time_step,
     group_causal_mask,
     hide_left_keys,
     hide_right_pad_from_unknown,
     interpolate,
-    ladder_levels,
     maybe_drop_left,
     pack_2l,
     pack_2l_mask,
     pack_2l_parallel_blocks_mask,
+    sample_logit_normal_t,
     sample_w_sc,
     v_star,
     validate_joint_tune,
@@ -75,6 +74,14 @@ class _RMSNorm(nn.Module):
         return self.weight.to(dtype=x.dtype) * x
 
 
+def _drop_legacy_levels(state_dict: dict) -> dict:
+    """旧 BELF 把梯子 ``levels`` 写成 persistent buffer；现已删除，加载时丢掉。"""
+    sd = dict(state_dict)
+    for key in [k for k in sd if k == "levels" or k.endswith(".levels")]:
+        sd.pop(key)
+    return sd
+
+
 class _BelfBackbone(nn.Module):
     """块条件流：训练 2L 并行，推理 ``block_generate``。"""
 
@@ -95,8 +102,6 @@ class _BelfBackbone(nn.Module):
         self.block_size = int(config.block_size)
         if self.block_size < 1:
             raise ValueError(f"block_size W 须为正整数，收到 {config.block_size}")
-        self.time_step = int(config.time_step)
-        check_time_step(self.time_step)
         validate_loaded_block(
             family="belf",
             loaded_block=bundle.block_size,
@@ -198,16 +203,14 @@ class _BelfBackbone(nn.Module):
             nn.Linear(2 * self.n_embd, self.n_embd, bias=True) if self.sc_cfg else None
         )
         self.exit_head = None
-
-        levels = ladder_levels(
-            self.time_step, self.denoiser_p_mean, self.denoiser_p_std, self.t_clean_eps,
-        )
-        self.register_buffer("levels", levels, persistent=True)
         self._mask_cache: dict[tuple[int, int, int, torch.device, bool], torch.Tensor] = {}
 
         self.last_l2_loss = float("nan")
         self.last_ce_loss = float("nan")  # 兼容旧日志列；恒为 nan
         self.last_s1_loss = float("nan")
+
+    def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+        return super().load_state_dict(_drop_legacy_levels(state_dict), strict=strict)
 
     def _whiten(self, z: torch.Tensor) -> torch.Tensor:
         """可选白化，仍在流空间 X。"""
@@ -344,7 +347,7 @@ class _BelfBackbone(nn.Module):
         *,
         known_max: int | None = None,
     ) -> LeftKVCache | None:
-        """生成：把新提交的左块增量写入 KV（``commit_x0hat`` 路径）。"""
+        """生成：把新提交的左块增量写入 KV（``commit_x0hat=true``）。"""
         if h_new.size(1) == 0:
             return cache
         if cache is None or cache.left_len == 0:
@@ -596,7 +599,6 @@ class _BelfBackbone(nn.Module):
         if seq_len > self.max_seq_len:
             raise ValueError(f"序列长度 {seq_len} 超过 max_seq_len={self.max_seq_len}")
         device = tokens.device
-        levels = self.levels.to(device=device)
 
         z, mu, logvar = self.bundle.encode(tokens, sample=self.training)
         if z.shape[:2] != tokens.shape:
@@ -611,9 +613,14 @@ class _BelfBackbone(nn.Module):
         pad_id = int(self.token_layout.pad_token_id)
         not_pad = tokens != pad_id
 
-        # 梯子长度 T+1；G 落在 L_0…L_{T-1}
-        hops = torch.randint(0, self.time_step, (bsz,), device=device)
-        t_hop = levels[hops].to(dtype=dtype)
+        # 按样本一个连续 t~Ln，未知槽广播；已知 / PAD 钉 t=1。
+        t_hop = sample_logit_normal_t(
+            (bsz,),
+            self.denoiser_p_mean,
+            self.denoiser_p_std,
+            device=device,
+            dtype=dtype,
+        )
 
         rem = torch.zeros(bsz, device=device, dtype=torch.long)
         b_cur = torch.zeros(bsz, device=device, dtype=torch.long)
@@ -674,7 +681,7 @@ class _BelfBackbone(nn.Module):
             self.ctx_drop_prob if self.training else 0.0,
             return_drop=True,
         )
-        # self-left：先抽样本，仅 use_self 行跑现有 2L G（仍 no_grad、t=L_{T-1}、sc=0）
+        # self-left：先抽样本，仅 use_self 行跑现有 2L G（仍 no_grad、t=1-ε、sc=0）
         p_left = 0.0
         if self.training:
             thaw = int(self.self_left_thaw_tokens)
@@ -685,7 +692,7 @@ class _BelfBackbone(nn.Module):
             use_self = torch.rand(bsz, device=device) < p_left
             if bool(use_self.any()):
                 idx_sl = row_idx(use_self)
-                t_last = levels[self.time_step - 1].to(dtype=dtype)
+                t_last = x0.new_full((), 1.0 - self.t_clean_eps)
                 t_commit = torch.where(
                     known | is_pad,
                     x0.new_ones(bsz, seq_len),
@@ -911,6 +918,9 @@ class FL_BelfModel(FL_PreTrainedModel):
         self.backbone = _BelfBackbone(config, bundle)
         self.post_init()
         self._restore_adaln_zero_init()
+
+    def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+        return super().load_state_dict(_drop_legacy_levels(state_dict), strict=strict)
 
     def _restore_adaln_zero_init(self) -> None:
         """post_init 会打乱 AdaLN-Zero / FinalLayer 零初始化；按 Cola 意图补回。"""

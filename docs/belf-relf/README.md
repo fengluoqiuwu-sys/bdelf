@@ -39,7 +39,7 @@ latexmk -xelatex -interaction=nonstopmode -halt-on-error belf-relf.tex
 | [`cola`](../../models/lm/cola/) | 2L pack `[clean\|noisy]`、块因果注意力、AdaLN-Zero DiT、独立读出 | \(t=0\) 干净；速度靶 \(z_1-z_0\)；压缩码 + `cola_vae` |
 | [`bd3lm`](../../models/lm/bd3lm/) | 块间提交、KV 的**离散**对应物 | 吸收态 mask、同一网络出 logits |
 
-入口 encoder 的注意力块长以加载结果为准（例如 `latent_vae` 的 `block_size`），不随 BELF 的 \(W\) 改写。BELF 的 `block_size`（\(W\)）是 \(G\) 的去噪块长：100m 默认 16，主跑 \(W=T\)。受约束的是加载入口块长：只能是 \(1\)（逐 token 因果）或等于本题 BELF \(W\)。RELF **不声明** `block_size`，加载入口块长必须为 \(1\)；窗长 `window_size` 与入口无关。
+入口 encoder 的注意力块长以加载结果为准（例如 `latent_vae` 的 `block_size`），不随 BELF 的 \(W\) 改写。BELF 的 `block_size`（\(W\)）是 \(G\) 的去噪块长：100m 默认 16。受约束的是加载入口块长：只能是 \(1\)（逐 token 因果）或等于本题 BELF \(W\)。RELF **不声明** `block_size`，加载入口块长必须为 \(1\)；窗长 `window_size` 与入口无关。
 
 Cola 的 VAE 加载器与本规格入口不是同一条路：
 
@@ -68,7 +68,7 @@ models/lm/
 │   ├── layers.py            # AdaLN-Zero；prefill_left / forward_right（训练共用左 KV）
 │   ├── flex_mask.py         # 训练 Flex：2L、左 prefill 组因果、右段 Q=N KV=2N
 │   ├── rows.py              # 按 batch 切行（self_left / guided 子批）
-│   ├── time.py              # Φ / Q / {L_i}；T≥4
+│   ├── time.py              # 训练 sample_logit_normal_t；推理 Φ / Q / {L_i}；T≥4
 │   ├── flow.py              # z_t 插值、x-pred→v、v*
 │   ├── pack.py              # 2L [sg(h_left)|h_t]；组内双向、组间单向
 │   ├── cfg.py               # w_sc 采样；ctx drop；v_tgt
@@ -97,16 +97,16 @@ tokens
      self_left / 生成完整 2L：pack_2l [sg(h_left)|h_t]
   → 逐列 (t, [w_sc], [m]) → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → SwiGLU）
   → FinalLayer D→X → x̂₀
-  → Exit（锁死）：全文已提交的 \(\hat x_0\) 走加载的 VAE-dec → logits（仅推理读出一次；训练主体不算 CE）
+  → Exit（锁死）：\(\hat x_0\) 走加载的 VAE-dec → logits（推理读出；训练主体不算 CE）
 ```
 
-出口无 `exit` 键、无 `linear` 对照。推理循环只提交 \(\hat x_0\)，跑满后全文一次 VAE-dec。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
+出口无 `exit` 键、无 `linear` 对照。推理默认每块 / 每次 pop 后 VAE-dec 读词再 encode（`commit_x0hat=false`）；对照 `true` 提交 \(\hat x_0\)、跑满后全文一次 VAE-dec。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
 
 ### 训练热路径（不改规格 / 哈希）
 
 `v_{\mathrm{tgt}}`、sc、AdaLN 与 self-left 的**数值语义**仍以 LaTeX 为准；实现做两件等价事（不进指纹、不改 YAML）：
 
-1. **按样本跳过用不上的 \(G\)。** 先抽 `use_self ~ Bern(p_left)` 与 `g ~ Bern(p_g^{sc})`。self-left 只对命中行跑完整 2L `no_grad` \(G\)（\(t=L_{T-1}\)、sc=0），再写回左段；0 行则整次跳过。CFG teacher 只跑 \(g=1\) 的行；\(g=0\) 时 \(v_{\mathrm{tgt}}=v^\star\)、学生 sc=0。学生始终整批。
+1. **按样本跳过用不上的 \(G\)。** 先抽 `use_self ~ Bern(p_left)` 与 `g ~ Bern(p_g^{sc})`。self-left 只对命中行跑完整 2L `no_grad` \(G\)（\(t=1-\varepsilon\)、sc=0），再写回左段；0 行则整次跳过。CFG teacher 只跑 \(g=1\) 的行；\(g=0\) 时 \(v_{\mathrm{tgt}}=v^\star\)、学生 sc=0。学生始终整批。
 2. **CFG 三次共用左 KV。** self-left 之后对最终左段茎一次（茎后 `sg`，对齐 `pack_2l` 左半），`prefill_left` **带梯度**（不用生成路径的 `prefill_left_kv`，也不 `copy_` 扩容）。随后 \(G_u/G_c/\) 学生只跑右段（`cat(K_左,K_右)`）。训练默认 `attn_backend=flex`：右段 `Q=N`（RELF 为 `right_len`）、`KV=left+right`，可见性与完整 2L 右块相同；左 prefill 为组因果（BELF 组长 \(W\)，RELF 组长 1）。sc 只加在右列再 `sc_proj`。self-left 那次 \(G\) 仍是完整 2L，不共用这份 KV。
 
 对照脚本：`scripts/check_belf_relf_flex_mask.py`（右段 mask vs 2L 右块）。生成循环仍 SDPA + 按 hop 的左 KV，未改。
@@ -126,9 +126,9 @@ tokens
 
 | 类 | 例子 | 指纹 |
 |---|---|---|
-| 模型 | `latent_model`、`tag`、`n_embd`、`sc_cfg`、`self_left_prob`、`self_left_thaw_tokens`；BELF 另有 `block_size`；RELF 有 `window_size`/`time_step`/`step_size` | 模型指纹 |
+| 模型 | `latent_model`、`tag`、`n_embd`、`sc_cfg`、`self_left_prob`、`self_left_thaw_tokens`；BELF 另有 `block_size`；RELF 有 `window_size`/`step_size`（\(T=W/S\)） | 模型指纹 |
 | 训练 | `latent_tune`、日程、损失系数 | 训练指纹 |
-| 推理 | `commit_x0hat`、`sampling_method`、`sde_gamma`、`w_sc`/`w_ctx` | 现网 `build_train_fingerprint` 纳入 `generate_cfg` 与 model YAML 的 `sampling`（改推理默认会换哈希；不改全局管线） |
+| 推理 | `commit_x0hat`、`sampling_method`、`sde_gamma`、`w_sc`/`w_ctx`；BELF 另有 `num_sampling_steps` | 现网 `build_train_fingerprint` 纳入 `generate_cfg` 与 model YAML 的 `sampling`（改推理默认会换哈希；不改全局管线） |
 
 `latent_tune` 三档是**三个训练配置哈希**（`frozen` / `full` / `mid`），不是同一个 run 里的开关。`sc_cfg` 进模型指纹：主跑 `true`（ScaleEmbedder / teacher）；消融短训再关。
 
@@ -138,9 +138,8 @@ tokens
 
 - `latent_dim` 须等于 artifact 输出维 \(X\)；`n_embd` 是 \(G\) 隐层 \(D\)，二者无关
 - `n_embd` 整除 `n_head`
-- 两族 `time_step` \(T\ge 4\)
-- BELF：加载入口 `encoder.block_size` \(\in\{1,W\}\)；**训练** `forward` 要求序列长度被 \(W\) 整除
-- RELF：无 `block_size`；加载入口块长 \(=1\)；\(S\cdot T=W\)，\(T\ge 4\)
+- BELF：加载入口 `encoder.block_size` \(\in\{1,W\}\)；**训练** `forward` 要求序列长度被 \(W\) 整除；`num_sampling_steps` \(T\ge 4\)（generate YAML）
+- RELF：无 `block_size`；加载入口块长 \(=1\)；\(W\) 能被 \(S\) 整除且 \(T=W/S\ge 4\)
 - 可训档（`full` / `mid`）要求入口 `encoder.block_size==1`；块因果入口只允许 `frozen`
 - 出口锁死 VAE-dec，启动必须具备 decoder；可训档（`latent_tune` 的 `full` / `mid`）同样须具备 VAE-dec
 - 100m 默认 `tag: 100m-b32-d1`：若 artifact 块长为 32，BELF \(W=16\) / RELF 入口必须 1 **硬拒**，不放宽校验
@@ -148,8 +147,8 @@ tokens
 ### 100m 默认（规格）
 
 共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=true`，`self_left_prob=0.25`（`self_left_thaw_tokens=5B`，进指纹、不进消融），`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
-BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^2)\)）。  
-RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后提交 \(\hat x_0\)）。
+BELF：`block_size=16`；训练每样本 \(t\sim\mathrm{Ln}\)（\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^2)\)）；推理 `num_sampling_steps=32`（可改）。  
+RELF：`window_size=64`，`step_size=2`（推理 \(T=W/S=32\) 锁死）；训练逐档独立 \(t\sim\mathrm{Ln}\)；推理窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后提交 \(\hat x_0\)。
 
 推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。主跑启用 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
 
@@ -206,12 +205,12 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 
 | 族 | `forward(tokens)` | 生成 |
 |---|---|---|
-| BELF | `train_t_schedule=block`：抽一跳 \(i\)，未知槽广播 \(t=L_i\)；序列长度须被 \(W\) 整除 | `block_generate` |
-| RELF | `train_t_schedule=mixed`：按 BOS/EOS 截整窗 \(F\) | `rolling_generate` |
+| BELF | `train_t_schedule=independent`：每样本连续 \(t\sim\mathrm{Ln}\)，未知槽广播；序列长度须被 \(W\) 整除 | `block_generate`（\(T\) 来自 `num_sampling_steps`） |
+| RELF | `train_t_schedule=block`：按 BOS/EOS 切窗，逐档独立 \(t\sim\mathrm{Ln}\) | `rolling_generate`（\(T=W/S\)） |
 
 评测：BELF 走块采样，RELF 走 rolling；主指标沿用仓库 TriFluency / Gen.PPL，不再用出口 CE 充当 eval PPL。长度切分见 LaTeX 附录（full/mid 的 Stage1 对齐 512；full 扩展对齐 2048）。
 
-推理默认同规格：`commit_x0hat=true`（提交 \(\hat x_0\)，全文一次 VAE-dec），`sampling_method=sde`，`w_sc=2.0`。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
+推理默认同规格：`commit_x0hat=false`（VAE-dec 读词再 encode），`sampling_method=sde`，`w_sc=2.0`。对照 `true` 提交 \(\hat x_0\)、全文一次 VAE-dec。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
 ## `latent_tune` 与 \(\mathcal{L}_{\mathrm{s1}}\)
 

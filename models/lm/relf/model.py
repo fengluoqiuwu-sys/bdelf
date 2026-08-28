@@ -25,6 +25,7 @@ from models.lm.belf_relf_core import (
     pad_after_first_eos,
     pack_2l,
     pack_2l_mask,
+    sample_logit_normal_t,
     sample_w_sc,
     v_star,
     validate_joint_tune,
@@ -79,26 +80,25 @@ class _RelfBackbone(nn.Module):
         self.n_head = int(config.n_head)
         self.window_size = int(config.window_size)
         self.step_size = int(config.step_size)
-        self.time_step = int(config.time_step)
-        check_time_step(self.time_step)
-        if self.step_size * self.time_step != self.window_size:
+        if self.step_size < 1:
+            raise ValueError(f"relf step_size S 须为正，收到 {self.step_size}")
+        if self.window_size % self.step_size != 0:
             raise ValueError(
-                f"relf 要求 step_size*time_step==window_size，"
-                f"收到 {self.step_size}*{self.time_step}!={self.window_size}"
+                f"relf 要求 window_size 能被 step_size 整除，"
+                f"收到 W={self.window_size} S={self.step_size}"
             )
+        # 推理 T=W/S，由窗几何推出，不是训练超参。
+        self.infer_t = self.window_size // self.step_size
+        check_time_step(self.infer_t)
         if self.n_embd % self.n_head != 0:
             raise ValueError(f"n_embd={self.n_embd} 须能被 n_head={self.n_head} 整除")
         backend = str(config.attn_backend).strip().lower()
         if backend not in ("flex", "sdpa"):
             raise ValueError(f"relf attn_backend 须为 flex|sdpa，收到 {config.attn_backend!r}")
         self.attn_backend = backend
-        if str(config.train_t_schedule).strip().lower() != "mixed":
+        if str(config.train_t_schedule).strip().lower() != "block":
             raise ValueError(
-                f"relf train_t_schedule 锁死 mixed，收到 {config.train_t_schedule!r}"
-            )
-        if str(config.window_t).strip().lower() != "ladder":
-            raise ValueError(
-                f"relf window_t 锁死 ladder，收到 {config.window_t!r}"
+                f"relf train_t_schedule 锁死 block，收到 {config.train_t_schedule!r}"
             )
 
         self.latent = bundle
@@ -171,7 +171,7 @@ class _RelfBackbone(nn.Module):
         self.exit_head = None
 
         levels = ladder_levels(
-            self.time_step,
+            self.infer_t,
             float(config.denoiser_p_mean),
             float(config.denoiser_p_std),
             float(config.t_clean_eps),
@@ -179,7 +179,7 @@ class _RelfBackbone(nn.Module):
         self.register_buffer("ladder", levels, persistent=False)
         # F[k]=L_{T-1-⌊k/S⌋}：窗左是 L_{T-1}，不是 1-ε；L_T 只作末次 Euler 终点。
         f_k = torch.stack(
-            [levels[self.time_step - 1 - (k // self.step_size)] for k in range(self.window_size)]
+            [levels[self.infer_t - 1 - (k // self.step_size)] for k in range(self.window_size)]
         )
         self.register_buffer("F", f_k, persistent=False)
         self._ladder_cap = float(levels[-1].item())  # L_T=1-ε，勿用来标 decode CE
@@ -252,7 +252,7 @@ class _RelfBackbone(nn.Module):
         device = tokens.device
         w_sz = self.window_size
         step = self.step_size
-        t_steps = self.time_step
+        t_steps = self.infer_t
         n_phase = w_sz // step
         n_win = (seq_len + w_sz - 1) // w_sz + 1
         pad_id = int(self.token_layout.pad_token_id)
@@ -632,11 +632,18 @@ class _RelfBackbone(nn.Module):
             & in_win
             & (j != i_eos)
         )
-        t_w = self.F.to(device=device).view(1, 1, w_sz)
+        t_block = sample_logit_normal_t(
+            (bsz, n_win, w_sz // step),
+            float(self.config.denoiser_p_mean),
+            float(self.config.denoiser_p_std),
+            device=device,
+            dtype=dtype,
+        )
+        t_w = t_block.repeat_interleave(step, dim=-1)
         t_w = torch.where(
             in_win & (~known),
-            t_w.expand(bsz, n_win, w_sz),
-            torch.ones(bsz, n_win, w_sz, device=device, dtype=t_w.dtype),
+            t_w,
+            torch.ones(bsz, n_win, w_sz, device=device, dtype=dtype),
         )
         unknown = in_win & (~known)
         m_w = torch.zeros(bsz, n_win, w_sz, device=device, dtype=torch.long)
@@ -667,7 +674,7 @@ class _RelfBackbone(nn.Module):
             torch.cat([pos_left, pos_right], dim=1) if left_len > 0 else pos_right
         )
 
-        # self-left：先抽样本，仅 use_self 行跑完整 2L G（仍 no_grad、末流档、sc=0）
+        # self-left：先抽样本，仅 use_self 行跑完整 2L G（仍 no_grad、t=1-ε、sc=0）
         p_left = 0.0
         if self.training and compute_loss:
             thaw = int(self.self_left_thaw_tokens)
@@ -678,7 +685,7 @@ class _RelfBackbone(nn.Module):
             if bool(use_self.any()):
                 idx_sl = row_idx(use_self)
                 b_s = int(idx_sl.numel())
-                t_last = self.ladder[self.time_step - 1].to(device=device, dtype=t_w.dtype)
+                t_last = t_w.new_full((), 1.0 - float(self.config.t_clean_eps))
                 t_commit_w = torch.where(
                     unknown,
                     t_last.expand(bsz, n_win, w_sz),
@@ -907,7 +914,7 @@ class _RelfBackbone(nn.Module):
         # 找当前档 i 使 L_i ≈ t；下一档 min(i+1, T)，L_T 为末次 Euler 终点。
         dist = (t.unsqueeze(-1) - levels.view(*([1] * t.ndim), -1)).abs()
         idx = dist.argmin(dim=-1)
-        nxt = (idx + 1).clamp(max=int(self.time_step))
+        nxt = (idx + 1).clamp(max=int(self.infer_t))
         return levels[nxt]
 
     def _churn_eval_state(
@@ -977,6 +984,11 @@ class _RelfBackbone(nn.Module):
         cfg = dict(self.config.sampling or {})
         if sampling_cfg:
             cfg.update(sampling_cfg)
+        if "num_sampling_steps" in cfg:
+            raise ValueError(
+                f"relf 禁止 num_sampling_steps（T=W/S={self.infer_t} 由窗几何推出），"
+                f"收到 {cfg['num_sampling_steps']}"
+            )
         seqlen = int(seqlen or self.max_seq_len)
         seqlen = min(seqlen, self.max_seq_len)
         device = next(self.parameters()).device
@@ -989,10 +1001,7 @@ class _RelfBackbone(nn.Module):
         top_k = cfg.get("top_k", top_k)
         if top_k is not None:
             top_k = int(top_k)
-        if not bool(cfg.get("commit_x0hat", True)):
-            raise ValueError(
-                "commit_x0hat=false 已删除：热路径只提交 x_hat，全文一次 VAE-dec"
-            )
+        commit_x0 = bool(cfg.get("commit_x0hat", False))
         w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 2.0)))
         w_ctx = float(cfg.get("w_ctx", cfg.get("ctx_cfg_scale", 1.0)))
         bos_id = int(
@@ -1011,7 +1020,7 @@ class _RelfBackbone(nn.Module):
         else:
             prefix = torch.zeros((num_samples, 0), device=device, dtype=torch.long)
 
-        # 前缀词只用于 BOS 几何与已知余数；循环不读词、不按 EOS 早停。
+        # 前缀词用于 BOS 几何与已知余数；commit_x0hat=false 时循环内读词并可按 EOS 早停。
         tok_like = prefix if prefix.size(1) > 0 else prefix.new_zeros(num_samples, 1)
         tok_sb = SeqBuf(known_max=seqlen, seq_dim=1, like=tok_like, fill=pad_id)
         if prefix.size(1) > 0:
@@ -1019,6 +1028,9 @@ class _RelfBackbone(nn.Module):
         tokens = tok_sb.view()
         prefix_len = int(tokens.size(1))
         nfe = 0
+        alive = torch.ones(num_samples, dtype=torch.bool, device=device)
+        if tokens.size(1) > 0:
+            alive = alive & ~(tokens == eos_id).any(dim=1)
 
         def _encode_mapped(
             tok: torch.Tensor, source: str, *, sample: bool = False,
@@ -1034,6 +1046,10 @@ class _RelfBackbone(nn.Module):
         def _encode_x0(tok: torch.Tensor) -> torch.Tensor:
             """已知余数：encoder 干净码（X），与训练 ``x0_source`` 同一空间。"""
             return _encode_mapped(tok, self.config.x0_source)
+
+        def _commit_left(tok: torch.Tensor) -> torch.Tensor:
+            src = str(self.config.x0_source)
+            return self._stem(_encode_mapped(tok, src, sample=(src == "z")))
 
         def _one_g(
             h_left: torch.Tensor,
@@ -1207,7 +1223,7 @@ class _RelfBackbone(nn.Module):
             return x_hat, x_right, z_next, hidden
 
         def _fields_for_u(u: int, tok: torch.Tensor, *, target_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            """推理窗：前缀 BOS 左切，右切锁死目标长（不读未读出的 EOS）。"""
+            """推理窗：BOS 左切；``commit_x0hat=false`` 时用已读 EOS 右切，否则锁死目标长。"""
             bsz = tok.size(0)
             bos_hit = tok == bos_id
             bos_idx = torch.where(
@@ -1215,9 +1231,17 @@ class _RelfBackbone(nn.Module):
                 bos_hit.float().argmax(dim=1),
                 torch.zeros(bsz, device=device, dtype=torch.long),
             )
-            eos_idx = torch.full(
-                (bsz,), target_len - 1, device=device, dtype=torch.long,
-            )
+            if commit_x0:
+                eos_idx = torch.full(
+                    (bsz,), target_len - 1, device=device, dtype=torch.long,
+                )
+            else:
+                has_eos = (tok == eos_id).any(dim=1)
+                eos_idx = torch.where(
+                    has_eos,
+                    (tok == eos_id).float().argmax(dim=1),
+                    torch.full((bsz,), target_len - 1, device=device, dtype=torch.long),
+                )
             k = torch.arange(w_sz, device=device)
             j = u + k
             in_win = (
@@ -1356,20 +1380,80 @@ class _RelfBackbone(nn.Module):
             _append_committed(add)
             return n_out
 
-        while x_sb.filled < seqlen:
-            L = int(x_sb.filled)
+        def _append_decoded(
+            tok: torch.Tensor,
+            sampled: torch.Tensor,
+            dec: torch.Tensor,
+            alive_row: torch.Tensor,
+            *,
+            n_write: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+            """追加 VAE-dec 读出的 token；返回 ``(tokens, hit, n_out, valid)``。"""
+            empty_v = tok.new_zeros(tok.size(0), 0, dtype=torch.bool)
+            is_eos = dec & (sampled == eos_id)
+            prev_eos = is_eos.cumsum(dim=1) - is_eos.long()
+            already = (
+                (tok == eos_id).any(dim=1)
+                if tok.size(1) > 0
+                else torch.zeros(tok.size(0), device=device, dtype=torch.bool)
+            )
+            keep = dec & (prev_eos == 0) & alive_row[:, None] & (~already)[:, None]
+            hit = already | is_eos.any(dim=1)
+            if int(n_write) < 1 or not bool(keep.any().item()):
+                return tok, hit, 0, empty_v
+            idx = torch.arange(w_sz, device=device).expand_as(keep)
+            order = torch.where(keep, idx, torch.full_like(idx, w_sz)).sort(dim=1).values
+            n_real = int((order < w_sz).sum(dim=1).max().item())
+            n_out = min(int(n_write), n_real)
+            if n_out < 1:
+                return tok, hit, 0, empty_v
+            take = order[:, :n_out]
+            valid = take < w_sz
+            gathered = sampled.gather(1, take.clamp(max=w_sz - 1))
+            add = torch.where(valid, gathered, torch.full_like(gathered, pad_id))
+            return tok_sb.append(add), hit, n_out, valid
+
+        def _exit_tok(x_hat: torch.Tensor, left_len: int) -> torch.Tensor:
+            """与 2L ``x_hat`` 对齐的 token：左段用已写前缀，右段用非 PAD 占位。"""
+            bsz = int(x_hat.size(0))
+            two = int(x_hat.size(1))
+            dummy = eos_id if int(eos_id) != int(pad_id) else int(pad_id) + 1
+            out = torch.full((bsz, two), dummy, device=device, dtype=torch.long)
+            if left_len > 0 and tokens.size(1) > 0:
+                have = min(left_len, int(tokens.size(1)))
+                out[:, :have] = tokens[:, :have]
+                if have < left_len:
+                    out[:, have:left_len] = pad_id
+            elif left_len > 0:
+                out[:, :left_len] = pad_id
+            return out
+
+        def _invalidate_left_kv() -> None:
+            nonlocal left_kv, left_kv_key
+            left_kv = None
+            left_kv_key = None
+
+        while True:
+            L = int(x_sb.filled) if commit_x0 else int(tok_sb.filled)
+            if L >= seqlen:
+                break
+            if not commit_x0:
+                if not bool(alive.any().item()):
+                    break
+                if tokens.size(1) > 0 and bool((tokens == eos_id).any(dim=1).all()):
+                    break
             r = L % step
             g = (L // step) * step
 
             if L == 0:
-                # preroll：T 次 denoise Euler；末 hop 提交最左档 x_hat，不读词。
+                # preroll：T 次 denoise Euler；末 hop 提交或 VAE-dec。
                 sc_win = torch.zeros(num_samples, w_sz, self.latent_dim, device=device, dtype=dtype)
                 z_win = torch.randn(
                     num_samples, w_sz, self.latent_dim, device=device, dtype=dtype,
                 ) * float(self.config.noise_sigma)
                 h_left = tokens.new_zeros(num_samples, 0, self.n_embd).to(dtype=dtype)
-                for hop in range(self.time_step):
-                    k_bos = step * (self.time_step - hop - 1)
+                for hop in range(self.infer_t):
+                    k_bos = step * (self.infer_t - hop - 1)
                     u = -k_bos
                     t_w, m_w, in_win = _fields_for_u(u, tokens, target_len=seqlen)
                     m_w = torch.where(in_win, m_w, torch.zeros_like(m_w))
@@ -1385,7 +1469,7 @@ class _RelfBackbone(nn.Module):
                     )
                     sc_win = x_right.detach()
                     sc_win[:, w_sz - step :] = 0
-                    if hop < self.time_step - 1:
+                    if hop < self.infer_t - 1:
                         z_win = torch.cat(
                             [
                                 z_win[:, step:],
@@ -1400,12 +1484,29 @@ class _RelfBackbone(nn.Module):
                             dim=1,
                         )
                     else:
-                        # 末 hop 已 Euler 到 L_T；提交最左档 x_hat，不读词。
-                        n_out = _commit_emit(
-                            x_right, _emit_mask(in_win), step,
-                        )
-                        if n_out < 1:
-                            break
+                        # 末 hop 已 Euler 到 L_T。
+                        if commit_x0:
+                            n_out = _commit_emit(
+                                x_right, _emit_mask(in_win), step,
+                            )
+                        else:
+                            logits = self._exit_logits(
+                                x_hat, hidden, tokens=_exit_tok(x_hat, 0),
+                                last_n=w_sz,
+                            )
+                            sampled = self._sample_tokens(
+                                logits, temperature=temperature, top_k=top_k,
+                            )
+                            tokens, hit, n_out, _valid = _append_decoded(
+                                tokens, sampled, _emit_mask(in_win), alive,
+                                n_write=step,
+                            )
+                            tokens = tok_sb.replace(
+                                pad_after_first_eos(tokens, eos_id, pad_id),
+                            )
+                            alive = alive & ~hit
+                            h_left_cache = _set_h_left(_commit_left(tokens))
+                            _invalidate_left_kv()
                         z_carry = torch.cat(
                             [
                                 z_win[:, step:],
@@ -1419,10 +1520,13 @@ class _RelfBackbone(nn.Module):
                             [x_right[:, step:], torch.zeros_like(x_right[:, :step])],
                             dim=1,
                         )
+                grown = int(x_sb.filled) if commit_x0 else int(tok_sb.filled)
+                if grown < 1:
+                    break
                 continue
 
             if L > 0 and (r > 0 or z_carry is None):
-                # 余数爬梯：T 次 denoise Euler；末 hop 提交 x_hat / pop，不读词。
+                # 余数爬梯：T 次 denoise Euler；末 hop 提交 x_hat 或 VAE-dec 再 encode。
                 # 与训练单帧 (h,r) 同构。完整 pop [0,g) 进 KV。
                 # hop0 按 F 初始化；之后只钉已知、不重插值；中间 hop 不 pop。
                 sc_win = torch.zeros(num_samples, w_sz, self.latent_dim, device=device, dtype=dtype)
@@ -1430,10 +1534,13 @@ class _RelfBackbone(nn.Module):
                     num_samples, w_sz, self.latent_dim, device=device, dtype=dtype,
                 ) * float(self.config.noise_sigma)
                 h_all = h_left_cache if h_left_cache is not None else _encode_h(tokens)
-                h_x0_pref = x_sb.view() if x_sb.filled > 0 else _encode_x0(tokens)
+                if commit_x0:
+                    h_x0_pref = x_sb.view() if x_sb.filled > 0 else _encode_x0(tokens)
+                else:
+                    h_x0_pref = _encode_x0(tokens)
                 hop0 = True
-                for hop in range(self.time_step):
-                    k0 = step * (self.time_step - hop - 1)
+                for hop in range(self.infer_t):
+                    k0 = step * (self.infer_t - hop - 1)
                     u = g - k0
                     t_w, m_w, in_win = _fields_for_u(u, tokens, target_len=seqlen)
                     kk = torch.arange(w_sz, device=device)
@@ -1457,6 +1564,13 @@ class _RelfBackbone(nn.Module):
                     jj = u + kk
                     known = (kk >= k0) & (kk < k0 + r) & (jj >= 0) & (jj < L)
                     known = known.expand(tokens.size(0), -1)
+                    if (not commit_x0) and L > 0:
+                        tok_at = tokens.gather(
+                            1, jj.clamp(0, L - 1).expand(tokens.size(0), -1),
+                        )
+                        known = known & ~(
+                            (jj >= 0) & (jj < L) & (tok_at == eos_id)
+                        )
                     m_w = torch.where(known, torch.zeros_like(m_w), m_w)
                     t_w = torch.where(known, torch.ones_like(t_w), t_w)
                     m_w = torch.where(in_win & (~known), m_w, torch.zeros_like(m_w))
@@ -1493,6 +1607,8 @@ class _RelfBackbone(nn.Module):
                     sc_win[:, w_sz - step :] = 0
                     sc_win = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_win), sc_win)
                     past_end = g + step >= seqlen
+                    if not commit_x0:
+                        past_end = past_end or bool((tokens == eos_id).any(dim=1).all())
                     extra = (
                         torch.zeros(
                             num_samples, step, self.latent_dim, device=device, dtype=dtype,
@@ -1502,36 +1618,56 @@ class _RelfBackbone(nn.Module):
                             num_samples, step, self.latent_dim, device=device, dtype=dtype,
                         ) * float(self.config.noise_sigma)
                     )
-                    if hop < self.time_step - 1:
+                    if hop < self.infer_t - 1:
                         z_win = torch.cat([z_win[:, step:], extra], dim=1)
                         sc_win = torch.cat(
                             [sc_win[:, step:], torch.zeros_like(sc_win[:, :step])],
                             dim=1,
                         )
                     else:
-                        # 末 hop 已 Euler 到 L_T；提交余数+新档 x_hat，不读词。
-                        n_write = min(step - r, seqlen - L)
-                        n_pop = int(r) + int(n_write)
-                        left_pref = h_all[:, :g] if g > 0 else h_all[:, :0]
-                        x_sb.filled = g
-                        if n_pop > 0:
-                            pop = x_right[:, :n_pop]
-                            if gathered_x0 is not None:
-                                pop = torch.where(
-                                    known[:, :n_pop].unsqueeze(-1),
-                                    gathered_x0[:, :n_pop],
-                                    pop,
-                                )
-                            _append_committed(pop, left_pref=left_pref)
+                        # 末 hop 已 Euler 到 L_T。
+                        if commit_x0:
+                            n_write = min(step - r, seqlen - L)
+                            n_pop = int(r) + int(n_write)
+                            left_pref = h_all[:, :g] if g > 0 else h_all[:, :0]
+                            x_sb.filled = g
+                            if n_pop > 0:
+                                pop = x_right[:, :n_pop]
+                                if gathered_x0 is not None:
+                                    pop = torch.where(
+                                        known[:, :n_pop].unsqueeze(-1),
+                                        gathered_x0[:, :n_pop],
+                                        pop,
+                                    )
+                                _append_committed(pop, left_pref=left_pref)
+                            else:
+                                h_left_cache = _set_h_left(left_pref)
                         else:
-                            h_left_cache = _set_h_left(left_pref)
+                            right_n = int(x_hat.size(1)) - int(h_left.size(1))
+                            logits = self._exit_logits(
+                                x_hat, hidden, tokens=_exit_tok(x_hat, int(h_left.size(1))),
+                                last_n=right_n,
+                            )
+                            sampled = self._sample_tokens(
+                                logits, temperature=temperature, top_k=top_k,
+                            )
+                            tokens, hit, _n_out, _valid = _append_decoded(
+                                tokens, sampled, _emit_mask(in_win, known), alive,
+                                n_write=step - r,
+                            )
+                            tokens = tok_sb.replace(
+                                pad_after_first_eos(tokens, eos_id, pad_id),
+                            )
+                            alive = alive & ~hit
+                            h_left_cache = _set_h_left(_commit_left(tokens))
+                            _invalidate_left_kv()
                         z_carry = torch.cat([z_win[:, step:], extra], dim=1)
                         sc_carry = torch.cat(
                             [x_right[:, step:], torch.zeros_like(x_right[:, :step])], dim=1,
                         )
                 continue
 
-            # freeroll：r=0。窗从当前长度起铺 F；一次 Euler 后提交最左档 x_hat。
+            # freeroll：r=0。窗从当前长度起铺 F；一次 Euler 后提交或 VAE-dec。
             u = L
             t_w, m_w, in_win = _fields_for_u(u, tokens, target_len=seqlen)
             m_w = torch.where(in_win, m_w, torch.zeros_like(m_w))
@@ -1555,12 +1691,34 @@ class _RelfBackbone(nn.Module):
                 h_left, z_win, t_w, m_w, sc_win, pos_left, pos_win,
                 in_win=in_win, apply_ctx=True, left_kv=kv,
             )
-            del x_hat, hidden
-            n_out = _commit_emit(x_right, _emit_mask(in_win), step)
-            if n_out < 1:
-                if (not bool(in_win.any())) or u + step >= seqlen:
-                    break
+            if commit_x0:
+                n_out = _commit_emit(x_right, _emit_mask(in_win), step)
+                if n_out < 1:
+                    if (not bool(in_win.any())) or u + step >= seqlen:
+                        break
+            else:
+                right_n = int(x_hat.size(1)) - int(h_left.size(1))
+                logits = self._exit_logits(
+                    x_hat, hidden, tokens=_exit_tok(x_hat, int(h_left.size(1))),
+                    last_n=right_n,
+                )
+                sampled = self._sample_tokens(
+                    logits, temperature=temperature, top_k=top_k,
+                )
+                new_len = int(tokens.size(1))
+                tokens, hit, n_out, _valid = _append_decoded(
+                    tokens, sampled, _emit_mask(in_win), alive, n_write=step,
+                )
+                tokens = tok_sb.replace(pad_after_first_eos(tokens, eos_id, pad_id))
+                alive = alive & ~hit
+                if int(tokens.size(1)) == new_len:
+                    if (not bool(in_win.any())) or u + step >= seqlen:
+                        break
+                h_left_cache = _set_h_left(_commit_left(tokens))
+                _invalidate_left_kv()
             past_end = u + step >= seqlen
+            if not commit_x0:
+                past_end = past_end or (not bool(alive.any().item()))
             extra = (
                 torch.zeros(
                     num_samples, step, self.latent_dim, device=device, dtype=dtype,
@@ -1575,34 +1733,44 @@ class _RelfBackbone(nn.Module):
                 [x_right[:, step:], torch.zeros_like(x_right[:, :step])], dim=1,
             )
 
-        # 全文一次 VAE-dec；前缀词写回后按首个 EOS 填 PAD。
-        dec_in = x_sb.view()
-        if dec_in.size(1) < 1:
-            out = torch.full(
-                (num_samples, seqlen), pad_id, device=device, dtype=torch.long,
+        if commit_x0:
+            # 全文一次 VAE-dec；前缀词写回后按首个 EOS 填 PAD。
+            dec_in = x_sb.view()
+            if dec_in.size(1) < 1:
+                out = torch.full(
+                    (num_samples, seqlen), pad_id, device=device, dtype=torch.long,
+                )
+                return out, nfe
+            dec_tok = None
+            if prefix_len > 0:
+                dummy = eos_id if int(eos_id) != int(pad_id) else int(pad_id) + 1
+                dec_tok = torch.full(
+                    (num_samples, int(dec_in.size(1))), dummy,
+                    device=device, dtype=torch.long,
+                )
+                dec_tok[:, :prefix_len] = tokens[:, :prefix_len]
+            logits = self._exit_logits(dec_in, tokens=dec_tok)
+            sampled = self._sample_tokens(
+                logits, temperature=temperature, top_k=top_k,
             )
-            return out, nfe
-        dec_tok = None
-        if prefix_len > 0:
-            dummy = eos_id if int(eos_id) != int(pad_id) else int(pad_id) + 1
-            dec_tok = torch.full(
-                (num_samples, int(dec_in.size(1))), dummy,
+            if sampled.size(1) < seqlen:
+                pad = sampled.new_full((num_samples, seqlen - sampled.size(1)), pad_id)
+                sampled = torch.cat([sampled, pad], dim=1)
+            else:
+                sampled = sampled[:, :seqlen]
+            if prefix_len > 0:
+                sampled = sampled.clone()
+                sampled[:, :prefix_len] = tokens[:, :prefix_len]
+            tokens = pad_after_first_eos(sampled, eos_id, pad_id)
+            return tokens, nfe
+        if tok_sb.filled < seqlen:
+            pad = torch.full(
+                (num_samples, seqlen - tok_sb.filled), pad_id,
                 device=device, dtype=torch.long,
             )
-            dec_tok[:, :prefix_len] = tokens[:, :prefix_len]
-        logits = self._exit_logits(dec_in, tokens=dec_tok)
-        sampled = self._sample_tokens(
-            logits, temperature=temperature, top_k=top_k,
-        )
-        if sampled.size(1) < seqlen:
-            pad = sampled.new_full((num_samples, seqlen - sampled.size(1)), pad_id)
-            sampled = torch.cat([sampled, pad], dim=1)
+            tokens = tok_sb.append(pad)
         else:
-            sampled = sampled[:, :seqlen]
-        if prefix_len > 0:
-            sampled = sampled.clone()
-            sampled[:, :prefix_len] = tokens[:, :prefix_len]
-        tokens = pad_after_first_eos(sampled, eos_id, pad_id)
+            tokens = tok_sb.view()[:, :seqlen]
         return tokens, nfe
 
     def generate(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, int]:

@@ -1,16 +1,17 @@
-"""logit-normal 分位梯子：训练与推理共用确定档位 ``{L_i}``。"""
+"""logit-normal 连续时间（训练）与分位梯子（推理）。"""
 
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import torch
 
 
 def check_time_step(T: int) -> None:
-    """``time_step`` 须 ``T>=4``（``T`` 次流；无 decode 跳）。"""
+    """推理流步数须 ``T>=4``（``T`` 次流；无 decode 跳）。"""
     if int(T) < 4:
-        raise ValueError(f"time_step T 须 >= 4，收到 {T}")
+        raise ValueError(f"推理 T 须 >= 4，收到 {T}")
 
 
 def _logit_normal_quantile(
@@ -24,16 +25,36 @@ def _logit_normal_quantile(
     return torch.sigmoid(p_mean + p_std * inv_cdf)
 
 
+def sample_logit_normal_t(
+    shape: int | Sequence[int],
+    p_mean: float,
+    p_std: float,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """训练连续时间：``t=σ(P_m + P_s Z)``，``Z~N(0,1)``。与 ELF ``_sample_train_t`` 同分布。"""
+    if float(p_std) <= 0.0:
+        raise ValueError(f"denoiser p_std 须 > 0，收到 {p_std}")
+    t = torch.sigmoid(
+        float(p_mean)
+        + float(p_std) * torch.randn(shape, device=device, dtype=torch.float32)
+    )
+    if dtype is not None:
+        t = t.to(dtype=dtype)
+    return t
+
+
 def ladder_levels(
     T: int,
     p_mean: float,
     p_std: float,
     eps: float,
 ) -> torch.Tensor:
-    """``L_i = Q(i/T)``，长度 ``T+1``（``i=0,…,T``）。
+    """推理梯子 ``L_i = Q(i/T)``，长度 ``T+1``（``i=0,…,T``）。
 
     ``Q(0)=0``，``Q(1)=1-eps``；开区间分位再夹到 ``[0, 1-eps]``。
-    训练 / 推理的 ``G`` 只落在 ``L_0…L_{T-1}``；``L_T`` 仅作末次 Euler 终点。
+    推理 ``G`` 落在 ``L_0…L_{T-1}``；``L_T`` 仅作末次 Euler 终点。
     """
     check_time_step(T)
     if not (0.0 < float(eps) < 1.0):

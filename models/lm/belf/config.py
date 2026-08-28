@@ -21,7 +21,7 @@ _KEY_ALIASES = (
 )
 
 # 旧键：加载旧 config.json 时忽略，不进指纹语义。
-_LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g"})
+_LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g", "time_step"})
 
 
 class FL_BelfConfig(PretrainedConfig):
@@ -41,7 +41,6 @@ class FL_BelfConfig(PretrainedConfig):
             "tag",
             "sc_cfg",
             "latent_tune",
-            "time_step",
             "latent_dim",
             "attn_backend",
             "block_size",
@@ -67,7 +66,6 @@ class FL_BelfConfig(PretrainedConfig):
         tag: str = "100m-b32-d1",
         sc_cfg: bool = True,
         latent_tune: str = "mid",
-        time_step: int = 16,
         latent_dim: int = 32,
         attn_backend: str = "sdpa",
         block_size: int = 16,
@@ -103,7 +101,7 @@ class FL_BelfConfig(PretrainedConfig):
         sc_guided_prob: float = 0.5,
         ctx_p_drop: float = 0.1,
         sampling: Dict[str, Any] | None = None,
-        train_t_schedule: str = "block",
+        train_t_schedule: str = "independent",
         **kwargs: Any,
     ) -> None:
         if "gen_mode" in kwargs:
@@ -154,7 +152,6 @@ class FL_BelfConfig(PretrainedConfig):
         self.tag = tag
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = latent_tune
-        self.time_step = int(time_step)
         self.latent_dim = int(latent_dim)
         self.attn_backend = attn_backend
         self.block_size = int(block_size)
@@ -177,11 +174,15 @@ class FL_BelfConfig(PretrainedConfig):
         if self.cond_mode != "clean":
             raise ValueError(f"belf cond_mode 锁死 clean，收到 {cond_mode!r}")
         self.clean_block_prob = float(clean_block_prob)
-        self.train_t_schedule = str(train_t_schedule).strip().lower()
-        if self.train_t_schedule != "block":
+        sched = str(train_t_schedule).strip().lower()
+        # 旧 ckpt 的 block（离散 hop）视为 independent。
+        if sched in ("block", "independent"):
+            sched = "independent"
+        if sched != "independent":
             raise ValueError(
-                f"belf train_t_schedule 锁死 block，收到 {train_t_schedule!r}"
+                f"belf train_t_schedule 锁死 independent，收到 {train_t_schedule!r}"
             )
+        self.train_t_schedule = sched
         self.lambda_mse = float(lambda_mse)
         self.lambda_s1 = float(lambda_s1)
         self.lambda_vae = float(lambda_vae)
@@ -205,7 +206,7 @@ class FL_BelfConfig(PretrainedConfig):
             "w_sc": 2.0,
             "w_ctx": 1.0,
             "temperature": 0.0,
-            "commit_x0hat": True,
+            "commit_x0hat": False,
         }
 
     def token_layout(self) -> FL_TokenLayout:

@@ -38,7 +38,7 @@ from .pack import (
     pack_2l_mask,
     pack_2l_parallel_blocks_mask,
 )
-from .time import check_time_step, ladder_levels
+from .time import check_time_step, ladder_levels, sample_logit_normal_t
 
 __all__ = [
     "AdaLNZeroStack",
@@ -73,6 +73,7 @@ __all__ = [
     "pack_2l",
     "pack_2l_mask",
     "pack_2l_parallel_blocks_mask",
+    "sample_logit_normal_t",
     "sample_w_sc",
     "v_star",
     "validate_joint_tune",

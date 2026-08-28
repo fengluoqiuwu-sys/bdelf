@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 
 from models.tokens import FL_TokenLayout
 
-_LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g"})
+_LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g", "time_step", "window_t"})
 
 
 class FL_RelfConfig(PretrainedConfig):
@@ -28,7 +28,6 @@ class FL_RelfConfig(PretrainedConfig):
             "tag",
             "sc_cfg",
             "latent_tune",
-            "time_step",
             "latent_dim",
             "attn_backend",
             "window_size",
@@ -55,10 +54,9 @@ class FL_RelfConfig(PretrainedConfig):
         tag: str = "100m-b32-d1",
         sc_cfg: bool = True,
         latent_tune: str = "mid",
-        time_step: int = 16,
         latent_dim: int = 32,
         attn_backend: str = "sdpa",
-        window_size: int = 32,
+        window_size: int = 64,
         step_size: int = 2,
         proj_bias: bool = True,
         proj_norm: str = "rmsnorm",
@@ -82,8 +80,7 @@ class FL_RelfConfig(PretrainedConfig):
         x0_source: str = "z",
         cond_mode: str = "clean",
         clean_block_prob: float = 0.05,
-        train_t_schedule: str = "mixed",
-        window_t: str = "ladder",
+        train_t_schedule: str = "block",
         self_left_prob: float = 0.25,
         self_left_thaw_tokens: int | float = 5e9,
         self_cond_cfg_p_mean: float = -1.5,
@@ -126,7 +123,6 @@ class FL_RelfConfig(PretrainedConfig):
         self.tag = str(tag)
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = str(latent_tune).strip().lower()
-        self.time_step = int(time_step)
         self.latent_dim = int(latent_dim)
         self.attn_backend = str(attn_backend).strip().lower()
         self.window_size = int(window_size)
@@ -155,16 +151,15 @@ class FL_RelfConfig(PretrainedConfig):
         if self.cond_mode != "clean":
             raise ValueError(f"relf cond_mode 锁死 clean，收到 {cond_mode!r}")
         self.clean_block_prob = float(clean_block_prob)
-        self.train_t_schedule = str(train_t_schedule).strip().lower()
-        self.window_t = str(window_t).strip().lower()
-        if self.train_t_schedule != "mixed":
+        sched = str(train_t_schedule).strip().lower()
+        # 旧 ckpt 的 mixed（窗内铺梯子）视为逐档独立。
+        if sched in ("mixed", "block"):
+            sched = "block"
+        if sched != "block":
             raise ValueError(
-                f"relf train_t_schedule 锁死 mixed，收到 {train_t_schedule!r}"
+                f"relf train_t_schedule 锁死 block，收到 {train_t_schedule!r}"
             )
-        if self.window_t != "ladder":
-            raise ValueError(
-                f"relf window_t 锁死 ladder，收到 {window_t!r}"
-            )
+        self.train_t_schedule = sched
         p_left = float(self_left_prob)
         if not (0.0 <= p_left <= 1.0):
             raise ValueError(f"self_left_prob 须在 [0,1]，收到 {self_left_prob}")
@@ -182,7 +177,7 @@ class FL_RelfConfig(PretrainedConfig):
             "w_sc": 2.0,
             "w_ctx": 1.0,
             "temperature": 0.0,
-            "commit_x0hat": True,
+            "commit_x0hat": False,
         }
 
     def token_layout(self) -> FL_TokenLayout:

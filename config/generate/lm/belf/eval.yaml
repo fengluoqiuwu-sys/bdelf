@@ -3,7 +3,8 @@
 # =============================================================================
 _doc: BELF 训练在线 gen-eval / 测试采样  # 文件说明，写入 extra
 name: eval  # 配置名；非 prototype 时与文件名一致
-commit_x0hat: true  # 提交末流 x_hat 进左 KV；全文一次 VAE-dec
+commit_x0hat: false  # 关=VAE-dec 读词再 encode；开=提交 x_hat，全文一次 VAE-dec
+num_sampling_steps: 32  # 推理流步数 T；须 >= 4；梯子 L_i=Q(i/T)
 sampling_method: sde  # 采样方法：sde | ode
 sde_gamma: 1.5  # SDE churn 系数；末流关闭
 w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg 为假时忽略
