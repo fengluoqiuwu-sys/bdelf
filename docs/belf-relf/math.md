@@ -79,9 +79,9 @@ L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,\ldots,T.
 
 ## 5. CFG
 
-两轴独立。\(w_{\mathrm{sc}}\) 只进入右段未知槽 AdaLN（未知一律 denoise）；左段 / 已知 / PAD 不以之为条件。推理单次前向；扫描 \(w_{\mathrm{sc}}\) 不重算前缀 KV。无「纯 decode 步」：每跳都可跑 teacher。
+两轴独立。\(w_{\mathrm{sc}}\) 只在 `sc_cfg` 打开时进入右段未知槽 AdaLN（未知一律 denoise）；左段 / 已知 / PAD 不以之为条件。推理单次前向；扫描 \(w_{\mathrm{sc}}\) 不重算前缀 KV。无「纯 decode 步」。
 
-`sc_cfg` 为真时，每样本采 \(z\sim\mathcal{N}(P_m^{\mathrm{sc}},(P_s^{\mathrm{sc}})^2)\)，\(u=\sigma(z)\)，再
+主跑 `sc_cfg=false`（无通道、\(v_{\mathrm{tgt}}=v_z\)、无 teacher）。消融打开时每样本采 \(z\sim\mathcal{N}(P_m^{\mathrm{sc}},(P_s^{\mathrm{sc}})^2)\)，\(u=\sigma(z)\)，再
 
 \[
 a=1+w^{\mathrm{sc}}_{\min},\quad
@@ -89,7 +89,7 @@ b=1+w^{\mathrm{sc}}_{\max},\quad
 w_{\mathrm{sc}}=a\,(b/a)^{u}-1.
 \]
 
-并独立抽 \(g\sim\mathrm{Bern}(p_g^{\mathrm{sc}})\)。每跳两个 `no_grad` teacher（uncond 通道全 0；cond 通道 \(\mathrm{sg}(\hat x_0^{u})\)）得 \(v_u,v_c\)，学生
+并独立抽 \(g\sim\mathrm{Bern}(p_g^{\mathrm{sc}})\)。\(g=1\) 时两个 `no_grad` teacher（uncond 通道全 0；cond 通道 \(\mathrm{sg}(\hat x_0^{u})\)）得 \(v_u,v_c\)；\(g=0\) 不跑 teacher。学生
 
 \[
 v_{\mathrm{tgt}}=\begin{cases}
@@ -98,7 +98,7 @@ v_z & g=0.
 \end{cases}
 \]
 
-修正施加于右段未知列。\(g=0\) 时 sc 通道为 0，但未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。`sc_cfg` 为假：无通道、\(v_{\mathrm{tgt}}=v_z\)。不可单独再开 `self_cond`。
+修正施加于右段未知列。\(g=0\) 时 sc 通道为 0，但未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。`sc_cfg` 为假：无通道、\(v_{\mathrm{tgt}}=v_z\)。不可单独再开 `self_cond`。训练实现：CFG 三次共用一次左段 prefill KV，teacher / 学生只跑右；self-left 仅命中行跑完整 2L。语义不变，工程见 [`README.md`](README.md)。
 
 \(w_{\mathrm{ctx}}\) 不进 AdaLN。训练以 \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 丢弃 2L 左段。推理默认只跑带前缀一次前向；外推时无条件支路为空前缀、仅当前块/窗。RELF 最右 \(S\) 个新噪声槽 sc 恒为 0。
 
@@ -118,7 +118,7 @@ p_G(z_0)=\prod_b p_G\bigl(z_0^{(b)}\mid z_0^{(<b)}\bigr).
 
 训练已知条件不得含未来信息。右段 unknown Q **不可见同块 PAD K**（入口块长 1 也会发生）；PAD 仍钉 \(t=1\)、不进损失。可训档（`full` / `mid`）硬拒入口块长 \(\neq 1\)，块内未来看不见，不必二次 encode。仅冻结档且入口块长 \(=W\) 时，余数（抽到 `clean_block_prob`）再 encode 一份条件句：当前块 \([r,W)\) 写成 PAD，已知覆写与 PAD 干净码用这份；插值靶 \(x_0\) 仍来自整句 encode。`rem` 全 0 时跳过第二次 encode。左段整句教师强制不改。
 
-链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是再 encode 采 \(z\)（对照 `commit_x0hat`）。训练默认左段仍是 encoder 干净码；以概率 `self_left_prob`（默认 \(0.25\)，eval / 生成视为 0）把左段换成 **stop-grad 的末流 \(\hat x_0\)**：在 CFG 之前，用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 `no_grad` \(G\)（与推理末跳同条件，取 x-pred，不 Euler），按样本 Bernoulli 替换 `h_left`，再跑 teacher / 学生。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)（随机 \(t\) 离提交码太远）。
+链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是再 encode 采 \(z\)（对照 `commit_x0hat`）。训练默认左段仍是 encoder 干净码；以概率 `self_left_prob`（默认 \(0.25\)，eval / 生成视为 0）把左段换成 **stop-grad 的末流 \(\hat x_0\)**：先抽 Bernoulli，仅命中行在 CFG 之前用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 `no_grad` \(G\)（与推理末跳同条件，取 x-pred，不 Euler），写回 `h_left`，再跑 teacher / 学生。未命中行不跑该次 \(G\)。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)（随机 \(t\) 离提交码太远）。
 
 ## 7. RELF：局部时间场
 

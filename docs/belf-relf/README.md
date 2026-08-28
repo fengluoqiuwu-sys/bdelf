@@ -5,7 +5,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| 本文 | 工程：现状、复用点、包结构、加载、指纹、训练日程 |
+| 本文 | 工程：现状、复用点、包结构、加载、指纹、训练日程、训练热路径 |
 | [`math.md`](math.md) | 流几何、梯子、块/窗条件分解、v-MSE、self-left、CFG、半群 |
 | [`latex/belf-relf.tex`](latex/belf-relf.tex) | 完整规格（参数表、Clean、掩码图、消融） |
 
@@ -64,17 +64,20 @@ loaded = load_latent_artifact("latent_vae", "100m-b32-d1")
 
 ```
 models/lm/
-├── belf_relf_core/          # 共享：映射、AdaLN-Zero G、出口、梯子 Q、CFG teacher
-│   ├── layers.py            # AdaLN-Zero 块（无仿射 LN、残差 gate、调制零初始化）
+├── belf_relf_core/          # 共享：映射、AdaLN-Zero G、出口、梯子 Q、CFG
+│   ├── layers.py            # AdaLN-Zero；prefill_left / forward_right（训练共用左 KV）
+│   ├── flex_mask.py         # 训练 Flex：2L、左 prefill 组因果、右段 Q=N KV=2N
+│   ├── rows.py              # 按 batch 切行（self_left / guided 子批）
 │   ├── time.py              # Φ / Q / {L_i}；T≥4
 │   ├── flow.py              # z_t 插值、x-pred→v、v*
 │   ├── pack.py              # 2L [sg(h_left)|h_t]；组内双向、组间单向
-│   ├── cfg.py               # w_sc ScaleEmbedder；ctx drop；v_tgt
+│   ├── cfg.py               # w_sc 采样；ctx drop；v_tgt
+│   ├── gen_buf.py           # 生成 KV 扩容
 │   ├── latent.py            # load_latent_artifact 包装、s1、入口块长校验
 │   └── exit.py              # 出口叠法辅助（规格锁死 VAE-dec，无 linear）
 ├── belf/
 │   ├── config.py            # FL_BelfConfig；KIND 由目录 kind=lm 决定
-│   ├── model.py             # forward
+│   ├── model.py             # forward（跳过多余 G + CFG 共用左 KV）
 │   └── generate.py          # block_generate
 └── relf/
     ├── config.py            # FL_RelfConfig；无 block_size
@@ -89,13 +92,24 @@ models/lm/
 tokens
   → load_latent_artifact(latent_model, tag)
   → Enc → z ∈ R^{S×X} → 可选 whiten（仍在 X）
-  → G 茎 Linear(X→D=n_embd) → pack_2l [sg(h_left)|h_t] + 逐列 (t, [w_sc], [m])
-  → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → AdaLN-Zero → SwiGLU）
+  → G 茎 Linear(X→D=n_embd)
+  → 训练 CFG：prefill_left（茎后 sg，对齐 pack 左半）+ 右段 G
+     self_left / 生成完整 2L：pack_2l [sg(h_left)|h_t]
+  → 逐列 (t, [w_sc], [m]) → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → SwiGLU）
   → FinalLayer D→X → x̂₀
   → Exit（锁死）：x̂₀ 已在 X，加载的 VAE-dec → logits（仅推理读出；训练主体不算 CE）
 ```
 
 出口无 `exit` 键、无 `linear` 对照。推理 BELF 拼接已提交干净码再读当前块；RELF 读出前缀是 \(G\) 左段 \(\hat x_0\)。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
+
+### 训练热路径（不改规格 / 哈希）
+
+`v_{\mathrm{tgt}}`、sc、AdaLN 与 self-left 的**数值语义**仍以 LaTeX 为准；实现做两件等价事（不进指纹、不改 YAML）：
+
+1. **按样本跳过用不上的 \(G\)。** 先抽 `use_self ~ Bern(p_left)` 与 `g ~ Bern(p_g^{sc})`。self-left 只对命中行跑完整 2L `no_grad` \(G\)（\(t=L_{T-1}\)、sc=0），再写回左段；0 行则整次跳过。CFG teacher 只跑 \(g=1\) 的行；\(g=0\) 时 \(v_{\mathrm{tgt}}=v^\star\)、学生 sc=0。学生始终整批。
+2. **CFG 三次共用左 KV。** self-left 之后对最终左段茎一次（茎后 `sg`，对齐 `pack_2l` 左半），`prefill_left` **带梯度**（不用生成路径的 `prefill_left_kv`，也不 `copy_` 扩容）。随后 \(G_u/G_c/\) 学生只跑右段（`cat(K_左,K_右)`）。训练默认 `attn_backend=flex`：右段 `Q=N`（RELF 为 `right_len`）、`KV=left+right`，可见性与完整 2L 右块相同；左 prefill 为组因果（BELF 组长 \(W\)，RELF 组长 1）。sc 只加在右列再 `sc_proj`。self-left 那次 \(G\) 仍是完整 2L，不共用这份 KV。
+
+对照脚本：`scripts/check_belf_relf_flex_mask.py`（右段 mask vs 2L 右块）。生成循环仍 SDPA + 按 hop 的左 KV，未改。
 
 ## 配置与指纹
 
@@ -116,7 +130,7 @@ tokens
 | 训练 | `latent_tune`、日程、损失系数 | 训练指纹 |
 | 推理 | `commit_x0hat`、`sampling_method`、`sde_gamma`、`w_sc`/`w_ctx` | 现网 `build_train_fingerprint` 纳入 `generate_cfg` 与 model YAML 的 `sampling`（改推理默认会换哈希；不改全局管线） |
 
-`latent_tune` 三档是**三个训练配置哈希**（`frozen` / `full` / `mid`），不是同一个 run 里的开关。`sc_cfg` 进模型指纹：为假则不构建 ScaleEmbedder。
+`latent_tune` 三档是**三个训练配置哈希**（`frozen` / `full` / `mid`），不是同一个 run 里的开关。`sc_cfg` 进模型指纹：主跑 `false`（无 ScaleEmbedder / teacher）；消融短训再开。
 
 `belf` / `relf` 且 preprocess YAML 带 `curriculum` 指针时，`build_train_fingerprint` 另写入 `curriculum_cfg`（`config/train/curriculum/<名>.yaml` 正文）。改 mix / `graph_l` 会换本族哈希。其它模型不加此键，哈希不变。fast 用 `owt-seg512`（无指针）也不加。
 
@@ -133,11 +147,11 @@ tokens
 
 ### 100m 默认（规格）
 
-共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`self_left_prob=0.25`，`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
+共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=false`（消融再开），`self_left_prob=0.25`，`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
 BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(0,0.8^2)\)）。  
 RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后读出）。
 
-推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
+推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。主跑 `sc_cfg=false` 时忽略 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
 
 完整键与消融对照见 LaTeX 参数表；工程实现不得另发明默认。
 

@@ -21,6 +21,8 @@ from models.lm.belf_relf_core import (
     as_sdpa_mask,
     blend_v_tgt,
     build_belf_flex_block_mask,
+    build_belf_flex_left_mask,
+    build_belf_flex_right_mask,
     check_time_step,
     group_causal_mask,
     hide_left_keys,
@@ -37,6 +39,7 @@ from models.lm.belf_relf_core import (
     validate_loaded_block,
     x_to_v,
 )
+from models.lm.belf_relf_core.rows import row_idx, take_rows
 from models.model import (
     FL_PreTrainedModel,
     ensure_token_layout,
@@ -459,6 +462,104 @@ class _BelfBackbone(nn.Module):
         )
         return x_hat[:, left_len:] if left_len > 0 else x_hat
 
+    def _stem_left_train(self, h_left: torch.Tensor) -> torch.Tensor:
+        """训练共用左 KV：茎后 detach（对齐 ``pack_2l``），再零 sc 过 ``sc_proj``。"""
+        h = self.stem(h_left).detach()
+        if self.sc_proj is None:
+            return h
+        return self.sc_proj(torch.cat([h, torch.zeros_like(h)], dim=-1))
+
+    def _prefill_left_train(self, h_left: torch.Tensor) -> LeftKVCache:
+        """对最终左段茎一次，带梯度收集 K/V（不用 ``copy_`` 扩容）。"""
+        x = self._stem_left_train(h_left)
+        left_len = int(x.size(1))
+        device = x.device
+        use_flex = self.attn_backend == "flex"
+        flex_mask = None
+        mask = None
+        if use_flex:
+            flex_mask = build_belf_flex_left_mask(left_len, self.block_size, device)
+        else:
+            mask = group_causal_mask(left_len, self.block_size, device=device)
+        pos = torch.arange(left_len, device=device, dtype=torch.long)
+        return self.g.prefill_left(
+            x, attn_mask=mask, positions=pos, flex_block_mask=flex_mask,
+            pad_capacity=False,
+        )
+
+    def _right_attn(
+        self,
+        left_len: int,
+        right_len: int,
+        device: torch.device,
+        *,
+        is_pad: torch.Tensor | None,
+        unknown: torch.Tensor | None,
+        drop_left: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, object]:
+        """右 Q × (左+右) K：Flex ``Q=N KV=2N``，否则切 2L 布尔再转 SDPA。"""
+        parallel = left_len == right_len
+        use_flex = self.attn_backend == "flex" and parallel
+        if use_flex:
+            return None, build_belf_flex_right_mask(
+                left_len, self.block_size, device,
+                is_pad=is_pad, unknown=unknown, drop_left=drop_left,
+            )
+        raw = self._raw_2l_mask(left_len, right_len, device, parallel=parallel)
+        if is_pad is not None and unknown is not None:
+            raw = hide_right_pad_from_unknown(
+                raw, is_pad, unknown, self.block_size,
+            )
+        if drop_left is not None and left_len > 0:
+            if raw.ndim == 2:
+                raw = raw.unsqueeze(0).expand(int(drop_left.size(0)), -1, -1).clone()
+            else:
+                raw = raw.clone()
+            raw[drop_left, left_len:, :left_len] = False
+        right_vis = raw[left_len:, :] if raw.ndim == 2 else raw[:, left_len:, :]
+        mask = as_sdpa_mask(right_vis)
+        if mask is None:
+            raise RuntimeError("右段 mask 不能为空")
+        return mask, None
+
+    def _forward_g_right(
+        self,
+        h_right: torch.Tensor,
+        t_right: torch.Tensor,
+        m_right: torch.Tensor,
+        w_sc: torch.Tensor | None,
+        left_kv: LeftKVCache,
+        *,
+        sc_right: torch.Tensor | None = None,
+        drop_left: torch.Tensor | None = None,
+        is_pad: torch.Tensor | None = None,
+        unknown: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """只跑右段：sc 加在右列再 ``sc_proj``；注意力看已 prefill 的左 KV。"""
+        h_r = self.stem(h_right)
+        right_len = int(h_r.size(1))
+        left_len = int(left_kv.filled)
+        device = h_r.device
+        if self.sc_proj is not None:
+            sc = torch.zeros_like(h_r)
+            if sc_right is not None:
+                sc = self.stem(sc_right)
+            sc = torch.where(
+                (m_right == MODE_NONE).unsqueeze(-1), torch.zeros_like(sc), sc,
+            )
+            h_r = self.sc_proj(torch.cat([h_r, sc], dim=-1))
+        mask, flex_mask = self._right_attn(
+            left_len, right_len, device,
+            is_pad=is_pad, unknown=unknown, drop_left=drop_left,
+        )
+        pos_r = torch.arange(right_len, device=device, dtype=torch.long)
+        out = self.g.forward_right(
+            h_r, t_right, w_sc, m_right, left_kv,
+            attn_mask=mask, positions=pos_r, return_hidden=False,
+            flex_block_mask=flex_mask,
+        )
+        return out, None
+
     def _masked_mean(
         self, per_token: torch.Tensor, mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -570,77 +671,92 @@ class _BelfBackbone(nn.Module):
             self.ctx_drop_prob if self.training else 0.0,
             return_drop=True,
         )
-        # self-left：CFG 前用末流 no_grad x_hat 按样本替换左段
+        # self-left：先抽样本，仅 use_self 行跑现有 2L G（仍 no_grad、t=L_{T-1}、sc=0）
         p_left = self.self_left_prob if self.training else 0.0
+        use_self = torch.zeros(bsz, device=device, dtype=torch.bool)
         if p_left > 0.0:
-            t_last = levels[self.time_step - 1].to(dtype=dtype)
-            t_commit = torch.where(
-                known | is_pad,
-                x0.new_ones(bsz, seq_len),
-                t_last.expand(bsz, seq_len),
-            )
-            z_commit = interpolate(x0, t_commit, noise)
-            z_commit = torch.where((known | is_pad).unsqueeze(-1), x_known, z_commit)
-            m_commit = torch.full(
-                (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
-            )
-            m_commit = torch.where(
-                known | is_pad, torch.zeros_like(m_commit), m_commit,
-            )
-            with torch.no_grad():
-                x_hat_commit, _ = self._forward_g_m(
-                    x_ctx.detach(), z_commit, t_commit, m_commit, None,
-                    sc_right=torch.zeros_like(z_commit),
-                    drop_left=None, is_pad=is_pad, unknown=unknown,
-                )
             use_self = torch.rand(bsz, device=device) < p_left
-            h_left = torch.where(
-                use_self[:, None, None], x_hat_commit.detach(), h_left,
-            )
-            # 已知余数 / PAD 仍钉 encoder 干净码（与右段插值同一份 x_known）
-            pin = (known | is_pad).unsqueeze(-1)
-            h_left = torch.where(
-                use_self[:, None, None] & pin, x_known.detach(), h_left,
-            )
+            if bool(use_self.any()):
+                idx_sl = row_idx(use_self)
+                t_last = levels[self.time_step - 1].to(dtype=dtype)
+                t_commit = torch.where(
+                    known | is_pad,
+                    x0.new_ones(bsz, seq_len),
+                    t_last.expand(bsz, seq_len),
+                )
+                z_commit = interpolate(x0, t_commit, noise)
+                z_commit = torch.where((known | is_pad).unsqueeze(-1), x_known, z_commit)
+                m_commit = torch.full(
+                    (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
+                )
+                m_commit = torch.where(
+                    known | is_pad, torch.zeros_like(m_commit), m_commit,
+                )
+                x_ctx_s, z_c_s, t_c_s, m_c_s, is_pad_s, unknown_s = take_rows(
+                    idx_sl, x_ctx.detach(), z_commit, t_commit, m_commit, is_pad, unknown,
+                )
+                with torch.no_grad():
+                    x_hat_commit, _ = self._forward_g_m(
+                        x_ctx_s, z_c_s, t_c_s, m_c_s, None,
+                        sc_right=torch.zeros_like(z_c_s),
+                        drop_left=None, is_pad=is_pad_s, unknown=unknown_s,
+                    )
+                h_left = h_left.index_copy(0, idx_sl, x_hat_commit)
+                pin = (known | is_pad).unsqueeze(-1)
+                h_left = torch.where(
+                    use_self[:, None, None] & pin, x_known.detach(), h_left,
+                )
 
         w_sc = None
-        guided: torch.Tensor | bool = False
+        guided = torch.zeros(bsz, device=device, dtype=torch.bool)
         if self.sc_cfg:
             w_sc = sample_w_sc(
                 bsz, self.sc_p_mean, self.sc_p_std,
                 self.w_sc_min, self.w_sc_max, device,
             ).to(dtype=dtype)
-            guided = torch.rand(bsz, device=device) < self.sc_guided_prob
+            if self.training:
+                guided = torch.rand(bsz, device=device) < self.sc_guided_prob
 
         v_z = v_star(x0, z_t, t_right, self.vel_eps)
         sc_zero = torch.zeros_like(z_t)
+        left_kv = self._prefill_left_train(h_left)
         need_teacher = self.sc_cfg and self.training
-        if need_teacher:
+        if need_teacher and bool(guided.any()):
+            idx_g = row_idx(guided)
+            kv_g = left_kv.index_select(idx_g)
+            z_s, t_s, m_s, w_s, sc0_s, drop_s, pad_s, unk_s, known_s = take_rows(
+                idx_g, z_t, t_right, m_right, w_sc, sc_zero,
+                drop_left, is_pad, unknown, known,
+            )
             with torch.no_grad():
-                x_u, _ = self._forward_g_m(
-                    h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
-                    drop_left=drop_left, is_pad=is_pad, unknown=unknown,
+                x_u, _ = self._forward_g_right(
+                    z_s, t_s, m_s, w_s, kv_g, sc_right=sc0_s,
+                    drop_left=drop_s, is_pad=pad_s, unknown=unk_s,
                 )
-                v_u = x_to_v(x_u, z_t, t_right, self.vel_eps)
+                v_u_s = x_to_v(x_u, z_s, t_s, self.vel_eps)
                 sc_cond = x_u.detach()
-                sc_cond = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_cond), sc_cond)
-                x_c, _ = self._forward_g_m(
-                    h_left, z_t, t_right, m_right, w_sc, sc_right=sc_cond,
-                    drop_left=drop_left, is_pad=is_pad, unknown=unknown,
+                sc_cond = torch.where(known_s.unsqueeze(-1), torch.zeros_like(sc_cond), sc_cond)
+                x_c, _ = self._forward_g_right(
+                    z_s, t_s, m_s, w_s, kv_g, sc_right=sc_cond,
+                    drop_left=drop_s, is_pad=pad_s, unknown=unk_s,
                 )
-                v_c = x_to_v(x_c, z_t, t_right, self.vel_eps)
-            g = guided.to(dtype=dtype)[:, None, None]
-            sc_stu = x_u.detach() * g
+                v_c_s = x_to_v(x_c, z_s, t_s, self.vel_eps)
+            v_u = v_z.clone()
+            v_c = v_z.clone()
+            v_u = v_u.index_copy(0, idx_g, v_u_s)
+            v_c = v_c.index_copy(0, idx_g, v_c_s)
+            sc_stu = sc_zero.clone()
+            sc_stu = sc_stu.index_copy(0, idx_g, x_u.detach())
             sc_stu = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_stu), sc_stu)
-            x_hat, _ = self._forward_g_m(
-                h_left, z_t, t_right, m_right, w_sc, sc_right=sc_stu,
+            x_hat, _ = self._forward_g_right(
+                z_t, t_right, m_right, w_sc, left_kv, sc_right=sc_stu,
                 drop_left=drop_left, is_pad=is_pad, unknown=unknown,
             )
             v_tgt = blend_v_tgt(v_z, v_u, v_c, w_sc, guided)
             v_tgt = torch.where(denoise_mask.unsqueeze(-1), v_tgt, v_z)
         else:
-            x_hat, _ = self._forward_g_m(
-                h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
+            x_hat, _ = self._forward_g_right(
+                z_t, t_right, m_right, w_sc, left_kv, sc_right=sc_zero,
                 drop_left=drop_left, is_pad=is_pad, unknown=unknown,
             )
             v_tgt = v_z

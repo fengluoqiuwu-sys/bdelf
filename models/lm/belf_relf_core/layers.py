@@ -62,6 +62,16 @@ class LeftKVCache:
             return None
         return self.hidden[:, : self.filled]
 
+    def index_select(self, idx: torch.Tensor) -> LeftKVCache:
+        """按 batch 维切行（CFG 教师子批）。"""
+        return LeftKVCache(
+            layers=[(k.index_select(0, idx), v.index_select(0, idx)) for k, v in self.layers],
+            x_hat=None if self.x_hat is None else self.x_hat.index_select(0, idx),
+            hidden=None if self.hidden is None else self.hidden.index_select(0, idx),
+            filled=self.filled,
+            known_max=self.known_max,
+        )
+
 
 def _copy_into_cap(
     src: torch.Tensor,
@@ -373,13 +383,17 @@ class _DiTBlock(nn.Module):
         *,
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
+        flex_block_mask=None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """左段 prefill：与 ``forward`` 同构，并返回本层已 RoPE 的 ``(K, V)``。"""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_mod(cond)
         h = self.norm1(x) * (1.0 + scale_msa) + shift_msa
         bsz, seq_len, _ = h.shape
         q, k, v = self.attn._project_qkv(h, positions)
-        y = self.attn._attend(q, k, v, attn_mask, bsz=bsz, seq_len=seq_len)
+        y = self.attn._attend(
+            q, k, v, attn_mask, bsz=bsz, seq_len=seq_len,
+            flex_block_mask=flex_block_mask,
+        )
         x = x + gate_msa * y
         h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
         x = x + gate_mlp * self.mlp(h)
@@ -395,6 +409,7 @@ class _DiTBlock(nn.Module):
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         return_kv: bool = False,
+        flex_block_mask=None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """右段增量：Q 来自 ``x``，K/V 拼 ``(left_kv, 本层右段)``。"""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_mod(cond)
@@ -403,7 +418,10 @@ class _DiTBlock(nn.Module):
         q, k, v = self.attn._project_qkv(h, positions)
         k_all = torch.cat([left_k, k], dim=2)
         v_all = torch.cat([left_v, v], dim=2)
-        y = self.attn._attend(q, k_all, v_all, attn_mask, bsz=bsz, seq_len=seq_len)
+        y = self.attn._attend(
+            q, k_all, v_all, attn_mask, bsz=bsz, seq_len=seq_len,
+            flex_block_mask=flex_block_mask,
+        )
         x = x + gate_msa * y
         h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
         x = x + gate_mlp * self.mlp(h)
@@ -593,11 +611,15 @@ class AdaLNZeroStack(nn.Module):
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         known_max: int | None = None,
+        flex_block_mask=None,
+        pad_capacity: bool = True,
     ) -> LeftKVCache:
         """左段独立过栈（``m=none, t=1``），收集每层已 RoPE 的 K/V。
 
         2L 掩码下左不看右，故左表示与右段无关；生成 hop 可复用本 cache。
         ``known_max`` 有则一次预扩到该长，否则从 1024 起 ×2。
+        训练共用左 KV 时 ``pad_capacity=False``（``copy_`` 会切断反传），并传
+        ``flex_block_mask``；生成不传则仍 SDPA。
         """
         bsz, seq_len, _ = x.shape
         if seq_len == 0:
@@ -611,23 +633,36 @@ class AdaLNZeroStack(nn.Module):
         cond = self._cond(t, None, m, batch=bsz, seq_len=seq_len)
         if positions is None:
             positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
-        attn_mask = as_sdpa_mask(attn_mask)
+        use_flex = flex_block_mask is not None
+        if not use_flex:
+            attn_mask = as_sdpa_mask(attn_mask)
         layers: list[tuple[torch.Tensor, torch.Tensor]] = []
         for block in self.blocks:
             x, kv = block.forward_prefill(
                 x, cond, attn_mask=attn_mask, positions=positions,
+                flex_block_mask=flex_block_mask if use_flex else None,
             )
             k, v = kv
-            layers.append((
-                _copy_into_cap(k, filled=seq_len, known_max=known_max, seq_dim=2),
-                _copy_into_cap(v, filled=seq_len, known_max=known_max, seq_dim=2),
-            ))
+            if pad_capacity:
+                layers.append((
+                    _copy_into_cap(k, filled=seq_len, known_max=known_max, seq_dim=2),
+                    _copy_into_cap(v, filled=seq_len, known_max=known_max, seq_dim=2),
+                ))
+            else:
+                layers.append((k, v))
         hidden = x
         x_hat = self.final(x, cond)
+        if pad_capacity:
+            x_hat = _copy_into_cap(
+                x_hat, filled=seq_len, known_max=known_max, seq_dim=1,
+            )
+            hidden = _copy_into_cap(
+                hidden, filled=seq_len, known_max=known_max, seq_dim=1,
+            )
         return LeftKVCache(
             layers=layers,
-            x_hat=_copy_into_cap(x_hat, filled=seq_len, known_max=known_max, seq_dim=1),
-            hidden=_copy_into_cap(hidden, filled=seq_len, known_max=known_max, seq_dim=1),
+            x_hat=x_hat,
+            hidden=hidden,
             filled=seq_len,
             known_max=known_max,
         )
@@ -643,10 +678,12 @@ class AdaLNZeroStack(nn.Module):
         attn_mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         return_hidden: bool = False,
+        flex_block_mask=None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """只跑右段：每层 Q 看 ``cat(K_left, K_right)``。
 
         ``attn_mask`` 须为右 Q × (左+右) K，形状 ``(W, L+W)`` 或带 batch 维。
+        训练 Flex 传 ``flex_block_mask``；生成不传则仍 SDPA。
         """
         bsz, seq_len, _ = x.shape
         if x.size(-1) != self.n_embd:
@@ -660,12 +697,15 @@ class AdaLNZeroStack(nn.Module):
         cond = self._cond(t, w_sc, m, batch=bsz, seq_len=seq_len)
         if positions is None:
             positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
-        attn_mask = as_sdpa_mask(attn_mask)
+        use_flex = flex_block_mask is not None
+        if not use_flex:
+            attn_mask = as_sdpa_mask(attn_mask)
         filled = int(left_kv.filled)
         for block, (left_k, left_v) in zip(self.blocks, left_kv.layers):
             x = block.forward_right(
                 x, cond, left_k[:, :, :filled], left_v[:, :, :filled],
                 attn_mask=attn_mask, positions=positions,
+                flex_block_mask=flex_block_mask if use_flex else None,
             )
         x_hat = self.final(x, cond)
         if return_hidden:

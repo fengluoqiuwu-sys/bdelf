@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import repo_env
 
 repo_env.ensure_repo_root()
@@ -13,7 +15,10 @@ repo_env.ensure_repo_root()
 import torch
 
 from models.lm.belf_relf_core.flex_mask import (
+    belf_left_prefill_mask_mod,
+    make_belf_right_mask_mod,
     make_belf_train_mask_mod,
+    make_relf_right_mask_mod,
     make_relf_windows_mask_mod,
     materialize_mask_mod,
     relf_windows_visible,
@@ -73,6 +78,28 @@ def _check_belf(device: torch.device) -> None:
     )
     if not torch.equal(raw, static):
         raise AssertionError("BELF 静态 2L 与 pack_2l_parallel_blocks_mask 不一致")
+
+    right_mod = make_belf_right_mask_mod(
+        n, w, is_pad=is_pad, unknown=unknown, drop_left=drop,
+    )
+    right = materialize_mask_mod(
+        right_mod, q_len=n, kv_len=two, device=device, batch=bsz,
+    )
+    if not torch.equal(got[:, n:, :], right):
+        raise AssertionError(
+            f"BELF 右段 vs 2L 右块不一致：diff={(got[:, n:, :] != right).sum().item()}"
+        )
+    right_static = materialize_mask_mod(
+        make_belf_right_mask_mod(n, w), q_len=n, kv_len=two, device=device,
+    )
+    if not torch.equal(static[n:, :], right_static):
+        raise AssertionError("BELF 静态右段与 2L 右块不一致")
+    left = materialize_mask_mod(
+        partial(belf_left_prefill_mask_mod, block_size=w),
+        q_len=n, kv_len=n, device=device,
+    )
+    if not torch.equal(static[:n, :n], left):
+        raise AssertionError("BELF 左 prefill 与 2L 左-左块不一致")
     print("BELF mask_mod 对照通过")
 
 
@@ -101,6 +128,25 @@ def _check_relf(device: torch.device) -> None:
         raise AssertionError(
             f"RELF 可见性不一致：diff={(ref != got).sum().item()} / {ref.numel()}"
         )
+    right_mod, right_len, two_r = make_relf_right_mask_mod(
+        left, w, step, n_win, u, active, k0=k0, in_win=in_win, drop_left=drop,
+    )
+    if two_r != two:
+        raise AssertionError(f"RELF 右段 two 不一致：{two_r} vs {two}")
+    right = materialize_mask_mod(
+        right_mod, q_len=right_len, kv_len=two, device=device, batch=bsz,
+    )
+    if not torch.equal(got[:, left:, :], right):
+        raise AssertionError(
+            f"RELF 右段 vs 2L 右块不一致：diff={(got[:, left:, :] != right).sum().item()}"
+        )
+    left_got = materialize_mask_mod(
+        partial(belf_left_prefill_mask_mod, block_size=1),
+        q_len=left, kv_len=left, device=device,
+    )
+    for bi in range(bsz):
+        if not torch.equal(got[bi, :left, :left], left_got):
+            raise AssertionError(f"RELF 左 prefill 与 2L 左-左块不一致 (b={bi})")
     print("RELF mask_mod 对照通过")
 
 

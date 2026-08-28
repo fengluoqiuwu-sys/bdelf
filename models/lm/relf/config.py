@@ -53,7 +53,7 @@ class FL_RelfConfig(PretrainedConfig):
         mlp_ratio: float = 4.0,
         latent_model: str = "latent_vae",
         tag: str = "100m-b32-d1",
-        sc_cfg: bool = True,
+        sc_cfg: bool = False,
         latent_tune: str = "mid",
         time_step: int = 16,
         latent_dim: int = 32,

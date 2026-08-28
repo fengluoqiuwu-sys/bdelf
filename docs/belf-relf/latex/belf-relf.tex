@@ -174,7 +174,7 @@ Exit (locked):  x0_hat in X -> VAE-dec  (inference readout only)
 
 \paragraph{self-left。}
 \label{sec:self-left}
-推理左段默认是再 encode 采 \(z\) 写入的码（对照 \texttt{commit\_x0hat} 才提交 \(\hat x_0\)）；训练默认仍是 encoder 干净码。以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）按样本把左段换成 stop-grad 的末流 \(\hat x_0\)：在 CFG 之前，用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），Bernoulli 替换 \(h_{\mathrm{left}}\)，再跑 teacher / 学生。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)。BELF 与 RELF 共用。
+推理左段默认是再 encode 采 \(z\) 写入的码（对照 \texttt{commit\_x0hat} 才提交 \(\hat x_0\)）；训练默认仍是 encoder 干净码。以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）按样本把左段换成 stop-grad 的末流 \(\hat x_0\)：先抽 Bernoulli，仅命中行在 CFG 之前用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），写回 \(h_{\mathrm{left}}\)，再跑 teacher / 学生。未命中行不跑该次 \(G\)。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)。BELF 与 RELF 共用。
 
 \subsection{日程与 checkpoint}
 
@@ -334,7 +334,7 @@ CFG 含两根相互独立的轴。\(w_{\mathrm{sc}}\) 进入右段未知槽 AdaL
 条件对象为上一跳的 \(\hat x_0\)。启用时 \(w_{\mathrm{sc}}\) 进入 AdaLN 的 \texttt{ScaleEmbedder}，与 \(t\) 的 \texttt{TimestepEmbedder} 分开。推理为单次前向。
 
 \paragraph{启动开关。}
-\texttt{sc\_cfg} 默认 \texttt{true}，进入模型指纹，因其决定网络是否包含 ScaleEmbedder 与 self-cond 通道。为真时必须具备 sc 通道。训练启动时若设为 \texttt{false}：不构建 ScaleEmbedder、无 sc 通道、AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件（仍逐列加 \(m\)）、\(v_{\mathrm{tgt}}=v_z\)、不做 teacher 的 \(\Delta v\) 前向；推理忽略 \texttt{w\_sc}。\texttt{sc\_cfg} 为真则 \texttt{self\_cond=true}。
+\texttt{sc\_cfg} 默认 \texttt{false}（主跑关闭以减计算），进入模型指纹，因其决定网络是否包含 ScaleEmbedder 与 self-cond 通道。为假：不构建 ScaleEmbedder、无 sc 通道、AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件（仍逐列加 \(m\)）、\(v_{\mathrm{tgt}}=v_z\)、不做 teacher 的 \(\Delta v\) 前向；推理忽略 \texttt{w\_sc}。消融单独短训打开（\texttt{true}）时必须具备 sc 通道，且 \texttt{self\_cond=true}。
 
 \paragraph{训练采样。}
 \texttt{sc\_cfg} 为真时，每个样本独立采样两项：
@@ -358,9 +358,9 @@ CFG 含两根相互独立的轴。\(w_{\mathrm{sc}}\) 进入右段未知槽 AdaL
 三次前向使用同一个已采样的 \(w_{\mathrm{sc}}\)（两个 teacher \texttt{no\_grad}，一个学生），\(w_{\mathrm{sc}}\) \textbf{写入右段未知槽} AdaLN：
 
 \begin{enumerate}
-  \item Teacher uncond：self-cond 通道全 \(0\) \(\to\hat x_0^{u},\,v_u\)。
-  \item Teacher cond：通道 \(\mathrm{sg}(\hat x_0^{u})\) \(\to v_c\)。
-  \item 学生：未知列对 \(v_{\mathrm{tgt}}\) 计算 v-MSE。
+  \item Teacher uncond：self-cond 通道全 \(0\) \(\to\hat x_0^{u},\,v_u\)。仅 \(g=1\) 的行运行；\(g=0\) 跳过，\(v_{\mathrm{tgt}}=v_z\)。
+  \item Teacher cond：通道 \(\mathrm{sg}(\hat x_0^{u})\) \(\to v_c\)。同样仅 \(g=1\)。
+  \item 学生：整批未知列对 \(v_{\mathrm{tgt}}\) 计算 v-MSE。\(g=0\) 时 sc 通道为 \(0\)。
 \end{enumerate}
 
 \[
@@ -371,6 +371,9 @@ v_z & g=0.
 \]
 CFG 对 \(v_{\mathrm{tgt}}\) 的修正施加于右段未知列。
 \(g=1\) 时学生的 sc 通道为 \(\mathrm{sg}(\hat x_0^{u})\)；\(g=0\) 时通道为 \(0\)（未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件）。左段与已知槽 AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件。提交与 \texttt{forward\_clean} 同左段。Teacher 的 \(\Delta v\) 对目标 stop-grad。
+
+\paragraph{训练实现（等价，不进指纹）。}
+self-left 换完左段之后，对最终左段茎一次并 \texttt{prefill\_left}（带梯度；茎后 \(\mathrm{sg}\) 对齐 2L pack 左半）。随后 \(G_u\)/\(G_c\)/学生只跑右段，注意力可见性与完整 2L 右块相同。self-left 那次 \(G\) 仍是完整 2L，不共用这份 KV。生成循环仍按 hop 维护左 KV，不走训练这条 prefill。不改 \(v_{\mathrm{tgt}}\)、sc、AdaLN 语义。
 
 BELF：未知槽共享同一套 sc。已知槽 sc 为 0。RELF：即使 \(g=1\)，窗内最右 \(S\) 个新噪声槽的 sc 仍为 \(0\)（尚无上一跳估计）。左段与干净槽的 sc 为 \(0\)。最左档与其余未知档同样以 \(w_{\mathrm{sc}}\) 为条件。
 
@@ -398,7 +401,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 名称 & 符号 & 释义 & 默认 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型}} \\
-\texttt{sc\_cfg} & & 是否启用整套 \(w_{\mathrm{sc}}\)（含 sc 通道）。为假则无通道、不构建 ScaleEmbedder、不以 CFG 修正 \(v_{\mathrm{tgt}}\)。进入模型指纹。 & \texttt{true} \\
+\texttt{sc\_cfg} & & 是否启用整套 \(w_{\mathrm{sc}}\)（含 sc 通道）。为假则无通道、不构建 ScaleEmbedder、不以 CFG 修正 \(v_{\mathrm{tgt}}\)。进入模型指纹。主跑关；消融开。 & \texttt{false} \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练}} \\
 \texttt{self\_cond\_cfg\_p\_mean} & \(P_m^{\mathrm{sc}}\) & 训练 \(w_{\mathrm{sc}}\) 的 logit-normal 位置。对齐 ELF 原时间场，不随梯子 \(P_m\) 改。 & \(-1.5\) \\
@@ -418,7 +421,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 
 \subsection{CFG 消融}
 
-对照按下列网格执行。\texttt{sc\_cfg} 须单独短训；推理项使用同一 checkpoint。按槽拆损失已确定，见第~\ref{sec:open}~节，不作为消融项。\texttt{ctx\_p\_drop} 不进消融。
+对照按下列网格执行。主跑 \texttt{sc\_cfg=false}；打开 \(w_{\mathrm{sc}}\) 须单独短训。推理项使用同一 checkpoint。按槽拆损失已确定，见第~\ref{sec:open}~节，不作为消融项。\texttt{ctx\_p\_drop} 不进消融。
 
 {\small
 \setlength{\tabcolsep}{4pt}
@@ -433,7 +436,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 名称 & 符号 & 默认 & 对照 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型}} \\
-\texttt{sc\_cfg} & & \texttt{true} & \texttt{false}（训练启动时关闭整套 \(w_{\mathrm{sc}}\)，无 sc 通道） \\
+\texttt{sc\_cfg} & & \texttt{false} & \texttt{true}（单独短训打开整套 \(w_{\mathrm{sc}}\) 与 sc 通道） \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
 \texttt{w\_sc} & \(w_{\mathrm{sc}}\) & \(2\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\
@@ -836,7 +839,7 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是再 encode 采 \(z\)（对照 \texttt{commit\_x0hat}）；训练若始终喂 encoder 干净码（教师强制），则右段去噪习惯「完美前缀」，一到推理左边带自生成误差就崩。这是左条件上的暴露偏差。用当前训练 hop（随机 \(t\)）的 \(\hat x_0\) 冒充左段也不行：离提交码太远。块内已知余数与 PAD 另有钉干净规则，不应拿 \(\hat x_0\) 冒充。
 
 \textbf{解决方案。}
-以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）做 self-left scheduled sampling：在 CFG 之前，用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），按样本 Bernoulli 把 \(h_{\mathrm{left}}\) 换成 \textbf{stop-grad 的末流 \(\hat x_0\)}，再跑 teacher / 学生。已知余数与 PAD 仍钉 encoder 干净码。BELF 与 RELF 共用。消融 \(\{0,0.125,0.25,0.375,0.5\}\)。它不消除「插值 \(z\) vs Euler \(z\)」那条缺口，只缓解左条件分布差。机制见第~\ref{sec:self-left}~节。已确定。
+以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）做 self-left scheduled sampling：先抽 Bernoulli，仅命中行在 CFG 之前用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），把 \(h_{\mathrm{left}}\) 换成 \textbf{stop-grad 的末流 \(\hat x_0\)}，再跑 teacher / 学生。未命中行不跑该次 \(G\)。已知余数与 PAD 仍钉 encoder 干净码。BELF 与 RELF 共用。消融 \(\{0,0.125,0.25,0.375,0.5\}\)。它不消除「插值 \(z\) vs Euler \(z\)」那条缺口，只缓解左条件分布差。机制见第~\ref{sec:self-left}~节。已确定。
 
 \subsection{已确定：日程档 \texttt{mid}}
 
@@ -890,6 +893,7 @@ checkpoint 变体 \texttt{fast} / \texttt{mid} / \texttt{full} 与 \texttt{laten
 \texttt{mlp\_ratio} & & SwiGLU 扩展比。 & \(4.0\) \\
 \texttt{dropout} & & 注意力 / FFN dropout。 & \(0.0\) \\
 \texttt{qk\_norm} & & Q/K 每头 RMSNorm。 & \texttt{true} \\
+\texttt{attn\_backend} & & 训练注意力：\texttt{flex}（默认）或 \texttt{sdpa}。CFG 右段 Flex 为 \(Q=N\)、\(KV=2N\)（RELF 右长为窗）。生成仍 SDPA。 & \texttt{flex} \\
 \texttt{rope\_theta} & \(\theta\) & RoPE 基频。 & \(10000\) \\
 \texttt{t\_freq\_dim} & & 正弦时间嵌入频率维。 & \(256\) \\
 \texttt{ada\_ln} & & 主跑 AdaLN-Zero（无仿射 LN、残差 gate、调制末层与 FinalLayer 输出线性零初始化）。逐列 \((t,w_{\mathrm{sc}},m)\)；未知一律 \(m=\mathrm{denoise}\)，\texttt{sc\_cfg} 为真时再以 \(w_{\mathrm{sc}}\) 为条件。不再设 \(m=\mathrm{decode}\)。左段与已知槽 \(t=1\)、不加 \(m\)、不以 \(w_{\mathrm{sc}}\) 为条件。不用 ELF in-context。不进消融。 & \texttt{true} \\

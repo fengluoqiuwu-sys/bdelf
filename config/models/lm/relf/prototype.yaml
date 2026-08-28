@@ -10,7 +10,7 @@ dropout: 0.0  # Dropout
 mlp_ratio: 4.0  # SwiGLU 扩展比
 latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
-sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
+sc_cfg: false  # 是否建 ScaleEmbedder / w_sc 通道；主跑关，消融开
 latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
 time_step: 16  # 流步数 T（G 次数）；须 >= 4；梯子 L_i=Q(i/T)
 latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
@@ -52,7 +52,7 @@ self_cond_cfg_max: 5.0  # w_sc 上界
 sampling:
   sampling_method: sde  # 采样方法：sde | ode
   sde_gamma: 1.5  # SDE churn 系数；末流关闭
-  w_sc: 2.0  # 推理 self-cond CFG 缩放
+  w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg=false 时忽略
   w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
   temperature: 0.0  # 采样温度；≤0 为 argmax
   commit_x0hat: false  # 是否把 x0_hat 提交进下一窗（关则再 encode）

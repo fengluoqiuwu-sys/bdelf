@@ -95,6 +95,82 @@ def build_belf_flex_block_mask(
     )
 
 
+def belf_left_prefill_mask_mod(b, h, q_idx, kv_idx, block_size: int):
+    """左段组因果：与 2L 的左-左块相同。"""
+    del b, h
+    return (kv_idx // int(block_size)) <= (q_idx // int(block_size))
+
+
+def make_belf_right_mask_mod(
+    n: int,
+    block_size: int,
+    *,
+    is_pad: torch.Tensor | None = None,
+    unknown: torch.Tensor | None = None,
+    drop_left: torch.Tensor | None = None,
+):
+    """右 Q（局部 ``0..n``）看 ``[左|右]`` KV：把 ``q_idx`` 映到 2L 下标 ``q_idx+n``。"""
+    n_int = int(n)
+    full = make_belf_train_mask_mod(
+        n_int, block_size, is_pad=is_pad, unknown=unknown, drop_left=drop_left,
+    )
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return full(b, h, q_idx + n_int, kv_idx)
+
+    return mask_mod
+
+
+@torch.compiler.disable
+def build_belf_flex_left_mask(
+    left_len: int,
+    block_size: int,
+    device: torch.device,
+):
+    """左 prefill：``Q=KV=N`` 组因果。"""
+    require_flex()
+    n = int(left_len)
+    mask_mod = partial(belf_left_prefill_mask_mod, block_size=int(block_size))
+    return create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n, device=device,
+    )
+
+
+@torch.compiler.disable
+def build_belf_flex_right_mask(
+    left_len: int,
+    block_size: int,
+    device: torch.device,
+    *,
+    is_pad: torch.Tensor | None = None,
+    unknown: torch.Tensor | None = None,
+    drop_left: torch.Tensor | None = None,
+):
+    """CFG 右段：``Q=N``、``KV=2N``，可见性与完整 2L 的右 Q 块相同。"""
+    require_flex()
+    n = int(left_len)
+    two = 2 * n
+    extra = (is_pad is not None and unknown is not None) or drop_left is not None
+    if extra:
+        bsz = int(
+            (is_pad if is_pad is not None else drop_left).size(0)
+        )
+        mask_mod = make_belf_right_mask_mod(
+            n, block_size, is_pad=is_pad, unknown=unknown, drop_left=drop_left,
+        )
+        return create_block_mask(
+            mask_mod, B=bsz, H=None, Q_LEN=n, KV_LEN=two, device=device,
+        )
+    full = partial(belf_parallel_2l_mask_mod, block_size=int(block_size), n=n)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return full(b, h, q_idx + n, kv_idx)
+
+    return create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=two, device=device,
+    )
+
+
 def relf_windows_visible(
     left_len: int,
     window_size: int,
@@ -237,6 +313,68 @@ def build_relf_flex_block_mask(
     )
 
 
+def make_relf_right_mask_mod(
+    left_len: int,
+    window_size: int,
+    step_size: int,
+    n_win: int,
+    u: torch.Tensor,
+    active: torch.Tensor,
+    *,
+    k0: torch.Tensor | None = None,
+    in_win: torch.Tensor | None = None,
+    drop_left: torch.Tensor | None = None,
+):
+    """右 Q 局部下标映到 2L 的 ``q_idx + left_len``。"""
+    left = int(left_len)
+    full, two = make_relf_windows_mask_mod(
+        left, window_size, step_size, n_win, u, active,
+        k0=k0, in_win=in_win, drop_left=drop_left,
+    )
+    right_len = two - left
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return full(b, h, q_idx + left, kv_idx)
+
+    return mask_mod, right_len, two
+
+
+@torch.compiler.disable
+def build_relf_flex_left_mask(left_len: int, device: torch.device):
+    """RELF 左 prefill：token 因果（组长 1）。"""
+    require_flex()
+    n = int(left_len)
+    mask_mod = partial(belf_left_prefill_mask_mod, block_size=1)
+    return create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n, device=device,
+    )
+
+
+@torch.compiler.disable
+def build_relf_flex_right_mask(
+    left_len: int,
+    window_size: int,
+    step_size: int,
+    u: torch.Tensor,
+    active: torch.Tensor,
+    *,
+    k0: torch.Tensor | None = None,
+    in_win: torch.Tensor | None = None,
+    drop_left: torch.Tensor | None = None,
+):
+    """CFG 右段：``Q=right_len``、``KV=2L``。"""
+    require_flex()
+    n_win = int(u.size(1))
+    mask_mod, right_len, two = make_relf_right_mask_mod(
+        left_len, window_size, step_size, n_win, u, active,
+        k0=k0, in_win=in_win, drop_left=drop_left,
+    )
+    bsz = int(u.size(0))
+    return create_block_mask(
+        mask_mod, B=bsz, H=None, Q_LEN=right_len, KV_LEN=two, device=u.device,
+    )
+
+
 def materialize_mask_mod(
     mask_mod,
     *,
@@ -260,11 +398,18 @@ def materialize_mask_mod(
 
 __all__ = [
     "FLEX_ATTN_AVAILABLE",
-    "build_belf_flex_block_mask",
-    "build_relf_flex_block_mask",
+    "belf_left_prefill_mask_mod",
     "belf_parallel_2l_mask_mod",
+    "build_belf_flex_block_mask",
+    "build_belf_flex_left_mask",
+    "build_belf_flex_right_mask",
+    "build_relf_flex_block_mask",
+    "build_relf_flex_left_mask",
+    "build_relf_flex_right_mask",
     "fused_flex_attention",
+    "make_belf_right_mask_mod",
     "make_belf_train_mask_mod",
+    "make_relf_right_mask_mod",
     "make_relf_windows_mask_mod",
     "materialize_mask_mod",
     "relf_windows_visible",
