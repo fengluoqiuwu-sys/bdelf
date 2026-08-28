@@ -25,6 +25,7 @@ from models import build_model
 from models.latent.artifact_loader import load_latent_artifact
 from tokenizer import get_token_layout, get_tokenizer
 from train import CHECKPOINT_ROOT
+from train.run_path import TRAIN_VARIANTS
 
 _GENERATE_LOG = "[generate]"
 
@@ -49,7 +50,7 @@ def list_checkpoint_runs(root: Path | None = None) -> list[Path]:
         return []
     runs: list[Path] = []
     for variant_dir in sorted(root.iterdir()):
-        if not variant_dir.is_dir() or variant_dir.name not in ("fast", "full"):
+        if not variant_dir.is_dir() or variant_dir.name not in TRAIN_VARIANTS:
             continue
         for child in sorted(variant_dir.iterdir()):
             if not child.is_dir() or child.name == "artifacts":
@@ -103,8 +104,8 @@ def resolve_checkpoint(
         if not path.is_file():
             raise FileNotFoundError(
                 f"Checkpoint not found: {path}\n"
-                "Use --run {fast|full}/{kind}/{model}/{config-hash} "
-                "or legacy {fast|full}/{model}/{config-hash} "
+                "Use --run {fast|mid|full}/{kind}/{model}/{config-hash} "
+                "or legacy {fast|mid|full}/{model}/{config-hash} "
                 "(see scripts/resolve_checkpoint.py)."
             )
         return path
@@ -275,7 +276,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run",
         help=(
-            "Run under cache/checkpoints: {fast|full}/{model}/{config-hash} "
+            "Run under cache/checkpoints: {fast|mid|full}/{model}/{config-hash} "
             "(see scripts/resolve_checkpoint.py)"
         ),
     )

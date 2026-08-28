@@ -20,6 +20,9 @@ _KEY_ALIASES = (
     ("denoiser_noise_scale", "noise_sigma"),
 )
 
+# 旧键：加载旧 config.json 时忽略，不进指纹语义。
+_LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g"})
+
 
 class FL_BelfConfig(PretrainedConfig):
     """块条件 rectified flow：2L 去噪块 + AdaLN-Zero G。"""
@@ -36,7 +39,6 @@ class FL_BelfConfig(PretrainedConfig):
             "dropout",
             "latent_model",
             "tag",
-            "exit",
             "sc_cfg",
             "latent_tune",
             "time_step",
@@ -63,7 +65,6 @@ class FL_BelfConfig(PretrainedConfig):
         mlp_ratio: float = 4.0,
         latent_model: str = "latent_vae",
         tag: str = "100m-b32-d1",
-        exit: str = "decoder",
         sc_cfg: bool = True,
         latent_tune: str = "mid",
         time_step: int = 16,
@@ -85,16 +86,15 @@ class FL_BelfConfig(PretrainedConfig):
         denoiser_p_std: float = 0.8,
         t_clean_eps: float = 0.05,
         vel_eps: float = 1e-3,
-        ce_detach_g: bool = False,
         cond_mode: str = "clean",
         clean_block_prob: float = 0.05,
         lambda_mse: float = 1.0,
-        lambda_ce: float = 1.0,
         lambda_s1: float = 1.0,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
         ctx_source: str = "z",
         x0_source: str = "z",
+        self_left_prob: float = 0.25,
         self_cond_cfg_p_mean: float = -1.5,
         self_cond_cfg_p_std: float = 0.8,
         self_cond_cfg_min: float = 0.5,
@@ -108,7 +108,7 @@ class FL_BelfConfig(PretrainedConfig):
         if "gen_mode" in kwargs:
             raise ValueError("belf 不设 gen_mode；生成锁死 block_generate")
         if "n_layer_dec" in kwargs or "n_exit_layer" in kwargs:
-            raise ValueError("belf 出口无层数；exit=linear 映到 logits，exit=decoder 映到 VAE-dec")
+            raise ValueError("belf 出口锁死 VAE-dec，无层数键")
         if "proj_type" in kwargs or "bottleneck_dim" in kwargs:
             raise ValueError("belf 不设 proj_type/bottleneck_dim；流维是 latent_dim，G 隐层是 n_embd")
         for old, new in _KEY_ALIASES:
@@ -133,6 +133,8 @@ class FL_BelfConfig(PretrainedConfig):
                 ctx_p_drop = mapped
             elif new == "noise_sigma":
                 noise_sigma = mapped
+        for k in _LEGACY_IGNORED:
+            kwargs.pop(k, None)
         super().__init__(**kwargs)
         self.name = name
         self.tokenizer = tokenizer
@@ -149,7 +151,6 @@ class FL_BelfConfig(PretrainedConfig):
         self.mlp_ratio = float(mlp_ratio)
         self.latent_model = latent_model
         self.tag = tag
-        self.exit = str(exit).strip().lower()
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = latent_tune
         self.time_step = int(time_step)
@@ -171,7 +172,6 @@ class FL_BelfConfig(PretrainedConfig):
         self.denoiser_p_std = float(denoiser_p_std)
         self.t_clean_eps = float(t_clean_eps)
         self.vel_eps = float(vel_eps)
-        self.ce_detach_g = bool(ce_detach_g)
         self.cond_mode = str(cond_mode).strip().lower()
         if self.cond_mode != "clean":
             raise ValueError(f"belf cond_mode 锁死 clean，收到 {cond_mode!r}")
@@ -182,12 +182,15 @@ class FL_BelfConfig(PretrainedConfig):
                 f"belf train_t_schedule 锁死 block，收到 {train_t_schedule!r}"
             )
         self.lambda_mse = float(lambda_mse)
-        self.lambda_ce = float(lambda_ce)
         self.lambda_s1 = float(lambda_s1)
         self.lambda_vae = float(lambda_vae)
         self.lambda_ref = float(lambda_ref)
         self.ctx_source = str(ctx_source).strip().lower()
         self.x0_source = str(x0_source).strip().lower()
+        p_left = float(self_left_prob)
+        if not (0.0 <= p_left <= 1.0):
+            raise ValueError(f"self_left_prob 须在 [0,1]，收到 {self_left_prob}")
+        self.self_left_prob = p_left
         self.self_cond_cfg_p_mean = float(self_cond_cfg_p_mean)
         self.self_cond_cfg_p_std = float(self_cond_cfg_p_std)
         self.self_cond_cfg_min = float(self_cond_cfg_min)

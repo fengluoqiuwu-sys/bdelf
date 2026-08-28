@@ -130,10 +130,12 @@ def eval_model_ppl(
     batches = 0
     total_ce = 0.0
     ce_batches = 0
-    use_ce_ppl = bool(
-        getattr(raw, "eval_ppl_from_ce", False)
-        or getattr(getattr(raw, "backbone", None), "eval_ppl_from_ce", False)
-    )
+    # 仅类上显式 True 才用 decode CE 做 PPL；BELF/RELF 显式 False → 不把 MSE 指数化。
+    ce_flag = getattr(raw, "eval_ppl_from_ce", None)
+    if ce_flag is None:
+        ce_flag = getattr(getattr(raw, "backbone", None), "eval_ppl_from_ce", None)
+    use_ce_ppl = ce_flag is True
+    skip_nll_ppl = ce_flag is False
 
     batch_iter: DataLoader | tqdm = loader
     show_pbar = log and pbar_parent is not None and len(loader) > 0
@@ -186,6 +188,8 @@ def eval_model_ppl(
         avg_ppl = (
             loss_to_ppl(total_ce / ce_batches) if ce_batches > 0 else float("nan")
         )
+    elif skip_nll_ppl:
+        avg_ppl = float("nan")
     else:
         avg_ppl = loss_to_ppl(avg_loss)
     if log:
@@ -194,10 +198,12 @@ def eval_model_ppl(
             ce_txt = (
                 f" decode_ce {total_ce / ce_batches:.4f}" if ce_batches > 0 else ""
             )
-            summary = f"eval: {label} {avg_loss:.4f}{ce_txt} ppl {avg_ppl:.2f}"
+            ppl_txt = f" ppl {avg_ppl:.2f}" if avg_ppl == avg_ppl else ""
+            summary = f"eval: {label} {avg_loss:.4f}{ce_txt}{ppl_txt}"
         else:
             label = "decode ce" if branch == "decode" else "loss"
-            summary = f"eval: {label} {avg_loss:.4f} ppl {avg_ppl:.2f}"
+            ppl_txt = f" ppl {avg_ppl:.2f}" if avg_ppl == avg_ppl else ""
+            summary = f"eval: {label} {avg_loss:.4f}{ppl_txt}"
         if pbar_parent is not None:
             tqdm.write(f"{_TRAIN_LOG} {summary}")
         else:

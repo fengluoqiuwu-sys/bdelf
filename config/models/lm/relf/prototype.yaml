@@ -10,10 +10,9 @@ dropout: 0.0  # Dropout
 mlp_ratio: 4.0  # SwiGLU 扩展比
 latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
-exit: decoder  # 读出：linear 映到 logits（ELF）；decoder 映到 VAE-dec（Cola）
 sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道
 latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
-time_step: 16  # 梯子档数 T；须 >= 4
+time_step: 16  # 流步数 T（G 次数）；须 >= 4；梯子 L_i=Q(i/T)
 latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
 attn_backend: flex  # 注意力后端：flex | sdpa
 window_size: 32  # 滚动窗长 W；须等于 step_size×time_step
@@ -34,10 +33,9 @@ denoiser_p_mean: -1.5  # 梯子 logit-normal 均值
 denoiser_p_std: 0.8  # 梯子 logit-normal 标准差
 t_clean_eps: 0.05  # 干净端 1-ε
 vel_eps: 1.0e-3  # x-pred→v 分母下限
-lambda_mse: 1.0  # denoise v-MSE 权重
-lambda_ce: 1.0  # decode CE 权重
+lambda_mse: 1.0  # 未知槽 v-MSE 权重
+self_left_prob: 0.25  # 训练按样本把左段换成末流 sg(x_hat) 的概率；eval/生成视为 0
 lambda_s1: 1.0  # 联合训时 L_s1 权重
-ce_detach_g: false  # CE 是否 detach G
 ctx_source: z  # 左段条件来源：z | mu
 x0_source: z  # 干净端来源：z | mu
 cond_mode: clean  # 条件模式；主跑 clean

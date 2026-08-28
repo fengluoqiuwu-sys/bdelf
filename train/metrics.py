@@ -407,7 +407,7 @@ def build_train_core_row(
                 f"'denoise', 'decode', or 'mixed', got {loss_branch!r}"
             )
     else:
-        # BELF/RELF：PPL 对齐 HeldOut，用 decode CE，不用合计（含 L_s1）。
+        # 有限 decode CE 才写 PPL；BELF/RELF 的 decode_ce 恒 nan，不把 MSE 指数化。
         ce = _as_optional_float(metrics.get("decode_ce"))
         if ce is not None:
             row["train_ppl"] = round(loss_to_ppl(ce), 4)
@@ -548,12 +548,14 @@ def _train_metrics_text(core: dict[str, Any], official: dict[str, Any] | None) -
                 f"ppl {core.get('train_ppl', '')} | lr {lr} | {tok_s} tok/s"
             )
         )
+    ppl = core.get("train_ppl", "")
+    ppl_bit = f" ppl {ppl}" if ppl not in ("", None) else ""
     return (
-        f"loss {core.get('train_loss', '')} ppl {core.get('train_ppl', '')} | "
+        f"loss {core.get('train_loss', '')}{ppl_bit} | "
         f"lr {lr:.2e} | {float(tok_s):.0f} tok/s"
         if isinstance(lr, float) and isinstance(tok_s, (int, float))
         else (
-            f"loss {core.get('train_loss', '')} ppl {core.get('train_ppl', '')} | "
+            f"loss {core.get('train_loss', '')}{ppl_bit} | "
             f"lr {lr} | {tok_s} tok/s"
         )
     )

@@ -142,7 +142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"Available models: {model_help}\n"
             f"Available datasets: {', '.join(datasets)}\n"
             f"Available preprocess configs: {', '.join(preprocess_names)}\n"
-            "Train configs: {size}m-{fast,full} (from config/models/{kind}/<model>/)\n"
+            "Train configs: {size}m-{fast,mid,full} (from config/models/{kind}/<model>/)\n"
             "Generate configs: config/generate/{kind}/<model>/<name>.yaml\n"
             "Overrides: --set section.key=value "
             "(sections: optimizer, batch, schedule, eval, generate, model, extra)"
@@ -284,7 +284,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str, FL_TrainConfig]:
         raise SystemExit(
             f"Unknown train config {args.train_config!r}. {args.model} available: "
             f"{', '.join(configs)}\n"
-            f"Naming format: {{size}}m-{{fast,full,curriculum}}"
+            f"Naming format: {{size}}m-{{fast,mid,full,curriculum}}"
         )
 
     if args.train_config.endswith("-curriculum"):

@@ -8,6 +8,8 @@ from transformers import PretrainedConfig
 
 from models.tokens import FL_TokenLayout
 
+_LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g"})
+
 
 class FL_RelfConfig(PretrainedConfig):
     """滚动窗 rectified flow LM；入口走 ``LatentBundle``。"""
@@ -24,7 +26,6 @@ class FL_RelfConfig(PretrainedConfig):
             "dropout",
             "latent_model",
             "tag",
-            "exit",
             "sc_cfg",
             "latent_tune",
             "time_step",
@@ -52,7 +53,6 @@ class FL_RelfConfig(PretrainedConfig):
         mlp_ratio: float = 4.0,
         latent_model: str = "latent_vae",
         tag: str = "100m-b32-d1",
-        exit: str = "decoder",
         sc_cfg: bool = True,
         latent_tune: str = "mid",
         time_step: int = 16,
@@ -77,15 +77,14 @@ class FL_RelfConfig(PretrainedConfig):
         t_clean_eps: float = 0.05,
         vel_eps: float = 1e-3,
         lambda_mse: float = 1.0,
-        lambda_ce: float = 1.0,
         lambda_s1: float = 1.0,
-        ce_detach_g: bool = False,
         ctx_source: str = "z",
         x0_source: str = "z",
         cond_mode: str = "clean",
         clean_block_prob: float = 0.05,
         train_t_schedule: str = "mixed",
         window_t: str = "ladder",
+        self_left_prob: float = 0.25,
         self_cond_cfg_p_mean: float = -1.5,
         self_cond_cfg_p_std: float = 0.8,
         sc_guided_prob: float = 0.5,
@@ -103,9 +102,11 @@ class FL_RelfConfig(PretrainedConfig):
             if banned in kwargs:
                 raise ValueError(f"relf 不设 {banned}；截断由 BOS/EOS 给出")
         if "n_exit_layer" in kwargs or "n_layer_dec" in kwargs:
-            raise ValueError("relf 出口无层数；exit=linear 映到 logits，exit=decoder 映到 VAE-dec")
+            raise ValueError("relf 出口锁死 VAE-dec，无层数键")
         if "proj_type" in kwargs or "bottleneck_dim" in kwargs:
             raise ValueError("relf 不设 proj_type/bottleneck_dim；流维是 latent_dim，G 隐层是 n_embd")
+        for k in _LEGACY_IGNORED:
+            kwargs.pop(k, None)
         super().__init__(**kwargs)
         self.name = name
         self.tokenizer = tokenizer
@@ -122,7 +123,6 @@ class FL_RelfConfig(PretrainedConfig):
         self.mlp_ratio = float(mlp_ratio)
         self.latent_model = str(latent_model)
         self.tag = str(tag)
-        self.exit = str(exit).strip().lower()
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = str(latent_tune).strip().lower()
         self.time_step = int(time_step)
@@ -147,9 +147,7 @@ class FL_RelfConfig(PretrainedConfig):
         self.t_clean_eps = float(t_clean_eps)
         self.vel_eps = float(vel_eps)
         self.lambda_mse = float(lambda_mse)
-        self.lambda_ce = float(lambda_ce)
         self.lambda_s1 = float(lambda_s1)
-        self.ce_detach_g = bool(ce_detach_g)
         self.ctx_source = str(ctx_source).strip().lower()
         self.x0_source = str(x0_source).strip().lower()
         self.cond_mode = str(cond_mode).strip().lower()
@@ -166,6 +164,10 @@ class FL_RelfConfig(PretrainedConfig):
             raise ValueError(
                 f"relf window_t 锁死 ladder，收到 {window_t!r}"
             )
+        p_left = float(self_left_prob)
+        if not (0.0 <= p_left <= 1.0):
+            raise ValueError(f"self_left_prob 须在 [0,1]，收到 {self_left_prob}")
+        self.self_left_prob = p_left
         self.self_cond_cfg_p_mean = float(self_cond_cfg_p_mean)
         self.self_cond_cfg_p_std = float(self_cond_cfg_p_std)
         self.sc_guided_prob = float(sc_guided_prob)

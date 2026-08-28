@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Mask schematics: one claim per figure. Labels in English; keep text off neighbors."""
+"""掩码示意图：每张图一个主张。格内英文、避免挤到邻格。
+
+规格：T 次流、梯子 L_i=Q(i/T)；无 CE 跳。橙=最左/末流档（仍算 v-MSE，Euler 后读出）。
+"""
 
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ C_HIDE = "#f2f3f4"
 C_SPLIT = "#1c2833"
 C_NONE = "#d5d8dc"
 C_MSE = "#5dade2"
-C_CE = "#e67e22"
+C_LAST = "#e67e22"  # 末流档，仍是 v-MSE；读出在 Euler 之后
 C_KNOWN = "#a9dfbf"
 C_TOK = "#d6eaf8"
 C_MARK = "#f5b7b1"
@@ -228,7 +231,7 @@ def plot_belf_pack(font: mpl.font_manager.FontProperties) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(5.6, 1.85), layout="constrained")
     rows = [
         (axes[0], "flow hop", [C_NONE] * n_pre + [C_MSE] * n_blk, [""] * n_pre + ["MSE"] * n_blk),
-        (axes[1], "decode hop", [C_NONE] * n_pre + [C_CE] * n_blk, [""] * n_pre + ["CE"] * n_blk),
+        (axes[1], "last hop", [C_NONE] * n_pre + [C_LAST] * n_blk, [""] * n_pre + ["last"] * n_blk),
     ]
     for ax, ytick, colors, texts in rows:
         _fill_row(ax, colors, texts, font, ytick=ytick)
@@ -239,8 +242,8 @@ def plot_belf_pack(font: mpl.font_manager.FontProperties) -> None:
         fig,
         [
             Patch(facecolor=C_NONE, edgecolor="#b0b7bd", label="no loss"),
-            Patch(facecolor=C_MSE, label="velocity MSE only"),
-            Patch(facecolor=C_CE, label="CE only"),
+            Patch(facecolor=C_MSE, label="flow v-MSE"),
+            Patch(facecolor=C_LAST, label="last-flow v-MSE (then read)"),
         ],
         ncol=3,
     )
@@ -252,12 +255,12 @@ def plot_belf_clean(font: mpl.font_manager.FontProperties) -> None:
     n_left = n_pre
     fig, axes = plt.subplots(2, 1, figsize=(5.6, 1.95), layout="constrained")
     mid = [C_NONE] * n_pre + [C_KNOWN] * n_known + [C_MSE] * n_unk
-    last = [C_NONE] * n_pre + [C_KNOWN] * n_known + [C_CE] * n_unk
+    last = [C_NONE] * n_pre + [C_KNOWN] * n_known + [C_LAST] * n_unk
     mid_txt = [""] * n_pre + ["clean"] * n_known + ["MSE"] * n_unk
-    last_txt = [""] * n_pre + ["clean"] * n_known + ["CE"] * n_unk
+    last_txt = [""] * n_pre + ["clean"] * n_known + ["last"] * n_unk
     rows = [
         (axes[0], "flow hop", mid, mid_txt),
-        (axes[1], "decode hop", last, last_txt),
+        (axes[1], "last hop", last, last_txt),
     ]
     for ax, ytick, colors, texts in rows:
         _fill_row(ax, colors, texts, font, ytick=ytick)
@@ -280,8 +283,8 @@ def plot_belf_clean(font: mpl.font_manager.FontProperties) -> None:
         [
             Patch(facecolor=C_NONE, edgecolor="#b0b7bd", label="prefix, no loss"),
             Patch(facecolor=C_KNOWN, label="known, pinned clean"),
-            Patch(facecolor=C_MSE, label="velocity MSE only"),
-            Patch(facecolor=C_CE, label="CE only"),
+            Patch(facecolor=C_MSE, label="flow v-MSE"),
+            Patch(facecolor=C_LAST, label="last-flow v-MSE (then read)"),
         ],
         ncol=2,
     )
@@ -294,7 +297,8 @@ def _t_color(label: str) -> str:
         r"$L_0$": "#7d6608",
         r"$L_1$": "#b7950b",
         r"$L_2$": "#f4d03f",
-        "1-ε": "#f9e79f",
+        r"$L_3$": "#f9e79f",
+        r"$L_{T-1}$": "#f9e79f",
         "1": C_KNOWN,
         "t": "#b7950b",
         "": C_NONE,
@@ -308,8 +312,8 @@ def plot_relf_masks(font: mpl.font_manager.FontProperties) -> None:
         (
             "No clip: full $F$",
             ["·"] * 8,
-            ["1-ε", "1-ε", r"$L_2$", r"$L_2$", r"$L_1$", r"$L_1$", r"$L_0$", r"$L_0$"],
-            ["CE", "CE", "MSE", "MSE", "MSE", "MSE", "MSE", "MSE"],
+            [r"$L_3$", r"$L_3$", r"$L_2$", r"$L_2$", r"$L_1$", r"$L_1$", r"$L_0$", r"$L_0$"],
+            ["last", "last", "MSE", "MSE", "MSE", "MSE", "MSE", "MSE"],
         ),
         (
             "Left clip: BOS at $k{=}4$",
@@ -320,18 +324,18 @@ def plot_relf_masks(font: mpl.font_manager.FontProperties) -> None:
         (
             "Right clip: EOS at $k{=}3$",
             ["·"] * 3 + ["EOS"] + [""] * 4,
-            ["1-ε", "1-ε", r"$L_2$", r"$L_2$"] + [""] * 4,
-            ["CE", "CE", "MSE", "MSE"] + [""] * 4,
+            [r"$L_3$", r"$L_3$", r"$L_2$", r"$L_2$"] + [""] * 4,
+            ["last", "last", "MSE", "MSE"] + [""] * 4,
         ),
         (
             "Both clips: BOS $k{=}1$, EOS $k{=}5$",
             [""] + ["BOS"] + ["·"] * 3 + ["EOS"] + [""] * 2,
-            [""] + ["1-ε"] + [r"$L_2$", r"$L_2$", r"$L_1$", r"$L_1$"] + [""] * 2,
-            [""] + ["CE"] + ["MSE"] * 4 + [""] * 2,
+            [""] + [r"$L_3$"] + [r"$L_2$", r"$L_2$", r"$L_1$", r"$L_1$"] + [""] * 2,
+            [""] + ["last"] + ["MSE"] * 4 + [""] * 2,
         ),
     ]
     seq_color = {"": C_NONE, "BOS": C_MARK, "EOS": C_MARK, "·": C_TOK}
-    loss_color = {"CE": C_CE, "MSE": C_MSE, "": C_NONE}
+    loss_color = {"last": C_LAST, "MSE": C_MSE, "": C_NONE}
     fig, axes = plt.subplots(
         3,
         4,
@@ -357,8 +361,8 @@ def plot_relf_masks(font: mpl.font_manager.FontProperties) -> None:
         fig,
         [
             Patch(facecolor=C_MARK, label="BOS / EOS cell"),
-            Patch(facecolor=C_CE, label="CE only"),
-            Patch(facecolor=C_MSE, label="MSE only"),
+            Patch(facecolor=C_LAST, label="last-flow v-MSE (then read)"),
+            Patch(facecolor=C_MSE, label="flow v-MSE"),
             Patch(facecolor=C_NONE, edgecolor="#b0b7bd", label="truncated (not in window)"),
         ],
         ncol=4,
@@ -369,20 +373,21 @@ def plot_relf_masks(font: mpl.font_manager.FontProperties) -> None:
 
 def _relf_f_labels(w: int = 8, s: int = 2) -> list[str]:
     n_rung = w // s
-    names = ["1-ε"] + [rf"$L_{n_rung - 2 - r}$" for r in range(n_rung - 1)]
+    # 最左档 L_{T-1}（示意 T=W/S）；不再画 1-ε 的 CE 跳。
+    names = [rf"$L_{n_rung - 1 - r}$" for r in range(n_rung)]
     out: list[str] = []
     for name in names:
         out.extend([name] * s)
     return out
 
 
-def _loss_from_t(t_labs: list[str]) -> list[str]:
+def _loss_from_t(t_labs: list[str], last_lab: str) -> list[str]:
     out: list[str] = []
     for x in t_labs:
         if not x:
             out.append("")
-        elif x == "1-ε":
-            out.append("CE")
+        elif x == last_lab:
+            out.append("last")
         else:
             out.append("MSE")
     return out
@@ -403,21 +408,22 @@ def _mark_idx(ax: plt.Axes, i: int) -> None:
 
 
 def plot_relf_emit(font: mpl.font_manager.FontProperties) -> None:
-    # Two left-to-right rollouts, W=8, S=2. Column spacing matches relf_masks.
+    # 两次从左到右的 rollout，W=8、S=2；列距与 relf_masks 一致。
     w = 8
     f_labs = _relf_f_labels(w, 2)
+    last_lab = f_labs[0]
     seq_color = {"": C_NONE, "BOS": C_MARK, "EOS": C_MARK, "·": C_TOK}
-    loss_color = {"CE": C_CE, "MSE": C_MSE, "": C_NONE}
+    loss_color = {"last": C_LAST, "MSE": C_MSE, "": C_NONE}
 
     def left_clip(k_bos: int) -> tuple[list[str], list[str], list[str], int]:
         seq = [""] * k_bos + ["BOS"] + ["·"] * (w - 1 - k_bos)
         t_labs = [""] * k_bos + f_labs[k_bos:]
-        return seq, t_labs, _loss_from_t(t_labs), k_bos
+        return seq, t_labs, _loss_from_t(t_labs, last_lab), k_bos
 
     def right_clip(k_eos: int) -> tuple[list[str], list[str], list[str], int]:
         seq = ["·"] * k_eos + ["EOS"] + [""] * (w - 1 - k_eos)
         t_labs = f_labs[: k_eos + 1] + [""] * (w - 1 - k_eos)
-        return seq, t_labs, _loss_from_t(t_labs), k_eos
+        return seq, t_labs, _loss_from_t(t_labs, last_lab), k_eos
 
     strips = [
         (
@@ -459,8 +465,8 @@ def plot_relf_emit(font: mpl.font_manager.FontProperties) -> None:
         fig,
         [
             Patch(facecolor=C_MARK, label="BOS / EOS cell"),
-            Patch(facecolor=C_CE, label="CE only (read / pop)"),
-            Patch(facecolor=C_MSE, label="MSE only"),
+            Patch(facecolor=C_LAST, label="last-flow v-MSE (then read)"),
+            Patch(facecolor=C_MSE, label="flow v-MSE"),
             Patch(facecolor=C_NONE, edgecolor="#b0b7bd", label="truncated (not in window)"),
         ],
         ncol=4,
@@ -470,18 +476,18 @@ def plot_relf_emit(font: mpl.font_manager.FontProperties) -> None:
 
 
 def plot_relf_clean(font: mpl.font_manager.FontProperties) -> None:
-    # Left: mid-window remainder. Right: postroll remainder (EOS clip; F unshifted).
-    loss_color = {"CE": C_CE, "MSE": C_MSE, "": C_NONE}
+    # 左：窗中余数。右：句尾切（EOS 后截掉，F 不滑）。最左流档 L_3，不是 1-ε。
+    loss_color = {"last": C_LAST, "MSE": C_MSE, "": C_NONE}
     cases = [
         (
             "No clip (mid)",
-            ["clean", "1-ε", r"$L_2$", r"$L_2$", r"$L_1$", r"$L_1$", r"$L_0$", r"$L_0$"],
-            ["", "CE", "MSE", "MSE", "MSE", "MSE", "MSE", "MSE"],
+            ["clean", r"$L_3$", r"$L_2$", r"$L_2$", r"$L_1$", r"$L_1$", r"$L_0$", r"$L_0$"],
+            ["", "last", "MSE", "MSE", "MSE", "MSE", "MSE", "MSE"],
         ),
         (
             "Right clip: EOS at $k{=}4$",
-            ["clean", "1-ε", r"$L_2$", r"$L_2$", r"$L_1$", "", "", ""],
-            ["", "CE", "MSE", "MSE", "MSE", "", "", ""],
+            ["clean", r"$L_3$", r"$L_2$", r"$L_2$", r"$L_1$", "", "", ""],
+            ["", "last", "MSE", "MSE", "MSE", "", "", ""],
         ),
     ]
     fig, axes = plt.subplots(2, 2, figsize=(7.6, 1.95), layout="constrained")
@@ -513,8 +519,8 @@ def plot_relf_clean(font: mpl.font_manager.FontProperties) -> None:
         fig,
         [
             Patch(facecolor=C_KNOWN, label="known, pinned clean"),
-            Patch(facecolor=C_CE, label="CE only"),
-            Patch(facecolor=C_MSE, label="MSE only"),
+            Patch(facecolor=C_LAST, label="last-flow v-MSE (then read)"),
+            Patch(facecolor=C_MSE, label="flow v-MSE"),
             Patch(facecolor=C_NONE, edgecolor="#b0b7bd", label="truncated (not in window)"),
         ],
         ncol=4,
@@ -533,7 +539,7 @@ def _plot_cont_strip(
     figsize: tuple[float, float],
 ) -> None:
     seq_color = {"": C_NONE, "K": C_KNOWN, "·": C_TOK, "P": C_TOK}
-    loss_color = {"CE": C_CE, "MSE": C_MSE, "": C_NONE}
+    loss_color = {"last": C_LAST, "MSE": C_MSE, "": C_NONE}
     n = len(frames)
     fig, axes = plt.subplots(
         3,
@@ -563,8 +569,8 @@ def _plot_cont_strip(
         [
             Patch(facecolor=C_TOK, label="prefix / unknown token"),
             Patch(facecolor=C_KNOWN, label="known remainder, t=1"),
-            Patch(facecolor=C_CE, label="CE only (read / pop)"),
-            Patch(facecolor=C_MSE, label="MSE only"),
+            Patch(facecolor=C_LAST, label="last-flow v-MSE (then read)"),
+            Patch(facecolor=C_MSE, label="flow v-MSE"),
             Patch(facecolor=C_NONE, edgecolor="#b0b7bd", label="unused"),
         ],
         ncol=5,
@@ -577,15 +583,16 @@ def plot_belf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
     # W=4, prefix L=6 so r=2. Finish mixed block, then a full unknown block.
     n = 12
 
-    def frame(n_kv: int, n_known: int, n_unk: int, *, decode: bool) -> tuple:
+    def frame(n_kv: int, n_known: int, n_unk: int, *, last: bool) -> tuple:
         n_pad = n - n_kv - n_known - n_unk
         seq = [""] * n_pad + ["P"] * n_kv + ["K"] * n_known + ["·"] * n_unk
-        t_unk = ["1-ε"] * n_unk if decode else ["t"] * n_unk
+        # 示意 W=T=4，末流档为 L_3；勿写 L_{T-1}（小格里会挤坏）。
+        t_unk = [r"$L_3$"] * n_unk if last else ["t"] * n_unk
         t_labs = [""] * n_pad + [""] * n_kv + ["1"] * n_known + t_unk
-        loss_unk = ["CE"] * n_unk if decode else ["MSE"] * n_unk
+        loss_unk = ["last"] * n_unk if last else ["MSE"] * n_unk
         loss = [""] * (n_pad + n_kv + n_known) + loss_unk
         cur = n_pad + n_kv
-        marks = list(range(cur + n_known, cur + n_known + n_unk)) if decode else []
+        marks = list(range(cur + n_known, cur + n_known + n_unk)) if last else []
         splits = [cur]
         if n_known:
             splits.append(cur + n_known)
@@ -594,16 +601,16 @@ def plot_belf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
     _plot_cont_strip(
         font,
         [
-            frame(4, 2, 2, decode=False),
-            frame(4, 2, 2, decode=True),
-            frame(8, 0, 4, decode=False),
-            frame(8, 0, 4, decode=True),
+            frame(4, 2, 2, last=False),
+            frame(4, 2, 2, last=True),
+            frame(8, 0, 4, last=False),
+            frame(8, 0, 4, last=True),
         ],
         [
             r"$r{=}2$, flow",
-            r"decode: emit 2",
+            r"last hop: then read 2",
             r"next block, flow",
-            r"decode: emit 4",
+            r"last hop: then read 4",
         ],
         "belf_clean_cont",
         r"pack index  (left $\to$ right = successive $G$ frames; $W{=}4$, prefix $L{=}6$)",
@@ -612,9 +619,10 @@ def plot_belf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
 
 
 def plot_relf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
-    # 左切混合窗：K 从窗右端进入，每次 hop 左移 S；其右未知沿 F 从 L0 升到 1-ε 才 CE。
+    # 左切混合窗：K 从窗右端进入，每次 hop 左移 S；未知沿 F 爬到 L_{T-1} 后 Euler 再读出。
     w, s = 8, 2
     f_labs = _relf_f_labels(w, s)
+    last_lab = f_labs[0]
 
     def frame(k_k: int) -> tuple:
         k_new = k_k + 1
@@ -624,8 +632,8 @@ def plot_relf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
         for i, lab in enumerate(t_labs):
             if i <= k_k or not lab:
                 loss.append("")
-            elif lab == "1-ε":
-                loss.append("CE")
+            elif lab == last_lab:
+                loss.append("last")
             else:
                 loss.append("MSE")
         splits = [k_new] + [s * r for r in range(1, w // s)]
@@ -638,7 +646,7 @@ def plot_relf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
             r"$r{=}1$, MSE ($L_0$)",
             r"MSE ($L_1$)",
             r"MSE ($L_2$)",
-            r"CE: emit 1",
+            r"last hop: then read 1",
         ],
         "relf_clean_cont",
         r"virtual full-window index $k$  (left $\to$ right = $K$ moves left by $S$; $W{=}8$, $S{=}2$)",

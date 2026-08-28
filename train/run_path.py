@@ -19,6 +19,7 @@ from models import kind_of, resolve_model_config_path
 
 CHECKPOINT_ROOT = "cache/checkpoints"
 CONFIG_HASH_LEN = 16
+TRAIN_VARIANTS = ("fast", "mid", "full")
 
 
 def _strip_meta(obj: Any) -> Any:
@@ -182,9 +183,9 @@ def run_dir_for(
     checkpoint_root: str | Path = CHECKPOINT_ROOT,
     kind: str | None = None,
 ) -> Path:
-    """``{root}/{fast|full}/{kind}/{model}/{hash}/``；禁止别名。"""
-    if variant not in ("fast", "full"):
-        raise ValueError(f"variant must be fast|full, got {variant!r}")
+    """``{root}/{fast|mid|full}/{kind}/{model}/{hash}/``；禁止别名。"""
+    if variant not in TRAIN_VARIANTS:
+        raise ValueError(f"variant must be fast|mid|full, got {variant!r}")
     if not config_hash or any(c in config_hash for c in "/\\"):
         raise ValueError(f"invalid config_hash: {config_hash!r}")
     model_kind = kind or kind_of(model)
@@ -242,14 +243,14 @@ def parse_checkpoint_run_relpath(run: str) -> tuple[str, str, str]:
     ``{variant}/{kind}/{model}/{hash}``.
     """
     parts = Path(run).parts
-    if len(parts) == 3 and parts[0] in ("fast", "full"):
+    if len(parts) == 3 and parts[0] in TRAIN_VARIANTS:
         return parts[0], parts[1], parts[2]
-    if len(parts) == 4 and parts[0] in ("fast", "full") and parts[1] in ("lm", "latent"):
+    if len(parts) == 4 and parts[0] in TRAIN_VARIANTS and parts[1] in ("lm", "latent"):
         return parts[0], parts[2], parts[3]
     raise ValueError(
         f"invalid run relpath {run!r}; expected "
-        "{{fast|full}}/{{model}}/{{hash}} or "
-        "{{fast|full}}/{{lm|latent}}/{{model}}/{{hash}}"
+        "{{fast|mid|full}}/{{model}}/{{hash}} or "
+        "{{fast|mid|full}}/{{lm|latent}}/{{model}}/{{hash}}"
     )
 
 

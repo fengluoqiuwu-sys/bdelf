@@ -8,7 +8,7 @@ import torch
 
 
 def check_time_step(T: int) -> None:
-    """``time_step`` 须 ``T>=4``（``T-1`` 次流 + 1 次 decode）。"""
+    """``time_step`` 须 ``T>=4``（``T`` 次流；无 decode 跳）。"""
     if int(T) < 4:
         raise ValueError(f"time_step T 须 >= 4，收到 {T}")
 
@@ -30,9 +30,10 @@ def ladder_levels(
     p_std: float,
     eps: float,
 ) -> torch.Tensor:
-    """``L_i = Q(i/(T-1))``，长度 ``T``。
+    """``L_i = Q(i/T)``，长度 ``T+1``（``i=0,…,T``）。
 
     ``Q(0)=0``，``Q(1)=1-eps``；开区间分位再夹到 ``[0, 1-eps]``。
+    训练 / 推理的 ``G`` 只落在 ``L_0…L_{T-1}``；``L_T`` 仅作末次 Euler 终点。
     """
     check_time_step(T)
     if not (0.0 < float(eps) < 1.0):
@@ -41,12 +42,12 @@ def ladder_levels(
         raise ValueError(f"denoiser p_std 须 > 0，收到 {p_std}")
     t_int = int(T)
     cap = 1.0 - float(eps)
-    out = torch.empty(t_int, dtype=torch.float64)
+    out = torch.empty(t_int + 1, dtype=torch.float64)
     out[0] = 0.0
     out[-1] = cap
-    if t_int > 2:
-        i = torch.arange(1, t_int - 1, dtype=torch.float64)
-        p = i / (t_int - 1)
+    if t_int > 1:
+        i = torch.arange(1, t_int, dtype=torch.float64)
+        p = i / float(t_int)
         q = _logit_normal_quantile(p, float(p_mean), float(p_std))
         out[1:-1] = q.clamp(0.0, cap)
     return out

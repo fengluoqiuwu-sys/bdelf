@@ -1,0 +1,17 @@
+_doc: BELF/RELF Stage1 mid 占位 preprocess（实际用 owt-seg512；进指纹）  # 文件说明，写入 extra
+
+name: belf-relf-s1-mid  # 配置名；非 prototype 时与文件名一致
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+strategy: owt_segment  # 切分策略
+chunk_length: 512  # 本阶段图 L
+process_d: 512  # 处理宽度
+min_chunk_len: 128  # 最短句段
+pad_mode: fixed  # 填充：bucket | fixed
+bucket_lengths: [256, 512, 1024, 2048]  # 分桶长度（fixed 时不用）
+shuffle_seed: 42  # 打乱种子
+overflow_mode: discard  # 溢出：discard | wrap | pad_eos
+seed: 42  # 全局种子
+text_column: text  # 文本列名
+curriculum: belf-relf-s1-mid  # 指向 config/train/curriculum/ 下同名 yaml
+predecessor_preprocess: ""  # 前置 preprocess 名；空表示本 run 无前置
+predecessor_target_tokens: 0  # 解析前置 run 的 schedule.target_tokens；0 表示无前置

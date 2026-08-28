@@ -10,10 +10,10 @@ from models.lm.belf_relf_core import pad_after_first_eos, x_to_v
 from models.lm.belf_relf_core.gen_buf import SeqBuf
 from models.model import sample_from_logits
 
-# 与 AdaLNZeroStack 逐列模式一致。
+# 与 AdaLNZeroStack 逐列模式一致（训练/推理不再设 MODE_DECODE）。
 MODE_NONE = 0
 MODE_DENOISE = 1
-MODE_DECODE = 2
+MODE_DECODE = 2  # 保留常量以免外部 import 崩；主体路径不用
 
 
 def ode_update(z: torch.Tensor, v: torch.Tensor, t: float, t_next: float) -> torch.Tensor:
@@ -49,9 +49,10 @@ def block_generate(
     prefix_tokens: torch.Tensor | None = None,
     sampling_cfg: dict | None = None,
 ) -> tuple[torch.Tensor, int]:
-    """逐块：``T-1`` 次流 Euler + 1 次 decode（decode 不做 Euler）。
+    """逐块：``T`` 次流 Euler（末流关 churn）后 VAE-dec 读词。
 
-    末流关闭 SDE churn。默认 ``commit_x0hat=true``。末块可短；EOS 后该样本停。
+    梯子长 ``T+1``；末次从 ``L_{T-1}`` Euler 到 ``L_T=1-ε``，不再多跑 decode hop。
+    默认 ``commit_x0hat=true``。末块可短；EOS 后该样本停。
     """
     _ = bos_token_id
     cfg = dict(getattr(getattr(backbone, "config", None), "sampling", None) or {})
@@ -204,10 +205,11 @@ def block_generate(
 
         x_hat = z_block
         sc_right = torch.zeros_like(z_block)
-        for hop in range(t_steps - 1):
+        # T 次流：levels 长 T+1，末次从 L_{T-1} Euler 到 L_T=1-ε；之后直接 VAE-dec。
+        for hop in range(t_steps):
             t_curr = float(levels[hop].item())
             t_next = float(levels[hop + 1].item())
-            last_flow = hop == t_steps - 2
+            last_flow = hop == t_steps - 1
             if method == "sde" and not last_flow:
                 z_back, t_back = sde_churn(
                     z_block, t_curr, t_next, sde_gamma,
@@ -229,34 +231,20 @@ def block_generate(
                 sc_right = sc_right.clone()
                 sc_right[:, :known_n] = 0
 
-        nfe += 1
-        t_dec = float(levels[-1].item())
-        w_sc_dec = torch.zeros_like(w_sc) if w_sc is not None else None
-        x_hat, hidden = _g_right(
-            left, z_block, t_dec, MODE_DECODE, w_sc_dec,
-            known_right=known_n,
-            sc_right=sc_right,
-            left_kv=left_kv,
-        )
         start = b_idx * w
-        if getattr(backbone, "exit_kind", "decoder") == "decoder":
-            dec_in = x_hat
-            if clean.size(1) > 0:
-                dec_in = torch.cat([clean, x_hat], dim=1)
-            kpm = None
-            if start > 0:
-                written = tokens[:, :start]
-                pad = written == pad_id
-                if bool(pad.any().item()):
-                    extra = pad.new_zeros(num_samples, w_cur)
-                    kpm = torch.cat([pad, extra], dim=1)
-            logits = backbone.exit_logits(
-                dec_in, key_padding_mask=kpm, last_n=w_cur,
-            )
-            block_logits = logits
-        else:
-            logits = backbone.exit_logits(x_hat, hidden, last_n=w_cur)
-            block_logits = logits
+        dec_in = x_hat
+        if clean.size(1) > 0:
+            dec_in = torch.cat([clean, x_hat], dim=1)
+        kpm = None
+        if start > 0:
+            written = tokens[:, :start]
+            pad = written == pad_id
+            if bool(pad.any().item()):
+                extra = pad.new_zeros(num_samples, w_cur)
+                kpm = torch.cat([pad, extra], dim=1)
+        block_logits = backbone.exit_logits(
+            dec_in, key_padding_mask=kpm, last_n=w_cur,
+        )
         if temperature <= 0:
             blk_tok = block_logits.argmax(dim=-1)
         else:

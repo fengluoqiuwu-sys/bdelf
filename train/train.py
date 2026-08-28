@@ -27,12 +27,12 @@ from train.run_path import (
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "train"
 MODEL_DIR = CONFIG_DIR / "model"
 
-TrainVariant = Literal["fast", "full"]
+TrainVariant = Literal["fast", "mid", "full"]
 TrainDtype = Literal["bf16", "fp16", "fp32"]
 
 TSub = TypeVar("TSub")
 
-_MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|full|curriculum)$")
+_MODEL_CONFIG_RE = re.compile(r"^([0-9]+m)-(fast|mid|full|curriculum)$")
 _ARCH_SIZE_RE = re.compile(r"^[0-9]+m(?:-curriculum)?$")
 _ARCH_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "models"
 DEFAULT_NUM_WORKERS = 8
@@ -253,8 +253,8 @@ def _parse_train_ref(model: str, config_name: str | None = None) -> tuple[str, s
         )
     if not _MODEL_CONFIG_RE.fullmatch(config_name):
         raise ValueError(
-            f"Invalid config name {config_name!r}, expected {{size}}m-{{fast,full,curriculum}} "
-            "(e.g. 100m-full, 100m-curriculum)"
+            f"Invalid config name {config_name!r}, expected {{size}}m-{{fast,mid,full,curriculum}} "
+            "(e.g. 100m-full, 100m-mid, 100m-curriculum)"
         )
     available = list_train_configs(model)
     if config_name not in available:
@@ -580,8 +580,8 @@ def compose_train_config(
 ) -> FL_TrainConfig:
     """Merge per-model recipe with global schedule/eval + generate.
 
-    ``config_name`` must be ``{size}m-{fast,full}`` (e.g. ``100m-full``,
-    ``300m-full``) and loads ``config/train/model/<model>/{fast|full}.yaml``
+    ``config_name`` must be ``{size}m-{fast,mid,full}`` (e.g. ``100m-full``,
+    ``100m-mid``) and loads ``config/train/model/<model>/{fast|mid|full}.yaml``
     plus architecture ``config/models/<model>/{size}.yaml``. Shared refs:
       - schedule ← ``schedule/<variant>.yaml``
       - eval ← ``eval/{lm|latent}/default.yaml``
@@ -616,7 +616,7 @@ def compose_train_config(
         overrides=ov.get("batch"),
     )
     # 仅 100m-curriculum 配方 / 旧 latent-curriculum preprocess 锁 WSD；
-    # 其它带 extra.curriculum 的 preprocess 仍走 CLI variant（full/fast）日程。
+    # 其它带 extra.curriculum 的 preprocess 仍走 CLI variant（fast/mid/full）日程。
     schedule_name: str | None = None
     if recipe_variant == "curriculum" or preprocess == "latent-curriculum":
         schedule_name = "latent-curriculum"
@@ -650,7 +650,7 @@ def compose_train_config(
             "curriculum_spec": curriculum_fingerprint_piece(cur_spec),
             "curriculum_effective_tokens": cur_spec.effective_target_tokens,
         }
-        # 仅 latent-curriculum 日程带 lr_schedule=wsd；belf-relf 等走 fast/full 余弦。
+        # 仅 latent-curriculum 日程带 lr_schedule=wsd；belf-relf 等走 fast/mid/full 余弦。
         lr_sched = schedule.extra.get("lr_schedule")
         if lr_sched:
             curriculum_extra["lr_schedule"] = lr_sched
@@ -914,7 +914,7 @@ def _arch_sizes(model: str) -> List[str]:
 
 
 def list_train_configs(model: str | None = None) -> List[str]:
-    """Return available ``{size}m-{fast,full}`` profiles for ``model`` (or all)."""
+    """Return available ``{size}m-{fast,mid,full}`` profiles for ``model`` (or all)."""
     models = [model] if model is not None else list_train_models()
     names: List[str] = []
     for m in models:
@@ -929,7 +929,7 @@ def list_train_configs(model: str | None = None) -> List[str]:
         for size in sizes:
             if size.endswith("-curriculum"):
                 continue
-            for variant in ("fast", "full"):
+            for variant in ("fast", "mid", "full"):
                 if not (model_dir / f"{variant}.yaml").is_file():
                     continue
                 name = f"{size}-{variant}"

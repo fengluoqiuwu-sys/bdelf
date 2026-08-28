@@ -10,14 +10,12 @@ import torch.nn.functional as F
 
 from models.lm.belf.config import FL_BelfConfig
 from models.lm.belf.generate import (
-    MODE_DECODE,
     MODE_DENOISE,
     MODE_NONE,
     block_generate as run_block_generate,
 )
 from models.lm.belf_relf_core import (
     AdaLNZeroStack,
-    ExitMap,
     LatentBundle,
     LeftKVCache,
     as_sdpa_mask,
@@ -28,7 +26,6 @@ from models.lm.belf_relf_core import (
     hide_left_keys,
     hide_right_pad_from_unknown,
     interpolate,
-    keep_params_in_graph,
     ladder_levels,
     maybe_drop_left,
     pack_2l,
@@ -80,10 +77,10 @@ class _BelfBackbone(nn.Module):
 
     full_sequence_training = True
     supports_prefix = True
-    # 一次 forward 按槽拆 MSE/CE；不要 ELF decoder_prob 抽支。
+    # 一次 forward 只算 v-MSE；不要 ELF decoder_prob 抽支。
     dual_branch_logging = False
     mixed_branch_training = False
-    eval_ppl_from_ce = True
+    eval_ppl_from_ce = False
 
     def __init__(self, config: FL_BelfConfig, bundle: LatentBundle) -> None:
         super().__init__()
@@ -117,17 +114,14 @@ class _BelfBackbone(nn.Module):
                 f"belf latent_dim={config.latent_dim} != artifact.X={self.latent_dim}"
             )
         self.sc_cfg = bool(config.sc_cfg)
-        self.exit_kind = str(config.exit).strip().lower()
-        if self.exit_kind not in ("decoder", "linear"):
-            raise ValueError(f"exit 须为 decoder|linear，收到 {config.exit!r}")
-        if self.exit_kind == "decoder":
-            bundle.require_vae_dec(reason="exit=decoder")
-        self.ce_detach_g = bool(config.ce_detach_g)
+        # 出口锁死 VAE-dec；旧 exit=linear 不再支持。
+        self.exit_kind = "decoder"
+        bundle.require_vae_dec(reason="belf exit locked to VAE-dec")
         self.cond_mode = str(config.cond_mode)
         self.clean_block_prob = float(config.clean_block_prob)
         self.lambda_mse = float(config.lambda_mse)
-        self.lambda_ce = float(config.lambda_ce)
         self.lambda_s1 = float(config.lambda_s1)
+        self.self_left_prob = float(config.self_left_prob)
         self.denoiser_p_mean = float(config.denoiser_p_mean)
         self.denoiser_p_std = float(config.denoiser_p_std)
         self.t_clean_eps = float(config.t_clean_eps)
@@ -198,15 +192,7 @@ class _BelfBackbone(nn.Module):
         self.sc_proj = (
             nn.Linear(2 * self.n_embd, self.n_embd, bias=True) if self.sc_cfg else None
         )
-        if self.exit_kind == "decoder":
-            self.exit_head = None
-        else:
-            self.exit_head = ExitMap(
-                kind="linear",
-                n_embd=self.n_embd,
-                out_dim=int(self.token_layout.vocab_size),
-                bias=bool(config.lm_head_bias),
-            )
+        self.exit_head = None
 
         levels = ladder_levels(
             self.time_step, self.denoiser_p_mean, self.denoiser_p_std, self.t_clean_eps,
@@ -215,7 +201,7 @@ class _BelfBackbone(nn.Module):
         self._mask_cache: dict[tuple[int, int, int, torch.device, bool], torch.Tensor] = {}
 
         self.last_l2_loss = float("nan")
-        self.last_ce_loss = float("nan")
+        self.last_ce_loss = float("nan")  # 兼容旧日志列；恒为 nan
         self.last_s1_loss = float("nan")
 
     def _whiten(self, z: torch.Tensor) -> torch.Tensor:
@@ -242,18 +228,13 @@ class _BelfBackbone(nn.Module):
         key_padding_mask: torch.Tensor | None = None,
         last_n: int | None = None,
     ) -> torch.Tensor:
-        if self.exit_kind == "decoder":
-            kwargs: dict[str, Any] = {}
-            if key_padding_mask is not None:
-                kwargs["key_padding_mask"] = key_padding_mask
-            if last_n is not None:
-                kwargs["last_n"] = last_n
-            return self.bundle.decode_logits(x_hat, tokens=tokens, **kwargs)
-        if hidden is None:
-            raise ValueError("exit=linear 须传入 G 隐状态")
-        if last_n is not None and int(hidden.size(1)) > int(last_n):
-            hidden = hidden[:, -int(last_n):]
-        return self.exit_head(hidden)
+        del hidden  # 锁死 VAE-dec，不读 G 隐状态
+        kwargs: dict[str, Any] = {}
+        if key_padding_mask is not None:
+            kwargs["key_padding_mask"] = key_padding_mask
+        if last_n is not None:
+            kwargs["last_n"] = last_n
+        return self.bundle.decode_logits(x_hat, tokens=tokens, **kwargs)
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         return self.bundle.on_tokens_seen(n, optimizer)
@@ -438,7 +419,6 @@ class _BelfBackbone(nn.Module):
             t_r = t_r.clone()
             t_r[:, :known_right] = 1.0
             m_r[:, :known_right] = MODE_NONE
-        want_h = self.exit_kind == "linear"
         use_cache = (
             left_kv is not None
             and not drop_left
@@ -453,7 +433,7 @@ class _BelfBackbone(nn.Module):
             return self._g_right_cached(
                 h_right_x, t_r, m_r, w_sc, left_kv,
                 left_len=left_len, sc_right=sc_right,
-                known_right=known_right, want_h=want_h,
+                known_right=known_right, want_h=False,
             )
         left = h_left
         if drop_left:
@@ -473,16 +453,10 @@ class _BelfBackbone(nn.Module):
         packed = self._apply_sc(
             packed, sc_right, left_len, known_right=known_right,
         )
-        out = self.g(
+        x_hat = self.g(
             packed, t_all, w_all, m_all, attn_mask=mask, positions=positions,
-            return_hidden=want_h,
+            return_hidden=False,
         )
-        if want_h:
-            x_hat, hidden = out
-            x_r = x_hat[:, left_len:] if left_len > 0 else x_hat
-            h_r = hidden[:, left_len:] if left_len > 0 else hidden
-            return x_r, h_r
-        x_hat = out
         return x_hat[:, left_len:] if left_len > 0 else x_hat
 
     def _masked_mean(
@@ -533,9 +507,9 @@ class _BelfBackbone(nn.Module):
         pad_id = int(self.token_layout.pad_token_id)
         not_pad = tokens != pad_id
 
+        # 梯子长度 T+1；G 落在 L_0…L_{T-1}
         hops = torch.randint(0, self.time_step, (bsz,), device=device)
         t_hop = levels[hops].to(dtype=dtype)
-        is_decode = hops == (self.time_step - 1)
 
         rem = torch.zeros(bsz, device=device, dtype=torch.long)
         b_cur = torch.zeros(bsz, device=device, dtype=torch.long)
@@ -560,8 +534,7 @@ class _BelfBackbone(nn.Module):
         pos = torch.arange(seq_len, device=device)
         known = (pos[None, :] // w == b_cur[:, None]) & (pos[None, :] % w < rem[:, None])
         unknown = (~known) & not_pad
-        denoise_mask = unknown & (~is_decode[:, None])
-        decode_mask = unknown & is_decode[:, None]
+        denoise_mask = unknown
 
         noise = torch.randn_like(x0) * self.denoiser_noise_scale
         is_pad = ~not_pad
@@ -585,13 +558,9 @@ class _BelfBackbone(nn.Module):
         z_t = interpolate(x0, t_right, noise)
         z_t = torch.where((known | is_pad).unsqueeze(-1), x_known, z_t)
 
-        m_den = torch.full(
+        m_right = torch.full(
             (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
         )
-        m_dec = torch.full(
-            (bsz, seq_len), MODE_DECODE, device=device, dtype=torch.long,
-        )
-        m_right = torch.where(is_decode[:, None], m_dec, m_den)
         m_right = torch.where(
             known | is_pad, torch.zeros_like(m_right), m_right,
         )
@@ -601,6 +570,39 @@ class _BelfBackbone(nn.Module):
             self.ctx_drop_prob if self.training else 0.0,
             return_drop=True,
         )
+        # self-left：CFG 前用末流 no_grad x_hat 按样本替换左段
+        p_left = self.self_left_prob if self.training else 0.0
+        if p_left > 0.0:
+            t_last = levels[self.time_step - 1].to(dtype=dtype)
+            t_commit = torch.where(
+                known | is_pad,
+                x0.new_ones(bsz, seq_len),
+                t_last.expand(bsz, seq_len),
+            )
+            z_commit = interpolate(x0, t_commit, noise)
+            z_commit = torch.where((known | is_pad).unsqueeze(-1), x_known, z_commit)
+            m_commit = torch.full(
+                (bsz, seq_len), MODE_DENOISE, device=device, dtype=torch.long,
+            )
+            m_commit = torch.where(
+                known | is_pad, torch.zeros_like(m_commit), m_commit,
+            )
+            with torch.no_grad():
+                x_hat_commit, _ = self._forward_g_m(
+                    x_ctx.detach(), z_commit, t_commit, m_commit, None,
+                    sc_right=torch.zeros_like(z_commit),
+                    drop_left=None, is_pad=is_pad, unknown=unknown,
+                )
+            use_self = torch.rand(bsz, device=device) < p_left
+            h_left = torch.where(
+                use_self[:, None, None], x_hat_commit.detach(), h_left,
+            )
+            # 已知余数 / PAD 仍钉 encoder 干净码（与右段插值同一份 x_known）
+            pin = (known | is_pad).unsqueeze(-1)
+            h_left = torch.where(
+                use_self[:, None, None] & pin, x_known.detach(), h_left,
+            )
+
         w_sc = None
         guided: torch.Tensor | bool = False
         if self.sc_cfg:
@@ -612,9 +614,7 @@ class _BelfBackbone(nn.Module):
 
         v_z = v_star(x0, z_t, t_right, self.vel_eps)
         sc_zero = torch.zeros_like(z_t)
-        need_teacher = (
-            self.sc_cfg and self.training and bool((~is_decode).any())
-        )
+        need_teacher = self.sc_cfg and self.training
         if need_teacher:
             with torch.no_grad():
                 x_u, _ = self._forward_g_m(
@@ -624,9 +624,6 @@ class _BelfBackbone(nn.Module):
                 v_u = x_to_v(x_u, z_t, t_right, self.vel_eps)
                 sc_cond = x_u.detach()
                 sc_cond = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_cond), sc_cond)
-                sc_cond = torch.where(
-                    is_decode[:, None, None], torch.zeros_like(sc_cond), sc_cond,
-                )
                 x_c, _ = self._forward_g_m(
                     h_left, z_t, t_right, m_right, w_sc, sc_right=sc_cond,
                     drop_left=drop_left, is_pad=is_pad, unknown=unknown,
@@ -635,17 +632,14 @@ class _BelfBackbone(nn.Module):
             g = guided.to(dtype=dtype)[:, None, None]
             sc_stu = x_u.detach() * g
             sc_stu = torch.where(known.unsqueeze(-1), torch.zeros_like(sc_stu), sc_stu)
-            sc_stu = torch.where(
-                is_decode[:, None, None], torch.zeros_like(sc_stu), sc_stu,
-            )
-            x_hat, hidden = self._forward_g_m(
+            x_hat, _ = self._forward_g_m(
                 h_left, z_t, t_right, m_right, w_sc, sc_right=sc_stu,
                 drop_left=drop_left, is_pad=is_pad, unknown=unknown,
             )
             v_tgt = blend_v_tgt(v_z, v_u, v_c, w_sc, guided)
             v_tgt = torch.where(denoise_mask.unsqueeze(-1), v_tgt, v_z)
         else:
-            x_hat, hidden = self._forward_g_m(
+            x_hat, _ = self._forward_g_m(
                 h_left, z_t, t_right, m_right, w_sc, sc_right=sc_zero,
                 drop_left=drop_left, is_pad=is_pad, unknown=unknown,
             )
@@ -656,32 +650,7 @@ class _BelfBackbone(nn.Module):
         zero = x0.new_zeros(())
         mse = self._masked_mean(l2_tok, denoise_mask)
         self.last_l2_loss = mse.detach()
-
-        # 出口按样本因果，只跑 decode hop 行；与整批再 mask 的 CE 相同。
-        dec_rows = is_decode.nonzero(as_tuple=True)[0]
-        if dec_rows.numel() == 0:
-            keep_mod = self.exit_head if self.exit_head is not None else self.g
-            ce = zero + keep_params_in_graph(keep_mod, zero)
-            self.last_ce_loss = zero.new_full((), float("nan"))
-        else:
-            x_ce = x_hat.index_select(0, dec_rows)
-            h_ce = hidden.index_select(0, dec_rows) if hidden is not None else None
-            if self.ce_detach_g:
-                x_ce = x_ce.detach()
-                if h_ce is not None:
-                    h_ce = h_ce.detach()
-            logits = self.exit_logits(
-                x_ce, h_ce, tokens=tokens.index_select(0, dec_rows),
-            )
-            ce_tok = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                tokens.index_select(0, dec_rows).reshape(-1),
-                ignore_index=self.token_layout.ignore_index,
-                reduction="none",
-            ).view(dec_rows.size(0), seq_len)
-            ce = self._masked_mean(ce_tok, decode_mask.index_select(0, dec_rows))
-            self.last_ce_loss = ce.detach()
-            del logits
+        self.last_ce_loss = zero.new_full((), float("nan"))
 
         s1 = self.bundle.s1_loss(tokens, z=z, mu=mu, logvar=logvar)
         if self.bundle.is_trainable:
@@ -690,8 +659,8 @@ class _BelfBackbone(nn.Module):
             self.last_s1_loss = float("nan")
             s1 = zero.to(dtype=x0.dtype)
 
-        # 规格总目标为 L+L_s1，无外层 λ_s1；lambda_s1 仅留配置以免换哈希。
-        loss = self.lambda_mse * mse + self.lambda_ce * ce + s1
+        # 主体只有 v-MSE；lambda_s1 仅留配置。
+        loss = self.lambda_mse * mse + s1
         empty = tokens.new_zeros(
             bsz, 0, int(self.token_layout.vocab_size),
         )
@@ -754,16 +723,12 @@ class _BelfBackbone(nn.Module):
             packed,
             sc_right,
             left_len,
-            known_mask=(m_right == MODE_NONE) | (m_right == MODE_DECODE),
+            known_mask=(m_right == MODE_NONE),
         )
-        want_h = self.exit_kind == "linear"
         out = self.g(
             packed, t_all, w_sc, m_all, attn_mask=mask, positions=positions,
-            return_hidden=want_h, flex_block_mask=flex_mask,
+            return_hidden=False, flex_block_mask=flex_mask,
         )
-        if want_h:
-            x_hat, hidden = out
-            return x_hat[:, left_len:], hidden[:, left_len:]
         return out[:, left_len:], None
 
     @torch.compiler.disable
@@ -816,7 +781,7 @@ class _BelfBackbone(nn.Module):
 
 class FL_BelfModel(FL_PreTrainedModel):
     config_class = FL_BelfConfig
-    eval_ppl_from_ce = True
+    eval_ppl_from_ce = False
 
     def __init__(self, config: FL_BelfConfig, bundle: LatentBundle) -> None:
         super().__init__(config)

@@ -41,7 +41,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Resolve train launch args to "
-            "cache/checkpoints/{fast|full}/{lm|latent}/{model}/{config-hash}/ "
+            "cache/checkpoints/{fast|mid|full}/{lm|latent}/{model}/{config-hash}/ "
             "(legacy {variant}/{model}/{hash} still readable; same CLI as train.py)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

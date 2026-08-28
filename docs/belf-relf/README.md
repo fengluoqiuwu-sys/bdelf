@@ -6,7 +6,7 @@
 | 文档 | 内容 |
 |---|---|
 | 本文 | 工程：现状、复用点、包结构、加载、指纹、训练日程 |
-| [`math.md`](math.md) | 流几何、梯子、块/窗条件分解、损失拆分、CFG、半群 |
+| [`math.md`](math.md) | 流几何、梯子、块/窗条件分解、v-MSE、self-left、CFG、半群 |
 | [`latex/belf-relf.tex`](latex/belf-relf.tex) | 完整规格（参数表、Clean、掩码图、消融） |
 
 图在 [`assets/`](assets/)（`plot_masks.py` 可重绘）。编译 PDF：
@@ -23,7 +23,7 @@ latexmk -xelatex -interaction=nonstopmode -halt-on-error belf-relf.tex
 | 规格 | 冻结于本夹 LaTeX；`temp/ideas/belf-relf/proposal/` 不再同步 |
 | 主树模型包 | `models/lm/belf/`、`models/lm/relf/`、共享 `models/lm/belf_relf_core/` |
 | 配置 | `config/models/lm/{belf,relf}/`、`config/train/model/lm/{belf,relf}/` |
-| 启动脚本 | Stage1 `scripts/train/{belf,relf}-100m-full-s1.sh`；Stage2 `…-s2.sh`；fast 冒烟 `…-100m-fast.sh` |
+| 启动脚本 | Stage1 `…-full-s1.sh`；Stage2 `…-s2.sh`；fast 冒烟 `…-100m-fast.sh`；中档验证 `…-mid-s1.sh`（仅 s1，10B@128） |
 | 入口 VAE | `load_latent_artifact(latent_model, tag)` |
 | 近邻实现 | ELF（`models/lm/elf/`）、Cola Stage-2（`models/lm/cola/`）、`latent_vae` |
 
@@ -71,7 +71,7 @@ models/lm/
 │   ├── pack.py              # 2L [sg(h_left)|h_t]；组内双向、组间单向
 │   ├── cfg.py               # w_sc ScaleEmbedder；ctx drop；v_tgt
 │   ├── latent.py            # load_latent_artifact 包装、s1、入口块长校验
-│   └── exit.py              # 一层线性：linear→logits / decoder→X
+│   └── exit.py              # 出口叠法辅助（规格锁死 VAE-dec，无 linear）
 ├── belf/
 │   ├── config.py            # FL_BelfConfig；KIND 由目录 kind=lm 决定
 │   ├── model.py             # forward
@@ -92,14 +92,10 @@ tokens
   → G 茎 Linear(X→D=n_embd) → pack_2l [sg(h_left)|h_t] + 逐列 (t, [w_sc], [m])
   → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → AdaLN-Zero → SwiGLU）
   → FinalLayer D→X → x̂₀
-  → Exit
-     linear（ELF）：隐状态 Linear(D→V) → logits
-     decoder（Cola）：x̂₀ 已在 X，直接加载的 VAE-dec → logits
+  → Exit（锁死）：x̂₀ 已在 X，加载的 VAE-dec → logits（仅推理读出；训练主体不算 CE）
 ```
 
-出口没有层数键。BELF 训练只喂右段 \(\hat x_0\)；推理拼接已提交干净码。RELF decoder 前缀是 \(G\) 左段 \(\hat x_0\)。叠法见 LaTeX「出口叠法」。
-
-`exit=decoder` 时 VAE-dec 读 token；\(\mathcal{L}_{\mathrm{s1}}\) 仍只用它做重建。
+出口无 `exit` 键、无 `linear` 对照。推理 BELF 拼接已提交干净码再读当前块；RELF 读出前缀是 \(G\) 左段 \(\hat x_0\)。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
 
 ## 配置与指纹
 
@@ -108,7 +104,7 @@ tokens
 | 角色 | 路径 |
 |---|---|
 | 架构 | `config/models/lm/belf/{prototype,100m}.yaml`；`config/models/lm/relf/...` |
-| 训练 optimizer/batch | `config/train/model/lm/belf/{fast,full}.yaml`（relf 同） |
+| 训练 optimizer/batch | `config/train/model/lm/belf/{fast,mid,full}.yaml`（relf 同） |
 | 在线评测 generate | `config/generate/lm/belf/{generate,eval}.yaml`；`config/generate/lm/relf/...` 同构 |
 | 启动 | Stage1 `scripts/train/belf-100m-full-s1.sh`（短名 `belf-100m-full.sh`）；Stage2 `…-s2.sh`。RELF 同。远端经 `sbatch-train` / `launch-train` |
 
@@ -116,7 +112,7 @@ tokens
 
 | 类 | 例子 | 指纹 |
 |---|---|---|
-| 模型 | `latent_model`、`tag`、`n_embd`、`exit`、`sc_cfg`；BELF 另有 `block_size`；RELF 有 `window_size`/`time_step`/`step_size` | 模型指纹 |
+| 模型 | `latent_model`、`tag`、`n_embd`、`sc_cfg`、`self_left_prob`；BELF 另有 `block_size`；RELF 有 `window_size`/`time_step`/`step_size` | 模型指纹 |
 | 训练 | `latent_tune`、日程、损失系数 | 训练指纹 |
 | 推理 | `commit_x0hat`、`sampling_method`、`sde_gamma`、`w_sc`/`w_ctx` | 现网 `build_train_fingerprint` 纳入 `generate_cfg` 与 model YAML 的 `sampling`（改推理默认会换哈希；不改全局管线） |
 
@@ -132,14 +128,14 @@ tokens
 - BELF：加载入口 `encoder.block_size` \(\in\{1,W\}\)；**训练** `forward` 要求序列长度被 \(W\) 整除
 - RELF：无 `block_size`；加载入口块长 \(=1\)；\(S\cdot T=W\)，\(T\ge 4\)
 - 可训档（`full` / `mid`）要求入口 `encoder.block_size==1`；块因果入口只允许 `frozen`
-- `exit=decoder` 或可训档（`full` / `mid`）须具备 VAE-dec
+- 出口锁死 VAE-dec，启动必须具备 decoder；可训档（`latent_tune` 的 `full` / `mid`）同样须具备 VAE-dec
 - 100m 默认 `tag: 100m-b32-d1`：若 artifact 块长为 32，BELF \(W=16\) / RELF 入口必须 1 **硬拒**，不放宽校验
 
 ### 100m 默认（规格）
 
-共用：`n_embd=768`，`max_seq_len=4096`，`exit=decoder`，`latent_tune=mid`（解冻点 15B），主训 45B + 扩展 5B。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`，`ema_decay=0.9999`。  
-BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)）。  
-RELF：`window_size=32`，`time_step=16`，`step_size=2`。
+共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`self_left_prob=0.25`，`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
+BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)）。  
+RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后读出）。
 
 推理 CFG 键为 `w_sc` / `w_ctx`（默认 3.0 / 1.0）。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
 
@@ -150,10 +146,10 @@ RELF：`window_size=32`，`time_step=16`，`step_size=2`。
 主训（Stage1，45B@512）与扩展（Stage2，5B 混桶）是**两份独立训练**：不同 preprocess → 不同配置哈希 → 不同保存目录。`world_size` / GPU 型号不进哈希，Stage2 可换更大显存的卡。布局仍是：
 
 ```
-cache/checkpoints/{fast|full}/lm/{belf|relf}/{config-hash}/
+cache/checkpoints/{fast|mid|full}/lm/{belf|relf}/{config-hash}/
 ```
 
-Stage2 启动时解析同参 Stage1 哈希目录：须已有 `complete.json`（训练正常结束才写）与 `checkpoint_latest.pt`，否则直接报错退出。新 Stage2 run 从该 latest 的 **EMA** 初始化 live 权重（不恢复优化器 / step / RNG）；本 run 的 `hardware.json` 独立。`mid` 若 Stage1 已过 `latent_thaw_tokens`，扩展启动时立即解冻。
+Stage2 启动时解析同参 Stage1 哈希目录：须已有 `complete.json`（训练正常结束才写）与 `checkpoint_latest.pt`，否则直接报错退出。新 Stage2 run 从该 latest 的 **EMA** 初始化 live 权重（不恢复优化器 / step / RNG）；本 run 的 `hardware.json` 独立。`latent_tune=mid` 若 Stage1 已过 `latent_thaw_tokens`，扩展启动时立即解冻。日程档 `mid` 无 Stage2。
 
 无论是否训练 latent，该目录的 checkpoint **必须写入完整 latent 参数**（含随 artifact 加载的 VAE-dec）。同一 Stage 的续训只认本 run。新 run 自 step 0 调用 `load_latent_artifact`，再被 Stage1 EMA 覆盖，之后只用本 run 副本。
 
@@ -184,21 +180,22 @@ cache/checkpoints/artifacts/latent/{latent_model}/{tag}/
   --generate eval
 ```
 
-full 主训 / 扩展分开（可换卡）：
+full 主训 / 扩展分开（可换卡）；`mid` 仅 Stage1（10B、全局批 128、`eval_step=1000`）：
 
 ```bash
 bash scripts/train/belf-100m-full-s1.sh    # 45B@512
 bash scripts/train/belf-100m-full-s2.sh    # 5B 混桶；须同参 s1 已完成
+bash scripts/train/belf-100m-mid-s1.sh     # 10B@128，eval 每 1000 优化器步，仅 s1
 ```
 
-RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段；改模型类字段会换哈希。本机只跑 fast 冒烟；full 经 `sbatch-train` / `launch-train`（须用户授权占 GPU）。
+RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段；改模型类字段会换哈希。本机只跑 fast 冒烟；`mid` / full 经 `sbatch-train` / `launch-train`（须用户授权占 GPU）。日程档 `mid` 与 `latent_tune=mid` 不是同一键。
 
 | 族 | `forward(tokens)` | 生成 |
 |---|---|---|
 | BELF | `train_t_schedule=block`：抽一跳 \(i\)，未知槽广播 \(t=L_i\)；序列长度须被 \(W\) 整除 | `block_generate` |
 | RELF | `train_t_schedule=mixed`：按 BOS/EOS 截整窗 \(F\) | `rolling_generate` |
 
-评测：BELF 走块采样，RELF 走 rolling；主指标沿用仓库 TriFluency / Gen.PPL。长度切分见 LaTeX 附录（主训对齐 512，扩展对齐 2048）。
+评测：BELF 走块采样，RELF 走 rolling；主指标沿用仓库 TriFluency / Gen.PPL，不再用出口 CE 充当 eval PPL。长度切分见 LaTeX 附录（full/mid 的 Stage1 对齐 512；full 扩展对齐 2048）。
 
 推理默认同规格：`commit_x0hat=true`，`sampling_method=sde`。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
@@ -210,12 +207,12 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 | `full` | step 0 起 | 重建 + \(\mathrm{KL}(q\|N(0,I))\) + BERT-mask + ref-KL |
 | `mid` | 未到解冻点同 frozen；之后同 full | 解冻前不算；解冻后算。新参数新优化器状态 |
 
-\(\mathcal{L}_{\mathrm{s1}}\) 与流/出口损失 \(\mathcal{L}\) 分开相加。`exit=decoder` 时 CE 也经 VAE-dec；其参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
+\(\mathcal{L}_{\mathrm{s1}}\) 与流损失 \(\mathcal{L}=\lambda_{\mathrm{mse}}\mathcal{L}_{\mathrm{mse}}\) 分开相加。主体不含出口 CE。VAE-dec 参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
 
 ## 明确不做（工程）
 
 - 不把离散 BD3LM 换皮成连续嵌入
 - 不把 Cola 压缩项 \(I_q(X;Z_0)\) 当主声明
-- 不做 ELF `decoder_prob`；CE 只在出口读出位
+- 不做 ELF `decoder_prob`；主体损失无出口 CE，读出仅推理 VAE-dec
 - 不设 RELF `p_preroll` / `p_freeroll` / `p_postroll`；截断由 BOS/EOS 位置给出
 - 不登记 CPU-only 为 GPU 作业；未实现前禁止占卡「冒烟当可行性」
