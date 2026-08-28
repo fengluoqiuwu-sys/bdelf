@@ -52,7 +52,7 @@ def block_generate(
     """逐块：``T`` 次流 Euler（末流关 churn）后 VAE-dec 读词。
 
     梯子长 ``T+1``；末次从 ``L_{T-1}`` Euler 到 ``L_T=1-ε``，不再多跑 decode hop。
-    默认 ``commit_x0hat=true``。末块可短；EOS 后该样本停。
+    默认 ``commit_x0hat=false``（再 encode），``w_sc=2``。末块可短；EOS 后该样本停。
     """
     _ = bos_token_id
     cfg = dict(getattr(getattr(backbone, "config", None), "sampling", None) or {})
@@ -75,8 +75,8 @@ def block_generate(
     top_k = cfg.get("top_k", top_k)
     if top_k is not None:
         top_k = int(top_k)
-    commit_x0hat = bool(cfg.get("commit_x0hat", True))
-    w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 3.0)))
+    commit_x0hat = bool(cfg.get("commit_x0hat", False))
+    w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 2.0)))
     w_ctx = float(cfg.get("w_ctx", cfg.get("ctx_cfg_scale", 1.0)))
     x0_src = str(getattr(backbone, "x0_source", "z")).strip().lower()
     ctx_src = str(getattr(backbone, "ctx_source", "z")).strip().lower()

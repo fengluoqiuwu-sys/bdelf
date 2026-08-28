@@ -869,8 +869,8 @@ class _RelfBackbone(nn.Module):
         top_k = cfg.get("top_k", top_k)
         if top_k is not None:
             top_k = int(top_k)
-        commit_x0 = bool(cfg.get("commit_x0hat", True))
-        w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 3.0)))
+        commit_x0 = bool(cfg.get("commit_x0hat", False))
+        w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 2.0)))
         w_ctx = float(cfg.get("w_ctx", cfg.get("ctx_cfg_scale", 1.0)))
         bos_id = int(
             self.token_layout.bos_token_id if bos_token_id is None else bos_token_id

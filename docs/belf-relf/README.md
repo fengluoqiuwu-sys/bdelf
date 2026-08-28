@@ -134,10 +134,10 @@ tokens
 ### 100m 默认（规格）
 
 共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`self_left_prob=0.25`，`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
-BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)）。  
+BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(0,0.8^2)\)）。  
 RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后读出）。
 
-推理 CFG 键为 `w_sc` / `w_ctx`（默认 3.0 / 1.0）。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
+推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
 
 完整键与消融对照见 LaTeX 参数表；工程实现不得另发明默认。
 
@@ -197,7 +197,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 
 评测：BELF 走块采样，RELF 走 rolling；主指标沿用仓库 TriFluency / Gen.PPL，不再用出口 CE 充当 eval PPL。长度切分见 LaTeX 附录（full/mid 的 Stage1 对齐 512；full 扩展对齐 2048）。
 
-推理默认同规格：`commit_x0hat=true`，`sampling_method=sde`。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
+推理默认同规格：`commit_x0hat=false`（再 encode 采 \(z\)），`sampling_method=sde`，`w_sc=2.0`。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
 ## `latent_tune` 与 \(\mathcal{L}_{\mathrm{s1}}\)
 

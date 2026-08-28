@@ -72,7 +72,7 @@ class FL_RelfConfig(PretrainedConfig):
         latent_thaw_tokens: int = 15_000_000_000,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
-        denoiser_p_mean: float = -1.5,
+        denoiser_p_mean: float = 0.0,
         denoiser_p_std: float = 0.8,
         t_clean_eps: float = 0.05,
         vel_eps: float = 1e-3,
@@ -177,10 +177,10 @@ class FL_RelfConfig(PretrainedConfig):
         self.sampling = sampling or {
             "sampling_method": "sde",
             "sde_gamma": 1.5,
-            "w_sc": 3.0,
+            "w_sc": 2.0,
             "w_ctx": 1.0,
             "temperature": 0.0,
-            "commit_x0hat": True,
+            "commit_x0hat": False,
         }
 
     def token_layout(self) -> FL_TokenLayout:

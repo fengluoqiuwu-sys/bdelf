@@ -72,7 +72,7 @@ Rolling Diffusion~\cite{rolling2024} 将全局 \(t\) 映射为帧局部 \(t_k\)�
 \subsection{设计要点}
 
 \begin{enumerate}
-  \item BELF：将同一流用于块因果 2L/KV；未知槽共享同一 \(t\)，块间提交 \(\hat x_0\)；已知余数钉干净条件；\(T\) 次流均算 v-MSE；末次 Euler 后 VAE-dec 读 token（不多一次 \(G\)）。
+  \item BELF：将同一流用于块因果 2L/KV；未知槽共享同一 \(t\)，块间默认再 encode 提交（对照 \texttt{commit\_x0hat}）；已知余数钉干净条件；\(T\) 次流均算 v-MSE；末次 Euler 后 VAE-dec 读 token（不多一次 \(G\)）。
   \item RELF：将 ELF 流几何用于滚动窗；局部时间梯子铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后 pop。整窗 \(F\)，BOS 前 / EOS 后截断。已知余数钉干净条件。每步 pop \(S\) 个槽。训练未知真槽一律 v-MSE。
   \item 训练日程（非第三条机制贡献）：日程档 \texttt{full} 下每一族 \(\times\) 每一 \texttt{latent\_tune} 完成主训后再做扩展；日程档 \texttt{mid} 仅 Stage1（\(10\mathrm{B}@128\)，\texttt{eval\_step}=1000，\texttt{ema\_decay}=0.999）。切分见附录~\ref{sec:len}。预算与 \texttt{max\_seq\_len} 见表。日程档与 \texttt{latent\_tune=mid} 不是同一键。
 \end{enumerate}
@@ -174,7 +174,7 @@ Exit (locked):  x0_hat in X -> VAE-dec  (inference readout only)
 
 \paragraph{self-left。}
 \label{sec:self-left}
-推理左段默认是提交的 \(\hat x_0\)；训练默认仍是 encoder 干净码。以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）按样本把左段换成 stop-grad 的末流 \(\hat x_0\)：在 CFG 之前，用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），Bernoulli 替换 \(h_{\mathrm{left}}\)，再跑 teacher / 学生。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)。BELF 与 RELF 共用。
+推理左段默认是再 encode 采 \(z\) 写入的码（对照 \texttt{commit\_x0hat} 才提交 \(\hat x_0\)）；训练默认仍是 encoder 干净码。以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）按样本把左段换成 stop-grad 的末流 \(\hat x_0\)：在 CFG 之前，用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），Bernoulli 替换 \(h_{\mathrm{left}}\)，再跑 teacher / 学生。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)。BELF 与 RELF 共用。
 
 \subsection{日程与 checkpoint}
 
@@ -268,7 +268,7 @@ Q(p)=\begin{cases}
 \[
 L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,1,\ldots,T.
 \]
-因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，\(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理用末次流的 \(\hat x_0\) 走 VAE-dec，不再于 \(t=1-\varepsilon\) 多跑一次 \(G\)。默认 \(T=16\) 不变；变的是分位分母。训练与推理共用该确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。
+因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，\(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理用末次流的 \(\hat x_0\) 走 VAE-dec，不再于 \(t=1-\varepsilon\) 多跑一次 \(G\)。默认 \(T=16\)、\(P_m=0\)、\(P_s=0.8\)。训练与推理共用该确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。
 
 {\small
 \begin{center}
@@ -277,7 +277,7 @@ L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,1,\ldots,T.
 名称 & 符号 & 释义 & 默认 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型（共用）}} \\
-\texttt{denoiser\_p\_mean} & \(P_m\) & \(\mathrm{logit}(t)\sim\mathcal{N}(P_m,P_s^{2})\) 的均值。 & \(-1.5\) \\
+\texttt{denoiser\_p\_mean} & \(P_m\) & \(\mathrm{logit}(t)\sim\mathcal{N}(P_m,P_s^{2})\) 的均值。 & \(0\) \\
 \texttt{denoiser\_p\_std} & \(P_s\) & 同上，标准差。 & \(0.8\) \\
 \texttt{t\_clean\_eps} & \(\varepsilon\) & \(Q(1)=L_T=1-\varepsilon\)；末次 Euler 终点。窗 / 训练 hop 不到此点。 & \(0.05\) \\
 \bottomrule
@@ -401,13 +401,13 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \texttt{sc\_cfg} & & 是否启用整套 \(w_{\mathrm{sc}}\)（含 sc 通道）。为假则无通道、不构建 ScaleEmbedder、不以 CFG 修正 \(v_{\mathrm{tgt}}\)。进入模型指纹。 & \texttt{true} \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练}} \\
-\texttt{self\_cond\_cfg\_p\_mean} & \(P_m^{\mathrm{sc}}\) & 训练 \(w_{\mathrm{sc}}\) 的 logit-normal 位置。对齐 ELF 时间场的 \(P_m\)。 & \(-1.5\) \\
+\texttt{self\_cond\_cfg\_p\_mean} & \(P_m^{\mathrm{sc}}\) & 训练 \(w_{\mathrm{sc}}\) 的 logit-normal 位置。对齐 ELF 原时间场，不随梯子 \(P_m\) 改。 & \(-1.5\) \\
 \texttt{self\_cond\_cfg\_p\_std} & \(P_s^{\mathrm{sc}}\) & 尺度。 & \(0.8\) \\
 \texttt{sc\_guided\_prob} & \(p_g^{\mathrm{sc}}\) & 仅 \texttt{sc\_cfg}：本 step 按 CFG 修正速度目标并写入 sc 通道的概率。 & \(0.5\) \\
 \texttt{ctx\_p\_drop} & \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) & 丢弃 2L 左段的概率。与 \(g\) 独立。不进消融。 & \(0.1\) \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
-\texttt{w\_sc} & \(w_{\mathrm{sc}}\) & 推理尺度。\texttt{sc\_cfg=false} 的 ckpt 忽略。YAML / \texttt{sampling} 键名即此；实现仍接受 ELF 别名 \texttt{self\_cond\_cfg\_scale}，但已写 \texttt{w\_sc} 时别名不生效。 & \(3.0\) \\
+\texttt{w\_sc} & \(w_{\mathrm{sc}}\) & 推理尺度。\texttt{sc\_cfg=false} 的 ckpt 忽略。YAML / \texttt{sampling} 键名即此；实现仍接受 ELF 别名 \texttt{self\_cond\_cfg\_scale}，但已写 \texttt{w\_sc} 时别名不生效。 & \(2.0\) \\
 \texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & 推理上下文外推；\(1\)=不外推。YAML 键名即此；别名 \texttt{ctx\_cfg\_scale} 同上。 & \(1.0\) \\
 \bottomrule
 \end{tabularx}
@@ -436,7 +436,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \texttt{sc\_cfg} & & \texttt{true} & \texttt{false}（训练启动时关闭整套 \(w_{\mathrm{sc}}\)，无 sc 通道） \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
-\texttt{w\_sc} & \(w_{\mathrm{sc}}\) & \(3\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\
+\texttt{w\_sc} & \(w_{\mathrm{sc}}\) & \(2\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\
 \texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & \(1\) & \(\{1,2,3,5,7\}\) \\
 \bottomrule
 \end{tabularx}
@@ -459,15 +459,15 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \paragraph{自生成。}
 \texttt{block\_generate} 给定前缀 token（长 \(L\)）：
 \begin{enumerate}
-  \item \textbf{已齐的完整块}写入 KV。同一次生成循环里刚写完的块默认 \texttt{commit\_x0hat=true}：把 \(G\) 的 \(\hat x_0\) 提交，不再 encode。若这次调用的前缀是外部文本（提示，或上一轮已经写出再当作新前缀），完整块走 encoder 再按第~\ref{sec:infer}~节提交。这是左段干净条件，不是当前块内的余数。
+  \item \textbf{已齐的完整块}写入 KV。同一次生成循环里刚写完的块默认 \texttt{commit\_x0hat=false}：先 VAE-dec 读出再 encode \textbf{采 \(z\)} 写入。对照 \texttt{true} 才把 \(G\) 的 \(\hat x_0\) 提交、不再 encode。若这次调用的前缀是外部文本（提示，或上一轮已经写出再当作新前缀），完整块走 encoder 再按第~\ref{sec:infer}~节提交。这是左段干净条件，不是当前块内的余数。
   \item \textbf{当前块已知余数}只在 \(r>0\) 时出现：槽 \([0,r)\) 钉 \(t=1\)，码是前缀对应位置的 encoder 干净码，不进入损失。这 \(r\) 个 token 可以是提示，也可以是上一轮已写出、这次当新前缀的自生成 token。\(r=0\) 则整块未知。
   \item 未知槽从噪声走 \(T\) 次流。每跳之后把已知槽覆写回 encoder 干净码并钉 \(t=1\)，避免 Euler / SDE 冲掉已知位。末次 Euler 后用该跳 \(\hat x_0\) 读出。
-  \item 出口读整块 token，丢掉已知槽对应位置，只保留新写的。再把本块 \(\hat x_0\) 提交进 KV。此后下一块整块未知：自生成的完整块只出现在左段 KV，不再以块内余数出现。
+  \item 出口读整块 token，丢掉已知槽对应位置，只保留新写的。再把本块按第~\ref{sec:infer}~节提交进 KV。此后下一块整块未知：自生成的完整块只出现在左段 KV，不再以块内余数出现。
   \item 一块一次读出。不会在同一块内把刚 decode 的 token 立刻改成已知余数再继续流。EOS 停。
 \end{enumerate}
 
 \paragraph{训练。}
-以概率 \texttt{clean\_block\_prob} 把当前块抽成混合块：有效长 \(W'\)（末块可短），切点 \(r\sim\mathrm{Unif}\{1,\ldots,W'-1\}\)。槽 \([0,r)\) 为已知（\(t=1\)、不进损失），\([r,W')\) 为未知（走该跳 \(t=L_i\)）。其余前向整块均为未知。\(W=1\) 或 \(W'\le 1\) 时不抽混合块。已知槽始终是 encoder 码，不用 \(\hat x_0\) 冒充余数。右段 unknown Q 不可见同块 PAD K。可训档硬拒入口块长 \(\neq 1\)，不必二次 encode。仅冻结档且入口块长 \(=W\) 时，余数再 encode 一份条件句（当前块 \([r,W)\) 写成 PAD），已知覆写与 PAD 干净码用这份；插值靶仍来自整句 encode。左段 KV 训练时默认是 encoder 干净码（教师强制），以概率 \texttt{self\_left\_prob} 换成末流 \(\mathrm{sg}(\hat x_0)\)（见第~\ref{sec:self-left}~节）；推理左段默认是自生成的 \(\hat x_0\)。
+以概率 \texttt{clean\_block\_prob} 把当前块抽成混合块：有效长 \(W'\)（末块可短），切点 \(r\sim\mathrm{Unif}\{1,\ldots,W'-1\}\)。槽 \([0,r)\) 为已知（\(t=1\)、不进损失），\([r,W')\) 为未知（走该跳 \(t=L_i\)）。其余前向整块均为未知。\(W=1\) 或 \(W'\le 1\) 时不抽混合块。已知槽始终是 encoder 码，不用 \(\hat x_0\) 冒充余数。右段 unknown Q 不可见同块 PAD K。可训档硬拒入口块长 \(\neq 1\)，不必二次 encode。仅冻结档且入口块长 \(=W\) 时，余数再 encode 一份条件句（当前块 \([r,W)\) 写成 PAD），已知覆写与 PAD 干净码用这份；插值靶仍来自整句 encode。左段 KV 训练时默认是 encoder 干净码（教师强制），以概率 \texttt{self\_left\_prob} 换成末流 \(\mathrm{sg}(\hat x_0)\)（见第~\ref{sec:self-left}~节）；推理左段默认是再 encode 采 \(z\)。
 
 \paragraph{排除项。}
 不随机挪块界。任意位置填空（左右都有干净上下文）须改 2L 可见性，不在本文档范围。
@@ -754,7 +754,7 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 
 本节给出两族共用的推理项。这些字段可在同一 checkpoint 上更改，不进入训练指纹。BELF 生成使用 \texttt{block\_generate}，RELF 生成使用 \texttt{rolling\_generate}。CFG 的推理尺度见第~\ref{sec:cfg}~节。
 
-默认 \texttt{commit\_x0hat=true}：将 \(G\) 的 \(\hat x_0\)（流空间 \(X\)）写入 \(G\) 的 KV。对照 \texttt{false}：先由 VAE-dec 读出 token，再 encode \textbf{采 \(z\)}（\texttt{sample=(x0\_source==z)}）写入，空间与 \texttt{x0\_source} 一致。外部前缀完整块仍走 encoder、\texttt{sample=false}。两条策略分开报告。训练时左段默认是 encoder 的干净码，以概率 \texttt{self\_left\_prob} 换成末流 \(\mathrm{sg}(\hat x_0)\)。VAE-dec 无状态，不维护 KV。提交时左段 \(t=1\)，AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件，sc 通道为 0。
+默认 \texttt{commit\_x0hat=false}：先由 VAE-dec 读出 token，再 encode \textbf{采 \(z\)}（\texttt{sample=(x0\_source==z)}）写入，空间与 \texttt{x0\_source} 一致。对照 \texttt{true}：将 \(G\) 的 \(\hat x_0\)（流空间 \(X\)）写入 \(G\) 的 KV。外部前缀完整块仍走 encoder、\texttt{sample=false}。两条策略分开报告。训练时左段默认是 encoder 的干净码，以概率 \texttt{self\_left\_prob} 换成末流 \(\mathrm{sg}(\hat x_0)\)。VAE-dec 无状态，不维护 KV。提交时左段 \(t=1\)，AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件，sc 通道为 0。
 
 采样默认 \texttt{sampling\_method=sde}（\(\gamma\) 见表），对照 \texttt{ode}。\texttt{sde} 时 churn 关在最后一次\textbf{流}（BELF 跳 \(T-1\)；RELF 升档侧，含最左末流）。\texttt{sc\_cfg} 为真时，未知槽 AdaLN 以推理 \(w_{\mathrm{sc}}\) 为条件（仅开训 checkpoint 可扫描）。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
@@ -767,7 +767,7 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 名称 & 符号 & 释义 & 默认 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
-\texttt{commit\_x0hat} & & 提交 \(\hat x_0\)；关则再 encode 采 \(z\)。 & \texttt{true} \\
+\texttt{commit\_x0hat} & & 关则再 encode 采 \(z\)；开则提交 \(\hat x_0\)。 & \texttt{false} \\
 \texttt{sampling\_method} & & \texttt{sde} 或 \texttt{ode}。 & \texttt{sde} \\
 \texttt{sde\_gamma} & \(\gamma\) & 仅 \texttt{sde} 的噪声系数。 & \(1.5\) \\
 \texttt{temperature} & & 出口温度；\(\le 0\) 为 argmax。 & \(0.0\) \\
@@ -793,7 +793,7 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 名称 & 符号 & 默认 & 对照 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
-\texttt{commit\_x0hat} & & \texttt{true} & 再 encode 采 \(z\) \\
+\texttt{commit\_x0hat} & & \texttt{false} & 提交 \(\hat x_0\) \\
 \texttt{sampling\_method} & & \texttt{sde} & \texttt{ode} \\
 \texttt{sde\_gamma} & \(\gamma\) & \(1.5\) & \(\{1.0,1.5,2.0\}\)；仅 \texttt{sde} \\
 \bottomrule
@@ -833,7 +833,7 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 \subsection{已确定：左条件暴露偏差（self-left）}
 
 \textbf{问题。}
-链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是提交的 \(\hat x_0\)；训练若始终喂 encoder 干净码（教师强制），则右段去噪习惯「完美前缀」，一到推理左边带自生成误差就崩。这是左条件上的暴露偏差。用当前训练 hop（随机 \(t\)）的 \(\hat x_0\) 冒充左段也不行：离提交码太远。块内已知余数与 PAD 另有钉干净规则，不应拿 \(\hat x_0\) 冒充。
+链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是再 encode 采 \(z\)（对照 \texttt{commit\_x0hat}）；训练若始终喂 encoder 干净码（教师强制），则右段去噪习惯「完美前缀」，一到推理左边带自生成误差就崩。这是左条件上的暴露偏差。用当前训练 hop（随机 \(t\)）的 \(\hat x_0\) 冒充左段也不行：离提交码太远。块内已知余数与 PAD 另有钉干净规则，不应拿 \(\hat x_0\) 冒充。
 
 \textbf{解决方案。}
 以概率 \texttt{self\_left\_prob}（默认 \(0.25\)，eval / 生成视为 0）做 self-left scheduled sampling：在 CFG 之前，用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 \texttt{no\_grad} \(G\)（与推理末跳同条件，取 x-pred，不 Euler），按样本 Bernoulli 把 \(h_{\mathrm{left}}\) 换成 \textbf{stop-grad 的末流 \(\hat x_0\)}，再跑 teacher / 学生。已知余数与 PAD 仍钉 encoder 干净码。BELF 与 RELF 共用。消融 \(\{0,0.125,0.25,0.375,0.5\}\)。它不消除「插值 \(z\) vs Euler \(z\)」那条缺口，只缓解左条件分布差。机制见第~\ref{sec:self-left}~节。已确定。

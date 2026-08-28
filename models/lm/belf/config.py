@@ -82,7 +82,7 @@ class FL_BelfConfig(PretrainedConfig):
         lm_head_bias: bool = False,
         noise_sigma: float = 1.0,
         latent_thaw_tokens: int | float = 15e9,
-        denoiser_p_mean: float = -1.5,
+        denoiser_p_mean: float = 0.0,
         denoiser_p_std: float = 0.8,
         t_clean_eps: float = 0.05,
         vel_eps: float = 1e-3,
@@ -200,10 +200,10 @@ class FL_BelfConfig(PretrainedConfig):
         self.sampling = sampling or {
             "sampling_method": "sde",
             "sde_gamma": 1.5,
-            "w_sc": 3.0,
+            "w_sc": 2.0,
             "w_ctx": 1.0,
             "temperature": 0.0,
-            "commit_x0hat": True,
+            "commit_x0hat": False,
         }
 
     def token_layout(self) -> FL_TokenLayout:
