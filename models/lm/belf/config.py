@@ -83,7 +83,7 @@ class FL_BelfConfig(PretrainedConfig):
         noise_sigma: float = 1.0,
         latent_thaw_tokens: int | float = 15e9,
         denoiser_p_mean: float = 0.0,
-        denoiser_p_std: float = 0.8,
+        denoiser_p_std: float = 1.2,
         t_clean_eps: float = 0.05,
         vel_eps: float = 1e-3,
         cond_mode: str = "clean",
@@ -95,6 +95,7 @@ class FL_BelfConfig(PretrainedConfig):
         ctx_source: str = "z",
         x0_source: str = "z",
         self_left_prob: float = 0.25,
+        self_left_thaw_tokens: int | float = 5e9,
         self_cond_cfg_p_mean: float = -1.5,
         self_cond_cfg_p_std: float = 0.8,
         self_cond_cfg_min: float = 0.5,
@@ -191,6 +192,7 @@ class FL_BelfConfig(PretrainedConfig):
         if not (0.0 <= p_left <= 1.0):
             raise ValueError(f"self_left_prob 须在 [0,1]，收到 {self_left_prob}")
         self.self_left_prob = p_left
+        self.self_left_thaw_tokens = int(self_left_thaw_tokens)
         self.self_cond_cfg_p_mean = float(self_cond_cfg_p_mean)
         self.self_cond_cfg_p_std = float(self_cond_cfg_p_std)
         self.self_cond_cfg_min = float(self_cond_cfg_min)
@@ -203,7 +205,7 @@ class FL_BelfConfig(PretrainedConfig):
             "w_sc": 2.0,
             "w_ctx": 1.0,
             "temperature": 0.0,
-            "commit_x0hat": False,
+            "commit_x0hat": True,
         }
 
     def token_layout(self) -> FL_TokenLayout:

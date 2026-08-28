@@ -18,7 +18,7 @@ z_t = t\,x_0+(1-t)\,\varepsilon,\qquad t\in[0,1].
 
 \(\varepsilon_t=\) `vel_eps`，避免 \(t\to 1\) 除零。v-MSE 监督 \(\|\hat v-v_{\mathrm{tgt}}\|^2\)（无 CFG 时 \(v_{\mathrm{tgt}}=v^\star\)）。这与「带权重 \(1/(1-t)^2\) 的 \(x_0\)-MSE」在 \(\varepsilon_t=0\) 时等价。
 
-**一致性：** 右段加噪所用的干净端、v-MSE 靶、以及推理写入 KV 的对象必须在同一空间 \(X\)。若靶是 \(\mu\)，则 `commit_x0hat` 提交的 \(\hat x_0\) 也对准 \(\mu\)。左段用采样 \(z\) 只改变条件随机性，不改路径端点。两条 commit 策略都合法，不可混评：默认再 encode **采 \(z\)**（`sample=(x0_source=="z")`），写入空间与 `x0_source` 一致；对照臂提交 \(\hat x_0\)。外部前缀完整块仍 `sample=False`。
+**一致性：** 右段加噪所用的干净端、v-MSE 靶、以及推理写入 KV 的对象必须在同一空间 \(X\)。若靶是 \(\mu\)，则 `commit_x0hat` 提交的 \(\hat x_0\) 也对准 \(\mu\)。默认提交 \(\hat x_0\)；热路径已删除再 encode 词。外部前缀完整块仍 `sample=False`。
 
 ELF 原文是整句一个标量 \(t\)、全程双向，定义的是联合流。本规格把同一插值接到**条件**分解上：已提交前缀进 KV，流只作用在当前块或窗的未知槽。
 
@@ -36,7 +36,7 @@ Q(p)=\sigma\bigl(P_m+P_s\,\Phi^{-1}(p)\bigr),\qquad p\in(0,1),
 L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,\ldots,T.
 \]
 
-因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，步长 \(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理在末次流的 \(\hat x_0\) 上直接 VAE-dec，**不再**于 \(t=1-\varepsilon\) 多跑一次 \(G\)。训练与推理共用这把确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。默认 \(T=16\)、\(P_m=0\)、\(P_s=0.8\)（即 \(\mathrm{logit}(t)\sim\mathcal{N}(0,0.8^2)\)）；100m 仍 \(W=T\)、RELF 仍 \(S\cdot T=W\)。
+因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，步长 \(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理循环只提交 \(\hat x_0\)，全文一次 VAE-dec，**不再**于 \(t=1-\varepsilon\) 多跑一次 \(G\)。训练与推理共用这把确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。默认 \(T=16\)、\(P_m=0\)、\(P_s=1.2\)（不用 \(0.8\)：档会挤在 \(t\approx 0.5\)，两端 \(\Delta t\) 过大）；100m 仍 \(W=T\)、RELF 仍 \(S\cdot T=W\)。
 
 ## 3. 条件通道
 
@@ -112,13 +112,13 @@ p_G(z_0)=\prod_b p_G\bigl(z_0^{(b)}\mid z_0^{(<b)}\bigr).
 
 每一因子是条件 rectified flow：**未知槽共享同一标量 \(t\)**；已知余数钉 \(t=1\)。去噪块长 \(W\) 为 BELF 的 `block_size`：100m 默认 16，主跑 \(W=T\)。加载入口块长须 \(\in\{1,W\}\)（逐 token 因果，或与本题 \(W\) 相同）；入口注意力按加载结果，不随 \(W\) 改写。
 
-训练：序列长度须被 \(W\) 整除，否则报错；抽一跳 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，把 \(t=L_i\) 广播到未知槽，对该跳未知有效位算 v-MSE。推理 `block_generate`：跳 \(i=0,\ldots,T-1\) 均 Euler \(\Delta t=L_{i+1}-L_i\)（末流从 \(L_{T-1}\) 走到 \(1-\varepsilon\)）；然后用末次流的 \(\hat x_0\) 走 VAE-dec，不再多一次 \(G\)。已知槽每跳覆写 encoder 干净码。SDE churn 关在最后一次流（跳 \(T-1\)）。推理末块可短。
+训练：序列长度须被 \(W\) 整除，否则报错；抽一跳 \(i\sim\mathrm{Unif}\{0,\ldots,T-1\}\)，把 \(t=L_i\) 广播到未知槽，对该跳未知有效位算 v-MSE。推理 `block_generate`：跳 \(i=0,\ldots,T-1\) 均 Euler \(\Delta t=L_{i+1}-L_i\)（末流从 \(L_{T-1}\) 走到 \(1-\varepsilon\)）；提交 \(\hat x_0\)，不再多一次 \(G\)。已知槽每跳覆写 encoder 干净码。SDE churn 关在最后一次流（跳 \(T-1\)）。推理末块可短。跑满目标长后全文一次 VAE-dec，不按 EOS 早停。
 
-`cond_mode=clean`：前缀长 \(L\) 时 \(r=L\bmod W\)。完整块进 KV；当前块槽 \([0,r)\) 为已知余数（\(t=1\)，不进损失）。一块一次读出，不会在同一块内把刚 decode 的 token 立刻改成已知余数再继续流。
+`cond_mode=clean`：前缀长 \(L\) 时 \(r=L\bmod W\)。完整块进 KV；当前块槽 \([0,r)\) 为已知余数（\(t=1\)，不进损失）。块循环不读词，不会在同一块内把刚 decode 的 token 立刻改成已知余数再继续流。
 
 训练已知条件不得含未来信息。右段 unknown Q **不可见同块 PAD K**（入口块长 1 也会发生）；PAD 仍钉 \(t=1\)、不进损失。可训档（`full` / `mid`）硬拒入口块长 \(\neq 1\)，块内未来看不见，不必二次 encode。仅冻结档且入口块长 \(=W\) 时，余数（抽到 `clean_block_prob`）再 encode 一份条件句：当前块 \([r,W)\) 写成 PAD，已知覆写与 PAD 干净码用这份；插值靶 \(x_0\) 仍来自整句 encode。`rem` 全 0 时跳过第二次 encode。左段整句教师强制不改。
 
-链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是再 encode 采 \(z\)（对照 `commit_x0hat`）。训练默认左段仍是 encoder 干净码；以概率 `self_left_prob`（默认 \(0.25\)，eval / 生成视为 0）把左段换成 **stop-grad 的末流 \(\hat x_0\)**：先抽 Bernoulli，仅命中行在 CFG 之前用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 `no_grad` \(G\)（与推理末跳同条件，取 x-pred，不 Euler），写回 `h_left`，再跑 teacher / 学生。未命中行不跑该次 \(G\)。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)（随机 \(t\) 离提交码太远）。
+链式法则写的是 \(p_G(z^{(b)}\mid z^{(<b)})\)。推理左段默认是提交的 \(\hat x_0\)。训练默认左段仍是 encoder 干净码；累计 token 未到 `self_left_thaw_tokens`（默认 \(5\mathrm{B}\)，进指纹、不进消融）时不跑 self-left。到点后以概率 `self_left_prob`（默认 \(0.25\)，eval / 生成视为 0）把左段换成 **stop-grad 的末流 \(\hat x_0\)**：先抽 Bernoulli，仅命中行在 CFG 之前用 GT 左 + 右段钉 \(t=L_{T-1}\)、\(m=\mathrm{denoise}\) 做一次 `no_grad` \(G\)（与推理末跳同条件，取 x-pred，不 Euler），写回 `h_left`，再跑 teacher / 学生。未命中行不跑该次 \(G\)。已知余数与 PAD 仍钉 encoder 干净码。这不是当前训练 hop 的 \(\hat x_0\)（随机 \(t\) 离提交码太远）。
 
 ## 7. RELF：局部时间场
 
@@ -136,11 +136,11 @@ F_k=L_{T-1-\lfloor k/S\rfloor},\qquad k=0,\ldots,W-1.
 
 档 \(r\) 占槽 \([rS,(r+1)S)\)，值为 \(L_{T-1-r}\)。最左档 \(t=L_{T-1}\)（末流起点），右组纯噪 \(L_0\)。窗内不出现 \(L_T=1-\varepsilon\)：那是末档 Euler 的终点。每档 \(S\) 槽共享同一 \(L_i\)，不是逐槽独立采样 \(t\)。
 
-**半群（不依赖 \(G\)）。** 推理稳态：每步一次 \(G\)，未知档（含最左）各 Euler 升一档（最左从 \(L_{T-1}\) 走到 \(1-\varepsilon\)）；用最左档该步的 \(\hat x_0\) 读出并 pop 这 \(S\) 槽，右端补 \(S\) 个 \(L_0\) 新噪声后，时间场回到 \(F\)。证明只依赖梯子算术与 \(S\cdot T=W\)。Euler 有局部截断误差；SDE churn 关在升档侧（含最左末流）。
+**半群（不依赖 \(G\)）。** 推理稳态：每步一次 \(G\)，未知档（含最左）各 Euler 升一档（最左从 \(L_{T-1}\) 走到 \(1-\varepsilon\)）；把最左档该步的 \(\hat x_0\) 提交并 pop 这 \(S\) 槽，右端补 \(S\) 个 \(L_0\) 新噪声后，时间场回到 \(F\)。证明只依赖梯子算术与 \(S\cdot T=W\)。Euler 有局部截断误差；SDE churn 关在升档侧（含最左末流）。读词只在全文结束。
 
 **截断。** 虚拟满窗铺 \(F\)。窗起点 \(u\) 按文档 \(S\) 对齐。对格 \(k\)、文档下标 \(j=u+k\)：\(j<i_{\mathrm{bos}}\) 丢掉（句首切），\(j>i_{\mathrm{eos}}\) 丢掉（句尾切），否则 \(t_k=F_k\)。丢掉的位置不在窗：不赋 \(t=0\)、不加 \(m\)，也不把留下的梯子挪到另一头凑满 \(W\)。两切独立可叠加。PAD 不是边界。抽窗须保住 BOS / EOS。
 
-**余数爬梯。** 前缀 \(L\) 不对齐档界时 \(r=L\bmod S>0\)。新词从 \(L_0\) 爬到 \(L_{T-1}\) 再 Euler 到 \(1-\varepsilon\) 才 **读出 / pop**，禁止钉满窗 \(F\) 左侧一次读出。hop \(h=0,\ldots,T-1\) 的虚拟余数起点 \(k_0=S(T-h-1)\)；\(h<T-1\) 时最左流档已切掉（只更噪档 v-MSE、不 pop）；\(h=T-1\) 时 \(k_0=0\)，未知最左档算 v-MSE 并 Euler，推理再 VAE-dec 后 pop。RELF 左前缀同样可按 `self_left_prob` 换成末流 \(\mathrm{sg}(\hat x_0)\)。
+**余数爬梯。** 前缀 \(L\) 不对齐档界时 \(r=L\bmod S>0\)。新槽从 \(L_0\) 爬到 \(L_{T-1}\) 再 Euler 到 \(1-\varepsilon\) 才 **提交 / pop**，禁止钉满窗 \(F\) 左侧一次提交。hop \(h=0,\ldots,T-1\) 的虚拟余数起点 \(k_0=S(T-h-1)\)；\(h<T-1\) 时最左流档已切掉（只更噪档 v-MSE、不 pop）；\(h=T-1\) 时 \(k_0=0\)，未知最左档算 v-MSE 并 Euler，推理提交 \(\hat x_0\) 后 pop。RELF 左前缀同样可按 `self_left_prob` 换成末流 \(\mathrm{sg}(\hat x_0)\)。训练句尾切仍按数据 EOS；推理滚动不依赖未读出的 EOS。
 
 **对齐前缀冷启动。** \(L>0,\,r=0\) 且尚无 \(z_{\mathrm{carry}}\)（对齐前缀第一次滚动）时，不得把整窗标满 \(F\) 当 freeroll：训练从未见过「纯噪却钉左档 \(t=L_{T-1}\)」。须走与余数相同的 \(T\) 帧爬梯（known 为空，\(n_{\mathrm{write}}=S\)，末 hop 再 pop 并写出 carry）。**\(r=0\) 仅在已有 carry 时跳过爬梯**（preroll / 上次 pop 之后）。无条件 \(L=0\) preroll 不变。
 
@@ -153,7 +153,7 @@ RELF 的联合由「pop 后条件于 KV 的窗上局部时间流」迭代定义�
 1. **时间轴。** 干净端 \(t=1\)。2L 左段标 \(t=1\)，不对噪声 \(t\) 做 v-MSE。
 2. **半群。** RELF 滑窗后梯子复位只依赖 \(\Delta t\) 与 \(S\cdot T=W\)；状态 Euler 的截断误差是数值问题，用末流关 churn 避免读出前把左槽拉回噪声。
 3. **分母。** 训练 \(t\) 落在 \(L_0,\ldots,L_{T-1}\)，末点 \(L_T=1-\varepsilon\) 只作 Euler 终点；分母有 \(\varepsilon_t\)，v-MSE 有界。丢掉的格不进损失。
-4. **左条件。** 默认训练左段是 encoder 码，推理默认是再 encode 采 \(z\)。`self_left_prob>0` 时按样本用末流 \(t=L_{T-1}\) 的 \(\mathrm{sg}(\hat x_0)\) 替换训练左段（见第 6 节）。
-5. **出口。** 锁死 VAE-dec，无层数、无 `exit`/`linear`。主体 \(\mathcal{L}\) 不含 CE。推理 BELF 拼接已提交码再读当前块；RELF 读出前缀是 \(G\) 左段 \(\hat x_0\)，丢掉格不 scatter 进因果前缀。
+4. **左条件。** 默认训练左段是 encoder 码，推理默认是提交的 \(\hat x_0\)。累计 token 到 `self_left_thaw_tokens` 后，`self_left_prob>0` 时按样本用末流 \(t=L_{T-1}\) 的 \(\mathrm{sg}(\hat x_0)\) 替换训练左段（见第 6 节）。
+5. **出口。** 锁死 VAE-dec，无层数、无 `exit`/`linear`。主体 \(\mathcal{L}\) 不含 CE。推理全文一次 VAE-dec；循环内只提交 \(\hat x_0\)。丢掉格不 scatter 进因果前缀。
 6. **两族。** 不同 \(t\) 场是不同输入分布。共享结构合法；共享一份权重会让同一网络逼近两种条件场。规格是两个模型族、两套训练剖面。
 7. **日程档。** `fast` / `mid` / `full` 是 checkpoint 变体（`cache/checkpoints/{fast|mid|full}/…`），与 `latent_tune=mid`（15B 解冻）不是同一键。`mid` 仅 Stage1：全局序列批 128、主预算 10B、`eval_step=1000`、`ema_decay=0.999`，用于中档验证。

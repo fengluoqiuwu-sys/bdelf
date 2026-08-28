@@ -73,7 +73,7 @@ class FL_RelfConfig(PretrainedConfig):
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
         denoiser_p_mean: float = 0.0,
-        denoiser_p_std: float = 0.8,
+        denoiser_p_std: float = 1.2,
         t_clean_eps: float = 0.05,
         vel_eps: float = 1e-3,
         lambda_mse: float = 1.0,
@@ -85,6 +85,7 @@ class FL_RelfConfig(PretrainedConfig):
         train_t_schedule: str = "mixed",
         window_t: str = "ladder",
         self_left_prob: float = 0.25,
+        self_left_thaw_tokens: int | float = 5e9,
         self_cond_cfg_p_mean: float = -1.5,
         self_cond_cfg_p_std: float = 0.8,
         sc_guided_prob: float = 0.5,
@@ -168,6 +169,7 @@ class FL_RelfConfig(PretrainedConfig):
         if not (0.0 <= p_left <= 1.0):
             raise ValueError(f"self_left_prob 须在 [0,1]，收到 {self_left_prob}")
         self.self_left_prob = p_left
+        self.self_left_thaw_tokens = int(self_left_thaw_tokens)
         self.self_cond_cfg_p_mean = float(self_cond_cfg_p_mean)
         self.self_cond_cfg_p_std = float(self_cond_cfg_p_std)
         self.sc_guided_prob = float(sc_guided_prob)
@@ -180,7 +182,7 @@ class FL_RelfConfig(PretrainedConfig):
             "w_sc": 2.0,
             "w_ctx": 1.0,
             "temperature": 0.0,
-            "commit_x0hat": False,
+            "commit_x0hat": True,
         }
 
     def token_layout(self) -> FL_TokenLayout:

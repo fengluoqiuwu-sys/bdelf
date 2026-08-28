@@ -125,6 +125,8 @@ class _BelfBackbone(nn.Module):
         self.lambda_mse = float(config.lambda_mse)
         self.lambda_s1 = float(config.lambda_s1)
         self.self_left_prob = float(config.self_left_prob)
+        self.self_left_thaw_tokens = int(config.self_left_thaw_tokens)
+        self._tokens_seen = 0
         self.denoiser_p_mean = float(config.denoiser_p_mean)
         self.denoiser_p_std = float(config.denoiser_p_std)
         self.t_clean_eps = float(config.t_clean_eps)
@@ -240,6 +242,7 @@ class _BelfBackbone(nn.Module):
         return self.bundle.decode_logits(x_hat, tokens=tokens, **kwargs)
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
+        self._tokens_seen = int(n)
         return self.bundle.on_tokens_seen(n, optimizer)
 
     def _raw_2l_mask(
@@ -672,7 +675,11 @@ class _BelfBackbone(nn.Module):
             return_drop=True,
         )
         # self-left：先抽样本，仅 use_self 行跑现有 2L G（仍 no_grad、t=L_{T-1}、sc=0）
-        p_left = self.self_left_prob if self.training else 0.0
+        p_left = 0.0
+        if self.training:
+            thaw = int(self.self_left_thaw_tokens)
+            if thaw <= 0 or int(self._tokens_seen) >= thaw:
+                p_left = self.self_left_prob
         use_self = torch.zeros(bsz, device=device, dtype=torch.bool)
         if p_left > 0.0:
             use_self = torch.rand(bsz, device=device) < p_left

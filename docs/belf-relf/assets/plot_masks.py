@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """掩码示意图：每张图一个主张。格内英文、避免挤到邻格。
 
-规格：T 次流、梯子 L_i=Q(i/T)；无 CE 跳。橙=最左/末流档（仍算 v-MSE，Euler 后读出）。
+规格：T 次流、梯子 L_i=Q(i/T)；无 CE 跳。橙=最左/末流档（仍算 v-MSE，Euler 后提交 x_hat）。
+读词只在全文结束。
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ C_HIDE = "#f2f3f4"
 C_SPLIT = "#1c2833"
 C_NONE = "#d5d8dc"
 C_MSE = "#5dade2"
-C_LAST = "#e67e22"  # 末流档，仍是 v-MSE；读出在 Euler 之后
+C_LAST = "#e67e22"  # 末流档，仍是 v-MSE；Euler 后提交 x_hat
 C_KNOWN = "#a9dfbf"
 C_TOK = "#d6eaf8"
 C_MARK = "#f5b7b1"
@@ -619,7 +620,7 @@ def plot_belf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
 
 
 def plot_relf_clean_cont(font: mpl.font_manager.FontProperties) -> None:
-    # 左切混合窗：K 从窗右端进入，每次 hop 左移 S；未知沿 F 爬到 L_{T-1} 后 Euler 再读出。
+    # 左切混合窗：K 从窗右端进入，每次 hop 左移 S；未知沿 F 爬到 L_{T-1} 后 Euler 再提交 x_hat。
     w, s = 8, 2
     f_labs = _relf_f_labels(w, s)
     last_lab = f_labs[0]

@@ -29,12 +29,13 @@ noise_sigma: 1.0  # SDE 回噪标准差
 latent_thaw_tokens: 15000000000  # mid 解冻有效 token 点
 lambda_vae: 1.0  # s1 重建项权重
 lambda_ref: 1.0  # s1 参考编码器 KL 权重
-denoiser_p_mean: 0.0  # 梯子 logit-normal 均值（N(0, 0.8^2)）
-denoiser_p_std: 0.8  # 梯子 logit-normal 标准差
+denoiser_p_mean: 0.0  # 梯子 logit-normal 均值（N(0, 1.2^2)）
+denoiser_p_std: 1.2  # 梯子 logit-normal 标准差；0.8 会把档挤在 t≈0.5
 t_clean_eps: 0.05  # 干净端 1-ε
 vel_eps: 1.0e-3  # x-pred→v 分母下限
 lambda_mse: 1.0  # 未知槽 v-MSE 权重
 self_left_prob: 0.25  # 训练按样本把左段换成末流 sg(x_hat) 的概率；eval/生成视为 0
+self_left_thaw_tokens: 5000000000  # self-left 解锁有效 token 点；0 表示一开始就开
 lambda_s1: 1.0  # 联合训时 L_s1 权重
 ctx_source: z  # 左段条件来源：z | mu
 x0_source: z  # 干净端来源：z | mu
@@ -55,4 +56,4 @@ sampling:
   w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg=false 时忽略
   w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
   temperature: 0.0  # 采样温度；≤0 为 argmax
-  commit_x0hat: false  # 是否把 x0_hat 提交进下一窗（关则再 encode）
+  commit_x0hat: true  # 提交末流 x_hat 进左 KV；全文一次 VAE-dec

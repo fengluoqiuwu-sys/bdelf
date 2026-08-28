@@ -43,16 +43,16 @@ def block_generate(
     num_samples: int = 1,
     seqlen: int | None = None,
     *,
-        temperature: float = 0.0,
+    temperature: float = 0.0,
     top_k: int | None = None,
     bos_token_id: int | None = None,
     prefix_tokens: torch.Tensor | None = None,
     sampling_cfg: dict | None = None,
 ) -> tuple[torch.Tensor, int]:
-    """逐块：``T`` 次流 Euler（末流关 churn）后 VAE-dec 读词。
+    """逐块：``T`` 次流 Euler（末流关 churn），提交末流 ``x_hat``；全文一次 VAE-dec。
 
-    梯子长 ``T+1``；末次从 ``L_{T-1}`` Euler 到 ``L_T=1-ε``，不再多跑 decode hop。
-    默认 ``commit_x0hat=false``（再 encode），``w_sc=2``。末块可短；EOS 后该样本停。
+    梯子长 ``T+1``；末次从 ``L_{T-1}`` Euler 到 ``L_T=1-ε``。热路径只提交流空间
+    码（``commit_x0hat`` 默认 true；再 encode 词已删除）。跑满 ``seqlen`` 后读出。
     """
     _ = bos_token_id
     cfg = dict(getattr(getattr(backbone, "config", None), "sampling", None) or {})
@@ -75,7 +75,8 @@ def block_generate(
     top_k = cfg.get("top_k", top_k)
     if top_k is not None:
         top_k = int(top_k)
-    commit_x0hat = bool(cfg.get("commit_x0hat", False))
+    if not bool(cfg.get("commit_x0hat", True)):
+        raise ValueError("commit_x0hat=false 已删除：热路径只提交 x_hat，全文一次 VAE-dec")
     w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 2.0)))
     w_ctx = float(cfg.get("w_ctx", cfg.get("ctx_cfg_scale", 1.0)))
     x0_src = str(getattr(backbone, "x0_source", "z")).strip().lower()
@@ -111,11 +112,6 @@ def block_generate(
 
     n_full = prefix_len // w
     rem = prefix_len % w
-    tokens = torch.full(
-        (num_samples, seqlen), pad_id, device=device, dtype=torch.long,
-    )
-    if prefix is not None and prefix_len > 0:
-        tokens[:, :prefix_len] = prefix
 
     clean_like = torch.zeros(
         num_samples, 1, backbone.latent_dim, device=device, dtype=dtype,
@@ -135,9 +131,6 @@ def block_generate(
     nfe = 0
     start_block = n_full
     known_rem = rem if str(backbone.cond_mode) == "clean" else 0
-    alive = torch.ones(num_samples, dtype=torch.bool, device=device)
-    if prefix_len > 0:
-        alive = alive & ~(tokens[:, :prefix_len] == eos_id).any(dim=1)
 
     left_kv = (
         backbone.prefill_left_kv(clean, known_max=seqlen)
@@ -146,8 +139,6 @@ def block_generate(
     )
 
     for b_idx in range(start_block, n_blocks):
-        if not bool(alive.any().item()):
-            break
         w_cur = min(w, seqlen - b_idx * w)
         z_block = torch.randn(
             num_samples, w_cur, backbone.latent_dim, device=device, dtype=dtype,
@@ -205,7 +196,7 @@ def block_generate(
 
         x_hat = z_block
         sc_right = torch.zeros_like(z_block)
-        # T 次流：levels 长 T+1，末次从 L_{T-1} Euler 到 L_T=1-ε；之后直接 VAE-dec。
+        # T 次流：levels 长 T+1，末次从 L_{T-1} Euler 到 L_T=1-ε；提交 x_hat，不读词。
         for hop in range(t_steps):
             t_curr = float(levels[hop].item())
             t_next = float(levels[hop + 1].item())
@@ -231,55 +222,44 @@ def block_generate(
                 sc_right = sc_right.clone()
                 sc_right[:, :known_n] = 0
 
-        start = b_idx * w
-        dec_in = x_hat
-        if clean.size(1) > 0:
-            dec_in = torch.cat([clean, x_hat], dim=1)
-        kpm = None
-        if start > 0:
-            written = tokens[:, :start]
-            pad = written == pad_id
-            if bool(pad.any().item()):
-                extra = pad.new_zeros(num_samples, w_cur)
-                kpm = torch.cat([pad, extra], dim=1)
-        block_logits = backbone.exit_logits(
-            dec_in, key_padding_mask=kpm, last_n=w_cur,
-        )
-        if temperature <= 0:
-            blk_tok = block_logits.argmax(dim=-1)
-        else:
-            blk_tok = sample_from_logits(
-                block_logits, temperature=temperature, top_k=top_k,
-            )
-        if known_n > 0 and prefix is not None:
-            blk_tok = blk_tok.clone()
-            blk_tok[:, :known_n] = prefix[:, n_full * w : prefix_len][:, :known_n]
-        write = blk_tok.clone()
-        write[~alive] = pad_id
-        tokens[:, start : start + w_cur] = write
-        tokens = pad_after_first_eos(tokens, eos_id, pad_id)
-
-        if commit_x0hat:
-            committed = x_hat
-            if x_known is not None:
-                committed = committed.clone()
-                committed[:, :known_n] = x_known
-        else:
-            z_c, mu_c, _ = backbone.bundle.encode(
-                tokens[:, : start + w_cur], sample=(x0_src == "z"),
-            )
-            committed = _mapped(z_c, mu_c, x0_src)[:, start : start + w_cur]
+        committed = x_hat
+        if x_known is not None:
+            committed = committed.clone()
+            committed[:, :known_n] = x_known
         clean = clean_buf.append(committed)
-        if commit_x0hat:
-            left_kv = backbone.extend_left_kv(
-                left_kv, committed, known_max=seqlen,
-            )
-        else:
-            left_kv = backbone.prefill_left_kv(clean, known_max=seqlen)
+        left_kv = backbone.extend_left_kv(
+            left_kv, committed, known_max=seqlen,
+        )
         known_rem = 0
-        alive = alive & ~(tokens[:, : start + w_cur] == eos_id).any(dim=1)
 
+    dec_in = clean_buf.view()
+    if dec_in.size(1) < 1:
+        tokens = torch.full(
+            (num_samples, seqlen), pad_id, device=device, dtype=torch.long,
+        )
+        return tokens, nfe
+    kpm = None
+    if prefix is not None and prefix_len > 0:
+        pref_pad = prefix == pad_id
+        if bool(pref_pad.any().item()):
+            extra = pref_pad.new_zeros(num_samples, max(0, dec_in.size(1) - prefix_len))
+            kpm = torch.cat([pref_pad, extra], dim=1)
+            if kpm.size(1) > dec_in.size(1):
+                kpm = kpm[:, : dec_in.size(1)]
+    logits = backbone.exit_logits(dec_in, key_padding_mask=kpm)
+    if temperature <= 0:
+        tokens = logits.argmax(dim=-1)
+    else:
+        tokens = sample_from_logits(
+            logits, temperature=temperature, top_k=top_k,
+        )
+    if tokens.size(1) < seqlen:
+        pad = tokens.new_full((num_samples, seqlen - tokens.size(1)), pad_id)
+        tokens = torch.cat([tokens, pad], dim=1)
+    else:
+        tokens = tokens[:, :seqlen]
     if prefix_len > 0 and prefix is not None:
         tokens = tokens.clone()
         tokens[:, :prefix_len] = prefix
+    tokens = pad_after_first_eos(tokens, eos_id, pad_id)
     return tokens, nfe

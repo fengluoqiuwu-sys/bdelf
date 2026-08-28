@@ -97,10 +97,10 @@ tokens
      self_left / 生成完整 2L：pack_2l [sg(h_left)|h_t]
   → 逐列 (t, [w_sc], [m]) → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → SwiGLU）
   → FinalLayer D→X → x̂₀
-  → Exit（锁死）：x̂₀ 已在 X，加载的 VAE-dec → logits（仅推理读出；训练主体不算 CE）
+  → Exit（锁死）：全文已提交的 \(\hat x_0\) 走加载的 VAE-dec → logits（仅推理读出一次；训练主体不算 CE）
 ```
 
-出口无 `exit` 键、无 `linear` 对照。推理 BELF 拼接已提交干净码再读当前块；RELF 读出前缀是 \(G\) 左段 \(\hat x_0\)。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
+出口无 `exit` 键、无 `linear` 对照。推理循环只提交 \(\hat x_0\)，跑满后全文一次 VAE-dec。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
 
 ### 训练热路径（不改规格 / 哈希）
 
@@ -126,7 +126,7 @@ tokens
 
 | 类 | 例子 | 指纹 |
 |---|---|---|
-| 模型 | `latent_model`、`tag`、`n_embd`、`sc_cfg`、`self_left_prob`；BELF 另有 `block_size`；RELF 有 `window_size`/`time_step`/`step_size` | 模型指纹 |
+| 模型 | `latent_model`、`tag`、`n_embd`、`sc_cfg`、`self_left_prob`、`self_left_thaw_tokens`；BELF 另有 `block_size`；RELF 有 `window_size`/`time_step`/`step_size` | 模型指纹 |
 | 训练 | `latent_tune`、日程、损失系数 | 训练指纹 |
 | 推理 | `commit_x0hat`、`sampling_method`、`sde_gamma`、`w_sc`/`w_ctx` | 现网 `build_train_fingerprint` 纳入 `generate_cfg` 与 model YAML 的 `sampling`（改推理默认会换哈希；不改全局管线） |
 
@@ -147,9 +147,9 @@ tokens
 
 ### 100m 默认（规格）
 
-共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=false`（消融再开），`self_left_prob=0.25`，`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
-BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(0,0.8^2)\)）。  
-RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后读出）。
+共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=false`（消融再开），`self_left_prob=0.25`（`self_left_thaw_tokens=5B`，进指纹、不进消融），`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
+BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(0,1.2^2)\)）。  
+RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后提交 \(\hat x_0\)）。
 
 推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。主跑 `sc_cfg=false` 时忽略 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
 
@@ -211,7 +211,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 
 评测：BELF 走块采样，RELF 走 rolling；主指标沿用仓库 TriFluency / Gen.PPL，不再用出口 CE 充当 eval PPL。长度切分见 LaTeX 附录（full/mid 的 Stage1 对齐 512；full 扩展对齐 2048）。
 
-推理默认同规格：`commit_x0hat=false`（再 encode 采 \(z\)），`sampling_method=sde`，`w_sc=2.0`。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
+推理默认同规格：`commit_x0hat=true`（提交 \(\hat x_0\)，全文一次 VAE-dec），`sampling_method=sde`，`w_sc=2.0`。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
 ## `latent_tune` 与 \(\mathcal{L}_{\mathrm{s1}}\)
 
