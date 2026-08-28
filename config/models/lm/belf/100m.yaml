@@ -10,7 +10,7 @@ dropout: 0.0  # Dropout
 mlp_ratio: 4.0  # SwiGLU 扩展比
 latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
-sc_cfg: false  # 是否建 ScaleEmbedder / w_sc 通道；主跑关，消融开
+sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道；主跑开
 latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
 time_step: 16  # 流步数 T（G 次数）；须 >= 4；梯子 L_i=Q(i/T)
 latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
@@ -27,8 +27,8 @@ t_freq_dim: 256  # 时间正弦嵌入维
 lm_head_bias: false  # lm_head 是否带 bias
 noise_sigma: 1.0  # 插值噪声尺度
 latent_thaw_tokens: 15000000000  # mid 解冻有效 token 点
-denoiser_p_mean: 0.0  # 梯子 logit-normal 均值（N(0, 1.2^2)）
-denoiser_p_std: 1.2  # 梯子 logit-normal 标准差；0.8 会把档挤在 t≈0.5
+denoiser_p_mean: -1.5  # 梯子 logit-normal 均值（N(-1.5, 0.8^2)，推向更噪端）
+denoiser_p_std: 0.8  # 梯子 logit-normal 标准差
 t_clean_eps: 0.05  # 干净端 1-ε
 vel_eps: 1.0e-3  # x-pred→v 分母下限
 cond_mode: clean  # 条件模式；主跑 clean
@@ -52,7 +52,7 @@ ctx_p_drop: 0.1  # 丢掉左段前缀的概率（不进 AdaLN）
 sampling:
   sampling_method: sde  # 采样方法：sde | ode
   sde_gamma: 1.5  # SDE churn 系数；末流关闭
-  w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg=false 时忽略
+  w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg 为假时忽略
   w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
   temperature: 0.0  # 采样温度；≤0 为 argmax
   commit_x0hat: true  # 提交末流 x_hat 进左 KV；全文一次 VAE-dec

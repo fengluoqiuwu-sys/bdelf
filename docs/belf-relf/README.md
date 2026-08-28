@@ -130,7 +130,7 @@ tokens
 | 训练 | `latent_tune`、日程、损失系数 | 训练指纹 |
 | 推理 | `commit_x0hat`、`sampling_method`、`sde_gamma`、`w_sc`/`w_ctx` | 现网 `build_train_fingerprint` 纳入 `generate_cfg` 与 model YAML 的 `sampling`（改推理默认会换哈希；不改全局管线） |
 
-`latent_tune` 三档是**三个训练配置哈希**（`frozen` / `full` / `mid`），不是同一个 run 里的开关。`sc_cfg` 进模型指纹：主跑 `false`（无 ScaleEmbedder / teacher）；消融短训再开。
+`latent_tune` 三档是**三个训练配置哈希**（`frozen` / `full` / `mid`），不是同一个 run 里的开关。`sc_cfg` 进模型指纹：主跑 `true`（ScaleEmbedder / teacher）；消融短训再关。
 
 `belf` / `relf` 且 preprocess YAML 带 `curriculum` 指针时，`build_train_fingerprint` 另写入 `curriculum_cfg`（`config/train/curriculum/<名>.yaml` 正文）。改 mix / `graph_l` 会换本族哈希。其它模型不加此键，哈希不变。fast 用 `owt-seg512`（无指针）也不加。
 
@@ -147,11 +147,11 @@ tokens
 
 ### 100m 默认（规格）
 
-共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=false`（消融再开），`self_left_prob=0.25`（`self_left_thaw_tokens=5B`，进指纹、不进消融），`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
-BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(0,1.2^2)\)）。  
+共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=true`，`self_left_prob=0.25`（`self_left_thaw_tokens=5B`，进指纹、不进消融），`latent_tune=mid`（解冻点 15B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
+BELF：`block_size=16`，`time_step=16`（主跑 \(W=T\)；\(T\) 次流，梯子 \(L_i=Q(i/T)\)，\(i=0,\ldots,T\)，\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^2)\)）。  
 RELF：`window_size=32`，`time_step=16`，`step_size=2`（窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后提交 \(\hat x_0\)）。
 
-推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。主跑 `sc_cfg=false` 时忽略 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
+推理 CFG 键为 `w_sc` / `w_ctx`（默认 2.0 / 1.0）。主跑启用 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` 时别名不生效；扫参请改 `w_sc`。
 
 完整键与消融对照见 LaTeX 参数表；工程实现不得另发明默认。
 

@@ -269,7 +269,7 @@ Q(p)=\begin{cases}
 \[
 L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,1,\ldots,T.
 \]
-因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，\(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理循环只提交 \(\hat x_0\)，全文一次 VAE-dec，不再于 \(t=1-\varepsilon\) 多跑一次 \(G\)。默认 \(T=16\)、\(P_m=0\)、\(P_s=1.2\)（不用 \(0.8\)：那会把档挤在 \(t\approx 0.5\)，首步 \(\Delta t\approx 0.23\)、末次 \(L_{15}\to 1-\varepsilon\) 又过大；\(1.5\) 又太接近均匀）。训练与推理共用该确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。
+因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，\(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理循环只提交 \(\hat x_0\)，全文一次 VAE-dec，不再于 \(t=1-\varepsilon\) 多跑一次 \(G\)。默认 \(T=16\)、\(P_m=-1.5\)、\(P_s=0.8\)（\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^{2})\)，质量偏向更噪端，压低末档 \(1/(1-t)^{2}\)）。训练与推理共用该确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。
 
 {\small
 \begin{center}
@@ -278,8 +278,8 @@ L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,1,\ldots,T.
 名称 & 符号 & 释义 & 默认 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型（共用）}} \\
-\texttt{denoiser\_p\_mean} & \(P_m\) & \(\mathrm{logit}(t)\sim\mathcal{N}(P_m,P_s^{2})\) 的均值。 & \(0\) \\
-\texttt{denoiser\_p\_std} & \(P_s\) & 同上，标准差。 & \(1.2\) \\
+\texttt{denoiser\_p\_mean} & \(P_m\) & \(\mathrm{logit}(t)\sim\mathcal{N}(P_m,P_s^{2})\) 的均值。 & \(-1.5\) \\
+\texttt{denoiser\_p\_std} & \(P_s\) & 同上，标准差。 & \(0.8\) \\
 \texttt{t\_clean\_eps} & \(\varepsilon\) & \(Q(1)=L_T=1-\varepsilon\)；末次 Euler 终点。窗 / 训练 hop 不到此点。 & \(0.05\) \\
 \bottomrule
 \end{tabularx}
@@ -335,7 +335,7 @@ CFG 含两根相互独立的轴。\(w_{\mathrm{sc}}\) 进入右段未知槽 AdaL
 条件对象为上一跳的 \(\hat x_0\)。启用时 \(w_{\mathrm{sc}}\) 进入 AdaLN 的 \texttt{ScaleEmbedder}，与 \(t\) 的 \texttt{TimestepEmbedder} 分开。推理为单次前向。
 
 \paragraph{启动开关。}
-\texttt{sc\_cfg} 默认 \texttt{false}（主跑关闭以减计算），进入模型指纹，因其决定网络是否包含 ScaleEmbedder 与 self-cond 通道。为假：不构建 ScaleEmbedder、无 sc 通道、AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件（仍逐列加 \(m\)）、\(v_{\mathrm{tgt}}=v_z\)、不做 teacher 的 \(\Delta v\) 前向；推理忽略 \texttt{w\_sc}。消融单独短训打开（\texttt{true}）时必须具备 sc 通道，且 \texttt{self\_cond=true}。
+\texttt{sc\_cfg} 默认 \texttt{true}（主跑打开 ScaleEmbedder 与 teacher），进入模型指纹，因其决定网络是否包含 ScaleEmbedder 与 self-cond 通道。为假：不构建 ScaleEmbedder、无 sc 通道、AdaLN 不以 \(w_{\mathrm{sc}}\) 为条件（仍逐列加 \(m\)）、\(v_{\mathrm{tgt}}=v_z\)、不做 teacher 的 \(\Delta v\) 前向；推理忽略 \texttt{w\_sc}。消融单独短训关掉（\texttt{false}）。为真时必须具备 sc 通道，且 \texttt{self\_cond=true}。
 
 \paragraph{训练采样。}
 \texttt{sc\_cfg} 为真时，每个样本独立采样两项：
@@ -402,7 +402,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 名称 & 符号 & 释义 & 默认 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型}} \\
-\texttt{sc\_cfg} & & 是否启用整套 \(w_{\mathrm{sc}}\)（含 sc 通道）。为假则无通道、不构建 ScaleEmbedder、不以 CFG 修正 \(v_{\mathrm{tgt}}\)。进入模型指纹。主跑关；消融开。 & \texttt{false} \\
+\texttt{sc\_cfg} & & 是否启用整套 \(w_{\mathrm{sc}}\)（含 sc 通道）。为假则无通道、不构建 ScaleEmbedder、不以 CFG 修正 \(v_{\mathrm{tgt}}\)。进入模型指纹。主跑开；消融关。 & \texttt{true} \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练}} \\
 \texttt{self\_cond\_cfg\_p\_mean} & \(P_m^{\mathrm{sc}}\) & 训练 \(w_{\mathrm{sc}}\) 的 logit-normal 位置。对齐 ELF 原时间场，不随梯子 \(P_m\) 改。 & \(-1.5\) \\
@@ -422,7 +422,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 
 \subsection{CFG 消融}
 
-对照按下列网格执行。主跑 \texttt{sc\_cfg=false}；打开 \(w_{\mathrm{sc}}\) 须单独短训。推理项使用同一 checkpoint。按槽拆损失已确定，见第~\ref{sec:open}~节，不作为消融项。\texttt{ctx\_p\_drop} 不进消融。
+对照按下列网格执行。主跑 \texttt{sc\_cfg=true}；关掉 \(w_{\mathrm{sc}}\) 须单独短训。推理项使用同一 checkpoint。按槽拆损失已确定，见第~\ref{sec:open}~节，不作为消融项。\texttt{ctx\_p\_drop} 不进消融。
 
 {\small
 \setlength{\tabcolsep}{4pt}
@@ -437,7 +437,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 名称 & 符号 & 默认 & 对照 \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型}} \\
-\texttt{sc\_cfg} & & \texttt{false} & \texttt{true}（单独短训打开整套 \(w_{\mathrm{sc}}\) 与 sc 通道） \\
+\texttt{sc\_cfg} & & \texttt{true} & \texttt{false}（单独短训关掉整套 \(w_{\mathrm{sc}}\) 与 sc 通道） \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
 \texttt{w\_sc} & \(w_{\mathrm{sc}}\) & \(2\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\

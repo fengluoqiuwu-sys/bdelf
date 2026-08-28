@@ -36,7 +36,7 @@ Q(p)=\sigma\bigl(P_m+P_s\,\Phi^{-1}(p)\bigr),\qquad p\in(0,1),
 L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,\ldots,T.
 \]
 
-因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，步长 \(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理循环只提交 \(\hat x_0\)，全文一次 VAE-dec，**不再**于 \(t=1-\varepsilon\) 多跑一次 \(G\)。训练与推理共用这把确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。默认 \(T=16\)、\(P_m=0\)、\(P_s=1.2\)（不用 \(0.8\)：档会挤在 \(t\approx 0.5\)，两端 \(\Delta t\) 过大）；100m 仍 \(W=T\)、RELF 仍 \(S\cdot T=W\)。
+因而 \(L_0=0\)，\(L_T=Q(1)=1-\varepsilon\)。第 \(i\) 跳（\(i=0,\ldots,T-1\)）在 \(t=L_i\) 上跑 \(G\)，步长 \(\Delta t=L_{i+1}-L_i\)，末次 Euler 到 \(1-\varepsilon\)。推理循环只提交 \(\hat x_0\)，全文一次 VAE-dec，**不再**于 \(t=1-\varepsilon\) 多跑一次 \(G\)。训练与推理共用这把确定梯子：推理不再从 logit-normal 随机采样，也不使用 \(\mathrm{linspace}(0,1)\)。默认 \(T=16\)、\(P_m=-1.5\)、\(P_s=0.8\)（\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^2)\)，质量偏向更噪端，压低末档 \(1/(1-t)^2\)）；100m 仍 \(W=T\)、RELF 仍 \(S\cdot T=W\)。
 
 ## 3. 条件通道
 
@@ -81,7 +81,7 @@ L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,\ldots,T.
 
 两轴独立。\(w_{\mathrm{sc}}\) 只在 `sc_cfg` 打开时进入右段未知槽 AdaLN（未知一律 denoise）；左段 / 已知 / PAD 不以之为条件。推理单次前向；扫描 \(w_{\mathrm{sc}}\) 不重算前缀 KV。无「纯 decode 步」。
 
-主跑 `sc_cfg=false`（无通道、\(v_{\mathrm{tgt}}=v_z\)、无 teacher）。消融打开时每样本采 \(z\sim\mathcal{N}(P_m^{\mathrm{sc}},(P_s^{\mathrm{sc}})^2)\)，\(u=\sigma(z)\)，再
+主跑 `sc_cfg=true`。每样本采 \(z\sim\mathcal{N}(P_m^{\mathrm{sc}},(P_s^{\mathrm{sc}})^2)\)，\(u=\sigma(z)\)，再
 
 \[
 a=1+w^{\mathrm{sc}}_{\min},\quad
@@ -98,7 +98,7 @@ v_z & g=0.
 \end{cases}
 \]
 
-修正施加于右段未知列。\(g=0\) 时 sc 通道为 0，但未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。`sc_cfg` 为假：无通道、\(v_{\mathrm{tgt}}=v_z\)。不可单独再开 `self_cond`。训练实现：CFG 三次共用一次左段 prefill KV，teacher / 学生只跑右；self-left 仅命中行跑完整 2L。语义不变，工程见 [`README.md`](README.md)。
+修正施加于右段未知列。\(g=0\) 时 sc 通道为 0，但未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。`sc_cfg` 为假（消融关）：无通道、\(v_{\mathrm{tgt}}=v_z\)。不可单独再开 `self_cond`。训练实现：CFG 三次共用一次左段 prefill KV，teacher / 学生只跑右；self-left 仅命中行跑完整 2L。语义不变，工程见 [`README.md`](README.md)。
 
 \(w_{\mathrm{ctx}}\) 不进 AdaLN。训练以 \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 丢弃 2L 左段。推理默认只跑带前缀一次前向；外推时无条件支路为空前缀、仅当前块/窗。RELF 最右 \(S\) 个新噪声槽 sc 恒为 0。
 
