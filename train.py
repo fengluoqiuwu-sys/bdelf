@@ -636,18 +636,39 @@ def _run_training_body(
                 f"(~{eval_run_size // world_size} samples/rank)",
             )
         if model_kind == "lm" and eval_loader is not None:
+            prefix_n = int(getattr(cfg, "gen_eval_prefix_tokens", 0) or 0)
+            use_pfx = prefix_n > 0 and bool(
+                getattr(model, "supports_prefix", True)
+            )
+            pfx = (
+                f", prefix={prefix_n} via {cfg.gen_eval_prefix_model}"
+                if use_pfx
+                else ""
+            )
             _train_log(
                 f"gen. ppl: {cfg.gen_eval_samples} samples / eval via "
                 f"{cfg.gen_eval_model} "
                 f"({cfg.gen_eval_model_dtype} on {cfg.gen_eval_model_device}"
                 + (f", sharded×{world_size}" if world_size > 1 else "")
-                + ")",
+                + f"{pfx})",
             )
         if model_kind == "latent" and cfg.vae_probe_samples > 0:
             _train_log(
                 f"vae probe: {cfg.vae_probe_samples} samples / eval "
                 f"(seed={cfg.eval_sample_seed}+step)",
             )
+
+    if model_kind == "lm" and eval_loader is not None:
+        from train.eval import warmup_eval_prefix_pool
+
+        warmup_eval_prefix_pool(
+            model,
+            cfg,
+            rank=rank,
+            world_size=world_size,
+            is_distributed=is_distributed,
+            log=(rank == 0),
+        )
 
     train_loop(
         model,

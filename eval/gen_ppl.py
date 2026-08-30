@@ -1,7 +1,8 @@
 """Gen.PPL 与 unigram entropy 权威实现（论文 / ELF metrics_utils 口径）。
 
-训练在线 gen-eval（``train.eval.eval_one_batch_gen_ppl``）与离线 TriFluency
-均从此模块取重分词与打分原语。
+训练在线 gen-eval（共享样本管线 / ``eval_one_batch_gen_ppl``）与离线
+TriFluency 均从此模块取重分词与打分原语。可续写 LM 的在线 gen-eval 只对
+GPT-2 前缀之后的续写段打分。
 """
 
 from __future__ import annotations

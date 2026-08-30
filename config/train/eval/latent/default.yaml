@@ -8,3 +8,6 @@ eval_sample_seed: 42  # held-out 子采样随机种子
 # eval_split: dev  # 省略则自动：owt 用 dev，arxiv 等用 eval
 vae_probe_samples: 16  # 每次 eval 的 VAE probe 图数量（0=关闭）
 gen_eval_samples: 256  # 占位（latent 不跑 gen-eval；与 lm 同值以保持 config-hash）
+gen_eval_prefix_tokens: 0  # GPT-2 前缀 token 数；0=无条件生成（仅 supports_prefix 生效）
+gen_eval_prefix_seed: 42  # 前缀起始种子，按 offset 递增；开训前生成且批次内互异
+gen_eval_prefix_model: gpt2  # 生成前缀的 HF 因果 LM 名

@@ -64,6 +64,7 @@ class _ELFBackbone(nn.Module):
     dual_branch_logging = True
     # Official train_step: one forward mixes per-example denoise/decode rows.
     mixed_branch_training = True
+    supports_prefix = False
 
     def __init__(
         self,

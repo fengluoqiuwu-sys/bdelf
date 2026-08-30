@@ -26,11 +26,13 @@ from train import FL_TrainConfig
 from train.checkpoint import unwrap_model
 from train.eval import (
     _gen_eval_local_count,
-    _gen_eval_sampling_cfg,
+    _gen_eval_local_offset,
     eval_gen_seqlen,
     eval_model_ppl,
     get_amp_dtype,
     release_eval_cuda_scratch,
+    resolve_eval_prefix_pool,
+    sample_eval_generated_rows,
 )
 from train.metrics import (
     EVAL_OFFICIAL_FIELDS,
@@ -158,7 +160,8 @@ def generate_shared_samples(
     """各卡分担生成，再汇总 texts / uniq（顺序：rank0, rank1, …）。
 
     长度上限为 preprocess ``chunk_length``（s1=512 / s2=2048）；模型在 EOS
-    处提前停。BOS/EOS/PAD 不计入 uniq 与后续 gen_ppl / entropy / dist1。
+    处提前停。可续写 LM 使用跨 run 固定的 GPT-2 前缀，指标只算续写段。
+    BOS/EOS/PAD 不计入 uniq 与后续 gen_ppl / entropy / dist1。
 
     只切 unwrap 后原模块的 ``eval()``，不动 DDP/compile 外壳，避免 Dynamo
     为 eval 模式另编一张图。
@@ -170,49 +173,50 @@ def generate_shared_samples(
         seqlen = eval_gen_seqlen(cfg)
         n_total = int(cfg.gen_eval_samples)
         n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
+        local_offset = _gen_eval_local_offset(
+            n_total, rank=rank, world_size=world_size,
+        )
         micro_bs = max(1, int(cfg.batch_size))
         local_seed = seed * max(1, world_size) + rank
-        use_train_amp = train_device.type == "cuda"
+        prefix_n, prefix_texts, prefix_ids = resolve_eval_prefix_pool(
+            train_model,
+            cfg,
+            n_total=n_total,
+            rank=rank,
+            is_distributed=is_distributed,
+            log=log,
+        )
 
         if log and pbar_parent is not None:
             pbar_parent.clear()
+            pfx = f" prefix={prefix_n}" if prefix_n else ""
             tqdm.write(
-                f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen} "
+                f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen}{pfx} "
                 f"(world={world_size}, local={n_local}, micro_bs={micro_bs}, "
                 f"seed={local_seed}) ...",
             )
 
-        devices = [train_device] if train_device.type == "cuda" else []
         local_texts: list[str] = []
         local_uniq: list[float] = []
         local_lens: list[int] = []
 
         if n_local > 0:
-            chunks: list[torch.Tensor] = []
-            with torch.random.fork_rng(devices=devices):
-                torch.manual_seed(local_seed)
-                if train_device.type == "cuda":
-                    torch.cuda.manual_seed_all(local_seed)
-                sampling_cfg = _gen_eval_sampling_cfg(cfg)
-                with torch.amp.autocast(
-                    "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
-                ):
-                    remaining = n_local
-                    while remaining > 0:
-                        this_bs = min(micro_bs, remaining)
-                        generated, _nfe = raw.generate(
-                            num_samples=this_bs,
-                            seqlen=seqlen,
-                            for_eval=True,
-                            sampling_cfg=sampling_cfg,
-                        )
-                        chunks.append(generated.detach())
-                        remaining -= this_bs
-            generated = torch.cat(chunks, dim=0)
+            generated = sample_eval_generated_rows(
+                train_model,
+                cfg=cfg,
+                train_device=train_device,
+                train_amp_dtype=train_amp_dtype,
+                local_seed=local_seed,
+                n_local=n_local,
+                local_offset=local_offset,
+                seqlen=seqlen,
+                prefix_texts=prefix_texts,
+                prefix_ids=prefix_ids,
+            )
             src_tok_name = get_preprocess(cfg.preprocess).tokenizer
             src_tok = _get_src_tokenizer(src_tok_name)
             local_texts, local_uniq, local_lens = decode_eval_texts(
-                generated.detach().cpu(), src_tok,
+                generated, src_tok,
             )
 
         texts = _gather_object_list(local_texts, is_distributed=is_distributed)

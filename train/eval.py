@@ -36,6 +36,190 @@ def _gen_eval_local_count(n_total: int, *, rank: int, world_size: int) -> int:
     return base + (1 if rank < rem else 0)
 
 
+def _gen_eval_local_offset(n_total: int, *, rank: int, world_size: int) -> int:
+    """本 rank 在全局样本序列中的起始下标（与 ``_gen_eval_local_count`` 对齐）。"""
+    if world_size <= 1 or rank <= 0:
+        return 0
+    base, rem = divmod(n_total, world_size)
+    if rank < rem:
+        return rank * (base + 1)
+    return rem * (base + 1) + (rank - rem) * base
+
+
+def _model_supports_prefix(model: nn.Module) -> bool:
+    return bool(getattr(unwrap_model(model), "supports_prefix", True))
+
+
+def resolve_eval_prefix_pool(
+    train_model: nn.Module,
+    cfg: FL_TrainConfig,
+    *,
+    n_total: int,
+    rank: int,
+    is_distributed: bool,
+    log: bool,
+) -> tuple[int, list[str] | None, list[list[int]] | None]:
+    """可续写且配置了前缀长度时，返回全局共享的 GPT-2 前缀池。"""
+    from eval.gen_prefix import ensure_prefix_pool, gen_eval_prefix_spec
+
+    prefix_n, prefix_seed, prefix_model = gen_eval_prefix_spec(cfg)
+    if prefix_n < 1 or not _model_supports_prefix(train_model):
+        return 0, None, None
+    texts, ids = ensure_prefix_pool(
+        n_total,
+        prefix_n,
+        seed=prefix_seed,
+        model_name=prefix_model,
+        rank=rank,
+        is_distributed=is_distributed,
+        log=log,
+    )
+    return prefix_n, texts, ids
+
+
+def warmup_eval_prefix_pool(
+    train_model: nn.Module,
+    cfg: FL_TrainConfig,
+    *,
+    rank: int,
+    world_size: int,
+    is_distributed: bool,
+    log: bool,
+) -> None:
+    """开训前把 gen-eval 前缀池生成并校验互异；之后 eval 只读缓存。"""
+    del world_size
+    n_total = int(cfg.gen_eval_samples)
+    prefix_n, texts, ids = resolve_eval_prefix_pool(
+        train_model,
+        cfg,
+        n_total=n_total,
+        rank=rank,
+        is_distributed=is_distributed,
+        log=log,
+    )
+    if prefix_n < 1 or ids is None:
+        return
+    n_uniq = len({tuple(int(x) for x in row) for row in ids})
+    if n_uniq != len(ids):
+        raise RuntimeError(
+            f"gen-eval prefixes not unique: {n_uniq}/{len(ids)}"
+        )
+    if log:
+        _train_log(
+            f"eval/gen prefix: ready {len(ids)} unique x {prefix_n} "
+            f"(start_seed={cfg.gen_eval_prefix_seed}, "
+            f"model={cfg.gen_eval_prefix_model})"
+        )
+
+
+@torch.compiler.disable
+@torch.no_grad()
+def sample_eval_generated_rows(
+    train_model: nn.Module,
+    *,
+    cfg: FL_TrainConfig,
+    train_device: torch.device,
+    train_amp_dtype: torch.dtype,
+    local_seed: int,
+    n_local: int,
+    local_offset: int,
+    seqlen: int,
+    prefix_texts: list[str] | None,
+    prefix_ids: list[list[int]] | None,
+) -> torch.Tensor:
+    """本 rank 生成 ``n_local`` 条；有前缀时只返回续写段（右垫 PAD）。"""
+    from eval.gen_prefix import RaggedPrefixError, encode_prefix_batch
+
+    if n_local <= 0:
+        return torch.empty(0, 0, dtype=torch.long)
+
+    gen_model = unwrap_model(train_model)
+    src_tok_name = get_preprocess(cfg.preprocess).tokenizer
+    src_tok = _get_src_tokenizer(src_tok_name)
+    pad_id = int(src_tok.get_token_layout().pad_token_id)
+    micro_bs = max(1, int(cfg.batch_size))
+    use_prefix = (
+        prefix_texts is not None
+        and prefix_ids is not None
+        and len(prefix_texts) >= local_offset + n_local
+    )
+    if use_prefix:
+        assert prefix_ids is not None
+        local_keys = [
+            tuple(int(x) for x in row)
+            for row in prefix_ids[local_offset : local_offset + n_local]
+        ]
+        if len(set(local_keys)) != len(local_keys):
+            raise RuntimeError(
+                "gen-eval 本 rank 批次前缀有重复 "
+                f"(n_local={n_local}, offset={local_offset})"
+            )
+    sampling_cfg = _gen_eval_sampling_cfg(cfg)
+    use_train_amp = train_device.type == "cuda"
+    devices = [train_device] if train_device.type == "cuda" else []
+    chunks: list[torch.Tensor] = []
+    cursor = 0
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(local_seed)
+        if train_device.type == "cuda":
+            torch.cuda.manual_seed_all(local_seed)
+        with torch.amp.autocast(
+            "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
+        ):
+            remaining = n_local
+            while remaining > 0:
+                this_bs = min(micro_bs, remaining)
+                gen_kwargs: dict[str, Any] = dict(
+                    num_samples=this_bs,
+                    seqlen=seqlen,
+                    for_eval=True,
+                    sampling_cfg=sampling_cfg,
+                )
+                prefix_len = 0
+                if use_prefix:
+                    assert prefix_texts is not None and prefix_ids is not None
+                    sl0 = local_offset + cursor
+                    sl1 = sl0 + this_bs
+                    try:
+                        pten = encode_prefix_batch(
+                            prefix_texts[sl0:sl1],
+                            prefix_ids[sl0:sl1],
+                            src_tok_name=src_tok_name,
+                            device=train_device,
+                        )
+                    except RaggedPrefixError:
+                        this_bs = 1
+                        gen_kwargs["num_samples"] = 1
+                        sl1 = sl0 + 1
+                        pten = encode_prefix_batch(
+                            prefix_texts[sl0:sl1],
+                            prefix_ids[sl0:sl1],
+                            src_tok_name=src_tok_name,
+                            device=train_device,
+                        )
+                    prefix_len = int(pten.size(1))
+                    if prefix_len >= seqlen:
+                        raise ValueError(
+                            f"gen_eval prefix length {prefix_len} "
+                            f"must be < seqlen {seqlen}"
+                        )
+                    gen_kwargs["prefix_tokens"] = pten
+                generated, _nfe = gen_model.generate(**gen_kwargs)
+                cont = generated.detach()[:, prefix_len:]
+                chunks.append(cont)
+                cursor += this_bs
+                remaining -= this_bs
+    if not chunks:
+        return torch.empty(0, 0, dtype=torch.long)
+    max_l = max(int(t.size(1)) for t in chunks)
+    padded: list[torch.Tensor] = []
+    for t in chunks:
+        if t.size(1) < max_l:
+            t = torch.nn.functional.pad(t, (0, max_l - t.size(1)), value=pad_id)
+        padded.append(t.cpu())
+    return torch.cat(padded, dim=0)
+
+
 def get_amp_dtype(dtype: str) -> torch.dtype:
     if dtype == "bf16":
         return torch.bfloat16
@@ -253,7 +437,7 @@ def eval_one_batch_gen_ppl(
     is_distributed: bool = False,
     log: bool = True,
 ) -> tuple[float, float, float, float]:
-    """Unconditional gen. PPL: sample with train model, score via gpt2-large.
+    """Gen. PPL：可续写 LM 先接固定 GPT-2 前缀再续写，打分只看续写。
 
     全局共 ``cfg.gen_eval_samples`` 条；多卡时各 rank 分担采样与打分，再按
     token 加权聚合 loss、按样本聚合 uniq / nonempty。
@@ -270,24 +454,33 @@ def eval_one_batch_gen_ppl(
         getattr(gpt2_model.config, "eos_token_id", None) or 50256,
     )
     seqlen = eval_gen_seqlen(cfg)
-    use_train_amp = train_device.type == "cuda"
     use_gpt2_amp = gpt2_device.type == "cuda"
     gpt2_amp_dtype = get_amp_dtype(cfg.gen_eval_model_dtype)
     n_total = int(cfg.gen_eval_samples)
     n_local = _gen_eval_local_count(n_total, rank=rank, world_size=world_size)
     micro_bs = max(1, int(cfg.batch_size))
     local_seed = seed * max(1, world_size) + rank
+    local_offset = _gen_eval_local_offset(
+        n_total, rank=rank, world_size=world_size,
+    )
+    prefix_n, prefix_texts, prefix_ids = resolve_eval_prefix_pool(
+        train_model,
+        cfg,
+        n_total=n_total,
+        rank=rank,
+        is_distributed=is_distributed,
+        log=log,
+    )
 
     if log and pbar_parent is not None:
         pbar_parent.clear()
+        pfx = f" prefix={prefix_n}" if prefix_n else ""
         tqdm.write(
-            f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen} "
+            f"{_TRAIN_LOG} eval/gen: sampling {n_total} x {seqlen}{pfx} "
             f"(world={world_size}, local={n_local}, micro_bs={micro_bs}, "
             f"seed={local_seed}) ...",
         )
 
-    # Isolate sampling RNG from the training loop.
-    devices = [train_device] if train_device.type == "cuda" else []
     uniq_sum = 0.0
     nonempty_count = 0
     loss_sum = 0.0
@@ -295,35 +488,23 @@ def eval_one_batch_gen_ppl(
     skipped_local = 0
 
     if n_local > 0:
-        chunks: list[torch.Tensor] = []
-        with torch.random.fork_rng(devices=devices):
-            torch.manual_seed(local_seed)
-            if train_device.type == "cuda":
-                torch.cuda.manual_seed_all(local_seed)
-            gen_model = unwrap_model(train_model)
-            sampling_cfg = _gen_eval_sampling_cfg(cfg)
-            with torch.amp.autocast(
-                "cuda", dtype=train_amp_dtype, enabled=use_train_amp,
-            ):
-                remaining = n_local
-                while remaining > 0:
-                    this_bs = min(micro_bs, remaining)
-                    generated, _nfe = gen_model.generate(
-                        num_samples=this_bs,
-                        seqlen=seqlen,
-                        for_eval=True,
-                        sampling_cfg=sampling_cfg,
-                    )
-                    chunks.append(generated.detach())
-                    remaining -= this_bs
-        generated = torch.cat(chunks, dim=0)
+        generated = sample_eval_generated_rows(
+            train_model,
+            cfg=cfg,
+            train_device=train_device,
+            train_amp_dtype=train_amp_dtype,
+            local_seed=local_seed,
+            n_local=n_local,
+            local_offset=local_offset,
+            seqlen=seqlen,
+            prefix_texts=prefix_texts,
+            prefix_ids=prefix_ids,
+        )
         assert generated.size(0) == n_local
 
         src_tok_name = get_preprocess(cfg.preprocess).tokenizer
         src_tok = _get_src_tokenizer(src_tok_name)
-        texts, uniq_counts, _lens = decode_eval_texts(
-            generated.detach().cpu(), src_tok,
-        )
+        texts, uniq_counts, _lens = decode_eval_texts(generated, src_tok)
         uniq_sum = float(sum(uniq_counts))
         # Match official ELF: score only nonempty decoded strings.
         nonempty = [t for t in texts if isinstance(t, str) and t.strip()]

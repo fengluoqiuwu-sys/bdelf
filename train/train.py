@@ -137,6 +137,10 @@ class FL_EvalConfig:
     gen_eval_model_device: str = "cuda"
     # Total sequences to generate+score per gen-PPL eval
     gen_eval_samples: int = 32
+    # GPT-2 前缀续写；0=无条件。可续写 LM 才生效。
+    gen_eval_prefix_tokens: int = 0
+    gen_eval_prefix_seed: int = 42
+    gen_eval_prefix_model: str = "gpt2"
     # DEPRECATED：不再使用；加载后恒为 False
     skip: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -198,6 +202,9 @@ class FL_TrainConfig:
     gen_eval_model_dtype: TrainDtype
     gen_eval_model_device: str
     gen_eval_samples: int
+    gen_eval_prefix_tokens: int
+    gen_eval_prefix_seed: int
+    gen_eval_prefix_model: str
     skip_eval: bool
     generate_sampling: Dict[str, Any]  # from config/generate/<model>/<name>.yaml
     use_muon: bool = True
@@ -691,6 +698,23 @@ def compose_train_config(
             f"{run_label}: gen_eval_samples must be >= 1, "
             f"got {eval_cfg.gen_eval_samples}"
         )
+    if eval_cfg.gen_eval_prefix_tokens < 0:
+        raise ValueError(
+            f"{run_label}: gen_eval_prefix_tokens must be >= 0, "
+            f"got {eval_cfg.gen_eval_prefix_tokens}"
+        )
+    if (
+        kind_of(model) == "lm"
+        and eval_cfg.gen_eval_prefix_tokens > 0
+        and eval_cfg.gen_eval_prefix_tokens >= chunk_length
+    ):
+        raise ValueError(
+            f"{run_label}: gen_eval_prefix_tokens "
+            f"({eval_cfg.gen_eval_prefix_tokens}) must be < chunk_length "
+            f"({chunk_length})"
+        )
+    if not str(eval_cfg.gen_eval_prefix_model or "").strip():
+        raise ValueError(f"{run_label}: gen_eval_prefix_model must be non-empty")
     if eval_cfg.gen_eval_model_device not in ("cuda", "cpu"):
         raise ValueError(
             f"{run_label}: gen_eval_model_device must be 'cuda' or 'cpu', "
@@ -873,6 +897,9 @@ def compose_train_config(
         gen_eval_model_dtype=eval_cfg.gen_eval_model_dtype,
         gen_eval_model_device=eval_cfg.gen_eval_model_device,
         gen_eval_samples=eval_cfg.gen_eval_samples,
+        gen_eval_prefix_tokens=eval_cfg.gen_eval_prefix_tokens,
+        gen_eval_prefix_seed=eval_cfg.gen_eval_prefix_seed,
+        gen_eval_prefix_model=eval_cfg.gen_eval_prefix_model,
         skip_eval=False,
         generate_sampling=generate_cfg.to_sampling_cfg(),
         use_muon=schedule.use_muon,
