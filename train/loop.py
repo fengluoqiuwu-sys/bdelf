@@ -375,7 +375,7 @@ def _latent_tokens_seen(cfg: FL_TrainConfig, run_tokens: int) -> int:
 
     Stage2 续训的 ``run_tokens`` 只有本阶段（扩展 0–5B）。``_thawed`` 不进
     checkpoint，进程重建后 mid 从 False 起；若不加上 ``stage1_tokens_seen``，
-    会按 15B 门槛判成未解冻。无前置作业该键为空，行为与只传本 run 相同。
+    会按 5B 门槛判成未解冻。无前置作业该键为空，行为与只传本 run 相同。
     """
     prior = int(cfg.extra.get("stage1_tokens_seen") or 0)
     return int(run_tokens) + prior

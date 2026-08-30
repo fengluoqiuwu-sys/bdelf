@@ -204,7 +204,7 @@ Token 预算：日程档 \texttt{full} 下每族 \(\times\) 每一 \texttt{laten
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练（共用）}} \\
 \texttt{latent\_tune} & & 加载之后是否训练 latent 本体。三档对应三个训练配置哈希。与日程档 \texttt{mid} 不是同一键。 & \texttt{mid} \\
-\texttt{latent\_thaw\_tokens} & & 仅 \texttt{latent\_tune=mid} 的解冻点。 & \(15\mathrm{B}\) \\
+\texttt{latent\_thaw\_tokens} & & 仅 \texttt{latent\_tune=mid} 的解冻点。 & \(5\mathrm{B}\) \\
 \texttt{target\_tokens} & \(B_{\mathrm{main}}\) & 日程档 \texttt{full} 的主训预算（每族 \(\times\) 每一 \texttt{latent\_tune}）。 & \(45\mathrm{B}\) \\
 \texttt{ext\_tokens} & \(B_{\mathrm{ext}}\) & 日程档 \texttt{full} 的扩展预算。日程档 \texttt{mid} 无此项。 & \(5\mathrm{B}\) \\
 \texttt{mid\_tokens} & \(B_{\mathrm{mid}}\) & 日程档 \texttt{mid} 仅 Stage1 的预算。 & \(10\mathrm{B}\) \\
@@ -328,7 +328,7 @@ F_k = L_{T-1-\lfloor k/S\rfloor}.
 \section{CFG}
 \label{sec:cfg}
 
-CFG 含两根相互独立的轴。\(w_{\mathrm{sc}}\) 进入右段未知槽 AdaLN（未知一律 \(m=\mathrm{denoise}\)）。推理为单次前向。\(w_{\mathrm{ctx}}\) 在训练时以概率丢弃前缀；推理默认仅运行带前缀的一次前向，外推时另需无前缀支路，共两次前向。推理时 VAE-dec 只读取末次流的 \(\hat x_0\)。无「纯 decode 步」：每跳都可跑 teacher。
+CFG 含两根相互独立的轴。\(w_{\mathrm{sc}}\) 进入右段未知槽 AdaLN（未知一律 \(m=\mathrm{denoise}\)），推理为单次前向。\(w_{\mathrm{ctx}}\) 在训练时以概率丢弃前缀；推理默认 \(w_{\mathrm{ctx}}=2\)，另需无前缀支路，共两次前向（\(w_{\mathrm{ctx}}=1\) 时仅带前缀一次前向）。推理时 VAE-dec 只读取末次流的 \(\hat x_0\)。无「纯 decode 步」：每跳都可跑 teacher。
 
 \subsection{\texorpdfstring{\(w_{\mathrm{sc}}\)：self-cond CFG}{w_sc：self-cond CFG}}
 
@@ -387,11 +387,11 @@ BELF：未知槽共享同一套 sc。已知槽 sc 为 0。RELF：即使 \(g=1\)�
 \paragraph{训练采样。}
 每个样本再独立采样 \(d\sim\mathrm{Bern}(p_{\mathrm{drop}}^{\mathrm{ctx}})\)（与 \(g\)、\(w_{\mathrm{sc}}\) 均独立）。\(d=1\) 时丢弃 2L 左段，仅训练当前块/窗。此为训练期的无条件上下文。
 
-推理默认仅运行带前缀的一次前向。若对 \(w_{\mathrm{ctx}}\) 做外推：无条件支路为\textbf{无前缀、仅运行当前块/窗}。然后
+推理默认 \(w_{\mathrm{ctx}}=2\)，做上下文外推：无条件支路为\textbf{无前缀、仅运行当前块/窗}。然后
 \[
 v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ctx}}-v_{\mathrm{u}}^{\mathrm{ctx}}\bigr).
 \]
-消融取值见表。
+\(w_{\mathrm{ctx}}=1\) 时仅运行带前缀的一次前向。消融取值见表。
 
 \subsection{CFG 参数}
 
@@ -412,7 +412,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
 \texttt{w\_sc} & \(w_{\mathrm{sc}}\) & 推理尺度。\texttt{sc\_cfg=false} 的 ckpt 忽略。YAML / \texttt{sampling} 键名即此；实现仍接受 ELF 别名 \texttt{self\_cond\_cfg\_scale}，但已写 \texttt{w\_sc} 时别名不生效。 & \(2.0\) \\
-\texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & 推理上下文外推；\(1\)=不外推。YAML 键名即此；别名 \texttt{ctx\_cfg\_scale} 同上。 & \(1.0\) \\
+\texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & 推理上下文外推；\(1\)=不外推。YAML 键名即此；别名 \texttt{w\_cfg} / \texttt{ctx\_cfg\_scale} 同上。 & \(2.0\) \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -441,7 +441,7 @@ v=v_{\mathrm{u}}^{\mathrm{ctx}}+w_{\mathrm{ctx}}\bigl(v_{\mathrm{c}}^{\mathrm{ct
 \midrule
 \multicolumn{4}{@{}l}{\textit{推理}} \\
 \texttt{w\_sc} & \(w_{\mathrm{sc}}\) & \(2\) & \(\{0.5,1,2,3\}\)；仅 \texttt{sc\_cfg=true} \\
-\texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & \(1\) & \(\{1,2,3,5,7\}\) \\
+\texttt{w\_ctx} & \(w_{\mathrm{ctx}}\) & \(2\) & \(\{1,2,3,5,7\}\) \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -839,7 +839,7 @@ z^k=t_k z_0^k+(1-t_k)\varepsilon^k.
 
 \subsection{已确定：日程档 \texttt{mid}}
 
-checkpoint 变体 \texttt{fast} / \texttt{mid} / \texttt{full} 与 \texttt{latent\_tune=mid}（15B 解冻）不是同一键。日程档 \texttt{mid} 仅 Stage1：全局序列批 128、主预算 \(10\mathrm{B}\)、\texttt{eval\_step}=1000、\texttt{ema\_decay}=0.999，用于中档验证，无 Stage2。路径 \texttt{cache/checkpoints/mid/\ldots}。已确定。
+checkpoint 变体 \texttt{fast} / \texttt{mid} / \texttt{full} 与 \texttt{latent\_tune=mid}（5B 解冻）不是同一键。日程档 \texttt{mid} 仅 Stage1：全局序列批 128、主预算 \(10\mathrm{B}\)、\texttt{eval\_step}=1000、\texttt{ema\_decay}=0.999，用于中档验证，无 Stage2。路径 \texttt{cache/checkpoints/mid/\ldots}。已确定。
 
 \subsection{未决：少步蒸馏}
 

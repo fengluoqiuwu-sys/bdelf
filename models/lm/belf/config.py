@@ -79,7 +79,7 @@ class FL_BelfConfig(PretrainedConfig):
         t_freq_dim: int = 256,
         lm_head_bias: bool = False,
         noise_sigma: float = 1.0,
-        latent_thaw_tokens: int | float = 15e9,
+        latent_thaw_tokens: int | float = 5e9,
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         t_clean_eps: float = 0.05,
@@ -204,7 +204,7 @@ class FL_BelfConfig(PretrainedConfig):
             "sampling_method": "sde",
             "sde_gamma": 1.5,
             "w_sc": 2.0,
-            "w_ctx": 1.0,
+            "w_ctx": 2.0,
             "temperature": 0.0,
             "commit_x0hat": False,
         }

@@ -25,7 +25,7 @@ rope_theta: 10000.0  # RoPE 基频
 t_freq_dim: 256  # 时间正弦嵌入维
 lm_head_bias: false  # lm_head 是否带 bias
 noise_sigma: 1.0  # 插值噪声尺度
-latent_thaw_tokens: 15000000000  # mid 解冻有效 token 点
+latent_thaw_tokens: 5000000000  # mid 解冻有效 token 点
 denoiser_p_mean: -1.5  # 训练连续 t 的 logit-normal 均值（N(-1.5, 0.8^2)）
 denoiser_p_std: 0.8  # 训练连续 t 的 logit-normal 标准差
 t_clean_eps: 0.05  # 干净端 1-ε
@@ -52,6 +52,6 @@ sampling:
   sampling_method: sde  # 采样方法：sde | ode
   sde_gamma: 1.5  # SDE churn 系数；末流关闭
   w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg 为假时忽略
-  w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
+  w_ctx: 2.0  # 推理上下文 CFG；1 表示不丢前缀
   temperature: 0.0  # 采样温度；≤0 为 argmax
   commit_x0hat: false  # 关=VAE-dec 读词再 encode；开=提交 x_hat，全文一次 VAE-dec

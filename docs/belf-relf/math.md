@@ -102,7 +102,7 @@ v_z & g=0.
 
 修正施加于右段未知列。\(g=0\) 时 sc 通道为 0，但未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。`sc_cfg` 为假（消融关）：无通道、\(v_{\mathrm{tgt}}=v_z\)。不可单独再开 `self_cond`。训练实现：CFG 三次共用一次左段 prefill KV，teacher / 学生只跑右；self-left 仅命中行跑完整 2L。语义不变，工程见 [`README.md`](README.md)。
 
-\(w_{\mathrm{ctx}}\) 不进 AdaLN。训练以 \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 丢弃 2L 左段。推理默认只跑带前缀一次前向；外推时无条件支路为空前缀、仅当前块/窗。RELF 最右 \(S\) 个新噪声槽 sc 恒为 0。
+\(w_{\mathrm{ctx}}\) 不进 AdaLN。训练以 \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 丢弃 2L 左段。推理默认 \(w_{\mathrm{ctx}}=2\)：无条件支路为空前缀、仅当前块/窗，再与有前缀支路外推；\(w_{\mathrm{ctx}}=1\) 时只跑带前缀一次前向。RELF 最右 \(S\) 个新噪声槽 sc 恒为 0。
 
 ## 6. BELF：块条件流
 
@@ -158,4 +158,4 @@ RELF 的联合由「pop 后条件于 KV 的窗上局部时间流」迭代定义�
 4. **左条件。** 默认训练左段是 encoder 码，推理默认也是再 encode 的 encoder 码；对照 `commit_x0hat=true` 时推理左段是提交的 \(\hat x_0\)。累计 token 到 `self_left_thaw_tokens` 后，`self_left_prob>0` 时按样本用末流 \(t=1-\varepsilon\) 的 \(\mathrm{sg}(\hat x_0)\) 替换训练左段（见第 6 节）。
 5. **出口。** 锁死 VAE-dec，无层数、无 `exit`/`linear`。主体 \(\mathcal{L}\) 不含 CE。推理默认每块 / 每次 pop 后 VAE-dec；对照 `true` 全文一次。丢掉格不 scatter 进因果前缀。
 6. **两族。** 不同 \(t\) 场是不同输入分布。共享结构合法；共享一份权重会让同一网络逼近两种条件场。规格是两个模型族、两套训练剖面。
-7. **日程档。** `fast` / `mid` / `full` 是 checkpoint 变体（`cache/checkpoints/{fast|mid|full}/…`），与 `latent_tune=mid`（15B 解冻）不是同一键。`mid` 仅 Stage1：全局序列批 128、主预算 10B、`eval_step=1000`、`ema_decay=0.999`，用于中档验证。
+7. **日程档。** `fast` / `mid` / `full` 是 checkpoint 变体（`cache/checkpoints/{fast|mid|full}/…`），与 `latent_tune=mid`（5B 解冻）不是同一键。`mid` 仅 Stage1：全局序列批 128、主预算 10B、`eval_step=1000`、`ema_decay=0.999`，用于中档验证。

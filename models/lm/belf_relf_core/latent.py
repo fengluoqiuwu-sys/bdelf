@@ -90,7 +90,7 @@ class LatentBundle(nn.Module):
         *,
         latent: nn.Module | None = None,
         tune: str = _TUNE_FROZEN,
-        latent_thaw_tokens: int | float = 15_000_000_000,
+        latent_thaw_tokens: int | float = 5_000_000_000,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
         device: torch.device | str | None = None,

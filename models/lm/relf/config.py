@@ -67,7 +67,7 @@ class FL_RelfConfig(PretrainedConfig):
         t_freq_dim: int = 256,
         lm_head_bias: bool = False,
         noise_sigma: float = 1.0,
-        latent_thaw_tokens: int = 15_000_000_000,
+        latent_thaw_tokens: int = 5_000_000_000,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
         denoiser_p_mean: float = -1.5,
@@ -175,7 +175,7 @@ class FL_RelfConfig(PretrainedConfig):
             "sampling_method": "sde",
             "sde_gamma": 1.5,
             "w_sc": 2.0,
-            "w_ctx": 1.0,
+            "w_ctx": 2.0,
             "temperature": 0.0,
             "commit_x0hat": False,
         }
