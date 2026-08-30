@@ -116,16 +116,36 @@ class _LatentVAEBackbone(nn.Module):
         return tokens == self.token_layout.pad_token_id
 
     def _attn_pad_mask(self, tokens: torch.Tensor) -> torch.Tensor | None:
-        """无 pad 时返回 None。因果模式下游会忽略；块因果 / 双向才真正屏蔽。"""
-        pad = self._pad_mask(tokens)
-        return pad if pad.any() else None
+        """因果不加 pad mask（以便 Flash）；块因果才传 bool pad。避免 ``.any()`` 同步。"""
+        if self.encoder.attn_mode() == "causal":
+            return None
+        return self._pad_mask(tokens)
 
     def _loss_targets(self, tokens: torch.Tensor) -> torch.Tensor:
-        pad = self.token_layout.pad_token_id
-        ignore = self.token_layout.ignore_index
-        targets = tokens.clone()
-        targets[tokens == pad] = ignore
-        return targets
+        return tokens.masked_fill(
+            tokens == self.token_layout.pad_token_id,
+            self.token_layout.ignore_index,
+        )
+
+    def _ce(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            logits.reshape(-1, self.vocab_size),
+            targets.reshape(-1),
+            ignore_index=self.token_layout.ignore_index,
+        )
+
+    def _token_acc(
+        self,
+        logits: torch.Tensor,
+        tokens: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        pred = logits.argmax(dim=-1)
+        n = valid.float().sum()
+        acc = ((pred == tokens) & valid).float().sum() / n.clamp_min(1.0)
+        return torch.where(
+            n > 0, acc, torch.full((), float("nan"), device=tokens.device),
+        )
 
     def encode(
         self,
@@ -161,9 +181,6 @@ class _LatentVAEBackbone(nn.Module):
         mask = torch.rand(tokens.shape, device=tokens.device) < self.mask_ratio
         mask[:, 0] = False
         mask = mask & ~pad
-        if not mask.any():
-            self.last_mask_acc = torch.tensor(float("nan"), device=tokens.device)
-            return torch.zeros((), device=tokens.device)
         enc_masked = torch.where(
             mask, torch.full_like(tokens, self.mask_token_id), tokens,
         )
@@ -173,16 +190,14 @@ class _LatentVAEBackbone(nn.Module):
         )
         ignore = self.token_layout.ignore_index
         targets = self._loss_targets(tokens).masked_fill(~mask, ignore)
-        mask_loss = F.cross_entropy(
-            logits_m.reshape(-1, self.vocab_size),
-            targets.reshape(-1),
-            ignore_index=ignore,
+        mask_loss = self._ce(logits_m, targets)
+        n_mask = mask.to(dtype=mask_loss.dtype).sum()
+        mask_loss = torch.where(
+            n_mask > 0, mask_loss,
+            torch.zeros((), device=tokens.device, dtype=mask_loss.dtype),
         )
         with torch.no_grad():
-            pred_m = logits_m.argmax(dim=-1)
-            self.last_mask_acc = (
-                (pred_m[mask] == tokens[mask]).float().mean().detach()
-            )
+            self.last_mask_acc = self._token_acc(logits_m, tokens, mask).detach()
         return mask_loss
 
     def forward(
@@ -194,39 +209,65 @@ class _LatentVAEBackbone(nn.Module):
         del targets, kwargs
         tokens = idx
         pad = self._pad_mask(tokens)
-        z, mu, logvar = self.encode(tokens, sample=self.training)
-        logits = self.decode_logits(z, key_padding_mask=self._attn_pad_mask(tokens))
+        do_aux = bool(
+            self.training and self.lambda_mask > 0 and self.mask_ratio > 0
+        )
+        mask: torch.Tensor | None = None
+        enc_in = tokens
+        if do_aux:
+            # 文档：第二次前向 encode 被 mask 的序列。沿 batch 拼接两次独立序列
+            # （self-attn 不跨样本），损失仍只对清洁半段算 KL、只对 mask 位算 CE。
+            mask = torch.rand(tokens.shape, device=tokens.device) < self.mask_ratio
+            mask[:, 0] = False
+            mask = mask & ~pad
+            enc_masked = torch.where(
+                mask, torch.full_like(tokens, self.mask_token_id), tokens,
+            )
+            enc_in = torch.cat([tokens, enc_masked], dim=0)
+
+        pad_enc = self._attn_pad_mask(enc_in)
+        h = self.encoder(enc_in, key_padding_mask=pad_enc)
+        z_all, mu_all, logvar_all = self.readout(h, sample=self.training)
+        logits_all = self.decode_logits(z_all, key_padding_mask=pad_enc)
+
+        bsz = tokens.size(0)
+        logits_m: torch.Tensor | None = None
+        if do_aux:
+            logits, logits_m = logits_all.split(bsz, dim=0)
+            mu, _ = mu_all.split(bsz, dim=0)
+            logvar, _ = logvar_all.split(bsz, dim=0)
+        else:
+            logits, mu, logvar = logits_all, mu_all, logvar_all
 
         loss_targets = self._loss_targets(tokens)
-        ce = F.cross_entropy(
-            logits.reshape(-1, self.vocab_size),
-            loss_targets.reshape(-1),
-            ignore_index=self.token_layout.ignore_index,
-        )
+        ce = self._ce(logits, loss_targets)
         kl = posterior_regularizer(
             mu, logvar, mask=~pad, kl_entropy=self.kl_entropy,
         )
 
         mask_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
-        if self.training and self.lambda_mask > 0 and self.mask_ratio > 0:
-            mask_loss = self.bert_mask_loss(tokens)
+        if logits_m is not None and mask is not None:
+            ignore = self.token_layout.ignore_index
+            raw_mask_ce = self._ce(
+                logits_m, loss_targets.masked_fill(~mask, ignore),
+            )
+            # 空 mask 时 CE 为 NaN；文档要求仅在 mask 位计 CE，无位则为 0。
+            n_mask = mask.to(dtype=ce.dtype).sum()
+            mask_loss = torch.where(
+                n_mask > 0, raw_mask_ce, torch.zeros((), device=tokens.device, dtype=ce.dtype),
+            )
 
         self.last_ce_loss = ce.detach()
         self.last_kl_loss = kl.detach()
         self.last_mask_loss = mask_loss.detach()
         with torch.no_grad():
-            ignore = self.token_layout.ignore_index
-            valid = loss_targets != ignore
-            if valid.any():
-                pred = logits.argmax(dim=-1)
-                self.last_token_acc = (
-                    (pred[valid] == tokens[valid]).float().mean().detach()
-                )
+            valid = loss_targets != self.token_layout.ignore_index
+            self.last_token_acc = self._token_acc(logits, tokens, valid).detach()
+            if logits_m is not None and mask is not None:
+                self.last_mask_acc = self._token_acc(
+                    logits_m, tokens, mask,
+                ).detach()
             else:
-                self.last_token_acc = torch.tensor(
-                    float("nan"), device=tokens.device,
-                )
-            if not (self.training and self.lambda_mask > 0 and self.mask_ratio > 0):
                 self.last_mask_acc = torch.tensor(
                     float("nan"), device=tokens.device,
                 )

@@ -302,12 +302,14 @@ def _release_staged_ckpt(
         pass
 
 
-def _grads_are_finite(model: nn.Module) -> bool:
+def _grad_nonfinite_flag(model: nn.Module, device: torch.device) -> torch.Tensor:
+    """各参数 ``~isfinite.any()`` 累加到 GPU 标量；热路径不逐参数 ``.item()``。"""
+    bad = torch.zeros((), device=device, dtype=torch.int32)
     for param in model.parameters():
         grad = param.grad
-        if grad is not None and not torch.isfinite(grad).all():
-            return False
-    return True
+        if grad is not None:
+            bad = bad + (~torch.isfinite(grad)).any().to(dtype=torch.int32)
+    return bad
 
 
 def _params_are_finite(model: nn.Module) -> bool:
@@ -839,6 +841,16 @@ def train_loop(
                 **_pbar_kwargs(),
             )
 
+    prefetch: tuple[torch.Tensor, int] | None = None
+
+    def _next_cpu_batch(fetch_step: int) -> tuple[torch.Tensor, int]:
+        if curriculum_sampler is not None:
+            return curriculum_sampler.fetch_batch(fetch_step, rank)
+        assert train_ds is not None
+        return fetch_train_batch(
+            train_ds, fetch_step, cfg.batch_size, world_size, rank, cfg.seed,
+        ), 0
+
     try:
         while step < cfg.max_steps:
             if curriculum_sampler is not None and curriculum_sampler.is_complete():
@@ -851,17 +863,15 @@ def train_loop(
             log_stage_idx = -1
             log_stage_name = ""
             log_csv_step = step
+            if prefetch is not None:
+                batch, eff_rank = prefetch
+                prefetch = None
+            else:
+                batch, eff_rank = _next_cpu_batch(step)
             if curriculum_sampler is not None:
-                batch, eff_rank = curriculum_sampler.fetch_batch(step, rank)
                 log_stage_idx = curriculum_sampler._stage_idx
                 log_stage_name = curriculum_sampler.current_stage.name
                 log_csv_step = curriculum_sampler.stage_micro_step
-            else:
-                assert train_ds is not None
-                batch = fetch_train_batch(
-                    train_ds, step, cfg.batch_size, world_size, rank, cfg.seed,
-                )
-                eff_rank = 0
             batch = batch.to(device, non_blocking=True)
 
             if curriculum_sampler is not None:
@@ -945,11 +955,10 @@ def train_loop(
                 )
 
             if (step + 1) % accum == 0:
-                grads_ok = _all_ranks_true(
-                    _grads_are_finite(model),
-                    device,
-                    is_distributed,
-                )
+                bad_grads = _grad_nonfinite_flag(model, device)
+                if is_distributed:
+                    dist.all_reduce(bad_grads, op=dist.ReduceOp.MAX)
+                grads_ok = int(bad_grads.item()) == 0
                 if grads_ok:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                     optimizer.step()
@@ -971,10 +980,15 @@ def train_loop(
                     _train_log(
                         f"Skipping optimizer step at step {step}: non-finite gradients",
                     )
+                if not grads_ok and not _params_are_finite(raw):
+                    raise RuntimeError(
+                        f"Non-finite model weights at step {step}; "
+                        "resume from an earlier checkpoint",
+                    )
                 optimizer.zero_grad(set_to_none=True)
 
             # 训练指标主表 + 官方卫星；在线 eval（HeldOut 永开 + 共享样本组件）。
-            train_loss = micro_loss.item() if loss_ok else float("nan")
+            train_loss = float(micro_loss.item()) if loss_ok else float("nan")
             raw_for_log = unwrap_model(model)
             if mixed_branch:
                 loss_branch = "mixed"
@@ -1229,6 +1243,16 @@ def train_loop(
                 is_distributed=is_distributed,
                 rank0_work=do_save or do_snapshot,
             )
+
+            # 存盘后再预取，避免 curriculum_state 的 bucket 被写成下一步。
+            if (
+                step + 1 < cfg.max_steps
+                and not (
+                    curriculum_sampler is not None
+                    and curriculum_sampler.is_complete()
+                )
+            ):
+                prefetch = _next_cpu_batch(step + 1)
 
             step += 1
             t0 = time.time()

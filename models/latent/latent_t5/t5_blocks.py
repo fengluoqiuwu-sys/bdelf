@@ -112,6 +112,35 @@ class T5Attention(nn.Module):
             self.relative_attention_bias = nn.Embedding(
                 self.relative_attention_num_buckets, n_head,
             )
+        self._bucket_cache: dict[tuple, torch.Tensor] = {}
+
+    @torch.compiler.disable
+    def _relative_buckets(
+        self,
+        query_length: int,
+        key_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """相对位置桶（与长度有关、与权重无关）；eager 缓存以免每步重建 L×L。"""
+        key = (query_length, key_length, device)
+        cached = self._bucket_cache.get(key)
+        if cached is None:
+            context_position = torch.arange(
+                query_length, dtype=torch.long, device=device,
+            )[:, None]
+            memory_position = torch.arange(
+                key_length, dtype=torch.long, device=device,
+            )[None, :]
+            cached = relative_position_bucket(
+                memory_position - context_position,
+                bidirectional=self.bias_bidirectional,
+                num_buckets=self.relative_attention_num_buckets,
+                max_distance=self.relative_attention_max_distance,
+            )
+            if len(self._bucket_cache) > 8:
+                self._bucket_cache.pop(next(iter(self._bucket_cache)))
+            self._bucket_cache[key] = cached
+        return cached
 
     def compute_bias(
         self,
@@ -119,19 +148,7 @@ class T5Attention(nn.Module):
         key_length: int,
         device: torch.device,
     ) -> torch.Tensor:
-        context_position = torch.arange(
-            query_length, dtype=torch.long, device=device,
-        )[:, None]
-        memory_position = torch.arange(
-            key_length, dtype=torch.long, device=device,
-        )[None, :]
-        relative_position = memory_position - context_position
-        buckets = relative_position_bucket(
-            relative_position,
-            bidirectional=self.bias_bidirectional,
-            num_buckets=self.relative_attention_num_buckets,
-            max_distance=self.relative_attention_max_distance,
-        )
+        buckets = self._relative_buckets(query_length, key_length, device)
         values = self.relative_attention_bias(buckets)
         return values.permute(2, 0, 1).unsqueeze(0)
 
@@ -159,15 +176,13 @@ class T5Attention(nn.Module):
                 position_bias = self.compute_bias(
                     q_len, kv_len, device=hidden_states.device,
                 ).to(dtype=q.dtype)
-            else:
-                position_bias = torch.zeros(
-                    1, self.n_head, q_len, kv_len,
-                    device=q.device, dtype=q.dtype,
-                )
-            # 与 HF 相同：mask 只在首次计算 bias 时并入，随后各层复用。
+            # 无相对偏置时不要物化全零 (1,H,L,L)，否则 SDPA 走不出 Flash。
             if key_padding_mask is not None:
-                position_bias = position_bias + _key_padding_additive(
+                pad_add = _key_padding_additive(
                     key_padding_mask, dtype=q.dtype,
+                )
+                position_bias = (
+                    pad_add if position_bias is None else position_bias + pad_add
                 )
 
         y = F.scaled_dot_product_attention(

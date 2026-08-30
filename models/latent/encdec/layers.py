@@ -28,6 +28,10 @@ except ImportError:
 AttnMode = Literal["bidirectional", "causal", "block_causal"]
 
 
+def _maybe_dropout(p: float) -> nn.Module:
+    return nn.Dropout(p) if p > 0.0 else nn.Identity()
+
+
 def key_padding_additive(
     pad: torch.Tensor,
     *,
@@ -67,8 +71,8 @@ class SelfAttention(nn.Module):
         self.attn = nn.Module()
         self.attn.qkv = nn.Linear(n_embd, qkv_dim)
         self.attn.proj = nn.Linear(self.inner_dim, n_embd)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
+        self.attn_dropout = _maybe_dropout(dropout)
+        self.resid_dropout = _maybe_dropout(dropout)
         self.rope = RotaryEmbedding(d_kv)
         self._mask_cache: dict[tuple, object] = {}
 
@@ -120,8 +124,7 @@ class SelfAttention(nn.Module):
             return t.view(bsz, seq_len, self.n_head, self.d_kv).transpose(1, 2)
 
         q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
-        positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
-        q, k = self.rope.apply_qk(q, k, positions)
+        q, k = self.rope.apply_sequential(q, k)
 
         drop = self.dropout if self.training else 0.0
         # 右 pad + 逐 token 因果：真实 token 本来看不到右侧 pad，勿加 attn_mask，否则 SDPA 走不出 Flash。
@@ -168,7 +171,7 @@ class MLP(nn.Module):
         self.mlp = nn.Module()
         self.mlp.c_fc = nn.Linear(n_embd, d_ff)
         self.mlp.c_proj = nn.Linear(d_ff, n_embd)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = _maybe_dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.dropout(self.mlp.c_proj(F.gelu(self.mlp.c_fc(x))))
@@ -233,7 +236,7 @@ class CrossAttention(nn.Module):
         self.cross_attn.v_proj = nn.Linear(memory_dim, self.inner_dim)
         self.cross_attn.proj = nn.Linear(self.inner_dim, n_embd)
         self.dropout = dropout
-        self.resid_dropout = nn.Dropout(dropout)
+        self.resid_dropout = _maybe_dropout(dropout)
 
     def forward(
         self,

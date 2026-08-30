@@ -220,16 +220,38 @@ class _LatentT5Backbone(nn.Module):
         return tokens == self.token_layout.pad_token_id
 
     def _attn_pad_mask(self, tokens: torch.Tensor) -> torch.Tensor | None:
-        """无 pad 时返回 None，双向 encoder / cross-attn 可走 Flash。"""
-        pad = self._pad_mask(tokens)
-        return pad if pad.any() else None
+        """bool pad，供双向 self-attn 与 T5 cross-attn 屏蔽 pad key。
+
+        全 False 与 ``None`` 对注意力分数等价，避免 ``.any()`` 同步。
+        因果 self-attn 在层内仍忽略此 mask（右 pad + Flash）。
+        """
+        return self._pad_mask(tokens)
 
     def _loss_targets(self, tokens: torch.Tensor) -> torch.Tensor:
-        pad = self.token_layout.pad_token_id
-        ignore = self.token_layout.ignore_index
-        targets = tokens.clone()
-        targets[tokens == pad] = ignore
-        return targets
+        return tokens.masked_fill(
+            tokens == self.token_layout.pad_token_id,
+            self.token_layout.ignore_index,
+        )
+
+    def _ce(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            logits.reshape(-1, self.vocab_size),
+            targets.reshape(-1),
+            ignore_index=self.token_layout.ignore_index,
+        )
+
+    def _token_acc(
+        self,
+        logits: torch.Tensor,
+        tokens: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        pred = logits.argmax(dim=-1)
+        n = valid.float().sum()
+        acc = ((pred == tokens) & valid).float().sum() / n.clamp_min(1.0)
+        return torch.where(
+            n > 0, acc, torch.full((), float("nan"), device=tokens.device),
+        )
 
     def encode(
         self,
@@ -306,9 +328,6 @@ class _LatentT5Backbone(nn.Module):
             device=tokens.device,
         )
         span_mask = span_mask & ~pad
-        if not span_mask.any():
-            self.last_mask_acc = torch.tensor(float("nan"), device=tokens.device)
-            return torch.zeros((), device=tokens.device)
         corrupted = apply_span_sentinels(
             tokens,
             span_mask,
@@ -325,17 +344,30 @@ class _LatentT5Backbone(nn.Module):
             logits_c = self.decode_logits(dec_in, z_c, memory_pad_mask=mem_pad)
         ignore = self.token_layout.ignore_index
         targets = self._loss_targets(tokens).masked_fill(~span_mask, ignore)
-        span_loss = F.cross_entropy(
-            logits_c.reshape(-1, self.vocab_size),
-            targets.reshape(-1),
-            ignore_index=ignore,
+        span_loss = self._ce(logits_c, targets)
+        n_span = span_mask.to(dtype=span_loss.dtype).sum()
+        span_loss = torch.where(
+            n_span > 0, span_loss,
+            torch.zeros((), device=tokens.device, dtype=span_loss.dtype),
         )
         with torch.no_grad():
-            pred = logits_c.argmax(dim=-1)
-            self.last_mask_acc = (
-                (pred[span_mask] == tokens[span_mask]).float().mean().detach()
-            )
+            self.last_mask_acc = self._token_acc(
+                logits_c, tokens, span_mask,
+            ).detach()
         return span_loss
+
+    def _encode_readout(
+        self,
+        tokens: torch.Tensor,
+        *,
+        sample: bool,
+        key_padding_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self.encoder(tokens, key_padding_mask=key_padding_mask)
+        if self.readout_head is None:
+            zeros = torch.zeros((), device=h.device, dtype=h.dtype)
+            return h, h, zeros
+        return self.readout_head(h, sample=sample)
 
     def forward(
         self,
@@ -346,46 +378,83 @@ class _LatentT5Backbone(nn.Module):
         del targets, kwargs
         tokens = idx
         pad = self._pad_mask(tokens)
-        mem_pad = self._attn_pad_mask(tokens)
-        z, mu, logvar = self.encode(tokens, sample=self.training)
+        do_aux = bool(
+            self.training and self.lambda_span > 0 and self.span_mask_ratio > 0
+        )
+        span_mask: torch.Tensor | None = None
+        enc_in = tokens
+        if do_aux:
+            span_mask = span_corruption_mask(
+                tokens.shape,
+                mask_ratio=self.span_mask_ratio,
+                mean_span_len=self.span_mean_len,
+                device=tokens.device,
+            )
+            span_mask = span_mask & ~pad
+            corrupted = apply_span_sentinels(
+                tokens,
+                span_mask,
+                vocab_size=self.vocab_size,
+                num_sentinels=self.num_sentinels,
+            )
+            # 文档：encoder 看腐蚀序列、decoder 仍重建原 x；沿 batch 拼两次独立序列。
+            enc_in = torch.cat([tokens, corrupted], dim=0)
+
+        mem_pad = self._attn_pad_mask(enc_in)
+        z_all, mu_all, logvar_all = self._encode_readout(
+            enc_in, sample=self.training, key_padding_mask=mem_pad,
+        )
         if self.decoder_bidirectional:
-            dec_in = None
-            logits = self.decode_logits(None, z, memory_pad_mask=mem_pad)
+            dec_tokens = None
         else:
             dec_in = self._decoder_inputs(tokens)
-            logits = self.decode_logits(dec_in, z, memory_pad_mask=mem_pad)
+            dec_tokens = dec_in if not do_aux else dec_in.repeat(2, 1)
+        logits_all = self.decode_logits(
+            dec_tokens, z_all, memory_pad_mask=mem_pad,
+        )
+
+        bsz = tokens.size(0)
+        logits_c: torch.Tensor | None = None
+        if do_aux:
+            logits, logits_c = logits_all.split(bsz, dim=0)
+            if self.readout_head is None:
+                mu, logvar = mu_all, logvar_all
+            else:
+                mu, _ = mu_all.split(bsz, dim=0)
+                logvar, _ = logvar_all.split(bsz, dim=0)
+        else:
+            logits, mu, logvar = logits_all, mu_all, logvar_all
 
         loss_targets = self._loss_targets(tokens)
-        ce = F.cross_entropy(
-            logits.reshape(-1, self.vocab_size),
-            loss_targets.reshape(-1),
-            ignore_index=self.token_layout.ignore_index,
-        )
+        ce = self._ce(logits, loss_targets)
         if self.readout_head is None:
             kl = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         else:
             kl = kl_gaussian(mu, logvar, mask=~pad)
 
         span_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
-        if self.training and self.lambda_span > 0 and self.span_mask_ratio > 0:
-            span_loss = self.span_aux_loss(tokens, dec_in)
+        if logits_c is not None and span_mask is not None:
+            ignore = self.token_layout.ignore_index
+            raw_span_ce = self._ce(
+                logits_c, loss_targets.masked_fill(~span_mask, ignore),
+            )
+            n_span = span_mask.to(dtype=ce.dtype).sum()
+            span_loss = torch.where(
+                n_span > 0, raw_span_ce,
+                torch.zeros((), device=tokens.device, dtype=ce.dtype),
+            )
 
         self.last_ce_loss = ce.detach()
         self.last_kl_loss = kl.detach()
         self.last_mask_loss = span_loss.detach()
         with torch.no_grad():
-            ignore = self.token_layout.ignore_index
-            valid = loss_targets != ignore
-            if valid.any():
-                pred = logits.argmax(dim=-1)
-                self.last_token_acc = (
-                    (pred[valid] == tokens[valid]).float().mean().detach()
-                )
+            valid = loss_targets != self.token_layout.ignore_index
+            self.last_token_acc = self._token_acc(logits, tokens, valid).detach()
+            if logits_c is not None and span_mask is not None:
+                self.last_mask_acc = self._token_acc(
+                    logits_c, tokens, span_mask,
+                ).detach()
             else:
-                self.last_token_acc = torch.tensor(
-                    float("nan"), device=tokens.device,
-                )
-            if not (self.training and self.lambda_span > 0 and self.span_mask_ratio > 0):
                 self.last_mask_acc = torch.tensor(
                     float("nan"), device=tokens.device,
                 )
