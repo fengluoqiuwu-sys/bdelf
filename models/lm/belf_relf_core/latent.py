@@ -357,7 +357,7 @@ class LatentBundle(nn.Module):
         logvar: torch.Tensor | None = None,
         logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """重建 CE + 后验项（prior-KL 或 E[log q]）+ BERT-mask + ref-KL。frozen 为 0。"""
+        """重建 CE + 后验项（prior-KL，开 kl_entropy 时再加 E[log q]）+ BERT-mask + ref-KL。frozen 为 0。"""
         zero = torch.zeros((), device=tokens.device, dtype=torch.float32)
         if not self.is_trainable:
             return zero

@@ -26,7 +26,7 @@
 | 读出 | `readout: e`（可选 `b` / `none`） | 固定 B 读出 |
 | 辅助损失 | `lambda_span` + span 腐蚀 | `lambda_mask` + BERT-mask |
 | `beta_kl` | 0.1 | 0.1 |
-| `kl_entropy` | — | `true`（YAML 默认开；**缺键为关**，旧哈希不变） |
+| `kl_entropy` | `true`（YAML 默认开；**缺键 / false 与旧哈希相同**） | 同左 |
 
 ## 配置路径
 
@@ -111,19 +111,21 @@ models/latent/
 
 ### 损失（训练态）
 
-`latent_t5` 仍为 Cola Stage-1 形式：
+`latent_t5` 仍为 Cola Stage-1 形式（有瓶颈时）：
 
-$$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N}(0,I)) + \lambda\, \mathcal{L}_{\mathrm{aux}}$$
+$$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathcal{R}(q) + \lambda\, \mathcal{L}_{\mathrm{aux}}$$
 
-`latent_vae` 由 `kl_entropy` 切换后验项（**不进** `_YAML_REQUIRED`；缺键 / Python 默认 = 关，与旧 YAML 哈希一致）。默认 YAML 为开：用 \(\beta\,\mathbb{E}[\log q]\) 替代 prior-KL，抬后验 \(\sigma\)（对角高斯 \(\mathbb{E}[\log q]=-\tfrac12(1+\log 2\pi+\log\sigma^2)\)，不含 \(\mu\)）。关时与上式相同。开时导出 tag 自动加 `-sigma`。
+`kl_entropy` 切换 \(\mathcal{R}\)（**不进** `_YAML_REQUIRED`；缺键 / `false` / Python 默认 = 关，**与旧 YAML 同哈希**）。关：\(\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))\)。开（默认 YAML）：\(\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))+\mathbb{E}[\log q]\)，两项同权、乘同一 \(\beta\)。\(\mathbb{E}[\log q]=-\tfrac12(1+\log 2\pi+\log\sigma^2)\) 不含 \(\mu\)，最小化则抬 \(\sigma\)；prior-KL 仍约束 \(\mu\)。`latent_t5` 的 `readout=none` 无后验，\(\mathcal{R}=0\)。开时导出 tag 自动加 `-sigma`。`cola_vae` 仍只用 prior-KL。
 
 | 项 | `latent_t5` | `latent_vae` |
 |---|---|---|
 | $\mathcal{L}_{\mathrm{recon}}$ | decoder 双向：并行 CE；decoder 因果：教师强制 AR CE | 并行全 token CE |
 | $\mathcal{L}_{\mathrm{aux}}$ | 原地 span CE（[`span.py`](../../models/latent/latent_t5/span.py)） | BERT-mask CE |
-| 日志键 | `recon_ce`, `kl`, `mask`（span） | 同左（mask 为 BERT；`kl_entropy` 开时 `kl` 列为 \(\mathbb{E}[\log q]\)，常为负） |
+| 日志键 | `recon_ce`, `kl`, `mask`（span） | 同左（mask 为 BERT；`kl_entropy` 开时 `kl` 列为 \(\mathrm{KL}+\mathbb{E}[\log q]\)，后者常为负） |
 
-Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignore_index`；后验项（KL / \(\mathbb{E}[\log q]\)）只对非 pad 位置平均；BERT-mask / span 不抽 pad。双向 self-attn 与 T5 cross-attn 屏蔽 pad key；逐 token 因果**不加** pad mask（右 pad + Flash）；`block_size>1` 时块内双向会叠加 pad mask。`cola_vae` 未改。
+训练态若开 aux：把**清洁序列**与**腐蚀 / BERT-mask 序列**沿 batch 维拼接，一次 encode+decode（self-attn 不跨样本，与两次独立前向同分布）。重建 CE 与后验 \(\mathcal{R}\) 只用清洁半段；aux CE 只用 span / mask 位。无 span / mask 位时 aux 为 **0**（不是 NaN）。T5 因果 decoder 的 teacher-force 输入在 aux 半段重复原序列右移（decoder 仍重建原 \(x\)，不看腐蚀 token）。评测 `forward` 不开 aux。
+
+Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignore_index`；后验项（KL / \(\mathbb{E}[\log q]\)）只对非 pad 位置平均；BERT-mask / span 不抽 pad、也不抽第 0 位。双向 self-attn 与 T5 cross-attn 屏蔽 pad key（`latent_t5` 始终传入 bool pad；全 False 与 `None` 对注意力分数等价）。逐 token 因果 self-attn **不加** pad mask（右 pad 下真实 token 看不到右侧 pad，以便 Flash）；`block_size>1` 时块内双向会叠加 pad mask。`cola_vae` 未改。
 
 `latent_t5` encoder 词表扩展 **100** 个 sentinel（`vocab_size + [0,100)`），仅供 span 腐蚀；**不进** `lm_head`。`readout=none` 时 `lm_head.weight` 与 encoder **基础词表** embed 绑定（HF T5 默认 tie）；sentinel 行独立。
 
@@ -188,6 +190,9 @@ S3/S4 入口各留 **0.2B** 观察窗（计入该阶段预算）：允许 CE/KL 
 - 在线 eval：S1 起写 `seg512_*`；S2 起追加 `b256/512/1024/2048_*`（`eval_log.csv` 宽表）。
 - 仓库 `target_tokens` 按含 pad 计；设日程时按该阶段有效 token 比折算。
 - 4 卡参考 micro：`latent_vae` / `latent_t5` 均为 S1/S2=16、S3=8、S4=4（见 recipe `batch.stage_batch_size`；OOM 只减 micro，accum 维持全局条数）。
+- span 涂色在 CPU 上逐 span 循环（允许重叠、覆盖达标即停、不抽第 0 位），再拷到 GPU，避免逐步 `.item()` 同步。
+- `encdec` RoPE 顺序位置切预计算表（默认 4096）；超长回退现场 `apply_qk`。FFN 为精确 GELU（非 tanh 近似）；dropout \(p=0\) 时为 Identity。`readout=none` 的相对位置桶按 \((Q,K,\mathrm{device})\) 缓存；无相对偏置层不物化全零 \(L\times L\)，以便 Flash。
+- `train/loop.py`：**存盘后再**预取下一步 CPU batch，以免 `curriculum_state` 的 bucket 写成下一步。非有限 loss 且权重仍有限时跳过 backward（避免 DDP 中毒）；梯度非有限则跳过 optimizer step。
 
 ## 训练与 checkpoint
 

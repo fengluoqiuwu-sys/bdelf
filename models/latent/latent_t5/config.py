@@ -6,6 +6,7 @@ from typing import Any, Dict, Literal
 
 from transformers import PretrainedConfig
 
+from models.latent.encdec.readout import parse_kl_entropy
 from models.tokens import FL_TokenLayout
 
 ReadoutMode = Literal["e", "b", "none"]
@@ -55,6 +56,7 @@ class FL_LatentT5Config(PretrainedConfig):
         latent_dim: int = 32,
         dropout: float = 0.0,
         beta_kl: float = 0.1,
+        kl_entropy: bool = False,
         lambda_span: float = 1.0,
         span_mask_ratio: float = 0.15,
         span_mean_len: int = 3,
@@ -97,6 +99,7 @@ class FL_LatentT5Config(PretrainedConfig):
         self.latent_dim = latent_dim
         self.dropout = dropout
         self.beta_kl = beta_kl
+        self.kl_entropy = parse_kl_entropy(kl_entropy)
         self.lambda_span = lambda_span
         self.span_mask_ratio = span_mask_ratio
         self.span_mean_len = span_mean_len
@@ -129,6 +132,7 @@ class FL_LatentT5Config(PretrainedConfig):
             "latent_dim": self.latent_dim,
             "dropout": self.dropout,
             "beta_kl": self.beta_kl,
+            "kl_entropy": self.kl_entropy,
             "lambda_span": self.lambda_span,
             "span_mask_ratio": self.span_mask_ratio,
             "span_mean_len": self.span_mean_len,

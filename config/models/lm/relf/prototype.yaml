@@ -28,7 +28,7 @@ noise_sigma: 1.0  # SDE 回噪标准差
 latent_thaw_tokens: 5000000000  # mid 解冻有效 token 点
 lambda_vae: 1.0  # s1 重建项权重
 lambda_ref: 1.0  # s1 参考编码器 KL 权重
-kl_entropy: true  # 开则 s1 用 β·E[log q] 替代 prior-KL；缺键为关
+kl_entropy: true  # 开则 s1 为 β·(KL+E[log q])；缺键/false 与旧哈希相同
 denoiser_p_mean: -1.5  # 训练连续 t 的 logit-normal 均值（N(-1.5, 0.8^2)）
 denoiser_p_std: 0.8  # 训练连续 t 的 logit-normal 标准差
 t_clean_eps: 0.05  # 干净端 1-ε

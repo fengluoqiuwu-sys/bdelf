@@ -12,7 +12,7 @@ SIGMA_TAG_SUFFIX = "-sigma"
 
 
 def parse_kl_entropy(value: Any = None) -> bool:
-    """缺键 / ``None`` → ``False``（向前兼容，不改变旧哈希）。"""
+    """缺键 / ``None`` / ``false`` → ``False``（与省略同指纹）。"""
     if value is None:
         return False
     if isinstance(value, bool):
@@ -25,6 +25,14 @@ def parse_kl_entropy(value: Any = None) -> bool:
     if s in ("0", "false", "no", "off", ""):
         return False
     raise ValueError(f"kl_entropy 须为布尔，收到 {value!r}")
+
+
+def drop_off_kl_entropy(mapping: dict[str, Any]) -> dict[str, Any]:
+    """``kl_entropy`` 为关时从映射去掉，使 ``false`` 与缺键同哈希。"""
+    out = dict(mapping)
+    if "kl_entropy" in out and not parse_kl_entropy(out.get("kl_entropy")):
+        del out["kl_entropy"]
+    return out
 
 
 def ensure_sigma_tag(tag: str, kl_entropy: bool) -> str:
@@ -71,10 +79,11 @@ def posterior_regularizer(
     *,
     kl_entropy: bool = False,
 ) -> torch.Tensor:
-    """关：``KL(q‖N(0,I))``；开：``E[log q]``（抬 σ，不含 μ 项）。"""
-    if kl_entropy:
-        return gaussian_log_q(logvar, mask=mask)
-    return kl_gaussian(mu, logvar, mask=mask)
+    """关：``KL(q‖N(0,I))``；开：``KL + E[log q]``（先验仍约束 μ，另抬 σ）。"""
+    kl = kl_gaussian(mu, logvar, mask=mask)
+    if not kl_entropy:
+        return kl
+    return kl + gaussian_log_q(logvar, mask=mask)
 
 
 def sample_posterior(

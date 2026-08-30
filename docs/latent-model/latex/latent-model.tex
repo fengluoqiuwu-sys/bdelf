@@ -171,6 +171,7 @@ encoder / decoder self-attn & encoder：\texttt{bidirectional}；decoder：\text
 读出 & \texttt{readout=e|b|none} & 固定 $B$ 读出 \\
 辅助损失 & \texttt{lambda\_span} + span 腐蚀 & \texttt{lambda\_mask} + BERT-mask \\
 \texttt{beta\_kl} & \multicolumn{2}{c}{0.1} \\
+\texttt{kl\_entropy} & \multicolumn{2}{c}{缺键/\texttt{false} 同旧哈希；默认 YAML 开：$\mathrm{KL}+\mathbb{E}[\log q]$} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -183,8 +184,8 @@ encoder / decoder self-attn & encoder：\texttt{bidirectional}；decoder：\text
 \subsection{共享模块 \texttt{models/latent/encdec/}}
 
 \begin{description}
-  \item[\texttt{SelfAttention}]（\texttt{encdec}，\texttt{readout=e|b}）$Q,K,V$ 投影至 $H \cdot d_{\mathrm{kv}}$；RoPE 施加于 $Q,K$。
-  \item[\texttt{TransformerBlock}] pre-norm self-attn + FFN。
+  \item[\texttt{SelfAttention}]（\texttt{encdec}，\texttt{readout=e|b}）$Q,K,V$ 投影至 $H \cdot d_{\mathrm{kv}}$；RoPE 施加于 $Q,K$。顺序位置 $0{\ldots}L{-}1$ 切预计算表（默认长度 4096），超长回退按位置现场计算。
+  \item[\texttt{TransformerBlock}] pre-norm self-attn + FFN（精确 GELU，非 tanh 近似）。dropout $p{=}0$ 时为 Identity。
   \item[\texttt{LatentEncoder}] token embedding + $N_{\mathrm{enc}}$ 层 block；支持三种注意力模式（第~\ref{sec:attn} 节）。
   \item[\texttt{PosteriorBReadout}] $\mu,\log\sigma^2$ 均为 $\mathbb{R}^{E}\!\to\!\mathbb{R}^{B}$；$\mu$ 经无仿射 LayerNorm。
   \item[\texttt{PosteriorEReadout}] 瓶颈 $\mathbb{R}^{E}\!\to\!\mathbb{R}^{B}$，再 $\mathbb{R}^{B}\!\to\!\mathbb{R}^{E}$ 得 $\mu,\log\sigma^2$。
@@ -193,6 +194,7 @@ encoder / decoder self-attn & encoder：\texttt{bidirectional}；decoder：\text
 \subsection{原 T5 块（\texttt{models/latent/latent\_t5/t5\_blocks.py}）}
 
 仅 \texttt{readout=none} 组装。\texttt{T5LayerNorm}、相对位置偏置（首层共享）、\texttt{T5DenseReluDense}、独立 $Q/K/V/O$。Decoder 每层为 self-attn $\to$ cross-attn $\to$ FFN。
+相对位置桶按 $(Q,K,\mathrm{device})$ 缓存（与权重无关）；无相对偏置的层不物化全零 $L{\times}L$ bias，以便 SDPA 走 Flash。
 
 \section{Encoder 注意力三路}
 \label{sec:attn}
@@ -209,6 +211,10 @@ encoder / decoder self-attn & encoder：\texttt{bidirectional}；decoder：\text
 \texttt{readout=none}（原 T5）\textbf{写死} encoder 与 decoder 均为双向，禁止单向。
 \texttt{latent\_vae} \textbf{禁止} \texttt{bidirectional=true}（配置层与实现层均拒绝；encoder 写死 \texttt{False}）。
 
+Pad（独立 special，非 EOS）不进 CE / 后验平均；BERT-mask 与 span 不抽 pad、也不抽第 0 位。
+双向 self-attn 与 T5 cross-attn 屏蔽 pad key（\texttt{latent\_t5} 始终传入 bool pad；全 False 与 \texttt{None} 对注意力分数等价）。
+逐 token 因果 self-attn \textbf{不加} pad mask（右 pad 下真实 token 看不到右侧 pad，以便 Flash）；\texttt{block\_size>1} 时块内双向叠加 pad mask。
+
 \section{瓶颈与读出}
 
 \subsection{记号}
@@ -221,11 +227,12 @@ KL 为
 \end{equation}
 对 $z$ 所在空间各维取平均（\texttt{kl\_gaussian}）。
 
-\texttt{latent\_vae} 另有开关 \texttt{kl\_entropy}（不进必填键；缺键为关，以保持旧 YAML 指纹）。默认 YAML 为开：后验项改为
+\texttt{latent\_t5} 与 \texttt{latent\_vae} 另有开关 \texttt{kl\_entropy}（不进必填键；缺键或 \texttt{false} 不进指纹，与旧 YAML 同哈希）。关时后验项即为上式 KL。开（默认 YAML）时两项并存、同一 $\beta$：
 \begin{equation}
-  \mathbb{E}[\log q] = -\tfrac{1}{2}\,\mathbb{E}\bigl[1 + \log 2\pi + \log\sigma^2\bigr]
+  \mathcal{R}(q)=\mathrm{KL}(q\|p_0)+\mathbb{E}[\log q],\qquad
+  \mathbb{E}[\log q] = -\tfrac{1}{2}\,\mathbb{E}\bigl[1 + \log 2\pi + \log\sigma^2\bigr].
 \end{equation}
-（对角高斯熵的相反数，不含 $\mu$）。最小化该项抬高 $\sigma$。开时 artifact tag 后缀 \texttt{-sigma}。\texttt{latent\_t5} 无此开关。
+\(\mathbb{E}[\log q]\) 是对角高斯熵的相反数（不含 $\mu$），最小化则抬高 $\sigma$；prior-KL 仍约束 $\mu$。开时 artifact tag 后缀 \texttt{-sigma}。\texttt{readout=none} 无后验，$\mathcal{R}=0$。
 
 \subsection{\texttt{latent\_vae}：$z \in \mathbb{R}^{L \times B}$}
 
@@ -295,16 +302,16 @@ Decoder 仅接收 $\mathrm{from\_latent}(z)$，与 Cola \texttt{decode\_logits} 
 
 \subsection{总目标}
 
-\texttt{latent\_t5} 训练态为
+有瓶颈时训练态为
 \begin{equation}
-  \mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N}(0,I)) + \lambda\, \mathcal{L}_{\mathrm{aux}},
+  \mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathcal{R}(q) + \lambda\, \mathcal{L}_{\mathrm{aux}},
 \end{equation}
 默认 $\beta{=}0.1$，$\lambda{=}1$（与 \texttt{cola\_vae} 默认一致）。
-
-\texttt{latent\_vae} 在 \texttt{kl\_entropy} 为假（缺键）时与上式相同；为真（默认 YAML）时
+\texttt{kl\_entropy} 为假（缺键 / \texttt{false}，不进指纹）时 $\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))$；为真（默认 YAML）时
 \begin{equation}
-  \mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathbb{E}[\log q] + \lambda\, \mathcal{L}_{\mathrm{aux}}.
+  \mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))+\mathbb{E}[\log q].
 \end{equation}
+\texttt{readout=none} 无后验，$\mathcal{R}=0$。\texttt{cola\_vae} 无此开关，仍只用 prior-KL。
 
 \subsection{重建项 $\mathcal{L}_{\mathrm{recon}}$}
 
@@ -319,19 +326,26 @@ Held-out 评测走模型 \texttt{forward} 的重建 CE（T5 默认并行；单�
 
 \paragraph{\texttt{latent\_vae}：BERT-mask}
 以概率 \texttt{mask\_ratio}（默认 0.15）将 token 换为专用 \texttt{mask\_token\_id}$=V$（$V$ 为词表大小）。
-第二次前向：encode 被 mask 的序列，仅在 mask 位置对原始 $x$ 计 CE~\cite{devlin2019bert}。
+encode 被 mask 的序列，仅在 mask 位置对原始 $x$ 计 CE~\cite{devlin2019bert}。
 固定张量形状（\texttt{ignore\_index} 掩掉非 mask 位），便于 \texttt{torch.compile}。
+无 mask 位时辅助项为 $0$（不是 NaN）。
 
 \paragraph{\texttt{latent\_t5}：原地 span CE}
 受 T5 span corruption 启发~\cite{raffel2020t5}，但\textbf{不}采用变长 decoder 目标序列（与定长训练图不兼容）。
 流程：
 \begin{enumerate}
-  \item 按 span 级 mask 覆盖约 15\% token（平均 span 长 3）；
+  \item 按 span 级 mask 覆盖约 15\% token（平均 span 长 3；允许重叠；不抽第 0 位）；涂色在 CPU 上完成再拷到 GPU；
   \item encoder 输入将 span 换为 sentinel id $V{+}k$，$k\in\{0,\ldots,99\}$；
-  \item decoder 仍 AR 全长原始 $x$；
-  \item CE 仅在腐蚀位置计算。
+  \item decoder 仍重建全长原始 $x$（因果时 teacher-force 为原序列右移，aux 半段重复同一输入）；
+  \item CE 仅在腐蚀位置计算；无 span 位时辅助项为 $0$。
 \end{enumerate}
 100 个 sentinel 仅扩展 encoder embedding，\textbf{不}进入 \texttt{lm\_head}。
+
+\paragraph{训练图：清洁 / aux 沿 batch 拼接}
+训练态若 $\lambda{>}0$，将清洁序列与腐蚀 / BERT-mask 序列沿 batch 维拼接，一次 encode+decode。
+self-attn 不跨样本，与两次独立前向同分布。
+重建 CE 与后验 $\mathcal{R}$ 只用清洁半段；aux CE 只用 mask / span 位。
+评测 \texttt{forward} 不开 aux。
 
 \section{训练系统接口}
 
@@ -353,6 +367,11 @@ Latent 主表：\texttt{recon\_ce}、\texttt{kl}、\texttt{mask}、\texttt{token
 
 Muon 识别 \texttt{attn.qkv}、\texttt{attn.proj}、\texttt{mlp.c\_fc}、\texttt{mlp.c\_proj}；
 读出层、\texttt{from\_latent}、\texttt{lm\_head}、embedding 走 AdamW。
+
+\subsection{训练循环（与课程存盘）}
+
+\texttt{train/loop.py} 在 checkpoint 写完\textbf{之后}才预取下一步 CPU batch，以免 \texttt{curriculum\_state} 的 bucket 被写成下一步。
+非有限 loss 且权重仍有限时跳过 backward（避免 DDP 中毒）；梯度非有限则跳过 optimizer step。
 
 \section{长度课程（Stage-1）}
 \label{sec:curriculum}

@@ -13,7 +13,7 @@ from models.latent.encdec.layers import DecoderBlock
 from models.latent.encdec.readout import (
     PosteriorBReadout,
     PosteriorEReadout,
-    kl_gaussian,
+    posterior_regularizer,
 )
 from models.latent.latent_t5.config import FL_LatentT5Config
 from models.latent.latent_t5.span import apply_span_sentinels, span_corruption_mask
@@ -53,6 +53,7 @@ class _LatentT5Backbone(nn.Module):
         latent_dim: int = 32,
         dropout: float = 0.0,
         beta_kl: float = 0.1,
+        kl_entropy: bool = False,
         lambda_span: float = 1.0,
         span_mask_ratio: float = 0.15,
         span_mean_len: int = 3,
@@ -69,6 +70,7 @@ class _LatentT5Backbone(nn.Module):
         self.n_embd = n_embd
         self.latent_dim = latent_dim
         self.beta_kl = beta_kl
+        self.kl_entropy = bool(kl_entropy)
         self.lambda_span = lambda_span
         self.span_mask_ratio = span_mask_ratio
         self.span_mean_len = span_mean_len
@@ -430,7 +432,9 @@ class _LatentT5Backbone(nn.Module):
         if self.readout_head is None:
             kl = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         else:
-            kl = kl_gaussian(mu, logvar, mask=~pad)
+            kl = posterior_regularizer(
+                mu, logvar, mask=~pad, kl_entropy=self.kl_entropy,
+            )
 
         span_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         if logits_c is not None and span_mask is not None:
@@ -484,6 +488,7 @@ class _LatentT5Backbone(nn.Module):
             if fval == fval:
                 out[key] = fval
         out["beta_kl"] = float(self.beta_kl)
+        out["kl_entropy"] = 1.0 if self.kl_entropy else 0.0
         out["lambda_mask"] = float(self.lambda_span)
         return out
 

@@ -220,7 +220,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 | `full` | step 0 起 | 重建 + 后验项 + BERT-mask + ref-KL |
 | `mid` | 未到解冻点同 frozen；之后同 full | 解冻前不算；解冻后算。新参数新优化器状态 |
 
-\(\mathcal{L}_{\mathrm{s1}}\) 与流损失 \(\mathcal{L}=\lambda_{\mathrm{mse}}\mathcal{L}_{\mathrm{mse}}\) 分开相加。后验项由 `kl_entropy` 切换（缺键为关、与旧哈希一致；默认 YAML 为开：\(\beta\,\mathbb{E}[\log q]\) 替代 prior-KL，tag 后缀 `-sigma`）。主体不含出口 CE。VAE-dec 参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
+\(\mathcal{L}_{\mathrm{s1}}\) 与流损失 \(\mathcal{L}=\lambda_{\mathrm{mse}}\mathcal{L}_{\mathrm{mse}}\) 分开相加。后验项由 `kl_entropy` 切换（缺键 / `false` 不进指纹、与旧哈希一致；默认 YAML 为开：\(\beta\,(\mathrm{KL}+\mathbb{E}[\log q])\)，tag 后缀 `-sigma`）。主体不含出口 CE。VAE-dec 参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
 
 ## 明确不做（工程）
 

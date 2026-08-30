@@ -215,8 +215,8 @@ class _LatentVAEBackbone(nn.Module):
         mask: torch.Tensor | None = None
         enc_in = tokens
         if do_aux:
-            # 文档：第二次前向 encode 被 mask 的序列。沿 batch 拼接两次独立序列
-            # （self-attn 不跨样本），损失仍只对清洁半段算 KL、只对 mask 位算 CE。
+            # 文档：encoder 看 mask 序列；沿 batch 拼两次独立序列（self-attn 不跨样本）。
+            # 损失仍只对清洁半段算 KL、只对 mask 位算 CE。
             mask = torch.rand(tokens.shape, device=tokens.device) < self.mask_ratio
             mask[:, 0] = False
             mask = mask & ~pad

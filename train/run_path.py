@@ -16,6 +16,7 @@ from typing import Any, Mapping
 import yaml
 
 from models import kind_of, resolve_model_config_path
+from models.latent.encdec.readout import drop_off_kl_entropy
 
 CHECKPOINT_ROOT = "cache/checkpoints"
 CONFIG_HASH_LEN = 16
@@ -118,6 +119,16 @@ def build_train_fingerprint(
     # ``--set model.*`` 并入架构指纹（与 train.py 加载时一致）
     if overrides and overrides.get("model"):
         model_arch = {**model_arch, **dict(overrides["model"])}
+    # kl_entropy 关 / false 不进指纹，与旧 YAML 缺键同哈希。
+    model_arch = drop_off_kl_entropy(model_arch)
+    ov_fp = _fingerprint_overrides(overrides)
+    model_ov = ov_fp.get("model")
+    if isinstance(model_ov, dict):
+        cleaned = drop_off_kl_entropy(model_ov)
+        if cleaned:
+            ov_fp["model"] = cleaned
+        else:
+            ov_fp.pop("model", None)
     preprocess_yaml = _load_yaml_mapping(
         repo / "config" / "preprocess" / f"{preprocess}.yaml",
     )
@@ -139,7 +150,7 @@ def build_train_fingerprint(
         "dataset": dataset,
         "preprocess": preprocess,
         "generate": generate,
-        "overrides": _fingerprint_overrides(overrides),
+        "overrides": ov_fp,
         "optimizer": dataclass_fingerprint(optimizer),
         "batch": dataclass_fingerprint(batch),
         "schedule": dataclass_fingerprint(schedule),

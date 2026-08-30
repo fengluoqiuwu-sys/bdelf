@@ -10,6 +10,7 @@ from .readout import (
     gaussian_log_q,
     kl_gaussian,
     parse_kl_entropy,
+    drop_off_kl_entropy,
     posterior_regularizer,
     sample_posterior,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "gaussian_log_q",
     "kl_gaussian",
     "parse_kl_entropy",
+    "drop_off_kl_entropy",
     "posterior_regularizer",
     "sample_posterior",
 ]
