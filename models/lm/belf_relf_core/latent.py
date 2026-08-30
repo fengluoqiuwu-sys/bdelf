@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.latent.artifact_loader import load_latent_artifact
-from models.latent.encdec.readout import kl_gaussian
+from models.latent.encdec.readout import posterior_regularizer
 
 _TUNE_FROZEN = "frozen"
 _TUNE_FULL = "full"
@@ -93,6 +93,7 @@ class LatentBundle(nn.Module):
         latent_thaw_tokens: int | float = 5_000_000_000,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
+        kl_entropy: bool = False,
         device: torch.device | str | None = None,
         apply_ema: bool = True,
         checkpoint_root: str | None = None,
@@ -122,6 +123,7 @@ class LatentBundle(nn.Module):
         self.latent_thaw_tokens = int(latent_thaw_tokens)
         self.lambda_vae = float(lambda_vae)
         self.lambda_ref = float(lambda_ref)
+        self.kl_entropy = bool(kl_entropy)
         self._thawed = mode == _TUNE_FULL
         self._require_vae_dec_if_needed()
         # 冻结副本供 ref-KL。不注册进 module 树，避免 .cuda() 时 GPU 上双份 VAE。
@@ -355,7 +357,7 @@ class LatentBundle(nn.Module):
         logvar: torch.Tensor | None = None,
         logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """重建 CE + ``KL(q||N(0,I))`` + BERT-mask + ref-KL。frozen 为 0。"""
+        """重建 CE + 后验项（prior-KL 或 E[log q]）+ BERT-mask + ref-KL。frozen 为 0。"""
         zero = torch.zeros((), device=tokens.device, dtype=torch.float32)
         if not self.is_trainable:
             return zero
@@ -378,7 +380,9 @@ class LatentBundle(nn.Module):
             targets.reshape(-1),
             ignore_index=ignore,
         )
-        kl = kl_gaussian(mu, logvar, mask=~pad)
+        kl = posterior_regularizer(
+            mu, logvar, mask=~pad, kl_entropy=self.kl_entropy,
+        )
 
         mask_loss = zero.to(dtype=ce.dtype)
         lambda_mask = self._lambda_mask()

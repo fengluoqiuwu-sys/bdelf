@@ -2,8 +2,47 @@
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import torch
 import torch.nn as nn
+
+SIGMA_TAG_SUFFIX = "-sigma"
+
+
+def parse_kl_entropy(value: Any = None) -> bool:
+    """缺键 / ``None`` → ``False``（向前兼容，不改变旧哈希）。"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value) and value != 0
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    raise ValueError(f"kl_entropy 须为布尔，收到 {value!r}")
+
+
+def ensure_sigma_tag(tag: str, kl_entropy: bool) -> str:
+    """``kl_entropy`` 开时 tag 以 ``-sigma`` 结尾。"""
+    name = str(tag).strip()
+    if not kl_entropy:
+        return name
+    if name.endswith(SIGMA_TAG_SUFFIX):
+        return name
+    return name + SIGMA_TAG_SUFFIX
+
+
+def _masked_mean(per_tok: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return per_tok.mean()
+    weight = mask.to(dtype=per_tok.dtype)
+    denom = weight.sum().clamp_min(1.0)
+    return (per_tok * weight).sum() / denom
 
 
 def kl_gaussian(
@@ -13,12 +52,29 @@ def kl_gaussian(
 ) -> torch.Tensor:
     """逐位置 KL；``mask`` 为 True 的位置才计入（忽略 pad）。"""
     kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
-    per_tok = kl.mean(dim=-1)
-    if mask is None:
-        return per_tok.mean()
-    weight = mask.to(dtype=per_tok.dtype)
-    denom = weight.sum().clamp_min(1.0)
-    return (per_tok * weight).sum() / denom
+    return _masked_mean(kl.mean(dim=-1), mask)
+
+
+def gaussian_log_q(
+    logvar: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """对角高斯 E[log q] = -0.5 (1 + log(2π) + logvar)；平均方式同 ``kl_gaussian``。"""
+    log_q = -0.5 * (1.0 + math.log(2.0 * math.pi) + logvar)
+    return _masked_mean(log_q.mean(dim=-1), mask)
+
+
+def posterior_regularizer(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    kl_entropy: bool = False,
+) -> torch.Tensor:
+    """关：``KL(q‖N(0,I))``；开：``E[log q]``（抬 σ，不含 μ 项）。"""
+    if kl_entropy:
+        return gaussian_log_q(logvar, mask=mask)
+    return kl_gaussian(mu, logvar, mask=mask)
 
 
 def sample_posterior(

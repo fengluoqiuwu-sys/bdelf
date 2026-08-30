@@ -11,7 +11,8 @@ d_kv: 64  # 每头 K/V 维（T5-small）
 d_ff: 2048  # FFN 中间维（T5-small）
 latent_dim: 64  # 瓶颈维 B
 dropout: 0.0  # Dropout
-beta_kl: 0.1  # KL(q‖N(0,I)) 权重
+beta_kl: 0.1  # 后验项权重（prior-KL 或 E[log q]，由 kl_entropy 切）
+kl_entropy: true  # 开则 β·E[log q] 抬 σ（替代 prior-KL）；缺键为关
 lambda_mask: 1.0  # BERT-mask 损失权重
 mask_ratio: 0.15  # BERT-mask 比例
 use_flash: true  # 是否 SDPA

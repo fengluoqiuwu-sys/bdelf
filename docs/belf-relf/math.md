@@ -72,10 +72,12 @@ L_i=Q\!\left(\frac{i}{T}\right),\qquad i=0,\ldots,T.
 \[
 \mathcal{L}_{\mathrm{s1}}
 =\lambda_{\mathrm{vae}}\,\mathrm{CE}_{\mathrm{rec}}
-+\beta\,\mathrm{KL}(q_\phi\|N(0,I))
++\beta\,\mathcal{R}(q_\phi)
 +\lambda_{\mathrm{mask}}\,\mathcal{L}_{\mathrm{mask}}
 +\lambda_{\mathrm{ref}}\,\mathrm{KL}(q_\phi\|q_{\phi_{\mathrm{ref}}}).
 \]
+
+\(\mathcal{R}\) 由 `kl_entropy` 切换：关（缺键）为 \(\mathrm{KL}(q_\phi\|N(0,I))\)；开（默认 YAML）为 \(\mathbb{E}[\log q_\phi]\)（抬 \(\sigma\)）。开时 artifact tag 后缀 `-sigma`。
 
 重建与 BERT-mask 都经 VAE-dec。\(q_{\phi_{\mathrm{ref}}}\) 是 s2 开始时加载器给出的 encoder 冻结副本。
 

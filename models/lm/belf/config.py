@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from transformers import PretrainedConfig
 
+from models.latent.encdec.readout import ensure_sigma_tag, parse_kl_entropy
 from models.tokens import FL_TokenLayout
 
 _KEY_ALIASES = (
@@ -90,6 +91,7 @@ class FL_BelfConfig(PretrainedConfig):
         lambda_s1: float = 1.0,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
+        kl_entropy: bool = False,
         ctx_source: str = "z",
         x0_source: str = "z",
         self_left_prob: float = 0.25,
@@ -149,7 +151,8 @@ class FL_BelfConfig(PretrainedConfig):
         self.dropout = dropout
         self.mlp_ratio = float(mlp_ratio)
         self.latent_model = latent_model
-        self.tag = tag
+        self.kl_entropy = parse_kl_entropy(kl_entropy)
+        self.tag = ensure_sigma_tag(str(tag), self.kl_entropy)
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = latent_tune
         self.latent_dim = int(latent_dim)

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from models.latent.encdec.encoder import LatentEncoder
 from models.latent.encdec.layers import TransformerBlock
-from models.latent.encdec.readout import PosteriorBReadout, kl_gaussian
+from models.latent.encdec.readout import PosteriorBReadout, posterior_regularizer
 from models.latent.latent_vae.config import FL_LatentVAEConfig
 from models.model import (
     FL_PreTrainedModel,
@@ -38,6 +38,7 @@ class _LatentVAEBackbone(nn.Module):
         latent_dim: int = 64,
         dropout: float = 0.0,
         beta_kl: float = 0.1,
+        kl_entropy: bool = False,
         lambda_mask: float = 1.0,
         mask_ratio: float = 0.15,
         use_flash: bool = True,
@@ -56,6 +57,7 @@ class _LatentVAEBackbone(nn.Module):
         self.n_embd = n_embd
         self.latent_dim = latent_dim
         self.beta_kl = beta_kl
+        self.kl_entropy = bool(kl_entropy)
         self.lambda_mask = lambda_mask
         self.mask_ratio = mask_ratio
         self.block_size = block_size
@@ -201,7 +203,9 @@ class _LatentVAEBackbone(nn.Module):
             loss_targets.reshape(-1),
             ignore_index=self.token_layout.ignore_index,
         )
-        kl = kl_gaussian(mu, logvar, mask=~pad)
+        kl = posterior_regularizer(
+            mu, logvar, mask=~pad, kl_entropy=self.kl_entropy,
+        )
 
         mask_loss = torch.zeros((), device=tokens.device, dtype=ce.dtype)
         if self.training and self.lambda_mask > 0 and self.mask_ratio > 0:
@@ -252,6 +256,7 @@ class _LatentVAEBackbone(nn.Module):
             if fval == fval:
                 out[key] = fval
         out["beta_kl"] = float(self.beta_kl)
+        out["kl_entropy"] = 1.0 if self.kl_entropy else 0.0
         out["lambda_mask"] = float(self.lambda_mask)
         return out
 

@@ -947,6 +947,7 @@ def build_model_from_config(
         latent_thaw_tokens=config.latent_thaw_tokens,
         lambda_vae=config.lambda_vae,
         lambda_ref=config.lambda_ref,
+        kl_entropy=config.kl_entropy,
     )
     print(f"[belf] loaded latent {bundle.latent_model}/{bundle.tag}")
     return FL_BelfModel(config, bundle)

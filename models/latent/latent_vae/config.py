@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from transformers import PretrainedConfig
 
+from models.latent.encdec.readout import parse_kl_entropy
 from models.tokens import FL_TokenLayout
 
 
@@ -49,6 +50,7 @@ class FL_LatentVAEConfig(PretrainedConfig):
         latent_dim: int = 64,
         dropout: float = 0.0,
         beta_kl: float = 0.1,
+        kl_entropy: bool = False,
         lambda_mask: float = 1.0,
         mask_ratio: float = 0.15,
         use_flash: bool = True,
@@ -80,6 +82,7 @@ class FL_LatentVAEConfig(PretrainedConfig):
         self.latent_dim = latent_dim
         self.dropout = dropout
         self.beta_kl = beta_kl
+        self.kl_entropy = parse_kl_entropy(kl_entropy)
         self.lambda_mask = lambda_mask
         self.mask_ratio = mask_ratio
         self.use_flash = use_flash
@@ -109,6 +112,7 @@ class FL_LatentVAEConfig(PretrainedConfig):
             "latent_dim": self.latent_dim,
             "dropout": self.dropout,
             "beta_kl": self.beta_kl,
+            "kl_entropy": self.kl_entropy,
             "lambda_mask": self.lambda_mask,
             "mask_ratio": self.mask_ratio,
             "use_flash": self.use_flash,

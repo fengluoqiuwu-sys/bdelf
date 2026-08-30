@@ -23,12 +23,13 @@ from models.latent.artifact_loader import (
     _require_latent_model,
     resolve_artifact_dir,
 )
+from models.latent.encdec.readout import ensure_sigma_tag, parse_kl_entropy
 
 _SIZE_RE = re.compile(r"(\d+m)\b", re.IGNORECASE)
 
 
 def default_artifact_tag(model_cfg: dict[str, Any]) -> str:
-    """``100m-b32-d1``：档位 + 瓶颈 B + 块大小 D。"""
+    """``100m-b32-d1``；``kl_entropy`` 开时后缀 ``-sigma``。"""
     name = str(model_cfg.get("name") or "")
     m = _SIZE_RE.search(name)
     size = m.group(1).lower() if m else "unk"
@@ -38,7 +39,8 @@ def default_artifact_tag(model_cfg: dict[str, Any]) -> str:
         return f"{size}-none"
     if b is None:
         raise ValueError("model config 缺少 latent_dim，无法生成 tag")
-    return f"{size}-b{int(b)}-d{int(d)}"
+    tag = f"{size}-b{int(b)}-d{int(d)}"
+    return ensure_sigma_tag(tag, parse_kl_entropy(model_cfg.get("kl_entropy")))
 
 
 def _read_sidecar_config(run_dir: Path) -> dict[str, Any]:
@@ -161,6 +163,9 @@ def export_latent_artifact(
 
     model_cfg = dict(model_meta["config"] or {})
     tag_name = _check_segment(tag, what="tag") if tag else default_artifact_tag(model_cfg)
+    tag_name = ensure_sigma_tag(
+        tag_name, parse_kl_entropy(model_cfg.get("kl_entropy")),
+    )
     dest = resolve_artifact_dir(
         latent_model, tag_name, checkpoint_root=checkpoint_root
     )

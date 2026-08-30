@@ -1796,6 +1796,7 @@ def build_model_from_config(
             latent_thaw_tokens=config.latent_thaw_tokens,
             lambda_vae=config.lambda_vae,
             lambda_ref=config.lambda_ref,
+            kl_entropy=config.kl_entropy,
         )
     elif load_latent_weights:
         bundle = LatentBundle(
@@ -1805,6 +1806,7 @@ def build_model_from_config(
             latent_thaw_tokens=config.latent_thaw_tokens,
             lambda_vae=config.lambda_vae,
             lambda_ref=config.lambda_ref,
+            kl_entropy=config.kl_entropy,
         )
     else:
         raise ValueError("relf 须 load_latent_weights=True 或注入 latent")

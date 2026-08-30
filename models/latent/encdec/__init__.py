@@ -5,7 +5,12 @@ from .layers import TransformerBlock
 from .readout import (
     PosteriorBReadout,
     PosteriorEReadout,
+    SIGMA_TAG_SUFFIX,
+    ensure_sigma_tag,
+    gaussian_log_q,
     kl_gaussian,
+    parse_kl_entropy,
+    posterior_regularizer,
     sample_posterior,
 )
 
@@ -14,6 +19,11 @@ __all__ = [
     "TransformerBlock",
     "PosteriorBReadout",
     "PosteriorEReadout",
+    "SIGMA_TAG_SUFFIX",
+    "ensure_sigma_tag",
+    "gaussian_log_q",
     "kl_gaussian",
+    "parse_kl_entropy",
+    "posterior_regularizer",
     "sample_posterior",
 ]

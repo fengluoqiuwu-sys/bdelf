@@ -221,6 +221,12 @@ KL 为
 \end{equation}
 对 $z$ 所在空间各维取平均（\texttt{kl\_gaussian}）。
 
+\texttt{latent\_vae} 另有开关 \texttt{kl\_entropy}（不进必填键；缺键为关，以保持旧 YAML 指纹）。默认 YAML 为开：后验项改为
+\begin{equation}
+  \mathbb{E}[\log q] = -\tfrac{1}{2}\,\mathbb{E}\bigl[1 + \log 2\pi + \log\sigma^2\bigr]
+\end{equation}
+（对角高斯熵的相反数，不含 $\mu$）。最小化该项抬高 $\sigma$。开时 artifact tag 后缀 \texttt{-sigma}。\texttt{latent\_t5} 无此开关。
+
 \subsection{\texttt{latent\_vae}：$z \in \mathbb{R}^{L \times B}$}
 
 对 encoder 输出 $h_{\mathrm{enc}}$：
@@ -289,11 +295,16 @@ Decoder 仅接收 $\mathrm{from\_latent}(z)$，与 Cola \texttt{decode\_logits} 
 
 \subsection{总目标}
 
-训练态统一为
+\texttt{latent\_t5} 训练态为
 \begin{equation}
   \mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N}(0,I)) + \lambda\, \mathcal{L}_{\mathrm{aux}},
 \end{equation}
 默认 $\beta{=}0.1$，$\lambda{=}1$（与 \texttt{cola\_vae} 默认一致）。
+
+\texttt{latent\_vae} 在 \texttt{kl\_entropy} 为假（缺键）时与上式相同；为真（默认 YAML）时
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathbb{E}[\log q] + \lambda\, \mathcal{L}_{\mathrm{aux}}.
+\end{equation}
 
 \subsection{重建项 $\mathcal{L}_{\mathrm{recon}}$}
 

@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from transformers import PretrainedConfig
 
+from models.latent.encdec.readout import ensure_sigma_tag, parse_kl_entropy
 from models.tokens import FL_TokenLayout
 
 _LEGACY_IGNORED = frozenset({"exit", "lambda_ce", "ce_detach_g", "time_step", "window_t"})
@@ -70,6 +71,7 @@ class FL_RelfConfig(PretrainedConfig):
         latent_thaw_tokens: int = 5_000_000_000,
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
+        kl_entropy: bool = False,
         denoiser_p_mean: float = -1.5,
         denoiser_p_std: float = 0.8,
         t_clean_eps: float = 0.05,
@@ -120,7 +122,8 @@ class FL_RelfConfig(PretrainedConfig):
         self.dropout = float(dropout)
         self.mlp_ratio = float(mlp_ratio)
         self.latent_model = str(latent_model)
-        self.tag = str(tag)
+        self.kl_entropy = parse_kl_entropy(kl_entropy)
+        self.tag = ensure_sigma_tag(str(tag), self.kl_entropy)
         self.sc_cfg = bool(sc_cfg)
         self.latent_tune = str(latent_tune).strip().lower()
         self.latent_dim = int(latent_dim)

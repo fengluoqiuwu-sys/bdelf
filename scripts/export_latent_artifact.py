@@ -7,7 +7,7 @@
       --run full/latent/latent_vae/<hash>
 
     .venv/bin/python scripts/export_latent_artifact.py \\
-      --run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force
+      --run full/latent/latent_vae/<hash> --tag 100m-b32-d1-sigma --force
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  python scripts/export_latent_artifact.py "
             "--run full/latent/latent_vae/<hash>\n"
             "  python scripts/export_latent_artifact.py "
-            "--run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force\n"
+            "--run full/latent/latent_vae/<hash> --tag 100m-b32-d1-sigma --force\n"
         ),
     )
     parser.add_argument(
@@ -49,7 +49,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tag",
-        help="选用 tag；默认 {size}-b{latent_dim}-d{block_size}，如 100m-b32-d1",
+        help="选用 tag；默认 {size}-b{latent_dim}-d{block_size}[-sigma]，如 100m-b32-d1-sigma",
     )
     parser.add_argument(
         "--force",

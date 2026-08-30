@@ -26,6 +26,7 @@
 | 读出 | `readout: e`（可选 `b` / `none`） | 固定 B 读出 |
 | 辅助损失 | `lambda_span` + span 腐蚀 | `lambda_mask` + BERT-mask |
 | `beta_kl` | 0.1 | 0.1 |
+| `kl_entropy` | — | `true`（YAML 默认开；**缺键为关**，旧哈希不变） |
 
 ## 配置路径
 
@@ -61,7 +62,7 @@ models/latent/
 ├── encdec/                 # 共享 block / encoder / 读出（readout=e|b 与 latent_vae）
 │   ├── layers.py           # SelfAttention（RoPE）, TransformerBlock, DecoderBlock, CrossAttention
 │   ├── encoder.py          # LatentEncoder（三路 mask）
-│   └── readout.py          # PosteriorBReadout, PosteriorEReadout, KL
+│   └── readout.py          # PosteriorBReadout, PosteriorEReadout, KL / E[log q]
 ├── latent_t5/
 │   ├── config.py           # FL_LatentT5Config
 │   ├── model.py            # _LatentT5Backbone, FL_LatentT5Model
@@ -110,17 +111,19 @@ models/latent/
 
 ### 损失（训练态）
 
-两者均为 Cola Stage-1 形式：
+`latent_t5` 仍为 Cola Stage-1 形式：
 
 $$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathrm{KL}(q\| \mathcal{N}(0,I)) + \lambda\, \mathcal{L}_{\mathrm{aux}}$$
+
+`latent_vae` 由 `kl_entropy` 切换后验项（**不进** `_YAML_REQUIRED`；缺键 / Python 默认 = 关，与旧 YAML 哈希一致）。默认 YAML 为开：用 \(\beta\,\mathbb{E}[\log q]\) 替代 prior-KL，抬后验 \(\sigma\)（对角高斯 \(\mathbb{E}[\log q]=-\tfrac12(1+\log 2\pi+\log\sigma^2)\)，不含 \(\mu\)）。关时与上式相同。开时导出 tag 自动加 `-sigma`。
 
 | 项 | `latent_t5` | `latent_vae` |
 |---|---|---|
 | $\mathcal{L}_{\mathrm{recon}}$ | decoder 双向：并行 CE；decoder 因果：教师强制 AR CE | 并行全 token CE |
 | $\mathcal{L}_{\mathrm{aux}}$ | 原地 span CE（[`span.py`](../../models/latent/latent_t5/span.py)） | BERT-mask CE |
-| 日志键 | `recon_ce`, `kl`, `mask`（span） | 同左（mask 为 BERT） |
+| 日志键 | `recon_ce`, `kl`, `mask`（span） | 同左（mask 为 BERT；`kl_entropy` 开时 `kl` 列为 \(\mathbb{E}[\log q]\)，常为负） |
 
-Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignore_index`；KL 只对非 pad 位置平均；BERT-mask / span 不抽 pad。双向 self-attn 与 T5 cross-attn 屏蔽 pad key；逐 token 因果**不加** pad mask（右 pad + Flash）；`block_size>1` 时块内双向会叠加 pad mask。`cola_vae` 未改。
+Pad（`<|pad|>`，独立 special，非 EOS）**不参与训练**：CE 用 `ignore_index`；后验项（KL / \(\mathbb{E}[\log q]\)）只对非 pad 位置平均；BERT-mask / span 不抽 pad。双向 self-attn 与 T5 cross-attn 屏蔽 pad key；逐 token 因果**不加** pad mask（右 pad + Flash）；`block_size>1` 时块内双向会叠加 pad mask。`cola_vae` 未改。
 
 `latent_t5` encoder 词表扩展 **100** 个 sentinel（`vocab_size + [0,100)`），仅供 span 腐蚀；**不进** `lm_head`。`readout=none` 时 `lm_head.weight` 与 encoder **基础词表** embed 绑定（HF T5 默认 tie）；sentinel 行独立。
 
@@ -290,18 +293,18 @@ cache/checkpoints/artifacts/latent/{latent_model}/{tag}/   # 选用末档；只�
 
 ```bash
 .venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash>
-.venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force
+.venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash> --tag 100m-b32-d1-sigma --force
 ```
 
 加载只读，**不会**写回该目录：
 
 ```python
 from models.latent.artifact_loader import load_latent_artifact
-loaded = load_latent_artifact("latent_vae", "100m-b32-d1")
+loaded = load_latent_artifact("latent_vae", "100m-b32-d1-sigma")
 ```
 
 ```bash
-.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1
+.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1-sigma
 ```
 
 解析：
