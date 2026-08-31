@@ -79,7 +79,7 @@ def block_generate(
         top_k = int(top_k)
     commit_x0hat = bool(cfg.get("commit_x0hat", False))
     w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 2.0)))
-    w_ctx = float(cfg.get("w_ctx", cfg.get("w_cfg", cfg.get("ctx_cfg_scale", 2.0))))
+    w_ctx = float(cfg.get("w_ctx", cfg.get("w_cfg", cfg.get("ctx_cfg_scale", 1.0))))
     x0_src = str(getattr(backbone, "x0_source", "z")).strip().lower()
     ctx_src = "mu"
 

@@ -181,7 +181,7 @@ class FL_RelfConfig(PretrainedConfig):
             "sampling_method": "sde",
             "sde_gamma": 1.5,
             "w_sc": 2.0,
-            "w_ctx": 2.0,
+            "w_ctx": 1.0,
             "temperature": 0.0,
             "commit_x0hat": False,
         }

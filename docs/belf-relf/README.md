@@ -150,7 +150,7 @@ tokens
 BELF：`block_size=16`；训练每样本 \(t\sim\mathrm{Ln}\)（\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^2)\)）；推理 `num_sampling_steps=32`（可改）。  
 RELF：`window_size=64`，`step_size=2`（推理 \(T=W/S=32\) 锁死）；训练逐档独立 \(t\sim\mathrm{Ln}\)；推理窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后提交 \(\hat x_0\)。
 
-推理 CFG 键为 `w_sc` / `w_ctx`（默认皆 2.0；`w_cfg` 为 `w_ctx` 别名）。主跑启用 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` / `w_ctx` 时别名不生效；扫参请改这两键。
+推理 CFG 键为 `w_sc` / `w_ctx`（默认 `w_sc=2.0`、`w_ctx=1.0`；`w_cfg` 为 `w_ctx` 别名）。主跑启用 `w_sc`。生成循环仍接受 ELF 别名 `self_cond_cfg_scale` / `ctx_cfg_scale`，但 YAML 已写 `w_sc` / `w_ctx` 时别名不生效；扫参请改这两键。
 
 完整键与消融对照见 LaTeX 参数表；工程实现不得另发明默认。
 
@@ -210,7 +210,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 
 评测：BELF 走块采样，RELF 走 rolling；主指标沿用仓库 TriFluency / Gen.PPL，不再用出口 CE 充当 eval PPL。长度切分见 LaTeX 附录（full/mid 的 Stage1 对齐 512；full 扩展对齐 2048）。
 
-推理默认同规格：`commit_x0hat=false`（VAE-dec 读词再 encode），`sampling_method=sde`，`w_sc=2.0`，`w_ctx=2.0`。对照 `true` 提交 \(\hat x_0\)、全文一次 VAE-dec。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
+推理默认同规格：`commit_x0hat=false`（VAE-dec 读词再 encode），`sampling_method=sde`，`w_sc=2.0`，`w_ctx=1.0`。对照 `true` 提交 \(\hat x_0\)、全文一次 VAE-dec。前缀 KV 不随 \(w_{\mathrm{sc}}\) 重算。
 
 ## `latent_tune` 与 \(\mathcal{L}_{\mathrm{s1}}\)
 

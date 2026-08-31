@@ -7,5 +7,5 @@ commit_x0hat: false  # 关=VAE-dec 读词再 encode；开=提交 x_hat，全文�
 sampling_method: sde  # 采样方法：sde | ode
 sde_gamma: 1.5  # SDE churn 系数；末流关闭
 w_sc: 2.0  # 推理 self-cond CFG 缩放；sc_cfg 为假时忽略
-w_ctx: 2.0  # 推理上下文 CFG；1 表示不丢前缀
+w_ctx: 1.0  # 推理上下文 CFG；1 表示不丢前缀
 temperature: 0.0  # 采样温度；≤0 为 argmax

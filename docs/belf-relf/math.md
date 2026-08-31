@@ -104,7 +104,7 @@ v_z & g=0.
 
 修正施加于右段未知列。\(g=0\) 时 sc 通道为 0，但未知槽 AdaLN 仍以已采样的 \(w_{\mathrm{sc}}\) 为条件。`sc_cfg` 为假（消融关）：无通道、\(v_{\mathrm{tgt}}=v_z\)。不可单独再开 `self_cond`。训练实现：CFG 三次共用一次左段 prefill KV，teacher / 学生只跑右；self-left 仅命中行跑完整 2L。语义不变，工程见 [`README.md`](README.md)。
 
-\(w_{\mathrm{ctx}}\) 不进 AdaLN。训练以 \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 丢弃 2L 左段。推理默认 \(w_{\mathrm{ctx}}=2\)：无条件支路为空前缀、仅当前块/窗，再与有前缀支路外推；\(w_{\mathrm{ctx}}=1\) 时只跑带前缀一次前向。RELF 最右 \(S\) 个新噪声槽 sc 恒为 0。
+\(w_{\mathrm{ctx}}\) 不进 AdaLN。训练以 \(p_{\mathrm{drop}}^{\mathrm{ctx}}\) 丢弃 2L 左段。推理默认 \(w_{\mathrm{ctx}}=1\)：只跑带前缀一次前向；\(w_{\mathrm{ctx}}\neq 1\) 时无条件支路为空前缀、仅当前块/窗，再与有前缀支路外推。RELF 最右 \(S\) 个新噪声槽 sc 恒为 0。
 
 ## 6. BELF：块条件流
 
