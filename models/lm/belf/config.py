@@ -92,7 +92,7 @@ class FL_BelfConfig(PretrainedConfig):
         lambda_vae: float = 1.0,
         lambda_ref: float = 1.0,
         kl_entropy: bool = False,
-        ctx_source: str = "z",
+        ctx_source: str = "mu",
         x0_source: str = "z",
         self_left_prob: float = 0.25,
         self_left_thaw_tokens: int | float = 5e9,
@@ -190,7 +190,10 @@ class FL_BelfConfig(PretrainedConfig):
         self.lambda_s1 = float(lambda_s1)
         self.lambda_vae = float(lambda_vae)
         self.lambda_ref = float(lambda_ref)
-        self.ctx_source = str(ctx_source).strip().lower()
+        ctx = str(ctx_source).strip().lower()
+        if ctx != "mu":
+            raise ValueError(f"belf ctx_source 锁死 mu，不允许 {ctx_source!r}")
+        self.ctx_source = "mu"
         self.x0_source = str(x0_source).strip().lower()
         p_left = float(self_left_prob)
         if not (0.0 <= p_left <= 1.0):

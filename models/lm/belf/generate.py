@@ -81,7 +81,7 @@ def block_generate(
     w_sc_val = float(cfg.get("w_sc", cfg.get("self_cond_cfg_scale", 2.0)))
     w_ctx = float(cfg.get("w_ctx", cfg.get("w_cfg", cfg.get("ctx_cfg_scale", 2.0))))
     x0_src = str(getattr(backbone, "x0_source", "z")).strip().lower()
-    ctx_src = str(getattr(backbone, "ctx_source", "z")).strip().lower()
+    ctx_src = "mu"
 
     def _mapped(z: torch.Tensor, mu: torch.Tensor, source: str) -> torch.Tensor:
         src = mu if source == "mu" else z

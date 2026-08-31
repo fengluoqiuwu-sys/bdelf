@@ -153,7 +153,7 @@ class _BelfBackbone(nn.Module):
         self.whiten = bool(config.whiten)
         self.whiten_on = str(config.whiten_on).strip().lower()
         self.x0_source = str(config.x0_source).strip().lower()
-        self.ctx_source = str(config.ctx_source).strip().lower()
+        self.ctx_source = "mu"
 
         x_dim = self.latent_dim
         mean = torch.zeros(x_dim)
@@ -617,7 +617,7 @@ class _BelfBackbone(nn.Module):
                 f"latent 形状 {tuple(z.shape[:2])} 须与 token {tuple(tokens.shape)} 一致"
             )
         src_x0 = mu if self.x0_source == "mu" else z
-        src_ctx = mu if self.ctx_source == "mu" else z
+        src_ctx = mu
         x0 = self._whiten(src_x0)
         x_ctx = self._whiten(src_ctx)
         dtype = x0.dtype

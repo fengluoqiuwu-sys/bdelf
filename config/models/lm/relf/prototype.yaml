@@ -37,8 +37,8 @@ lambda_mse: 1.0  # 未知槽 v-MSE 权重
 self_left_prob: 0.25  # 训练按样本把左段换成末流 sg(x_hat) 的概率；eval/生成视为 0
 self_left_thaw_tokens: 5000000000  # self-left 解锁有效 token 点；0 表示一开始就开
 lambda_s1: 1.0  # 联合训时 L_s1 权重
-ctx_source: z  # 左段条件来源：z | mu
-x0_source: z  # 干净端来源：z | mu
+ctx_source: mu  # 左段条件锁死 μ；写 z 直接报错
+x0_source: z  # 干净端来源：z | mu（仅此项可选）
 cond_mode: clean  # 条件模式；主跑 clean
 clean_block_prob: 0.05  # 非句首窗抽余数 r 的概率
 train_t_schedule: block  # 训练抽 t：逐档独立连续 Ln

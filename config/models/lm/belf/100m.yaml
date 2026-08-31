@@ -40,8 +40,8 @@ lambda_s1: 1.0  # 联合训时 L_s1 权重
 lambda_vae: 1.0  # s1 重建项权重
 lambda_ref: 1.0  # s1 参考编码器 KL 权重
 kl_entropy: false  # 开则 s1 为 β·(KL+E[log q])；缺键/false 与旧哈希相同
-ctx_source: z  # 左段条件来源：z | mu
-x0_source: z  # 干净端来源：z | mu
+ctx_source: mu  # 左段条件锁死 μ；写 z 直接报错
+x0_source: z  # 干净端来源：z | mu（仅此项可选）
 self_cond_cfg_p_mean: -1.5  # w_sc 采样 logit-normal 均值
 self_cond_cfg_p_std: 0.8  # w_sc 采样 logit-normal 标准差
 self_cond_cfg_min: 0.5  # w_sc 下界

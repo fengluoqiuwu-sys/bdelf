@@ -868,7 +868,7 @@ class _RelfBackbone(nn.Module):
                 f"latent 形状 {tuple(z.shape[:2])} 须与 token {tuple(tokens.shape)} 一致"
             )
         src_x0 = mu if str(self.config.x0_source).lower() == "mu" else z
-        src_ctx = mu if str(self.config.ctx_source).lower() == "mu" else z
+        src_ctx = mu
         h_x0 = self._map_h(src_x0)
         h_ctx = self._map_h(src_ctx)
         bos, eos = self._bos_eos(tokens)
@@ -1020,8 +1020,8 @@ class _RelfBackbone(nn.Module):
             return self._map_h(src)
 
         def _encode_h(tok: torch.Tensor) -> torch.Tensor:
-            """左段 KV：茎后的 D，码来自 ``ctx_source``。"""
-            return self._stem(_encode_mapped(tok, self.config.ctx_source))
+            """左段 KV：茎后的 D，码锁死 μ。"""
+            return self._stem(_encode_mapped(tok, "mu"))
 
         def _encode_x0(tok: torch.Tensor) -> torch.Tensor:
             """已知余数：encoder 干净码（X），与训练 ``x0_source`` 同一空间。"""

@@ -78,7 +78,7 @@ class FL_RelfConfig(PretrainedConfig):
         vel_eps: float = 1e-3,
         lambda_mse: float = 1.0,
         lambda_s1: float = 1.0,
-        ctx_source: str = "z",
+        ctx_source: str = "mu",
         x0_source: str = "z",
         cond_mode: str = "clean",
         clean_block_prob: float = 0.05,
@@ -148,7 +148,10 @@ class FL_RelfConfig(PretrainedConfig):
         self.vel_eps = float(vel_eps)
         self.lambda_mse = float(lambda_mse)
         self.lambda_s1 = float(lambda_s1)
-        self.ctx_source = str(ctx_source).strip().lower()
+        ctx = str(ctx_source).strip().lower()
+        if ctx != "mu":
+            raise ValueError(f"relf ctx_source 锁死 mu，不允许 {ctx_source!r}")
+        self.ctx_source = "mu"
         self.x0_source = str(x0_source).strip().lower()
         self.cond_mode = str(cond_mode).strip().lower()
         if self.cond_mode != "clean":
