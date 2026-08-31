@@ -46,7 +46,7 @@ Cola 的 VAE 加载器与本规格入口不是同一条路：
 ```python
 # BELF / RELF 入口
 from models.latent.artifact_loader import load_latent_artifact
-loaded = load_latent_artifact("latent_vae", "100m-b32-d1-sigma")
+loaded = load_latent_artifact("latent_vae", "100m-b32-d1")
 
 # Cola Stage-2 入口（现网，勿混用）
 # models/lm/cola/vae_loader.py → artifacts/cola_vae/<tag>/
@@ -55,7 +55,7 @@ loaded = load_latent_artifact("latent_vae", "100m-b32-d1-sigma")
 现有选用示例（与本规格无关，仅说明加载器已可用）：
 
 ```bash
-.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1-sigma
+.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1
 ```
 
 ## 代码地图
@@ -142,7 +142,7 @@ tokens
 - RELF：无 `block_size`；加载入口块长 \(=1\)；\(W\) 能被 \(S\) 整除且 \(T=W/S\ge 4\)
 - 可训档（`full` / `mid`）要求入口 `encoder.block_size==1`；块因果入口只允许 `frozen`
 - 出口锁死 VAE-dec，启动必须具备 decoder；可训档（`latent_tune` 的 `full` / `mid`）同样须具备 VAE-dec
-- 100m 默认 `tag: 100m-b32-d1-sigma`（`kl_entropy` 开）：若 artifact 块长为 32，BELF \(W=16\) / RELF 入口必须 1 **硬拒**，不放宽校验
+- 100m 默认 `tag: 100m-b32-d1`（`kl_entropy` 关）：若 artifact 块长为 32，BELF \(W=16\) / RELF 入口必须 1 **硬拒**，不放宽校验
 
 ### 100m 默认（规格）
 
@@ -220,7 +220,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 | `full` | step 0 起 | 重建 + 后验项 + BERT-mask + ref-KL |
 | `mid` | 未到解冻点同 frozen；之后同 full | 解冻前不算；解冻后算。新参数新优化器状态 |
 
-\(\mathcal{L}_{\mathrm{s1}}\) 与流损失 \(\mathcal{L}=\lambda_{\mathrm{mse}}\mathcal{L}_{\mathrm{mse}}\) 分开相加。后验项由 `kl_entropy` 切换（缺键 / `false` 不进指纹、与旧哈希一致；默认 YAML 为开：\(\beta\,(\mathrm{KL}+\mathbb{E}[\log q])\)，tag 后缀 `-sigma`）。主体不含出口 CE。VAE-dec 参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
+\(\mathcal{L}_{\mathrm{s1}}\) 与流损失 \(\mathcal{L}=\lambda_{\mathrm{mse}}\mathcal{L}_{\mathrm{mse}}\) 分开相加。后验项由 `kl_entropy` 切换（缺键 / `false` 不进指纹、与旧哈希一致；默认 YAML 为关：仅 prior-KL；开：\(\beta\,(\mathrm{KL}+\mathbb{E}[\log q])\)，tag 后缀 `-sigma`）。主体不含出口 CE。VAE-dec 参数是否更新仍只由 `latent_tune` 决定。速度 MSE 仍可反传到 encoder；2L 左段 `sg` 只切断 pack 左半。可训档另要求入口块长为 1（块因果 encoder 禁止与 \(G\) 联合训）。
 
 ## 明确不做（工程）
 

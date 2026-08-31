@@ -5,7 +5,7 @@ Usage:
     python generate.py
     python generate.py --run full/lm/elf/<hash>
     python generate.py --checkpoint cache/checkpoints/full/lm/elf/<hash>/checkpoint_latest.pt
-    python generate.py --latent-model latent_vae --tag 100m-b32-d1-sigma
+    python generate.py --latent-model latent_vae --tag 100m-b32-d1
     python generate.py --num-tokens 1024 --seed 42
     python generate.py --prompt "Once upon a time" --num-tokens 256
     python generate.py --prompt-file prompt.txt --run full/ar/<hash>

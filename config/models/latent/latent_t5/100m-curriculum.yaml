@@ -13,7 +13,7 @@ d_ff: 2048  # FFN 中间维（T5-small）
 latent_dim: 32  # 瓶颈维 B；readout=none 时不用
 dropout: 0.0  # Dropout
 beta_kl: 0.1  # 后验项权重；kl_entropy 关时仅 prior-KL，开时 β·(KL+E[log q])；readout=none 时为 0
-kl_entropy: true  # 开则 prior-KL 与 E[log q] 并存（抬 σ）；缺键/false 与旧哈希相同
+kl_entropy: false  # 开则 prior-KL 与 E[log q] 并存（抬 σ）；缺键/false 与旧哈希相同
 lambda_span: 1.0  # span 辅助损失权重
 span_mask_ratio: 0.15  # span 腐蚀比例
 span_mean_len: 3  # span 平均长度

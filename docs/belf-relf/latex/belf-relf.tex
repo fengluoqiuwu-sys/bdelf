@@ -144,7 +144,7 @@ v^\star=x_0-\varepsilon.
 +\lambda_{\mathrm{mask}}\,\mathcal{L}_{\mathrm{mask}}
 +\lambda_{\mathrm{ref}}\,\mathrm{KL}(q_\phi\|q_{\phi_{\mathrm{ref}}}).
 \]
-后验项 \(\mathcal{R}\) 由 \texttt{kl\_entropy} 切换：缺键或假为 \(\mathrm{KL}(q_\phi\|N(0,I))\)；真（默认 YAML）为 \(\mathbb{E}[\log q_\phi]\)（对角高斯、不含 \(\mu\)，抬 \(\sigma\)）。开时 artifact \texttt{tag} 后缀 \texttt{-sigma}。\(\mathrm{CE}_{\mathrm{rec}}\) 与 BERT-mask 都经 VAE-dec。\(q_{\phi_{\mathrm{ref}}}\) 是 s2 开始时加载器给出的 encoder 冻结副本。\texttt{frozen} 时 \(\mathcal{L}_{\mathrm{s1}}=0\)。
+后验项 \(\mathcal{R}\) 由 \texttt{kl\_entropy} 切换：缺键或假（默认 YAML）为 \(\mathrm{KL}(q_\phi\|N(0,I))\)；真为 \(\mathrm{KL}(q_\phi\|N(0,I))+\mathbb{E}[\log q_\phi]\)（对角高斯、不含 \(\mu\)，抬 \(\sigma\)）。开时 artifact \texttt{tag} 后缀 \texttt{-sigma}。\(\mathrm{CE}_{\mathrm{rec}}\) 与 BERT-mask 都经 VAE-dec。\(q_{\phi_{\mathrm{ref}}}\) 是 s2 开始时加载器给出的 encoder 冻结副本。\texttt{frozen} 时 \(\mathcal{L}_{\mathrm{s1}}=0\)。
 
 网络默认分为三段：加载器编码、去噪器 \(G\)、推理时的 VAE-dec 读出。\(G\) 一律使用逐位置时间嵌入与 AdaLN-Zero；若本族各位置 \(t\) 相同，则广播同一标量。
 
@@ -195,8 +195,8 @@ Token 预算：日程档 \texttt{full} 下每族 \(\times\) 每一 \texttt{laten
 \midrule
 \multicolumn{4}{@{}l}{\textit{模型（共用）}} \\
 \texttt{latent\_model} & & 交给 \texttt{load\_latent\_artifact} 的家族名。 & 必填 \\
-\texttt{tag} & & 交给加载器的 tag。\texttt{kl\_entropy} 开时后缀 \texttt{-sigma}。 & \texttt{100m-b32-d1-sigma} \\
-\texttt{kl\_entropy} & & s1 后验项：真则 \(\beta(\mathrm{KL}+\mathbb{E}[\log q])\)，假则仅 prior-KL。不进必填键；缺键或 \texttt{false} 不进指纹。 & \texttt{true} \\
+\texttt{tag} & & 交给加载器的 tag。\texttt{kl\_entropy} 开时后缀 \texttt{-sigma}。 & \texttt{100m-b32-d1} \\
+\texttt{kl\_entropy} & & s1 后验项：真则 \(\beta(\mathrm{KL}+\mathbb{E}[\log q])\)，假则仅 prior-KL。不进必填键；缺键或 \texttt{false} 不进指纹。 & \texttt{false} \\
 \texttt{n\_embd} & \(D\) & \(G\) 隐层宽。与流空间 \(X\) 无关。 & \(768\) \\
 \texttt{latent\_dim} & \(X\) & 流空间维；须等于 artifact 输出维。 & \(32\) \\
 \texttt{max\_seq\_len} & & 位置编码与生成长度上限。 & \(4096\) \\

@@ -26,7 +26,7 @@
 | 读出 | `readout: e`（可选 `b` / `none`） | 固定 B 读出 |
 | 辅助损失 | `lambda_span` + span 腐蚀 | `lambda_mask` + BERT-mask |
 | `beta_kl` | 0.1 | 0.1 |
-| `kl_entropy` | `true`（YAML 默认开；**缺键 / false 与旧哈希相同**） | 同左 |
+| `kl_entropy` | `false`（YAML 默认关；**缺键 / false 与旧哈希相同**） | 同左 |
 
 ## 配置路径
 
@@ -115,7 +115,7 @@ models/latent/
 
 $$\mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathcal{R}(q) + \lambda\, \mathcal{L}_{\mathrm{aux}}$$
 
-`kl_entropy` 切换 \(\mathcal{R}\)（**不进** `_YAML_REQUIRED`；缺键 / `false` / Python 默认 = 关，**与旧 YAML 同哈希**）。关：\(\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))\)。开（默认 YAML）：\(\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))+\mathbb{E}[\log q]\)，两项同权、乘同一 \(\beta\)。\(\mathbb{E}[\log q]=-\tfrac12(1+\log 2\pi+\log\sigma^2)\) 不含 \(\mu\)，最小化则抬 \(\sigma\)；prior-KL 仍约束 \(\mu\)。`latent_t5` 的 `readout=none` 无后验，\(\mathcal{R}=0\)。开时导出 tag 自动加 `-sigma`。`cola_vae` 仍只用 prior-KL。
+`kl_entropy` 切换 \(\mathcal{R}\)（**不进** `_YAML_REQUIRED`；缺键 / `false` / Python 默认 / **默认 YAML** = 关，**与旧 YAML 同哈希**）。关：\(\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))\)。开：\(\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))+\mathbb{E}[\log q]\)，两项同权、乘同一 \(\beta\)。\(\mathbb{E}[\log q]=-\tfrac12(1+\log 2\pi+\log\sigma^2)\) 不含 \(\mu\)，最小化则抬 \(\sigma\)；prior-KL 仍约束 \(\mu\)。`latent_t5` 的 `readout=none` 无后验，\(\mathcal{R}=0\)。开时导出 tag 自动加 `-sigma`。`cola_vae` 仍只用 prior-KL。
 
 | 项 | `latent_t5` | `latent_vae` |
 |---|---|---|
@@ -298,18 +298,18 @@ cache/checkpoints/artifacts/latent/{latent_model}/{tag}/   # 选用末档；只�
 
 ```bash
 .venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash>
-.venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash> --tag 100m-b32-d1-sigma --force
+.venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force
 ```
 
 加载只读，**不会**写回该目录：
 
 ```python
 from models.latent.artifact_loader import load_latent_artifact
-loaded = load_latent_artifact("latent_vae", "100m-b32-d1-sigma")
+loaded = load_latent_artifact("latent_vae", "100m-b32-d1")
 ```
 
 ```bash
-.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1-sigma
+.venv/bin/python generate.py --latent-model latent_vae --tag 100m-b32-d1
 ```
 
 解析：

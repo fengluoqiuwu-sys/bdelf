@@ -171,7 +171,7 @@ encoder / decoder self-attn & encoder：\texttt{bidirectional}；decoder：\text
 读出 & \texttt{readout=e|b|none} & 固定 $B$ 读出 \\
 辅助损失 & \texttt{lambda\_span} + span 腐蚀 & \texttt{lambda\_mask} + BERT-mask \\
 \texttt{beta\_kl} & \multicolumn{2}{c}{0.1} \\
-\texttt{kl\_entropy} & \multicolumn{2}{c}{缺键/\texttt{false} 同旧哈希；默认 YAML 开：$\mathrm{KL}+\mathbb{E}[\log q]$} \\
+\texttt{kl\_entropy} & \multicolumn{2}{c}{缺键/\texttt{false} 同旧哈希（默认 YAML 关）；开：$\mathrm{KL}+\mathbb{E}[\log q]$} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -227,7 +227,7 @@ KL 为
 \end{equation}
 对 $z$ 所在空间各维取平均（\texttt{kl\_gaussian}）。
 
-\texttt{latent\_t5} 与 \texttt{latent\_vae} 另有开关 \texttt{kl\_entropy}（不进必填键；缺键或 \texttt{false} 不进指纹，与旧 YAML 同哈希）。关时后验项即为上式 KL。开（默认 YAML）时两项并存、同一 $\beta$：
+\texttt{latent\_t5} 与 \texttt{latent\_vae} 另有开关 \texttt{kl\_entropy}（不进必填键；缺键或 \texttt{false} 不进指纹，与旧 YAML 同哈希）。默认 YAML 关：后验项即为上式 KL。开时两项并存、同一 $\beta$：
 \begin{equation}
   \mathcal{R}(q)=\mathrm{KL}(q\|p_0)+\mathbb{E}[\log q],\qquad
   \mathbb{E}[\log q] = -\tfrac{1}{2}\,\mathbb{E}\bigl[1 + \log 2\pi + \log\sigma^2\bigr].
@@ -307,7 +307,7 @@ Decoder 仅接收 $\mathrm{from\_latent}(z)$，与 Cola \texttt{decode\_logits} 
   \mathcal{L} = \mathcal{L}_{\mathrm{recon}} + \beta\,\mathcal{R}(q) + \lambda\, \mathcal{L}_{\mathrm{aux}},
 \end{equation}
 默认 $\beta{=}0.1$，$\lambda{=}1$（与 \texttt{cola\_vae} 默认一致）。
-\texttt{kl\_entropy} 为假（缺键 / \texttt{false}，不进指纹）时 $\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))$；为真（默认 YAML）时
+\texttt{kl\_entropy} 为假（缺键 / \texttt{false}，不进指纹；默认 YAML）时 $\mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))$；为真时
 \begin{equation}
   \mathcal{R}=\mathrm{KL}(q\| \mathcal{N}(0,I))+\mathbb{E}[\log q].
 \end{equation}
