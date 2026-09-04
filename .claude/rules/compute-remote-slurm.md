@@ -1,0 +1,46 @@
+# 远端 Slurm 计算约束
+
+适用范围：`scripts/servers.csv` 中 `调度类型=slurm` 的主机。当前仅 **ovan-server**（`partition=cls1`）。  
+common 远端见 rule「远端 common 计算约束」；本机见「本机计算约束」。
+
+## 集群
+
+- 主机：`ssh ovan-server`；**仅** `partition=cls1`。
+- `cls1-srv1`：8× A6000（48GB）；`cls1-srv[2-4]`：8× RTX 4090（24GB）。（与 `servers.csv` 中 `A6000|RTX4090` / `48|24` 一致。）
+- 单作业：最多 **1 node**；禁止跨节点。
+- AI 训练作业默认卡数与该机 csv **「单个ai任务最大使用显卡数量」** 一致（`slurm/prototype.slurm` 的 `#SBATCH --gpus-per-node` 须与 csv 对齐，改额度时两处一起改）。已登记未结束作业的 **合计 GPU**（含即将提交的本作业）**不得超过**该机 csv **「最大使用显卡数量」**。数字**不要默记**：每次提交前跑 `remote_status.sh`，以其输出的 `agent_gpu_budget` / `gpu_per_job` 为准。若单任务上限等于合计上限，则满额度一次一作业，勿再叠加第二个 AI GPU 作业。
+
+## 远端状态（强制前置）
+
+在本机对 ovan-server 做**作业相关操作**之前（`sbatch` / `slurm/sbatch-train.sh` / `scancel`、改远端 `temp/agent` 登记等），**必须先**调用：
+
+```bash
+bash slurm/remote_status.sh          # 或加 --json
+```
+
+未跑完、未根据输出确认 GPU/队列/登记可继续之前，不得提交或取消作业。只读拉日志可用 `tail_remote_logs`（见 skill `train-ops`），不替代本工具。
+
+## 提交与登录节点
+
+- 占 CPU/GPU 的工作必须经 Slurm；登录节点禁止非 Slurm 的重 Python 作业。
+- 登录节点只做轻量事：队列/状态、只读日志、写 `temp/` 登记。
+- 训练提交：`bash slurm/sbatch-train.sh <name>`（脚本在 `scripts/train/`；模板 `slurm/prototype.slurm`，默认 GPU 数须与 csv「单个ai任务最大使用显卡数量」一致 / 16 CPU / 128G）。
+- Eval 提交：`bash slurm/sbatch-eval.sh <name> -- --run full/<model>/<hash> …`（脚本在 `scripts/eval/`；模板 `slurm/eval.slurm`，**默认卡数同 csv 单任务上限**）。
+- VRAM 探针：`bash slurm/sbatch-vram-probe.sh …`；预处理：`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`。
+- **禁止** AI 提交 `slurm/sbatch-preprocess.sh` / 预处理作业。
+
+## 文件系统
+
+- 项目树只读；改代码只在本地 → `bash scripts/sync.sh ovan-server push` → 再提交。
+- 远端 AI **可写**：`temp/`（agent 登记；不同步）与 `logs/`（作业日志；**pull 拉取**，push 不删远端）。
+- 作业日志统一：`logs/ovan-server/<时间戳>/`，含 `<job-name>-<job-id>.out` / `.err` / `gpu-<job-id>.log`（由 `sbatch-train.sh` + `prototype.slurm` 写入）。
+- `slurm/gpu_availability.py` / `tail_remote_logs.py` 内不得 SSH；本机汇总状态用 `slurm/remote_status.sh`。
+- 远端工作目录以 `servers.csv` 为准。
+
+## AI 作业登记与互斥
+
+- 远端 `temp/agent/active/<job_id>.json`：**每个**未结束 AI 作业一份（训练 / vram-probe 等）；`launched/` 为历史。
+- `scheduler` 建议写 `"slurm"`；以 Slurm `job_id` 为键；`gpus` 计入 `agent_gpu_sum`。
+- 可同时跑多个，条件：登记合计 GPU + 本作业申请 **≤ csv「最大使用显卡数量」**（以 `remote_status` 的 `agent_gpu_budget` 为准）。集群无空闲卡时仍可 `sbatch` 排队，勿空等 AVAIL。
+- 可 `scancel` **自己登记**的作业；勿动他人 / 未登记作业。
+- 禁止在远端交互式 `generate.py` / 人工看效果；离线 TriFluency eval 须经 `bash slurm/sbatch-eval.sh <name> -- --run …`（默认卡数同 csv 单任务上限；结果 `sync pull` 含 `cache/eval/`）。

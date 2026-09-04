@@ -1,7 +1,3 @@
----
-description: config/**/*.yaml 行内中文注释与同功能文件结构一致
----
-
 # config YAML 注释与结构
 
 适用于 `config/` 下全部 YAML（datasets / tokenizers / preprocess / models / train / generate）。

@@ -1,25 +1,42 @@
----
-description: checkpoint 路径为 {fast|full}/{model}/{hash}；禁止别名
----
-
 # Checkpoint 路径与配置哈希
 
-## 布局
+## 布局（唯一身份）
 
 ```
-cache/checkpoints/{fast|full}/{model}/{config-hash}/
+cache/checkpoints/{fast|full}/{model}/{config-hash}/   # 训练 run
+cache/checkpoints/artifacts/<kind>/…                     # 非训练选用产物
 ```
 
-- 权威相对路径：`{variant}/{model}/{config-hash}`。
-- **禁止**软链、人类别名、旧扁平 run 名。
-- `generate.py --run` 填 `fast|full/<model>/<hash>`。
-- 定位（本机已有权重时）：
+- 训练权威相对路径：`{variant}/{model}/{config-hash}`（`FL_TrainConfig.extra.run_relpath`）。
+- **禁止**软链、人类别名目录、`--run-name` 覆盖训练路径。
+- `config-hash`：训练入参 + 进入指纹的 YAML **内容** → 16 hex；`--set` 会改变哈希。
+- **不进哈希**：`world_size`、GPU 硬件规格。
+- 进入指纹的 YAML：recipe / schedule / eval / generate / model arch / dataset / preprocess。
+- 实现：`train/run_path.py`；定位 CLI 见 skill `generate`（`scripts/resolve_checkpoint.py`）。
 
-```bash
-.venv/bin/python scripts/resolve_checkpoint.py \
-  --model ar --config 100m-full \
-  --dataset owt --preprocess default --generate eval
-```
+### artifacts（非训练）
 
-- 本地 `hash_guide.csv`（仅 full）可只读查阅；Claude 不负责 sync。
-- 硬件锁定 / 训练哈希细节以仓库 Cursor rule 为准；Claude 侧只需能正确定位本机 checkpoint。
+供下游固定引用，**不**与 `fast|full` 训练目录混放：
+
+| 种类 | 路径 | 说明 |
+|---|---|---|
+| ACE direction | `artifacts/ace/{model-hash}/{step}/` | 自动估计/缓存（仅 ACE 用 hash/step） |
+| 选用 VAE 等 | `artifacts/<name>/<tag>/` | 人手从训练 run 拷贝；按 **tag** 选用 |
+| 选用 latent（HF） | `artifacts/latent/{model}/{tag}/` | `scripts/export_latent_artifact.py` 从训练 latest 导出（EMA 熔进权重）；加载只读 |
+
+Cola Stage-2 默认只认 `artifacts/cola_vae/<tag>/`（或 `COLA_VAE_CHECKPOINT` / `COLA_VAE_TAG` / `vae_run`）；**不**再按 mtime 扫 `full/cola_vae` 的 latest。`cola_vae` **训练**仍写 `fast|full/cola_vae/<hash>/`。
+
+`artifacts/latent/{model}/{tag}/` 供下游 / HuggingFace 固定引用。导出：`scripts/export_latent_artifact.py --run full/latent/<model>/<hash>`（只写最终参数与模型 config）。加载：`load_latent_artifact(latent_model, tag)`。训练保存若目标落在 `artifacts/latent/` 会拒绝（不影响 `artifacts/ace` 等）。
+
+本地 `cache/checkpoints/hash_guide.csv` 给人看（**仅 full** 训练时自动 upsert；fast 不写入）；**不随 sync 推送/拉取**。
+
+## 硬件锁定（不进哈希）
+
+首次训练写入 `hardware.json`（型号、张数、单卡 GiB）。续训须型号与张数一致；显存只比**四舍五入后的 GiB**。为确保训练结果一致与可复现，请勿在训练中途换卡或改可见 GPU 数；确需变更时请新开实验。
+
+## 配置演进
+
+- 默认只**新增**配置项并给保持旧行为的默认值，旧 hash 目录可续训；共享代码改动须**向前兼容**，不影响其他模型训练/推理。
+- **不向前兼容**的改动（修实现错误会改旧数值、删改必填语义、改共享 API/布局等）：Claude **须向用户二次确认**后再做；不要用别名指向新目录掩盖破坏性变更。
+- 严重正确性 bug：经确认后修代码并处理受影响的旧 checkpoint。
+- `generate.py --run` 用 `fast|full/<model>/<hash>`，不用旧扁平名。
