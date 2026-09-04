@@ -146,7 +146,7 @@ tokens
 
 ### 100m 默认（规格）
 
-共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=true`，`self_left_prob=0.25`（`self_left_thaw_tokens=5B`，进指纹、不进消融），`latent_tune=mid`（解冻点 5B）。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
+共用：`n_embd=768`，`max_seq_len=4096`，出口锁死 VAE-dec，主体损失仅 v-MSE（`lambda_mse`），`sc_cfg=true`，`self_left_prob=0.25`（`self_left_thaw_tokens=5B`，进指纹、不进消融），`latent_tune=frozen`，`x0_source=mu`。full 主训 45B + 扩展 5B。日程档 `mid` 仅 Stage1：10B、全局批 128、`eval_step=1000`。优化器与 ELF 配方相同：AdamW / Muon `learning_rate=0.002`，`dtype=bf16`；full/fast 的 `ema_decay=0.9999`，日程档 `mid` 为 `0.999`。  
 BELF：`block_size=16`；训练每样本 \(t\sim\mathrm{Ln}\)（\(\mathrm{logit}(t)\sim\mathcal{N}(-1.5,0.8^2)\)）；推理 `num_sampling_steps=32`（可改）。  
 RELF：`window_size=64`，`step_size=2`（推理 \(T=W/S=32\) 锁死）；训练逐档独立 \(t\sim\mathrm{Ln}\)；推理窗内铺 \(L_0,\ldots,L_{T-1}\)，最左档 Euler 到 \(1-\varepsilon\) 后提交 \(\hat x_0\)。
 
@@ -217,7 +217,7 @@ RELF 把脚本名里的 `belf` 换成 `relf`。`--set` 可改训练/推理字段
 
 | 档 | 梯度到 latent | \(\mathcal{L}_{\mathrm{s1}}\) |
 |---|---|---|
-| `frozen` | 否 | 不算；完整参数仍写入 ckpt |
+| `frozen` | 否（默认） | 不算；完整参数仍写入 ckpt |
 | `full` | step 0 起 | 重建 + 后验项 + BERT-mask + ref-KL |
 | `mid` | 未到解冻点同 frozen；之后同 full | 解冻前不算；解冻后算。新参数新优化器状态 |
 

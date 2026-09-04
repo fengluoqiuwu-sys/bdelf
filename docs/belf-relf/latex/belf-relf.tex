@@ -101,9 +101,9 @@ Rolling Diffusion~\cite{rolling2024} 将全局 \(t\) 映射为帧局部 \(t_k\)�
 \toprule
 \texttt{latent\_tune} & 含义 \\
 \midrule
-\texttt{frozen} & 全程冻结。完整 latent 参数仍写入 s2 checkpoint。 \\
+\texttt{frozen} & 默认。全程冻结。完整 latent 参数仍写入 s2 checkpoint。 \\
 \texttt{full} & 自 step 0 起更新 latent。 \\
-\texttt{mid} & 默认。已消费 token 未到 \texttt{latent\_thaw\_tokens} 时与冻结相同；到达该点后解冻一次，此后与 \texttt{full} 相同。解冻后为新可训参数分配新的优化器状态。 \\
+\texttt{mid} & 已消费 token 未到 \texttt{latent\_thaw\_tokens} 时与冻结相同；到达该点后解冻一次，此后与 \texttt{full} 相同。解冻后为新可训参数分配新的优化器状态。 \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -127,7 +127,7 @@ z_t=t\,x_0+(1-t)\,\varepsilon,\qquad
 \hat v=\frac{\hat x_0-z_t}{\max(1-t,\,\varepsilon_t)},\qquad
 v^\star=x_0-\varepsilon.
 \]
-\(G\) 输出干净点估计 \(\hat x_0\in\mathbb{R}^{X}\)，再转换为速度并计算 v-MSE。分母取 \(\max(1-t,\varepsilon_t)\)，其中 \(\varepsilon_t=\) \texttt{vel\_eps}，以避免 \(t\to 1\) 时除零。干净端默认取后验样本（对照均值）；推理写入 KV 的对象必须与该干净端处于同一空间 \(X\)。
+\(G\) 输出干净点估计 \(\hat x_0\in\mathbb{R}^{X}\)，再转换为速度并计算 v-MSE。分母取 \(\max(1-t,\varepsilon_t)\)，其中 \(\varepsilon_t=\) \texttt{vel\_eps}，以避免 \(t\to 1\) 时除零。干净端默认取均值 \(\mu\)（对照后验样本 \(z\)）；推理写入 KV 的对象必须与该干净端处于同一空间 \(X\)。
 
 \(G\) 是一份网络，不含 ELF \texttt{decoder\_prob} 双模式。条件通道为 AdaLN-Zero（DiT），不用 ELF 的 in-context control tokens（\texttt{num\_time\_tokens=0}）。块内 LayerNorm 无仿射；每层调制为 \(\mathrm{SiLU}\circ\mathrm{Linear}:D\to 6D\)，拆成 attn / MLP 的 shift、scale、gate；残差 \(x\leftarrow x+\mathrm{gate}\cdot\mathrm{sub}(\ldots)\)。调制末层权重与偏置零初始化，起步每块为恒等。FinalLayer 同样 AdaLN-Zero（调制 \(D\to 2D\) 的 shift / scale），输出线性零初始化。骨干其余不变：RoPE、qk-RMSNorm、SwiGLU。此为实现默认，不列入设计要点、不列入消融。每一层 AdaLN-Zero \textbf{逐列}以 \((t,\,w_{\mathrm{sc}},\,m)\) 为条件（\(m\) 进入模型指纹；不是序列 token，不改变 2L / 注意力）：未知列一律 \(m=\mathrm{denoise}\)，\texttt{sc\_cfg} 为真时再以 \(w_{\mathrm{sc}}\) 为条件；左段 / 已知 / PAD 不加 \(m\)、不以 \(w_{\mathrm{sc}}\) 为条件。不再设 \(m=\mathrm{decode}\)。BOS 前、EOS 后的格不在当前窗，同样不加 \(m\)。读 token 发生在推理：默认每块 / 每次 pop 后 VAE-dec；\texttt{commit\_x0hat=true} 时跑满后再全文一次。主体损失：未知列一律 v-MSE。左段与已知槽不进入 \(\mathcal{L}\)。BELF / RELF 均不引入 \(m_d\)/\(m_c\)。注意力与 sc 通道见本族掩码节。
 
@@ -204,7 +204,7 @@ Token 预算：日程档 \texttt{full} 下每族 \(\times\) 每一 \texttt{laten
 \texttt{self\_left\_thaw\_tokens} & & 累计 token 未到该点时不跑 self-left；\(0\) 表示一开始就开。进指纹，不进消融。 & \(5\mathrm{B}\) \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练（共用）}} \\
-\texttt{latent\_tune} & & 加载之后是否训练 latent 本体。三档对应三个训练配置哈希。与日程档 \texttt{mid} 不是同一键。 & \texttt{mid} \\
+\texttt{latent\_tune} & & 加载之后是否训练 latent 本体。三档对应三个训练配置哈希。与日程档 \texttt{mid} 不是同一键。 & \texttt{frozen} \\
 \texttt{latent\_thaw\_tokens} & & 仅 \texttt{latent\_tune=mid} 的解冻点。 & \(5\mathrm{B}\) \\
 \texttt{target\_tokens} & \(B_{\mathrm{main}}\) & 日程档 \texttt{full} 的主训预算（每族 \(\times\) 每一 \texttt{latent\_tune}）。 & \(45\mathrm{B}\) \\
 \texttt{ext\_tokens} & \(B_{\mathrm{ext}}\) & 日程档 \texttt{full} 的扩展预算。日程档 \texttt{mid} 无此项。 & \(5\mathrm{B}\) \\
@@ -235,8 +235,8 @@ Token 预算：日程档 \texttt{full} 下每族 \(\times\) 每一 \texttt{laten
 \texttt{self\_left\_prob} & \(p_{\mathrm{left}}\) & \(0.25\) & \(\{0,0.125,0.25,0.375,0.5\}\) \\
 \midrule
 \multicolumn{4}{@{}l}{\textit{训练}} \\
-\texttt{latent\_tune} & & \texttt{mid} & \texttt{frozen}、\texttt{full}（主网格；日程档 \texttt{full} 下每档各走 \(B_{\mathrm{main}}+B_{\mathrm{ext}}\)） \\
-\texttt{x0\_source} & & \texttt{z} & \texttt{mu} \\
+\texttt{latent\_tune} & & \texttt{frozen} & \texttt{mid}、\texttt{full}（主网格；日程档 \texttt{full} 下每档各走 \(B_{\mathrm{main}}+B_{\mathrm{ext}}\)） \\
+\texttt{x0\_source} & & \texttt{mu} & \texttt{z} \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -905,8 +905,8 @@ checkpoint 变体 \texttt{fast} / \texttt{mid} / \texttt{full} 与 \texttt{laten
 \texttt{self\_cond\_cfg\_max} & \(w^{\mathrm{sc}}_{\max}\) & 训练 \(w_{\mathrm{sc}}\) 区间上界。 & \(5.0\) \\
 \texttt{vel\_eps} & \(\varepsilon_t\) & 速度分母 \(\max(1-t,\varepsilon_t)\) 的下界。 & \(10^{-3}\) \\
 \texttt{lambda\_mse} & \(\lambda_{\mathrm{mse}}\) & v-MSE 系数。无 \texttt{lambda\_ce}。 & \(1.0\) \\
-\texttt{ctx\_source} & & 2L 左段用 \(z\) 还是 \(\mu\)。 & \texttt{z} \\
-\texttt{x0\_source} & & 流的干净端 / v-MSE 靶。 & \texttt{z} \\
+\texttt{ctx\_source} & & 2L 左段用 \(z\) 还是 \(\mu\)。锁死 \(\mu\)。 & \texttt{mu} \\
+\texttt{x0\_source} & & 流的干净端 / v-MSE 靶。 & \texttt{mu} \\
 \texttt{optimizer.dtype} & & 训练精度。与 ELF 配方相同。 & \texttt{bf16} \\
 \texttt{learning\_rate} & & AdamW 学习率。与 ELF 配方相同。 & \(0.002\) \\
 \texttt{muon\_learning\_rate} & & Muon 学习率。与 ELF 配方相同。 & \(0.002\) \\

@@ -11,7 +11,7 @@ mlp_ratio: 4.0  # SwiGLU 扩展比
 latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
 sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道；主跑开
-latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
+latent_tune: frozen  # 默认 frozen；入口可训档：frozen | full | mid；full/mid 要求入口块长 1
 latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
 attn_backend: flex  # 注意力后端：flex | sdpa
 block_size: 16  # G 去噪块长 W；入口 encoder 块长须 ∈{1,W}
@@ -41,7 +41,7 @@ lambda_vae: 1.0  # s1 重建项权重
 lambda_ref: 1.0  # s1 参考编码器 KL 权重
 kl_entropy: false  # 开则 s1 为 β·(KL+E[log q])；缺键/false 与旧哈希相同
 ctx_source: mu  # 左段条件锁死 μ；写 z 直接报错
-x0_source: z  # 干净端来源：z | mu（仅此项可选）
+x0_source: mu  # 默认 mu；干净端来源：z | mu（仅此项可选）
 self_cond_cfg_p_mean: -1.5  # w_sc 采样 logit-normal 均值
 self_cond_cfg_p_std: 0.8  # w_sc 采样 logit-normal 标准差
 self_cond_cfg_min: 0.5  # w_sc 下界

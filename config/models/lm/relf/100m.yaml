@@ -11,7 +11,7 @@ mlp_ratio: 4.0  # SwiGLU 扩展比
 latent_model: latent_vae  # 入口 latent 家族名
 tag: 100m-b32-d1  # artifacts/latent/{latent_model}/{tag}
 sc_cfg: true  # 是否建 ScaleEmbedder / w_sc 通道；主跑开
-latent_tune: mid  # 入口可训档：frozen | full | mid；full/mid 要求入口块长 1
+latent_tune: frozen  # 默认 frozen；入口可训档：frozen | full | mid；full/mid 要求入口块长 1
 latent_dim: 32  # 流空间 X；须与 artifact 输出维一致
 attn_backend: flex  # 注意力后端：flex | sdpa
 window_size: 64  # 滚动窗长 W；须能被 step_size 整除；推理 T=W/S
@@ -38,7 +38,7 @@ self_left_prob: 0.25  # 训练按样本把左段换成末流 sg(x_hat) 的概率
 self_left_thaw_tokens: 5000000000  # self-left 解锁有效 token 点；0 表示一开始就开
 lambda_s1: 1.0  # 联合训时 L_s1 权重
 ctx_source: mu  # 左段条件锁死 μ；写 z 直接报错
-x0_source: z  # 干净端来源：z | mu（仅此项可选）
+x0_source: mu  # 默认 mu；干净端来源：z | mu（仅此项可选）
 cond_mode: clean  # 条件模式；主跑 clean
 clean_block_prob: 0.05  # 非句首窗抽余数 r 的概率
 train_t_schedule: block  # 训练抽 t：逐档独立连续 Ln

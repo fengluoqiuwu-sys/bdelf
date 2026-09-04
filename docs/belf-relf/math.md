@@ -4,7 +4,7 @@
 
 ## 1. 数据点与 rectified flow
 
-入口给出 token 对齐后验 \(q_\phi(z\mid x)=\mathcal{N}(\mu(x),\mathrm{diag}\,\sigma^2(x))\)。训练可用样本 \(z=\mu+\sigma\odot\epsilon\)，或确定性 \(\mu\)。流空间是入口输出维 \(X=\) `latent_dim`（须与 artifact 一致），与 \(G\) 隐层宽 \(D=\) `n_embd` 无关。白化留在 \(X\)；\(G\) 茎一层 \(\mathrm{Linear}(X\to D)\)，FinalLayer 回到 \(X\)。干净端 \(x_0\in\mathbb{R}^{N\times X}\) 仅由 `x0_source` 选后验样本 \(z\) 或均值 \(\mu\)（默认 \(z\)）。**2L 左段条件锁死 \(\mu\)**，与 `x0_source` 无关。独立噪声 \(\varepsilon\sim\mathcal{N}(0,\sigma^2 I)\)。线性插值
+入口给出 token 对齐后验 \(q_\phi(z\mid x)=\mathcal{N}(\mu(x),\mathrm{diag}\,\sigma^2(x))\)。训练可用样本 \(z=\mu+\sigma\odot\epsilon\)，或确定性 \(\mu\)。流空间是入口输出维 \(X=\) `latent_dim`（须与 artifact 一致），与 \(G\) 隐层宽 \(D=\) `n_embd` 无关。白化留在 \(X\)；\(G\) 茎一层 \(\mathrm{Linear}(X\to D)\)，FinalLayer 回到 \(X\)。干净端 \(x_0\in\mathbb{R}^{N\times X}\) 仅由 `x0_source` 选后验样本 \(z\) 或均值 \(\mu\)（默认 \(\mu\)）。**2L 左段条件锁死 \(\mu\)**，与 `x0_source` 无关。独立噪声 \(\varepsilon\sim\mathcal{N}(0,\sigma^2 I)\)。线性插值
 
 \[
 z_t = t\,x_0+(1-t)\,\varepsilon,\qquad t\in[0,1].
@@ -160,4 +160,4 @@ RELF 的联合由「pop 后条件于 KV 的窗上局部时间流」迭代定义�
 4. **左条件。** 左段锁死 \(\mu\)（训练 / 推理 encode 后都取均值，不跟 `x0_source`）。对照 `commit_x0hat=true` 时推理左段是提交的 \(\hat x_0\)。累计 token 到 `self_left_thaw_tokens` 后，`self_left_prob>0` 时按样本用末流 \(t=1-\varepsilon\) 的 \(\mathrm{sg}(\hat x_0)\) 替换训练左段（见第 6 节）。
 5. **出口。** 锁死 VAE-dec，无层数、无 `exit`/`linear`。主体 \(\mathcal{L}\) 不含 CE。推理默认每块 / 每次 pop 后 VAE-dec；对照 `true` 全文一次。丢掉格不 scatter 进因果前缀。
 6. **两族。** 不同 \(t\) 场是不同输入分布。共享结构合法；共享一份权重会让同一网络逼近两种条件场。规格是两个模型族、两套训练剖面。
-7. **日程档。** `fast` / `mid` / `full` 是 checkpoint 变体（`cache/checkpoints/{fast|mid|full}/…`），与 `latent_tune=mid`（5B 解冻）不是同一键。`mid` 仅 Stage1：全局序列批 128、主预算 10B、`eval_step=1000`、`ema_decay=0.999`，用于中档验证。
+7. **日程档。** `fast` / `mid` / `full` 是 checkpoint 变体（`cache/checkpoints/{fast|mid|full}/…`），与 `latent_tune=mid`（5B 解冻）不是同一键。主跑 `latent_tune=frozen`、`x0_source=mu`。`mid` 仅 Stage1：全局序列批 128、主预算 10B、`eval_step=1000`、`ema_decay=0.999`，用于中档验证。
