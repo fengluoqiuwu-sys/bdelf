@@ -2,6 +2,7 @@
 
 只写最终模型参数（有 EMA 则熔进 ``model``，不再另存一份）和架构 ``config.json``。
 不含优化器 / RNG / 训练超参 / hardware。导出后不可再续训。
+默认接着离线写入逐维 μ 白化（``whitening_mean`` / ``whitening_std``）；
 加载仍走 ``artifact_loader.load_latent_artifact``（只读）。
 """
 
@@ -18,6 +19,7 @@ import torch
 from models.kinds import kind_of
 from models.latent.artifact_loader import (
     CHECKPOINT_ROOT,
+    WHITEN_JSON,
     _LATEST,
     _check_segment,
     _require_latent_model,
@@ -99,8 +101,8 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
 
 
 def _clean_artifact_dir(dest: Path) -> None:
-    """目录里只留 checkpoint_latest.pt 与 config.json。"""
-    keep = {_LATEST, "config.json"}
+    """目录里只留推理权重、config 与白化旁路。"""
+    keep = {_LATEST, "config.json", WHITEN_JSON}
     if not dest.is_dir():
         return
     for child in dest.iterdir():
@@ -142,10 +144,12 @@ def export_latent_artifact(
     tag: str | None = None,
     checkpoint_root: str | Path | None = None,
     force: bool = False,
+    skip_whiten: bool = False,
 ) -> Path:
     """从训练 latest 导出推理权重到 ``artifacts/latent/{model}/{tag}/``。
 
     有 EMA 则熔进 ``model`` 后丢弃影子权重；不写优化器 / 训练配置 / hardware。
+    随后默认离线写入逐维 μ 白化（可用 ``skip_whiten`` 跳过）。
     """
     src = resolve_source_checkpoint(
         run=run, checkpoint=checkpoint, checkpoint_root=checkpoint_root
@@ -195,4 +199,12 @@ def export_latent_artifact(
         encoding="utf-8",
     )
     _clean_artifact_dir(dest)
+    if not skip_whiten:
+        from models.latent.whiten_stats import write_artifact_whiten
+
+        write_artifact_whiten(
+            latent_model,
+            tag_name,
+            checkpoint_root=checkpoint_root,
+        )
     return dest

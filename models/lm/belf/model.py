@@ -226,6 +226,14 @@ class _BelfBackbone(nn.Module):
         mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
         return (z - mean) / std
 
+    def _unwhiten(self, x: torch.Tensor) -> torch.Tensor:
+        """流空间 X → VAE μ；缺统计时为单位仿射。"""
+        if not self.whiten:
+            return x
+        std = self.whiten_std.clamp(min=1e-8).to(dtype=x.dtype, device=x.device)
+        mean = self.whiten_mean.to(dtype=x.dtype, device=x.device)
+        return x * std + mean
+
     def stem(self, x: torch.Tensor) -> torch.Tensor:
         """G 茎：已白化的 X→D。"""
         return self.proj_norm(self.in_proj(x))
@@ -248,7 +256,7 @@ class _BelfBackbone(nn.Module):
             kwargs["key_padding_mask"] = key_padding_mask
         if last_n is not None:
             kwargs["last_n"] = last_n
-        return self.bundle.decode_logits(x_hat, tokens=tokens, **kwargs)
+        return self.bundle.decode_logits(self._unwhiten(x_hat), tokens=tokens, **kwargs)
 
     def on_tokens_seen(self, n: int, optimizer: Any = None) -> bool:
         self._tokens_seen = int(n)

@@ -91,13 +91,13 @@ models/lm/
 ```
 tokens
   → load_latent_artifact(latent_model, tag)
-  → Enc → z ∈ R^{S×X} → 可选 whiten（仍在 X）
+  → Enc → z ∈ R^{S×X} → 可选逐维 μ 白化（仍在 X；m,s 由 artifact 导出后离线写入）
   → G 茎 Linear(X→D=n_embd)
   → 训练 CFG：prefill_left（茎后 sg，对齐 pack 左半）+ 右段 G
      self_left / 生成完整 2L：pack_2l [sg(h_left)|h_t]
   → 逐列 (t, [w_sc], [m]) → G（AdaLN-Zero → Attn(RoPE, qk-RMSNorm) → SwiGLU）
   → FinalLayer D→X → x̂₀
-  → Exit（锁死）：\(\hat x_0\) 走加载的 VAE-dec → logits（推理读出；训练主体不算 CE）
+  → Exit（锁死）：\(\hat x_0\) **unwhiten** 后走加载的 VAE-dec → logits（推理读出；训练主体不算 CE）
 ```
 
 出口无 `exit` 键、无 `linear` 对照。推理默认每块 / 每次 pop 后 VAE-dec 读词再 encode（`commit_x0hat=false`）；对照 `true` 提交 \(\hat x_0\)、跑满后全文一次 VAE-dec。\(\mathcal{L}_{\mathrm{s1}}\) 重建仍经同一 VAE-dec。
@@ -172,13 +172,14 @@ Stage2 启动时解析同参 Stage1 哈希目录：须已有 `complete.json`（�
 cache/checkpoints/artifacts/latent/{latent_model}/{tag}/
 ```
 
-导出（现网工具，Stage-1 用）：
+导出（现网工具，Stage-1 用；默认接着离线写逐维 μ 白化）：
 
 ```bash
 .venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash> --tag <tag>
+.venv/bin/python scripts/compute_latent_whiten.py --latent-model latent_vae --tag <tag>
 ```
 
-禁止把 s2 训练目录写进 `artifacts/latent/`。
+禁止把 s2 训练目录写进 `artifacts/latent/`。白化统计不进 VAE 训练、不进 G 指纹；旧 artifact 无 `m,s` 时仍为单位仿射。新开 BELF/RELF 才会读到新统计（旧 run 的 `whiten_mean/std` buffer 已冻结）。
 
 ## 训练 / 推理接口
 

@@ -235,6 +235,14 @@ class _RelfBackbone(nn.Module):
         mean = self.whiten_mean.to(dtype=z.dtype, device=z.device)
         return (z - mean) / std
 
+    def _unwhiten(self, x: torch.Tensor) -> torch.Tensor:
+        """从流空间 X 还原到 VAE μ（缺统计时为单位仿射）。"""
+        if not self.whiten:
+            return x
+        std = self.whiten_std.clamp_min(1e-6).to(dtype=x.dtype, device=x.device)
+        mean = self.whiten_mean.to(dtype=x.dtype, device=x.device)
+        return x * std + mean
+
     def _stem(self, x: torch.Tensor) -> torch.Tensor:
         """已白化的 X→D。"""
         return self.proj_norm(self.in_proj(x))
@@ -511,7 +519,7 @@ class _RelfBackbone(nn.Module):
         kwargs: dict[str, Any] = {}
         if last_n is not None:
             kwargs["last_n"] = last_n
-        return self.latent.decode_logits(x_hat, tokens=tokens, **kwargs)
+        return self.latent.decode_logits(self._unwhiten(x_hat), tokens=tokens, **kwargs)
 
     def _exit_right_windows(
         self,

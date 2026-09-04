@@ -4,9 +4,10 @@
 
     cache/checkpoints/artifacts/latent/{latent_model}/{tag}/checkpoint_latest.pt
 
-只加载架构参数（``config.json`` / ``model_meta``）与模型权重（及可选 EMA），
+只加载架构参数（``config.json`` / ``model_meta``）与模型权重（及可选 EMA / 白化 buffer），
 **不**恢复优化器 / RNG，也**禁止**经本模块写回 ``artifacts/latent/``。
 训练产物仍在 ``fast|full/latent/{model}/{hash}/``；选用目录由人手拷贝。
+白化 ``m,s`` 由导出后离线写入（``scripts/compute_latent_whiten.py``），不进 VAE 训练。
 ACE / cola_vae 等其它 ``artifacts/<kind>/`` 不受影响。
 """
 
@@ -28,6 +29,16 @@ CHECKPOINT_ROOT = "cache/checkpoints"
 _ARTIFACTS_DIR = "artifacts"
 _LATENT_DIR = "latent"
 _LATEST = "checkpoint_latest.pt"
+WHITEN_JSON = "whiten.json"
+# 写入 artifact 的逐维 μ 仿射；不进 VAE 训练模块，加载时再挂到 backbone。
+WHITEN_BUFFER_NAMES = frozenset(
+    {
+        "whitening_mean",
+        "whitening_std",
+        "whitening_mean_z",
+        "whitening_std_z",
+    }
+)
 
 
 def artifacts_latent_root(*, checkpoint_root: str | Path | None = None) -> Path:
@@ -116,6 +127,38 @@ def list_artifact_tags(
     return tags
 
 
+def pop_whiten_state(weights: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """从 state_dict 取出白化 buffer，避免 ``load_state_dict`` 碰到未知键。"""
+    found: dict[str, torch.Tensor] = {}
+    for key in list(weights.keys()):
+        tail = str(key).rsplit(".", 1)[-1]
+        if tail not in WHITEN_BUFFER_NAMES:
+            continue
+        val = weights.pop(key)
+        if torch.is_tensor(val):
+            found[tail] = val
+    return found
+
+
+def attach_whiten_buffers(
+    model: torch.nn.Module,
+    buffers: dict[str, torch.Tensor],
+) -> None:
+    """把离线 μ 白化向量挂到 backbone（fp32），供 BELF/RELF 读取。"""
+    if not buffers:
+        return
+    target = getattr(model, "backbone", model)
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+    for name, val in buffers.items():
+        if name not in WHITEN_BUFFER_NAMES or not torch.is_tensor(val):
+            continue
+        tensor = val.detach().float().reshape(-1).contiguous().to(device=device)
+        target.register_buffer(name, tensor, persistent=True)
+
+
 def _load_model_meta(ckpt_path: Path, ck: dict[str, Any]) -> dict[str, Any]:
     meta = ck.get("model_meta") or {}
     if meta.get("name") and meta.get("config"):
@@ -179,6 +222,7 @@ def load_latent_artifact(
     weights = ck.get("model")
     if not isinstance(weights, dict) or not weights:
         raise ValueError(f"{ckpt_path}: checkpoint 无 model 权重")
+    whiten_buf = pop_whiten_state(weights)
     model.load_state_dict(weights)
     model.eval()
 
@@ -200,6 +244,7 @@ def load_latent_artifact(
     else:
         dtype = torch.bfloat16
     model = model.to(device=torch_device, dtype=dtype)
+    attach_whiten_buffers(model, whiten_buf)
 
     used_ema = ema_baked
     if apply_ema and isinstance(ema_raw, dict) and ema_raw:
@@ -223,7 +268,8 @@ def save_latent_artifact(*_args: Any, **_kwargs: Any) -> None:
     raise RuntimeError(
         "禁止经 artifacts 加载器保存或更新 "
         "cache/checkpoints/artifacts/latent/。该目录只读；"
-        "请用 scripts/export_latent_artifact.py 从训练 run 导出。"
+        "请用 scripts/export_latent_artifact.py 从训练 run 导出，"
+        "再用 scripts/compute_latent_whiten.py 写入白化统计。"
     )
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 latent 训练 run 的 checkpoint_latest 导出到 artifacts（推理权重）。
+"""把训练 run 的 latest 导出到 artifacts（推理权重 + 随后离线 μ 白化）。
 
 有 EMA 则熔进最终参数，不另存优化器 / 训练配置。工作目录为仓库根::
 
@@ -8,6 +8,11 @@
 
     .venv/bin/python scripts/export_latent_artifact.py \\
       --run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force
+
+白化可单独补算::
+
+    .venv/bin/python scripts/compute_latent_whiten.py \\
+      --latent-model latent_vae --tag 100m-b32-d1
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ import sys
 import repo_env
 
 repo_env.ensure_repo_root()
+
+import hf_config  # noqa: F401
 
 from models.latent.artifact_export import export_latent_artifact
 from models.latent.artifact_loader import list_artifact_tags
@@ -37,6 +44,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--run full/latent/latent_vae/<hash>\n"
             "  python scripts/export_latent_artifact.py "
             "--run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force\n"
+            "  python scripts/export_latent_artifact.py "
+            "--run full/latent/latent_vae/<hash> --skip-whiten\n"
         ),
     )
     parser.add_argument(
@@ -55,6 +64,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="覆盖已有 artifacts 目录",
+    )
+    parser.add_argument(
+        "--skip-whiten",
+        action="store_true",
+        help="只写权重，不离线估计逐维 μ 白化（随后可跑 compute_latent_whiten.py）",
     )
     parser.add_argument(
         "--list",
@@ -82,6 +96,7 @@ def main() -> None:
         checkpoint=args.checkpoint,
         tag=args.tag,
         force=args.force,
+        skip_whiten=args.skip_whiten,
     )
     print(f"exported {dest}")
 

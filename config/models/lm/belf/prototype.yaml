@@ -17,7 +17,7 @@ attn_backend: flex  # 注意力后端：flex | sdpa
 block_size: 16  # G 去噪块长 W；入口 encoder 块长须 ∈{1,W}
 proj_bias: true  # G 茎 Linear(X→D) 是否带 bias
 proj_norm: rmsnorm  # 茎后归一化
-whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
+whiten: true  # 入口逐维 μ 白化；m,s 由 artifact 导出后离线写入；缺则单位仿射
 whiten_on: mu  # 白化统计作用对象
 qk_norm: true  # Q/K RMSNorm
 rope_dim: null  # 每头 RoPE 维；null 表示用 head_dim

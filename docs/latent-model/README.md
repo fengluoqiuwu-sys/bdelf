@@ -294,14 +294,15 @@ cache/checkpoints/artifacts/latent/{latent_model}/{tag}/   # 选用末档；只�
 
 课程 run：`train_log.csv` / `eval_log.csv` 的 `step` 为**阶段内**微批计数（每个 Sn 从 0 重计），`tokens` 仍为全局有效 token 累计；分阶段快照为 `{sn}-checkpoint_step_{阶段内step:07d}.pt`（如 `s1-checkpoint_step_0001000.pt`），`checkpoint_latest.pt` 名不变。内部优化步、eval/save 间隔仍用全局 step。
 
-选用权重（上传 HF 等）放在 `artifacts/latent/<model>/<tag>/`。用导出工具把训练 `checkpoint_latest` 写成推理权重（EMA 熔进参数；只留模型 config）：
+选用权重（上传 HF 等）放在 `artifacts/latent/<model>/<tag>/`。用导出工具把训练 `checkpoint_latest` 写成推理权重（EMA 熔进参数；只留模型 config），**随后离线**在该目录估计逐维 μ 白化（默认 1048576 有效 token，不跑全集；`--skip-whiten` 可跳过）：
 
 ```bash
 .venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash>
 .venv/bin/python scripts/export_latent_artifact.py --run full/latent/latent_vae/<hash> --tag 100m-b32-d1 --force
+.venv/bin/python scripts/compute_latent_whiten.py --latent-model latent_vae --tag 100m-b32-d1
 ```
 
-加载只读，**不会**写回该目录：
+白化不进 VAE 训练。`whitening_mean` / `whitening_std` 写进 artifact；缺统计时 BELF/RELF 仍为单位仿射。加载只读，**不会**经加载器写回该目录：
 
 ```python
 from models.latent.artifact_loader import load_latent_artifact

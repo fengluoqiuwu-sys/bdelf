@@ -18,7 +18,7 @@ window_size: 64  # 滚动窗长 W；须能被 step_size 整除；推理 T=W/S
 step_size: 2  # 每步弹出槽数 S
 proj_bias: true  # G 茎 Linear(X→D) 是否带 bias
 proj_norm: rmsnorm  # 茎后归一化
-whiten: true  # 入口 latent 白化；无 m,s 时单位仿射
+whiten: true  # 入口逐维 μ 白化；m,s 由 artifact 导出后离线写入；缺则单位仿射
 whiten_on: mu  # 白化统计作用对象
 qk_norm: true  # Q/K RMSNorm
 rope_theta: 10000.0  # RoPE 基频

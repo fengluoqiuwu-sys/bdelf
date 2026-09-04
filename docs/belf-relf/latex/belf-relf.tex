@@ -152,7 +152,7 @@ v^\star=x_0-\varepsilon.
 tokens
   |  load_latent_artifact(latent_model, tag)
   |  Enc (block-causal) -> z in R^{S x X}
-  |  optional whiten on X
+  |  optional per-dim μ whiten on X (m,s after artifact export)
   |  G stem: Linear X -> D
   v
 pack_2l [sg(h_left)|h_t]
@@ -162,7 +162,7 @@ pack_2l [sg(h_left)|h_t]
   |                -> AdaLN-Zero -> SwiGLU)
   |  FinalLayer (AdaLN-Zero) D -> X -> x0_hat
   v
-Exit (locked):  x0_hat in X -> VAE-dec  (inference readout only)
+Exit (locked):  unwhiten x0_hat -> VAE-dec  (inference readout only)
 \end{verbatim}
 
 \paragraph{出口叠法。}
@@ -883,7 +883,7 @@ checkpoint 变体 \texttt{fast} / \texttt{mid} / \texttt{full} 与 \texttt{laten
 \multicolumn{4}{@{}l}{\textit{模型}} \\
 \texttt{proj\_bias} & & 映射是否带偏置。 & \texttt{true} \\
 \texttt{proj\_norm} & & 映射后是否 RMSNorm。 & \texttt{rmsnorm} \\
-\texttt{whiten} & & 映射前逐维仿射标准化。 & \texttt{true} \\
+\texttt{whiten} & & 映射前逐维仿射标准化（\(m,s\) 由 artifact 导出后离线写入）。 & \texttt{true} \\
 \texttt{whiten\_on} & & 白化统计对象。 & \texttt{mu} \\
 \texttt{n\_layer} & & AdaLN-Zero Transformer 层数。 & \(12\) \\
 \texttt{n\_head} & & 头数。须整除 \texttt{n\_embd}。 & \(12\) \\
