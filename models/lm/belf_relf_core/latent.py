@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from typing import Any
 
 import torch
@@ -143,6 +144,18 @@ class LatentBundle(nn.Module):
                 f"加载 {self.latent_model}/{self.tag} 没有该接口"
             )
 
+    @staticmethod
+    def _is_t5_style_decode(mod: nn.Module) -> bool:
+        """``latent_t5``：``decode_logits(dec_tokens, memory, …)``；VAE：``(z, *)``。"""
+        fn = getattr(mod, "decode_logits", None)
+        if not callable(fn):
+            return False
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+        return "memory_pad_mask" in params
+
     def decode_logits(
         self,
         z: torch.Tensor,
@@ -151,15 +164,113 @@ class LatentBundle(nn.Module):
     ) -> torch.Tensor:
         """走加载入口的 VAE-dec。参数是否可训由 ``latent_tune`` 决定。
 
-        ``tokens`` 与 ``z`` 对齐时补 ``key_padding_mask``（与 ``s1_loss`` 同一条路）。
+        ``tokens`` 与 ``z`` 对齐时补 pad mask（与 ``s1_loss`` 同一条路）。
+        ``latent_t5`` 签名为 ``(dec_tokens, memory)``：双向 decoder 一次并行重建；
+        因果 decoder 在已有 ``tokens`` 上 teacher-force，否则按 ``last_n`` 自回归读出。
         """
+        mod = self._module()
+        last_n = kwargs.pop("last_n", None)
         if tokens is not None and "key_padding_mask" not in kwargs:
-            attn_pad = getattr(self._module(), "_attn_pad_mask", None)
+            attn_pad = getattr(mod, "_attn_pad_mask", None)
             if callable(attn_pad):
-                kpm = attn_pad(tokens)
-                if kpm is not None:
-                    kwargs["key_padding_mask"] = kpm
-        return self._module().decode_logits(z, **kwargs)
+                # 因果 AR 前缀短于 z 时，pad mask 须对齐 memory 长度。
+                if (
+                    self._is_t5_style_decode(mod)
+                    and int(tokens.size(1)) != int(z.size(1))
+                ):
+                    pass
+                else:
+                    kpm = attn_pad(tokens)
+                    if kpm is not None:
+                        kwargs["key_padding_mask"] = kpm
+
+        if self._is_t5_style_decode(mod):
+            mem_pad = kwargs.pop("memory_pad_mask", None)
+            if mem_pad is None:
+                mem_pad = kwargs.pop("key_padding_mask", None)
+            else:
+                kwargs.pop("key_padding_mask", None)
+            if kwargs:
+                raise TypeError(
+                    f"latent_t5 decode_logits 不支持额外参数: {sorted(kwargs)}"
+                )
+            logits = self._decode_logits_t5(
+                mod, z, tokens=tokens, memory_pad_mask=mem_pad, last_n=last_n,
+            )
+        else:
+            if last_n is not None:
+                kwargs["last_n"] = last_n
+            logits = mod.decode_logits(z, **kwargs)
+
+        if last_n is not None and not self._is_t5_style_decode(mod):
+            n = int(last_n)
+            if n < 0:
+                raise ValueError(f"last_n 须非负，收到 {n}")
+            if n < int(logits.size(1)):
+                logits = logits[:, -n:]
+        return logits
+
+    def _decode_logits_t5(
+        self,
+        mod: nn.Module,
+        z: torch.Tensor,
+        *,
+        tokens: torch.Tensor | None,
+        memory_pad_mask: torch.Tensor | None,
+        last_n: int | None,
+    ) -> torch.Tensor:
+        """适配 ``latent_t5.decode_logits(dec_tokens, memory, …)``。"""
+        bidirectional = bool(getattr(mod, "decoder_bidirectional", False))
+        if bidirectional:
+            logits = mod.decode_logits(None, z, memory_pad_mask=memory_pad_mask)
+            if last_n is not None:
+                n = int(last_n)
+                if n < 0:
+                    raise ValueError(f"last_n 须非负，收到 {n}")
+                if n < int(logits.size(1)):
+                    logits = logits[:, -n:]
+            return logits
+
+        layout = getattr(mod, "token_layout", None)
+        bos_id = getattr(layout, "bos_token_id", None)
+        if bos_id is None:
+            raise ValueError("因果 latent_t5 decoder 需要 token_layout.bos_token_id")
+
+        # 与 z 等长：s1 / 全文 teacher-force。
+        if tokens is not None and int(tokens.size(1)) == int(z.size(1)):
+            bos = tokens.new_full((tokens.size(0), 1), int(bos_id))
+            dec_in = torch.cat([bos, tokens[:, :-1]], dim=1)
+            logits = mod.decode_logits(dec_in, z, memory_pad_mask=memory_pad_mask)
+            if last_n is not None:
+                n = int(last_n)
+                if n < 0:
+                    raise ValueError(f"last_n 须非负，收到 {n}")
+                if n < int(logits.size(1)):
+                    logits = logits[:, -n:]
+            return logits
+
+        # 生成出口：已写前缀可作 AR 上下文，否则从 BOS 采 ``last_n``（默认全长）。
+        n_need = int(last_n) if last_n is not None else int(z.size(1))
+        if n_need < 0:
+            raise ValueError(f"last_n 须非负，收到 {n_need}")
+        if n_need == 0:
+            return z.new_zeros((z.size(0), 0, int(getattr(mod, "vocab_size", 0))))
+
+        bos = z.new_full((z.size(0), 1), int(bos_id), dtype=torch.long)
+        if tokens is not None and tokens.numel() > 0:
+            dec = torch.cat([bos, tokens.to(dtype=torch.long)], dim=1)
+        else:
+            dec = bos
+
+        step_logits: list[torch.Tensor] = []
+        for _ in range(n_need):
+            logits = mod.decode_logits(dec, z, memory_pad_mask=memory_pad_mask)
+            cur = logits[:, -1, :]
+            step_logits.append(cur)
+            # 默认 eval temperature≤0：链上 argmax，与外层对返回 logits 再 argmax 一致。
+            nxt = cur.argmax(dim=-1, keepdim=True)
+            dec = torch.cat([dec, nxt], dim=1)
+        return torch.stack(step_logits, dim=1)
 
     def _require_vae_dec_if_needed(self) -> None:
         """full，或 mid（含尚未解冻）须具备 VAE-dec，否则启动即拒绝。"""
@@ -365,11 +476,8 @@ class LatentBundle(nn.Module):
         if mu is None or logvar is None or z is None:
             z, mu, logvar = self.encode(tokens, sample=self.training)
         if logits is None:
-            kpm = None
-            attn_pad = getattr(self._module(), "_attn_pad_mask", None)
-            if callable(attn_pad):
-                kpm = attn_pad(tokens)
-            logits = self._module().decode_logits(z, key_padding_mask=kpm)
+            # 走 Bundle 适配（VAE 与 latent_t5 签名不同）。
+            logits = self.decode_logits(z, tokens=tokens)
 
         ignore = self._ignore_index()
         targets = tokens.clone()

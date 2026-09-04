@@ -262,8 +262,13 @@ def block_generate(
                 if bool(pad.any().item()):
                     extra = pad.new_zeros(num_samples, w_cur)
                     kpm = torch.cat([pad, extra], dim=1)
+            # 因果 T5 decoder 需要已写 token 作 AR 前缀；VAE / 双向 decoder 可忽略。
+            written_tok = tokens[:, :start] if start > 0 else None
             block_logits = backbone.exit_logits(
-                dec_in, key_padding_mask=kpm, last_n=w_cur,
+                dec_in,
+                tokens=written_tok,
+                key_padding_mask=kpm,
+                last_n=w_cur,
             )
             if temperature <= 0:
                 blk_tok = block_logits.argmax(dim=-1)

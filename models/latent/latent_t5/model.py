@@ -69,6 +69,8 @@ class _LatentT5Backbone(nn.Module):
         self.readout = readout
         self.n_embd = n_embd
         self.latent_dim = latent_dim
+        # 入口始终逐 token 因果块长 1（无块因果）；BELF/RELF LatentBundle 须能读到。
+        self.block_size = 1
         self.beta_kl = beta_kl
         self.kl_entropy = bool(kl_entropy)
         self.lambda_span = lambda_span
