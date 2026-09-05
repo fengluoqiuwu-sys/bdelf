@@ -34,6 +34,7 @@ bash scripts/sync.sh ovan-server push \
 ```
 
 - 代码镜像（`--delete`）；排除 `.venv` / `cache` 链接 / `temp/` / `.git` / `.cursor/` / `.claude/` 等。
+- 仓库根 `requirements.txt`：push **前**按内容哈希与远端比较；有变更（含远端尚无此文件）且远端已有 `.venv/` 时，代码 rsync 之后在远端执行 `.venv/bin/pip install -r requirements.txt`。无 `.venv` 不创建、不安装（会提示跳过）。内容未变或本地无该文件则跳过。
 - `logs/`：gitignore；**push 不传、且 `--delete` 不删远端**；由 **pull** 增量拉取。
 - `cache/monitor/`：由 `scripts/sync_web.sh` 处理（`sync.sh` 的 push/pull 都会调用；`--code-only` 同样合并）。`charts.json` **按 hash 合并**：已有 hash 的图表不覆盖。
   - **push**：不覆盖远端已保存的 hash 图表，只补远端没有的。

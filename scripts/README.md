@@ -10,7 +10,7 @@
 |------|------|
 | `servers_lib.sh` | 解析 `servers.csv` |
 | `servers.csv.example` | 服务名 / 调度 / 工作目录 / GPU 额度表头 |
-| `sync.sh` | 代码 push + `logs/` pull；产物路径须重写 |
+| `sync.sh` | 代码 push + `logs/` pull；根目录 `requirements.txt` 变更且远端有 `.venv` 则 pip install；默认再推 models/tokenizers |
 | `sync_web.sh` | `sync.sh` 调用：按 hash 合并 `cache/monitor/charts.json` |
 | `web.sh` | `local\|服务名` + `up\|down`：本机或 SSH 隧道打开 monitor |
 | `job_log_dir.sh` | `logs/<服务名>/<时间戳>/` |

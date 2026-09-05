@@ -72,6 +72,8 @@ usage() {
 
   push [--code-only] [--with-datasets] [--checksum] [--checkpoints NAME FILE]...
       强制覆盖推送代码到 <服务>:<工作目录>（删除远端多余文件；.venv/cache/temp 等排除项保留）
+      若仓库根 requirements.txt 相对远端内容有变且远端已有 .venv，
+      则在推完代码后执行 .venv/bin/pip install -r requirements.txt。
       默认再推 cache 内容：models/ tokenizers/（按 size+mtime 增量；排除 .cache/ 等）
       默认不推：datasets/、huggingface/、preprocessed_datasets/、checkpoints/、compile*
       --with-datasets            额外推 datasets/
@@ -104,6 +106,27 @@ push_code() {
   rsync_to "${RSYNC_CODE_OPTS[@]}" \
     "${RSYNC_CODE_FILTERS[@]}" \
     "${LOCAL_DIR}/" "${REMOTE_SSH_TARGET}:${REMOTE_DIR}/"
+}
+
+# 本地仓库根 requirements.txt 相对远端是否有内容变化（含远端尚无此文件）。
+# 无本地文件则视为未更新。须在 rsync 之前调用。
+requirements_txt_updated() {
+  local local_req="${LOCAL_DIR}/requirements.txt"
+  [[ -f "${local_req}" ]] || return 1
+  local local_hash remote_hash
+  local_hash="$(sha256sum "${local_req}" | awk '{print $1}')"
+  remote_hash="$(remote_ssh "if [ -f ${REMOTE_DIR}/requirements.txt ]; then sha256sum ${REMOTE_DIR}/requirements.txt | awk '{print \$1}'; fi")"
+  [[ "${local_hash}" != "${remote_hash}" ]]
+}
+
+remote_has_venv() {
+  remote_ssh "test -d ${REMOTE_DIR}/.venv"
+}
+
+# 远端已有 .venv 时按刚推上去的仓库根 requirements.txt 重装依赖；不创建 venv。
+install_remote_requirements() {
+  echo "==> 远端 requirements.txt 已更新且存在 .venv，执行 pip install..."
+  remote_ssh "cd ${REMOTE_DIR} && if [ ! -x .venv/bin/pip ]; then echo '远端 .venv 缺少 .venv/bin/pip' >&2; exit 1; fi && .venv/bin/pip install -r requirements.txt"
 }
 
 ensure_remote_cache_dir() {
@@ -421,7 +444,18 @@ case "${cmd}" in
           ;;
       esac
     done
+    req_updated=0
+    if requirements_txt_updated; then
+      req_updated=1
+    fi
     push_code
+    if [[ "${req_updated}" -eq 1 ]]; then
+      if remote_has_venv; then
+        install_remote_requirements
+      else
+        echo "==> requirements.txt 已更新，但远端无 .venv，跳过 pip install"
+      fi
+    fi
     sync_web push
     if [[ "${code_only}" -eq 1 ]]; then
       echo "==> 跳过 cache 内容（--code-only）"
