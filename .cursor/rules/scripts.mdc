@@ -13,7 +13,7 @@ alwaysApply: true
 | `scripts/` | 通用辅助（resolve、download、sync、`sync_web.sh`、`web.sh`、`workspace_lock.py`、`agent_wakeup.py`、`preprocess.py`、`export_latent_artifact.py`、`compute_latent_whiten.py`、`vram_probe.py`、`launch-train.sh`、`launch-eval.sh`、`job_log_dir.sh` 等） |
 | `scripts/train/` | 训练启动 `.sh`（模板 `prototype.sh`；由包装器拉起） |
 | `scripts/eval/` | 离线评测启动 `.sh`（模板 `prototype.sh`；由 `sbatch-eval` / `launch-eval` 拉起） |
-| `slurm/` | `prototype.slurm` + `sbatch-train.sh`；`eval.slurm` + `sbatch-eval.sh`；`vram-probe.slurm` + `sbatch-vram-probe.sh`；`preprocess.slurm` + `sbatch-preprocess.sh`；`remote_status.sh`（ovan-server 专属）/ `gpu_availability.py` / `tail_remote_logs.py` |
+| `slurm/` | `gpu_availability.py` / `tail_remote_logs.py`（遗留）；Slurm 提交走 `sar`。仓库内 `sbatch-*.sh` / `prototype.slurm` 仅人用，AI 不得直接 sbatch |
 | `logs/<服务名>/<时间戳>/` | 作业日志（gitignore；`sync pull` 拉取，push 不删远端）：`.out` / `.err` / `gpu-*.log` |
 
 勿再为每个模型复制一份 `.slurm`。
@@ -21,7 +21,7 @@ alwaysApply: true
 ## 执行目录
 
 - **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
-- 写成：`.venv/bin/python scripts/foo.py`、`.venv/bin/python scripts/export_latent_artifact.py --run …`、`.venv/bin/python scripts/compute_latent_whiten.py --latent-model … --tag …`、`bash slurm/sbatch-train.sh <name>`、`bash slurm/sbatch-eval.sh <name> -- --run …`、`bash scripts/launch-train.sh <name> --server <服务名> --gpus …`、`bash scripts/launch-eval.sh <name> --server <服务名> --gpus … -- --run …`、`bash slurm/sbatch-vram-probe.sh …`、`bash slurm/sbatch-preprocess.sh --dataset … --preprocess …`、`bash scripts/sync.sh <服务名> push|pull|…`、`bash scripts/sync_web.sh <服务名> push|pull`、`bash scripts/web.sh <local|服务名> up|down`、`ssh <服务名> 'cd ~/source/bdelf && …'`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`；均可系统 SSH）。
+- 写成：`.venv/bin/python scripts/foo.py`、`.venv/bin/python scripts/export_latent_artifact.py --run …`、`.venv/bin/python scripts/compute_latent_whiten.py --latent-model … --tag …`、`ssh ovan-server '~/bin/sar …'`、`bash scripts/launch-train.sh <name> --server <服务名> --gpus …`、`bash scripts/launch-eval.sh <name> --server <服务名> --gpus … -- --run …`、`bash scripts/sync.sh <服务名> push|pull|…`、`bash scripts/sync_web.sh <服务名> push|pull`、`bash scripts/web.sh <local|服务名> up|down`、`ssh <服务名> 'cd ~/source/bdelf && …'`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`；均可系统 SSH）。
 - 禁止 `cd scripts && python foo.py`。
 - `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
 - `<服务名>` 与工作目录见 `scripts/servers.csv`；均可系统 SSH。
@@ -29,7 +29,7 @@ alwaysApply: true
 ## SSH 边界
 
 - `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**不得在进程内发起 SSH**；在目标机直接跑。
-- 本机查 ovan-server 作业前置状态：`bash slurm/remote_status.sh`（本机 ssh 汇总；**Slurm 远端任务前必跑**，见 rule「远端 Slurm 计算约束」；输出含 `agent_gpu_sum` 与 csv 现场额度 `agent_gpu_budget`）。
+- 本机查 ovan-server Slurm 队列/卡：`ssh ovan-server '~/bin/sar gpus'` / `'~/bin/sar status'`（见 skill `slurm-auto-run`）。本机包装查卡：`bash slurm/remote_status.sh`（即 `sar gpus`）。不要用它提交作业。
 - common 远端：`ssh <名字>`；占 GPU 须 `scripts/launch-train.sh` / `scripts/launch-eval.sh`（`--server` + `--gpus`），写 `temp/agent` 与 `logs/<名字>/<时间戳>/`；无 `remote_status.sh`（见 rule「远端 common 计算约束」）。
 - 本机读远端日志：push（如需）→ `ssh <服务名> 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`（可加 `--server <服务名>`）。
-- 具体命令与登记流程见 skill `train-ops` / `sync`。
+- 具体命令见 skill `train-ops` / `slurm-auto-run` / `sync`。

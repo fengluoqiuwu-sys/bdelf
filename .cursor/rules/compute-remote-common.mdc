@@ -8,22 +8,23 @@ alwaysApply: true
 适用范围：`scripts/servers.csv` 中 `调度类型=common` 的**远端**主机（SSH 目标；单机、无 Slurm）。  
 本机仅本地调试，见 rule「本机计算约束」（**不**算 common）。Slurm / ovan-server 见「远端 Slurm 计算约束」。
 
-## 主机与额度
+## 主机与单次卡数
 
-- 以 `scripts/servers.csv`（gitignore）为准：名字、调度类型、工作目录、显卡、单卡GB、最大使用显卡数量、单个 ai 任务最大使用显卡数量。
+- 以 `scripts/servers.csv`（gitignore）为准：名字、调度类型、工作目录、显卡、单卡GB、单个 ai 任务最大使用显卡数量。csv 里若仍有「最大使用显卡数量」列，**不要**当合计限额用。
 - 所有服务均可系统 SSH：`ssh <名字>`（「名字」即 SSH 主机名）。
 - 同步：`bash scripts/sync.sh <名字> …`；登录/执行：`ssh <名字> 'cd <工作目录> && …'`（工作目录见 csv，通常 `~/source/bdelf`）。
-- 占 GPU 时：张数与**具体卡号**均须合规；合计张数不得超过该机 csv **「最大使用显卡数量」**，单任务张数不得超过 **「单个ai任务最大使用显卡数量」**（每次启动前读 csv，不要默记数字）；`gpu_ids` 不得与已登记作业重叠。
+- 占 GPU 时：`--gpus` 为物理卡号；**单任务**张数不得超过该机 csv **「单个ai任务最大使用显卡数量」**（每次启动前读 csv，不要默记数字）。张数须为 1/2/4/8。
+- `gpu_ids` 不得与该机已登记作业重叠。**不**用合计占卡数当闸。
 
 ## 状态（占 GPU 前强制）
 
 无 `slurm/remote_status.sh`。在启动/结束**占 GPU** 作业或改该机 `temp/agent` 之前：
 
-1. 扫该机 `temp/agent/active/*.json`：死 `pid` 清 active；收集已占用的 `gpu_ids`，并汇总 `gpus`。
+1. 扫该机 `temp/agent/active/*.json`：死 `pid` 清 active；收集已占用的 `gpu_ids`。
 2. 可选：`ssh <名字> 'nvidia-smi -L'` / `nvidia-smi …` 看物理卡与占用。
-3. 确认：本作业 `gpu_ids` 与 active 无交集；张数未超 csv 上限；不与他人 `holder` 冲突。
+3. 确认：本作业 `gpu_ids` 与 active 无交集；张数未超 csv 单次上限；不与他人 `holder` 冲突。
 
-纯 CPU 任务**不**走上述登记/额度检查。
+纯 CPU 任务**不**走上述登记/卡号检查。
 
 ## 提交与运行
 

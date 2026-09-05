@@ -12,7 +12,7 @@ config/{datasets,tokenizers,preprocess,models,train,generate}/
 dataset/  tokenizer/  models/
 scripts/  scripts/train/   # 辅助与训练启动 sh；common 用 launch-train.sh
 scripts/eval/              # 离线评测启动 sh；sbatch-eval / launch-eval
-slurm/                     # prototype + sbatch-train/eval/vram-probe/preprocess；gpu/tail/remote_status
+slurm/                     # 遗留 gpu/tail；Slurm 作业走 sar（sbatch-*.sh 仅人用）
 logs/<服务名>/<时间戳>/     # 作业 .out/.err/gpu.log（gitignore；pull 同步，push 不删远端）
 train.py  generate.py  hf_config.py
 cache/                     # gitignore
@@ -47,8 +47,9 @@ cache/                     # gitignore
 | Skill | 用途 |
 |-------|------|
 | `train` | `train.py` CLI、配置拼装、checkpoint 定位 |
-| `train-ops` | 本机冒烟与登记、Slurm 远端 sbatch/登记、common 远端 GPU 登记（不登记 CPU）；ovan 作业前必跑 `slurm/remote_status.sh` |
-| `eval` | TriFluency `eval.py`（本机扫参 / 远端 sbatch-eval·launch-eval / `cache/eval`） |
+| `train-ops` | 本机冒烟与登记、common 远端 GPU 登记；Slurm 见 `slurm-auto-run` |
+| `slurm-auto-run` | ovan-server 上 `~/bin/sar`：daemon / task / gpus；**禁止直接 sbatch**；**禁止 `sar project`** |
+| `eval` | TriFluency `eval.py`（本机扫参 / 远端 sar 或 launch-eval / `cache/eval`） |
 | `vram-probe` | 单卡显存探针 → `temp/vram-probe/alloc.md`（model×batch）；开训查表选型 |
 | `generate` | 本机 `generate.py` |
 | `sync` | `scripts/sync.sh`（`<服务名>` 见 `servers.csv`；登录用系统 `ssh <服务名>`） |

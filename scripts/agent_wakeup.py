@@ -9,13 +9,13 @@ Cursor 无自主闹钟：在后台跑本脚本，turn 结束后由终端输出�
 用法（仓库根；通常 ``block_until_ms: 0`` 后台跑）::
 
     .venv/bin/python scripts/agent_wakeup.py --after 5m -- \\
-      '跑 bash slurm/remote_status.sh；若 RUNNING 则 pull fast 并判继续/调整'
+      '跑 ssh ovan-server ~/bin/sar status；若仍在跑则 pull 日志并判断下一步'
 
     .venv/bin/python scripts/agent_wakeup.py --nth 1 -- \\
       'auto-train 首次唤醒：查队列与日志'
 
     .venv/bin/python scripts/agent_wakeup.py --after 60m --tag resource-wait -- \\
-      '额度/排队等待结束：再 remote_status'
+      '排队等待结束：再 sar status / sar gpus'
 """
 
 from __future__ import annotations

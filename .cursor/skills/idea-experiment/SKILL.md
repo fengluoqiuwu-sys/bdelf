@@ -11,7 +11,7 @@ description: >-
 # idea-experiment
 
 开题之后的**实验阶段规范**。同一夹 `temp/ideas/<name>/`，当前阶段写 **`stage.md`**。  
-**实验不要求 AI 做**：不写训练闭环、不占 GPU、不提交远端作业。人要跑时另走 `compute-ops`。
+**实验不要求 AI 做**：不写训练闭环、不占 GPU、不提交远端作业。人要跑时：Slurm 走 `slurm-auto-run`，common / 本机走 `compute-ops`。
 
 ## 硬边界
 
@@ -75,7 +75,7 @@ temp/ideas/<name>/
 
 ## 明确不做
 
-- 不跑实验、不占 GPU、不 sbatch / launch。
+- 不跑实验、不占 GPU、不 `sar` / launch。
 - 不把全局 trainer / checkpoint 复制进 `source/` 或 `result/`。
 - 不把大权重塞进 `temp/`（全局 ckpt 保持全局）。
 - 不写论文、不重做开题。

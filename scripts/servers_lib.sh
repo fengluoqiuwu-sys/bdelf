@@ -9,8 +9,8 @@ SERVER_NAME=""
 REMOTE_DIR=""
 REMOTE_SSH_TARGET="" # 即服务「名字」
 SERVER_SCHEDULER=""
-SERVER_GPU_MAX=""      # csv「最大使用显卡数量」：AI 合计额度
-SERVER_GPU_PER_JOB=""  # csv「单个ai任务最大使用显卡数量」
+SERVER_GPU_MAX=""      # csv「最大使用显卡数量」：遗留列，不作为合计限额
+SERVER_GPU_PER_JOB=""  # csv「单个ai任务最大使用显卡数量」：单次任务上限
 SSH_BASE=(ssh)
 
 # 须先 load_server；供 sync.sh / web.sh 等共用。
