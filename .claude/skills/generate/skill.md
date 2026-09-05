@@ -54,3 +54,4 @@ description: 本机 generate.py 推理；Claude 只做本地推理，不训练�
 - ELF 生成无条件：传 `--prompt` 会报错。
 - 给 ELF 显式 `--temperature` 会从 argmax 切到 multinomial。
 - 跨实验对比请显式 `--run`，勿依赖「最新 mtime」。
+- 跑前确认在 **`master`**（被切走则切回）。**不**抢工作区锁。

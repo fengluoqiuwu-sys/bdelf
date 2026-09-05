@@ -17,7 +17,7 @@ description: 自由探索找 idea；Claude 可只读已有 run，不负责创建
 ## 硬边界（Cursor）
 
 - 只写 `temp/`：本 run 目录 + 通过 ingest 写的 `temp/papers/<slug>/`。
-- 禁止：改仓库代码/`config/`、训练/占 GPU、远端作业、往 `temp/ideas/` 写（正式开题由人确认后走 `idea-kickoff`）。
+- 禁止：改仓库代码/`config/`、训练/占 GPU、远端作业、往 `temp/ideas/` 写（正式开题由人确认后走 Cursor `idea-kickoff`）。亦禁止写 `temp/idea/`、`temp/auto-research/`。
 - 主循环**禁止**精读全文；只读 INDEX / 线索 / 检索摘要。
 - 与当前仓库实现**解耦**：不要求 repo-novel；自由探索即可。
 

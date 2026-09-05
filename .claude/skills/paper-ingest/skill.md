@@ -18,6 +18,7 @@ description: 下载论文到 temp/papers/<slug>/，编 AI 用 INDEX.md；Claude 
 - 只写 `temp/papers/<slug>/`（及其中 `paper/`）。
 - 禁止改代码、开训/占 GPU、远端作业、clone GitHub/`sources/`（除非用户明示）。
 - **不产出完整 research idea**（那是 scout / idea-explore 的事）；INDEX 里只给「可跟线索」。
+- 不写 `temp/ideas/`、`temp/idea/`、`temp/research-scout/`、`temp/auto-research/`。
 
 ## 输入（Cursor）
 
