@@ -17,6 +17,9 @@ TRAIN_DIR="$ROOT/scripts/train"
 cd "$ROOT"
 # shellcheck source=job_log_dir.sh
 source "$ROOT/scripts/job_log_dir.sh"
+SCRIPT_DIR="$ROOT/scripts"
+# shellcheck source=servers_lib.sh
+source "$SCRIPT_DIR/servers_lib.sh"
 
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
   PY="$ROOT/.venv/bin/python"
@@ -29,7 +32,7 @@ usage() {
 用法: bash scripts/launch-train.sh <train> --server NAME --gpus IDS [选项...]
 
   <train>          scripts/train/ 下脚本短名或路径（同 sbatch-train.sh）
-  --server NAME    servers.csv「名字」（日志目录 logs/<NAME>/<时间戳>/）
+  --server NAME    csv 服务名（冒号左侧；无冒号则整列）。日志目录 logs/<服务名>/<时间戳>/
   --gpus IDS       物理卡号，逗号分隔（例 0,1）；必填，并转给训练脚本
   -n, --name NAME  作业名（默认取脚本文件名）
   --holder WHO     agent 登记 holder（默认 manual）
@@ -121,6 +124,7 @@ done
 [[ -n "$TRAIN_ARG" ]] || usage
 [[ -n "$SERVER_NAME" ]] || { echo "缺少 --server" >&2; usage; }
 [[ -n "$GPUS" ]] || { echo "缺少 --gpus" >&2; usage; }
+load_server "$SERVER_NAME" || exit 1
 
 resolve_train_script() {
   local arg=$1

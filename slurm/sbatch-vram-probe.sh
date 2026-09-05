@@ -10,14 +10,17 @@
 # ``--`` 之后：传给 scripts/vram_probe.py 的参数。
 # 未写 ``--`` 时，第一个探针旗标起视为探针 CLI。
 #
-# 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err}
-# 探针参数写入 logs/ovan-server/pending/vram-probe-args.pending。
+# 日志：logs/<服务名>/<时间戳>/{job-name}-{job-id}.{out,err}
+# 探针参数写入 logs/<服务名>/pending/vram-probe-args.pending。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 # shellcheck source=../scripts/job_log_dir.sh
 source "$ROOT/scripts/job_log_dir.sh"
+SCRIPT_DIR="$ROOT/scripts"
+# shellcheck source=../scripts/servers_lib.sh
+source "$SCRIPT_DIR/servers_lib.sh"
 
 SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
@@ -118,6 +121,7 @@ else
   fi
 fi
 
+load_server "$SERVER_NAME" || exit 1
 job_log_alloc "$SERVER_NAME" "$PROJECT"
 PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
 

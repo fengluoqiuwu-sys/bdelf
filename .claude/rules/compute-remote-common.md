@@ -7,8 +7,8 @@
 ## 主机与单次卡数
 
 - 以 `scripts/servers.csv`（gitignore）为准：名字、调度类型、工作目录、显卡、单卡GB、单个 ai 任务最大使用显卡数量。csv 里若仍有「最大使用显卡数量」列，**不要**当合计限额用。
-- 所有服务均可系统 SSH：`ssh <名字>`（「名字」即 SSH 主机名）。
-- 同步：`bash scripts/sync.sh <名字> …`；登录/执行：`ssh <名字> 'cd <工作目录> && …'`（工作目录见 csv，通常 `~/source/bdelf`）。
+- 「名字」列：`服务名` 或 `别名:SSH主机`（无冒号则二者相同）。脚本 / `--server` / `logs/<服务名>/` 用服务名；登录用 `ssh <SSH主机>`。
+- 同步：`bash scripts/sync.sh <服务名> …`；登录/执行：`ssh <SSH主机> 'cd <工作目录> && …'`（工作目录见 csv，通常 `~/source/bdelf`）。
 - 占 GPU 时：`--gpus` 为物理卡号；**单任务**张数不得超过该机 csv **「单个ai任务最大使用显卡数量」**（每次启动前读 csv，不要默记数字）。张数须为 1/2/4/8。
 - `gpu_ids` 不得与该机已登记作业重叠。**不**用合计占卡数当闸。
 
@@ -17,7 +17,7 @@
 无 `slurm/remote_status.sh`。在启动/结束**占 GPU** 作业或改该机 `temp/agent` 之前：
 
 1. 扫该机 `temp/agent/active/*.json`：死 `pid` 清 active；收集已占用的 `gpu_ids`。
-2. 可选：`ssh <名字> 'nvidia-smi -L'` / `nvidia-smi …` 看物理卡与占用。
+2. 可选：`ssh <SSH主机> 'nvidia-smi -L'` / `nvidia-smi …` 看物理卡与占用。
 3. 确认：本作业 `gpu_ids` 与 active 无交集；张数未超 csv 单次上限；不与他人 `holder` 冲突。
 
 纯 CPU 任务**不**走上述登记/卡号检查。
@@ -27,23 +27,23 @@
 - **禁止**直接 `bash scripts/train/<name>.sh --gpus …` 或 `bash scripts/eval/<name>.sh` 占 GPU；须经包装器：
 
 ```bash
-ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]'
+ssh <SSH主机> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server <服务名> --gpus 0,1 [--holder WHO]'
 # 离线 eval（默认与训练同为 4 卡）：
-ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-eval.sh <name> --server <名字> --gpus 0,1,2,3 -- --run full/<model>/<hash>'
+ssh <SSH主机> 'cd ~/source/bdelf && bash scripts/launch-eval.sh <name> --server <服务名> --gpus 0,1,2,3 -- --run full/<model>/<hash>'
 ```
 
- `--gpus` 为物理卡号（逗号分隔）；张数须为 1/2/4/8。包装器后台拉起，并写入与 Slurm 同构的三个日志文件到 `logs/<名字>/<时间戳>/`：
+ `--gpus` 为物理卡号（逗号分隔）；张数须为 1/2/4/8。包装器后台拉起，并写入与 Slurm 同构的三个日志文件到 `logs/<服务名>/<时间戳>/`：
  `<job-name>-<pid>.out` / `.err` / `gpu-<pid>.log`（另有 `meta.json`）。
 - **允许**做重 **CPU** 任务（如 `scripts/preprocess.py`）；**不**登记 CPU、不经 `launch-train` / `launch-eval`。
 - **禁止**擅自占 **GPU**；须用户明确授权，并指定 `--gpus`（`launch-train` / `launch-eval` 会写 `temp/agent`，含 `gpu_ids`）。训练作业优先交给 **Cursor**。
-- **generate.py**：禁止在远端交互式跑；离线 eval 经 `launch-eval`；权重/产物 `scripts/sync.sh <名字> pull …` 后本机查看。
+- **generate.py**：禁止在远端交互式跑；离线 eval 经 `launch-eval`；权重/产物 `scripts/sync.sh <服务名> pull …` 后本机查看。
 - 可停本 `holder` 登记且仍存活的进程；勿杀用户自启 / 他人 holder。
 
 ## 文件系统
 
-- 项目树只读；改代码只在本地 → `bash scripts/sync.sh <名字> push` → 再跑。
+- 项目树只读；改代码只在本地 → `bash scripts/sync.sh <服务名> push` → 再跑。
 - 远端 AI **可写**：该机 `temp/`（agent 登记；不同步）与 `logs/`（作业日志；**pull 拉取**，push 不删远端）。
-- generate / eval 产物：`scripts/sync.sh <名字> pull …`（pull 含 `logs/` 与 `cache/eval/`）后本机查看。
+- generate / eval 产物：`scripts/sync.sh <服务名> pull …`（pull 含 `logs/` 与 `cache/eval/`）后本机查看。
 
 ## AI 作业登记（仅占 GPU；登记用了哪几张卡）
 
@@ -54,4 +54,4 @@ ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-eval.sh <name> --server <
 - **必填**：`pid`、`gpus`（张数）、`gpu_ids`（物理卡号列表，与 `--gpus` 一致）、`holder`、`started_at`、`state`、`scheduler: "common"`。
 - `gpu_ids` 与其他 active 作业**不得重叠**。
 - 结束后更新 launched、删对应 active。
-- 读日志：`ssh <名字> 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server <名字>'`。
+- 读日志：`ssh <SSH主机> 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server <服务名>'`。

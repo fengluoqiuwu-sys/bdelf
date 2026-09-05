@@ -230,7 +230,7 @@ case "${1}" in
     exit 0
     ;;
   push|pull)
-    echo "请先指定 servers.csv 中的服务名，例如: $(basename "$0") ovan-server $1" >&2
+    echo "请先指定 servers.csv 中的服务名，例如: $(basename "$0") ovan $1" >&2
     usage >&2
     exit 1
     ;;

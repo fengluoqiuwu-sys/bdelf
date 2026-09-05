@@ -9,7 +9,7 @@
 # 模板默认 4 GPU / 16 CPU / 128G mem（与 sbatch-train / prototype.slurm 对齐）。
 # 若要更少卡：追加 --gpus-per-node=1 --mem=64G。
 #
-# 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err} 与 gpu-{job-id}.log
+# 日志：logs/<服务名>/<时间戳>/{job-name}-{job-id}.{out,err} 与 gpu-{job-id}.log
 # -- 之后参数写入 pending，由 eval.slurm 转给 scripts/eval/<name>.sh。
 set -euo pipefail
 
@@ -18,6 +18,9 @@ EVAL_DIR="$ROOT/scripts/eval"
 cd "$ROOT"
 # shellcheck source=../scripts/job_log_dir.sh
 source "$ROOT/scripts/job_log_dir.sh"
+SCRIPT_DIR="$ROOT/scripts"
+# shellcheck source=../scripts/servers_lib.sh
+source "$SCRIPT_DIR/servers_lib.sh"
 
 SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
@@ -31,7 +34,7 @@ usage() {
   -n, --name   Slurm --job-name（默认取脚本文件名去掉 .sh）
   --           之后参数原样传给 scripts/eval/<eval>.sh（如 --run full/odar/<hash>）
 
-日志写入 logs/ovan-server/<时间戳>/（可用 BDELF_SERVER_NAME 覆盖服务名）。
+日志写入 logs/<服务名>/<时间戳>/（BDELF_SERVER_NAME 默认 ovan-server；经 load_server 规范成 csv 服务名）。
 
 示例:
   bash slurm/sbatch-eval.sh odar-sc-ace -- --run full/odar/5428154e7c817e11
@@ -145,6 +148,7 @@ if [[ ! -f "$EVAL_SCRIPT" ]]; then
   exit 1
 fi
 
+load_server "$SERVER_NAME" || exit 1
 job_log_alloc "$SERVER_NAME" "$PROJECT"
 PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
 PENDING="$PENDING_DIR/eval-script-${JOB_NAME}.pending"

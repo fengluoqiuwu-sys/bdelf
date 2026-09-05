@@ -3,7 +3,7 @@ name: sync
 description: >-
   Sync bdelf with a remote named in scripts/servers.csv via scripts/sync.sh:
   push code/cache, pull checkpoint metadata or latest weights, pull-file for a
-  single step. First arg is the server row name (e.g. ovan-server). Use when
+  single step. First arg is the service name (csv nick; e.g. ovan). Use when
   the user asks to push/pull or fetch a checkpoint. AI must not use pull
   --mode full unless the user insists twice.
 ---
@@ -11,8 +11,8 @@ description: >-
 # sync
 
 仓库根：`bash scripts/sync.sh <服务名> …`。  
-登录/执行：系统 `ssh <服务名> 'cd ~/source/bdelf && …'`（「名字」即可 SSH）。  
-`<服务名>` 必须是 `scripts/servers.csv` 的「名字」列（该文件 gitignore；含调度类型/工作目录/显卡额度等）。  
+登录/执行：系统 `ssh <SSH主机> 'cd ~/source/bdelf && …'`。  
+csv「名字」列为 `服务名` 或 `别名:SSH主机`（无冒号则二者相同）。`<服务名>` 是冒号左侧（gitignore；含调度类型/工作目录/显卡额度等）。`ssh` 用冒号右侧。  
 执行目录见 rule「脚本约定」。Checkpoint 路径见 rule「Checkpoint 路径与配置哈希」。
 
 ## 禁止

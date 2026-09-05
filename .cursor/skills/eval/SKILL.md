@@ -90,12 +90,12 @@ ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-eval.sh odar-sc-ace -- -
 ```
 
 模板：`slurm/eval.slurm`（默认 GPU 数须与 csv 单任务上限一致 / 16 CPU / 128G，与 `prototype.slurm` 对齐）。  
-日志：`logs/ovan-server/<时间戳>/`；AI 须登记 `temp/agent/active/<job_id>.json`（`gpus` 取 csv 单任务上限）。
+日志：`logs/<服务名>/<时间戳>/`；AI 须登记 `temp/agent/active/<job_id>.json`（`gpus` 取 csv 单任务上限）。
 
 ### common
 
 ```bash
-ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-eval.sh odar-sc-ace --server <名字> --gpus 0,1,2,3 -- --run full/odar/<hash>'
+ssh <SSH主机> 'cd ~/source/bdelf && bash scripts/launch-eval.sh odar-sc-ace --server <服务名> --gpus 0,1,2,3 -- --run full/odar/<hash>'
 ```
 
 禁止直接 `bash scripts/eval/*.sh` 占 GPU；`launch-eval` 自动写 agent + 三日志文件。

@@ -21,15 +21,15 @@ alwaysApply: true
 ## 执行目录
 
 - **工作目录一律是仓库根**（含 `train.py` / `config/` / `.venv/`）。
-- 写成：`.venv/bin/python scripts/foo.py`、`.venv/bin/python scripts/export_latent_artifact.py --run …`、`.venv/bin/python scripts/compute_latent_whiten.py --latent-model … --tag …`、`ssh ovan-server '~/bin/sar …'`、`bash scripts/launch-train.sh <name> --server <服务名> --gpus …`、`bash scripts/launch-eval.sh <name> --server <服务名> --gpus … -- --run …`、`bash scripts/sync.sh <服务名> push|pull|…`、`bash scripts/sync_web.sh <服务名> push|pull`、`bash scripts/web.sh <local|服务名> up|down`、`ssh <服务名> 'cd ~/source/bdelf && …'`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`；均可系统 SSH）。
+- 写成：`.venv/bin/python scripts/foo.py`、`.venv/bin/python scripts/export_latent_artifact.py --run …`、`.venv/bin/python scripts/compute_latent_whiten.py --latent-model … --tag …`、`ssh ovan-server '~/bin/sar …'`、`bash scripts/launch-train.sh <name> --server <服务名> --gpus …`、`bash scripts/launch-eval.sh <name> --server <服务名> --gpus … -- --run …`、`bash scripts/sync.sh <服务名> push|pull|…`、`bash scripts/sync_web.sh <服务名> push|pull`、`bash scripts/web.sh <local|服务名> up|down`、`ssh <SSH主机> 'cd ~/source/bdelf && …'`、`.venv/bin/python scripts/agent_wakeup.py --after 5m -- '下一步…'`（服务名见 `scripts/servers.csv`）。
 - 禁止 `cd scripts && python foo.py`。
 - `scripts/` 下 Python 用 `repo_env.ensure_repo_root()`；`slurm/*.py` 自行 `chdir` 到仓库根。
-- `<服务名>` 与工作目录见 `scripts/servers.csv`；均可系统 SSH。
+- `<服务名>` 与工作目录见 `scripts/servers.csv`。「名字」可写 `别名:SSH主机`；脚本 / `--server` / `logs/<服务名>/` 用服务名，`ssh` 用 SSH 主机。
 
 ## SSH 边界
 
 - `slurm/gpu_availability.py`、`slurm/tail_remote_logs.py` 等**不得在进程内发起 SSH**；在目标机直接跑。
 - 本机查 ovan-server Slurm 队列/卡：`ssh ovan-server '~/bin/sar gpus'` / `'~/bin/sar status'`（见 skill `slurm-auto-run`）。本机包装查卡：`bash slurm/remote_status.sh`（即 `sar gpus`）。不要用它提交作业。
-- common 远端：`ssh <名字>`；占 GPU 须 `scripts/launch-train.sh` / `scripts/launch-eval.sh`（`--server` + `--gpus`），写 `temp/agent` 与 `logs/<名字>/<时间戳>/`；无 `remote_status.sh`（见 rule「远端 common 计算约束」）。
-- 本机读远端日志：push（如需）→ `ssh <服务名> 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`（可加 `--server <服务名>`）。
+- common 远端：`ssh <SSH主机>`；占 GPU 须 `scripts/launch-train.sh` / `scripts/launch-eval.sh`（`--server` + `--gpus`），写 `temp/agent` 与 `logs/<服务名>/<时间戳>/`；无 `remote_status.sh`（见 rule「远端 common 计算约束」）。
+- 本机读远端日志：push（如需）→ `ssh <SSH主机> 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py …'`（可加 `--server <服务名>`）。
 - 具体命令见 skill `train-ops` / `slurm-auto-run` / `sync`。

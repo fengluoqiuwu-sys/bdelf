@@ -52,7 +52,7 @@ cache/                     # gitignore
 | `eval` | TriFluency `eval.py`（本机扫参 / 远端 sar 或 launch-eval / `cache/eval`） |
 | `vram-probe` | 单卡显存探针 → `temp/vram-probe/alloc.md`（model×batch）；开训查表选型 |
 | `generate` | 本机 `generate.py` |
-| `sync` | `scripts/sync.sh`（`<服务名>` 见 `servers.csv`；登录用系统 `ssh <服务名>`） |
+| `sync` | `scripts/sync.sh`（`<服务名>` 见 `servers.csv`；登录用系统 `ssh <SSH主机>`） |
 | `auto-train` | 用户明确「自动执行」后的闭环优化；**须先确认训练服务名**（见「本机计算约束」） |
 | `research-scout` | 自由探索找未充分做过的 idea → `temp/research-scout/`（单条深化见同目录 `idea-explore.md`） |
 | `idea-kickoff` | 人确认某条可行后拷贝到 `temp/ideas/<name>/`；开题分综述→规格→报告（均 subagent） |

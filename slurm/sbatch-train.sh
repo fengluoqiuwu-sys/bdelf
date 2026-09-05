@@ -10,7 +10,7 @@
 # 模板默认 GPU 数须与 servers.csv「单个 ai 任务最大使用显卡数量」对齐（QOS cpu/user=64）；
 # 若要更少卡：追加 --gpus-per-node=2 --mem=64G。
 #
-# 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err} 与 gpu-{job-id}.log
+# 日志：logs/<服务名>/<时间戳>/{job-name}-{job-id}.{out,err} 与 gpu-{job-id}.log
 # 训练脚本默认在 scripts/train/ 下查找（可省略路径与 .sh）。
 # --name / -n 指定 Slurm job-name；其余参数原样传给 sbatch。
 set -euo pipefail
@@ -20,6 +20,9 @@ TRAIN_DIR="$ROOT/scripts/train"
 cd "$ROOT"
 # shellcheck source=../scripts/job_log_dir.sh
 source "$ROOT/scripts/job_log_dir.sh"
+SCRIPT_DIR="$ROOT/scripts"
+# shellcheck source=../scripts/servers_lib.sh
+source "$SCRIPT_DIR/servers_lib.sh"
 
 SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 # 计算节点上 /home/csh 常不可见；与 prototype.slurm 统一为 BeeGFS 绝对路径。
@@ -33,7 +36,7 @@ usage() {
            ar-100m-full  |  ar-100m-full.sh  |  scripts/train/ar-100m-full.sh
   -n, --name   Slurm --job-name（默认取脚本文件名去掉 .sh）
 
-日志写入 logs/ovan-server/<时间戳>/（可用 BDELF_SERVER_NAME 覆盖服务名）。
+日志写入 logs/<服务名>/<时间戳>/（BDELF_SERVER_NAME 默认 ovan-server；经 load_server 规范成 csv 服务名）。
 
 示例:
   bash slurm/sbatch-train.sh ar-100m-full
@@ -138,6 +141,7 @@ if [[ ! -f "$TRAIN_SCRIPT" ]]; then
   exit 1
 fi
 
+load_server "$SERVER_NAME" || exit 1
 job_log_alloc "$SERVER_NAME" "$PROJECT"
 PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
 PENDING="$PENDING_DIR/train-script-${JOB_NAME}.pending"

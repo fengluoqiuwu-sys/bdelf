@@ -14,8 +14,8 @@ alwaysApply: true
 - **推理/评测**：本机可直接 `eval.py` / `generate.py`；远端 TriFluency eval：Slurm 经 `sar`，common 经 `scripts/launch-eval.sh`，默认卡数与 csv「单个ai任务最大使用显卡数量」相同；结果经 `sync pull`（含 `cache/eval/`）拉回查看。`generate.py` 交互式续写仍只在本机。
 - **自动训练目标机（强制）**：启动 `auto-train` / 远端 full 前，必须先与用户确认
   `scripts/servers.csv` 中的**服务名**（及对应调度类型 `slurm`|`common`）。未确认不得默认
-  `ovan-server` 或其它主机；确认后写入 `temp/auto-research/<idea>/README.md` 并全程只用该名字
-  做 sync / 提交（细则见 skill `auto-train`）。`slurm` 则走 skill `slurm-auto-run`，不得直接 sbatch。
+  `ovan-server` 或其它主机；确认后写入 `temp/auto-research/<idea>/README.md`；
+  sync / `--server` / `logs/` 用服务名，登录用 `ssh <SSH主机>`（细则见 skill `auto-train`）。`slurm` 则走 skill `slurm-auto-run`，不得直接 sbatch。
 - 远端流程见 skill `train-ops` / `slurm-auto-run` / `sync`；规则见「远端 Slurm 计算约束」「远端 common 计算约束」。
 
 ## 本机作业登记（强制）

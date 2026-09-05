@@ -68,7 +68,7 @@ usage() {
   cat <<EOF
 用法: $(basename "$0") <服务名> {push|pull|pull-file} ...
 
-  <服务名>  scripts/servers.csv 中「名字」列（如 ovan-server）
+  <服务名>  servers.csv「名字」冒号左侧（无冒号则整列；如 ovan 或 ovan-server）
 
   push [--code-only] [--with-datasets] [--checksum] [--checkpoints NAME FILE]...
       强制覆盖推送代码到 <服务>:<工作目录>（删除远端多余文件；.venv/cache/temp 等排除项保留）
@@ -404,7 +404,7 @@ case "${1}" in
     exit 0
     ;;
   push|pull|pull-file)
-    echo "请先指定 servers.csv 中的服务名，例如: $(basename "$0") ovan-server $1 ..." >&2
+    echo "请先指定 servers.csv 中的服务名，例如: $(basename "$0") ovan $1 ..." >&2
     usage >&2
     exit 1
     ;;

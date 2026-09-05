@@ -50,11 +50,11 @@ ssh ovan-server '~/bin/sar status'
 - 占 GPU 须用户授权；**禁止**直接跑占卡脚本，须经 `scripts/launch-*.sh`：
 
 ```bash
-ssh <名字> 'cd <工作目录> && bash scripts/launch-*.sh <name> --server <名字> --gpus 0,1 [--holder WHO]'
+ssh <SSH主机> 'cd <工作目录> && bash scripts/launch-*.sh <name> --server <服务名> --gpus 0,1 [--holder WHO]'
 ```
 
 - `--gpus` 张数不得超过 csv「单个ai任务最大使用显卡数量」（现场读，不要默记）。不要用「最大使用显卡数量」当合计闸。
-- 包装器自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<名字>/<时间戳>/` 下三个日志文件。
+- 包装器自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<服务名>/<时间戳>/` 下三个日志文件。
 - 作业前扫该机 `active/` 的 `gpu_ids` + 可选 `nvidia-smi`；无 `remote_status.sh`。
 
 ## 远端提交（Slurm / ovan-server）
@@ -128,10 +128,10 @@ cp temp/agent/active/pid${PID}.json temp/agent/launched/pid${PID}.json
   "job_id": "pid12345",
   "pid": 12345,
   "job_name": "<name>",
-  "cmdline": "bash scripts/launch-*.sh <name> --server <名字> --gpus 0,1",
+  "cmdline": "bash scripts/launch-*.sh <name> --server <服务名> --gpus 0,1",
   "gpus": 2,
   "gpu_ids": [0, 1],
-  "log_dir": "logs/<名字>/20260806T100000",
+  "log_dir": "logs/<服务名>/20260806T100000",
   "started_at": "2026-08-06T10:00:00+08:00",
   "state": "RUNNING",
   "holder": "<who>",
@@ -155,7 +155,7 @@ logs/<server-name>/<时间戳>/
   meta.json
 ```
 
-- `<server-name>`：`servers.csv`「名字」。
+- `<server-name>`：`servers.csv`「名字」冒号左侧（无冒号则整列）。
 - Slurm（sar）：以 `ssh ovan-server '~/bin/sar task show ID'` 的日志目录为准；附属跑完后 sar 会把 logs 拉回主集群。
 - `logs/` gitignore；**pull 增量拉取**；push 不上传且 `--delete` 不删远端。
 
@@ -167,7 +167,7 @@ Slurm：优先 `sar task show ID` / `sar status`。需要读项目 `logs/` 时�
 # Slurm（若仍走仓库 logs/<服务>/<ts>/）
 ssh ovan-server 'cd <工作目录> && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
 # common
-ssh <名字> 'cd <工作目录> && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server <名字>'
+ssh <SSH主机> 'cd <工作目录> && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server <服务名>'
 ```
 
 看日志不要靠 pull；勿手写长串 `ssh ... tail`，除非脚本不可用。  

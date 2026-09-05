@@ -20,7 +20,8 @@ usage() {
 本机调用，经 ssh 在登录节点执行 ~/bin/sar gpus，输出原样传回。
 等价于: ssh ovan-server '~/bin/sar gpus …'
 
-环境变量：REMOTE_HOST（默认 ovan-server，须在 scripts/servers.csv 且调度类型=slurm）。
+环境变量：REMOTE_HOST（默认 ovan-server，须能在 scripts/servers.csv 查到且调度类型=slurm）。
+可用服务名或 SSH 主机；实际 ssh 目标取 csv 冒号右侧。
 EOF
 }
 
@@ -42,7 +43,7 @@ done
 
 load_server "$REMOTE_HOST" || exit 1
 if [[ "${SERVER_SCHEDULER}" != "slurm" ]]; then
-  echo "remote_status.sh 仅用于调度类型=slurm 的主机（当前 ${REMOTE_HOST} 为 ${SERVER_SCHEDULER:-?}）" >&2
+  echo "remote_status.sh 仅用于调度类型=slurm 的主机（当前 ${SERVER_NAME} 为 ${SERVER_SCHEDULER:-?}）" >&2
   exit 1
 fi
 if [[ -n "${CLUSTER}" && ! "${CLUSTER}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -60,4 +61,4 @@ if [[ "${JSON}" == "1" ]]; then
 fi
 
 # shellcheck disable=SC2029
-ssh "$REMOTE_HOST" "${remote_cmd}"
+"${SSH_BASE[@]}" "${REMOTE_SSH_TARGET}" "${remote_cmd}"

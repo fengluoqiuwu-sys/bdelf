@@ -5,7 +5,7 @@
 #   bash slurm/sbatch-preprocess.sh --dataset owt --preprocess default
 #   bash slurm/sbatch-preprocess.sh --dataset owt --preprocess elf --exclude=cls1-srv2
 #
-# 日志：logs/ovan-server/<时间戳>/{job-name}-{job-id}.{out,err}
+# 日志：logs/<服务名>/<时间戳>/{job-name}-{job-id}.{out,err}
 # ``--`` 之前也可夹杂其它 sbatch 选项；dataset/preprocess 均须显式给出。
 set -euo pipefail
 
@@ -13,6 +13,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 # shellcheck source=../scripts/job_log_dir.sh
 source "$ROOT/scripts/job_log_dir.sh"
+SCRIPT_DIR="$ROOT/scripts"
+# shellcheck source=../scripts/servers_lib.sh
+source "$SCRIPT_DIR/servers_lib.sh"
 
 SERVER_NAME="${BDELF_SERVER_NAME:-ovan-server}"
 PROJECT=/data/cls1-beegfs/home/csh/source/bdelf
@@ -90,6 +93,7 @@ done
 [[ -n "$PREPROCESS" ]] || { echo "缺少 --preprocess" >&2; usage; }
 [[ -n "$JOB_NAME" ]] || JOB_NAME="${DATASET}-${PREPROCESS}-preprocess"
 
+load_server "$SERVER_NAME" || exit 1
 job_log_alloc "$SERVER_NAME" "$PROJECT"
 PENDING_DIR="$(job_log_pending_dir "$SERVER_NAME" "$PROJECT")"
 ARGS_FILE="$PENDING_DIR/preprocess-args-${JOB_NAME}.pending"

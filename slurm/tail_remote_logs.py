@@ -20,7 +20,7 @@
     .venv/bin/python slurm/tail_remote_logs.py 1234567 --which err
     .venv/bin/python slurm/tail_remote_logs.py --list
     .venv/bin/python slurm/tail_remote_logs.py --job-name ar-100m-full -n 50
-    .venv/bin/python slurm/tail_remote_logs.py --server ovan-server --list
+    .venv/bin/python slurm/tail_remote_logs.py --server ovan --list
 """
 
 from __future__ import annotations
@@ -239,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--server",
-        help="限制在 logs/<server>/ 下查找（如 ovan-server、train-server-1）",
+        help="限制在 logs/<服务名>/ 下查找（csv 冒号左侧，如 ovan、train-1）",
     )
     p.add_argument(
         "--list",

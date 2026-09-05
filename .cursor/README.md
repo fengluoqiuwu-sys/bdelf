@@ -42,7 +42,7 @@
 | 路径 | 用途 |
 |------|------|
 | `scripts/sync.sh` | 代码 push + `logs/` pull；根目录 `requirements.txt` 变更且远端有 `.venv` 则 pip install；产物路径见文件头 |
-| `scripts/servers.csv.example` | 复制为 `servers.csv` 并改「工作目录」 |
+| `scripts/servers.csv.example` | 复制为 `servers.csv` 并改「工作目录」；「名字」可 `别名:SSH主机` |
 | `scripts/servers_lib.sh` | 解析 csv |
 | `scripts/job_log_dir.sh` | `logs/<服务>/<时间戳>/` |
 | `scripts/workspace_lock.py` | 遗留工具；AI 改代码**不**调用 |

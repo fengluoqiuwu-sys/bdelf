@@ -73,10 +73,10 @@ bash slurm/remote_status.sh          # 可读表；机器用加 --json
 - 占 GPU 须用户授权；**禁止**直接跑 `scripts/train/*.sh` / `scripts/eval/*.sh`，须经 `launch-train` / `launch-eval`（eval 细则见 skill `eval`）：
 
 ```bash
-ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server <名字> --gpus 0,1 [--holder WHO]'
+ssh <SSH主机> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server <服务名> --gpus 0,1 [--holder WHO]'
 ```
 
-- `launch-train` / `launch-eval` 自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<名字>/<时间戳>/` 下三个日志文件。
+- `launch-train` / `launch-eval` 自动写该机 `temp/agent/active|launched/pid<PID>.json`（含 `gpu_ids`）与 `logs/<服务名>/<时间戳>/` 下三个日志文件。
 - 作业前扫 active 的 `gpu_ids` + 可选 `nvidia-smi`；无 `remote_status.sh`。
 
 ## 远端提交 full（Slurm / ovan-server）
@@ -98,11 +98,11 @@ ssh <名字> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> --server 
 ssh ovan-server 'cd ~/source/bdelf && bash slurm/sbatch-train.sh <name>'
 # 例：bash slurm/sbatch-train.sh elf-100m-full --name elf-cfg-100m-full --exclude=cls1-srv2
 # 若要 2 卡：追加 --gpus-per-node=2 --mem=64G
-# stdout 含 Submitted batch job <id> 与 log_dir=logs/ovan-server/<时间戳>
+# stdout 含 Submitted batch job <id> 与 log_dir=logs/<服务名>/<时间戳>
 ```
 
 禁止 AI 提交预处理作业（`slurm/sbatch-preprocess.sh`）。模板：`slurm/prototype.slurm`（GPU 数须与 csv「单个ai任务最大使用显卡数量」一致；16 CPU / 128G）。  
-日志目录：`logs/ovan-server/<时间戳>/`（`.out` / `.err` / `gpu-<job_id>.log`）。
+日志目录：`logs/<服务名>/<时间戳>/`（`.out` / `.err` / `gpu-<job_id>.log`）。
 
 AI 合计将超 `agent_gpu_budget`：auto-train 按「资源等待」睡 **60 分钟**再 `remote_status`（等本侧额度）；`AVAIL` 不足则**先 sbatch 排队**，再 60m 看是否 RUNNING。一次性手动任务额度满则向用户说明后停下。
 
@@ -197,10 +197,10 @@ cp temp/agent/active/pid${PID}.json temp/agent/launched/pid${PID}.json
   "job_id": "pid12345",
   "pid": 12345,
   "job_name": "elf-100m-full",
-  "cmdline": "bash scripts/launch-train.sh elf-cfg-100m-full --server train-server-1 --gpus 0,1",
+  "cmdline": "bash scripts/launch-train.sh elf-cfg-100m-full --server train-1 --gpus 0,1",
   "gpus": 2,
   "gpu_ids": [0, 1],
-  "log_dir": "logs/train-server-1/20260806T100000",
+  "log_dir": "logs/train-1/20260806T100000",
   "started_at": "2026-08-06T10:00:00+08:00",
   "state": "RUNNING",
   "holder": "auto-train:<idea>",
@@ -221,7 +221,7 @@ logs/<server-name>/<时间戳>/
   meta.json                 # 可选：server / job_id / script / …
 ```
 
-- `<server-name>`：`servers.csv`「名字」（Slurm 默认 `ovan-server`）。
+- `<server-name>`：csv「名字」冒号左侧（无冒号则整列；Slurm 默认查找 `ovan-server`）。
 - `<job_id>`：Slurm 数字 job id，或 common 的进程 PID（文件名用裸 PID；agent 键为 `pid<PID>`）。
 - `logs/` gitignore；**pull 增量拉取**；push 不上传且 `--delete` 不删远端。
 - 旧路径 `slurm/logs/` 仍被 `tail_remote_logs.py` 兼容扫描。
@@ -234,9 +234,9 @@ logs/<server-name>/<时间戳>/
 # Slurm
 ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID>'
 ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py <JOB_ID> --which err -n 120'
-ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --server ovan-server --list'
+ssh ovan-server 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py --server ovan --list'
 # common
-ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server train-server-1'
+ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --server train-1'
 ssh train-server-1 'cd ~/source/bdelf && .venv/bin/python slurm/tail_remote_logs.py pid12345 --which gpu'
 ```
 

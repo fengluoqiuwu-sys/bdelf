@@ -23,7 +23,7 @@ usage() {
 用法: $(basename "$0") <local|服务名> {up|down}
 
   local       本机直接跑 monitor.py（--instance local）
-  <服务名>    scripts/servers.csv「名字」列：远端跑 monitor（--instance remote），
+  <服务名>    csv「名字」冒号左侧（无冒号则整列）：远端跑 monitor（--instance remote），
               本机高端口做 SSH 隧道（优先复用上次本机端口，占用再随机）。
               远端若还没有 monitor.py 会 sync push --code-only（instance.json 写成 remote）。
 
@@ -279,8 +279,8 @@ start_tunnel() {
 
 cmd_up_remote() {
   local sf pid tunnel_pid local_port remote_port url rurl
+  load_server "${SERVER_NAME}" || exit 1
   sf="$(state_file "${SERVER_NAME}")"
-  load_server "${SERVER_NAME}"
   ensure_remote_monitor
   mkdir -p "${STATE_DIR}"
 
@@ -330,7 +330,7 @@ EOF
 
 cmd_down_remote() {
   local sf pid tunnel_pid extra
-  load_server "${SERVER_NAME}"
+  load_server "${SERVER_NAME}" || exit 1
   sf="$(state_file "${SERVER_NAME}")"
   pid="$(read_state_field "${sf}" monitor_pid || true)"
   tunnel_pid="$(read_state_field "${sf}" tunnel_pid || true)"

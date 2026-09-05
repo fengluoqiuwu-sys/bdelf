@@ -60,7 +60,7 @@ description: >-
 | 场景 | 命令 |
 |------|------|
 | 本机 fast 冒烟 | `.venv/bin/python train.py ... --config 100m-fast ...` 或 `bash scripts/train/<name>.sh`（若脚本已是 fast） |
-| 远端 Slurm full | `bash slurm/sbatch-train.sh <name>`（短名 → `scripts/train/<name>.sh`；`--name` 改 job-name；日志 `logs/ovan-server/<时间戳>/`） |
+| 远端 Slurm full | `bash slurm/sbatch-train.sh <name>`（短名 → `scripts/train/<name>.sh`；`--name` 改 job-name；日志 `logs/<服务名>/<时间戳>/`） |
 | 远端 common full | `bash scripts/launch-train.sh <name> --server <服务名> --gpus 0,1`（**禁止**直接跑 `scripts/train/*.sh`；日志 `logs/<服务名>/<时间戳>/`） |
 
 `world_size` 按**可见** GPU 探测（∈ {1,2,4,8}）。AI 在 Slurm 上 full 默认 4 卡（`prototype.slurm`）；common 须经 `launch-train` 显式 `--gpus` 选卡。本机不要跑 full 规模。

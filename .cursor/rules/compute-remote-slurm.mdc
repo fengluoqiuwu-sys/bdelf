@@ -5,7 +5,7 @@ alwaysApply: true
 
 # 远端 Slurm 计算约束
 
-适用范围：`scripts/servers.csv` 中 `调度类型=slurm` 的主机。当前登录机 **ovan-server**。  
+适用范围：`scripts/servers.csv` 中 `调度类型=slurm` 的主机。当前登录机 SSH 主机 **ovan-server**（csv 服务名可以是别名，如 `ovan:ovan-server`）。  
 common 远端见 rule「远端 common 计算约束」；本机见「本机计算约束」。  
 操作细则见 skill `slurm-auto-run`（入口 `~/bin/sar`）。
 

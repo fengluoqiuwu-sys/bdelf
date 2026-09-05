@@ -27,11 +27,11 @@ description: >-
 
 1. 用户描述任务（可能还提到某个架构/思路），并说"请自动执行"。
 2. **必须**在下一条回复里先确认两件事，都得到明确答复后才动：
-   - **训练服务名**：`scripts/servers.csv` 的「名字」列（如 `ovan-server` / `upload-server`）；
+   - **训练服务名**：csv「名字」冒号左侧（无冒号则整列；如 `ovan` 或 `ovan-server`）；
      未指定则列出可用名字请用户选。**禁止**默认任一主机。
    - **是否执行**：得到明确确认后才进入下一步。
-3. 将确认的服务名记入 `temp/auto-research/<idea>/README.md`（字段建议：`server: <名字>`、
-   `scheduler: slurm|common`）；本轮全程 sync / ssh / 提交 / 登记**只使用该名字**。
+3. 将确认的服务名记入 `temp/auto-research/<idea>/README.md`（字段建议：`server: <服务名>`、
+   `scheduler: slurm|common`）；本轮 sync / `--server` / 日志目录只用该服务名，登录用对应 SSH 主机。
    中途换机须重新向用户确认并改写 README。
 4. 确认执行时，把后续**所有可能运行的一次性指令**（打 tag、起后台调度、首次 push、
    sbatch / common 启训等）合并成**一个待批准块**一次给出，让用户一次性授权，防止其离开后逐条授权卡住。
@@ -200,7 +200,7 @@ git commit -m "<语义化描述>"
          → AVAIL 不足仍 sbatch 排队 → ssh 后 bash slurm/sbatch-train.sh <name>
          → 写 active/<job_id>.json（gpus: csv 单任务上限, holder:auto-train:<idea>, scheduler:slurm）
 - common：扫该机 active → 选不冲突 --gpus（张数≤csv 单任务上限）
-         → ssh <服务名> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> \
+         → ssh <SSH主机> 'cd ~/source/bdelf && bash scripts/launch-train.sh <name> \
               --server <服务名> --gpus … --holder auto-train:<idea>'
          （自动写 agent + logs/<服务名>/<时间戳>/；见远端 common 规则）
 - 若已 RUNNING → 启动「5 分钟后首次唤醒」（见「唤醒调度」）
