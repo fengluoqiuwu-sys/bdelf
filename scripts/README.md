@@ -14,6 +14,6 @@
 | `sync_web.sh` | `sync.sh` 调用：按 hash 合并 `cache/monitor/charts.json` |
 | `web.sh` | `local\|服务名` + `up\|down`：本机或 SSH 隧道打开 monitor |
 | `job_log_dir.sh` | `logs/<服务名>/<时间戳>/` |
-| `workspace_lock.py` | 本机非 temp 改动互斥锁 |
+| `workspace_lock.py` | 遗留；AI 改代码不调用 |
 | `agent_wakeup.py` | 延时打印 `AGENT_WAKEUP` |
 | `repo_env.py` | `scripts/*.py` 切到仓库根 |

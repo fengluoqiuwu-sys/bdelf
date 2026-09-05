@@ -8,11 +8,11 @@
 
 | 文件 | 内容 |
 |------|------|
-| `compute-local.mdc` | 本机 5080 只调试；GPU 互斥；`master` + 工作区锁；`temp/agent` 登记 |
+| `compute-local.mdc` | 本机 5080 只调试；GPU 互斥；改代码须 `master`（不抢锁）；`temp/agent` 登记 |
 | `compute-remote-slurm.mdc` | ovan-server / cls1；作业前 `remote_status.sh`；合计 GPU 以 csv「最大使用显卡数量」为准 |
 | `compute-remote-common.mdc` | 非 Slurm 远端；占卡须包装器 + `gpu_ids`；禁止擅自占 GPU |
 | `python-venv.mdc` | 一律仓库根 `.venv` |
-| `temp-layout.mdc` | `ideas` / `papers` / `research-scout` / `agent` / 工作区锁 |
+| `temp-layout.mdc` | `ideas` / `papers` / `research-scout` / `agent` |
 | `scripts.mdc` | 工作目录=仓库根；SSH 边界 |
 | `project-conventions.mdc` | 通用目录、中文注释、skill 索引 |
 | `git-commit.mdc` | 人说才提交；禁机密；多逻辑先问再拆 |
@@ -48,7 +48,7 @@
 | `scripts/servers.csv.example` | 复制为 `servers.csv` 并改「工作目录」 |
 | `scripts/servers_lib.sh` | 解析 csv |
 | `scripts/job_log_dir.sh` | `logs/<服务>/<时间戳>/` |
-| `scripts/workspace_lock.py` | 本机工作区锁 |
+| `scripts/workspace_lock.py` | 遗留工具；AI 改代码**不**调用 |
 | `scripts/agent_wakeup.py` | `AGENT_WAKEUP` |
 | `scripts/repo_env.py` | 切到仓库根 |
 | `slurm/remote_status.sh` | 作业前汇总 GPU/队列/登记（工作目录来自 csv） |

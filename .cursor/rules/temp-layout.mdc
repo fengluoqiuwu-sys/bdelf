@@ -15,7 +15,6 @@ alwaysApply: true
 | `temp/papers/<name>/` | 论文（`paper/` + `INDEX.md`）与可选 `sources/` |
 | `temp/research-scout/<run>/` | 自由探索找 idea 的 run 记录（见 skill `research-scout`）；可行 `ideas/I-{n}/`，失败 `ideas/D-{n}/`（由 `idea-explore` 写入、scout 改名） |
 | `temp/vram-probe/` | `alloc.md`：model×batch→alloc_peak_GiB（见 skill `vram-probe`）；开训按当前卡+global_bs 查表 |
-| `temp/local-workspace.lock/` | **本机** AI 非 temp 改动互斥锁（用 `scripts/workspace_lock.py` 抢/释；见 skill `train-ops`） |
 | `temp/web/` | 本机 `scripts/web.sh` 状态（pid / 隧道 / 端口）；远端另有 `temp/web/monitor.pid` |
 | `temp/agent/`（本机） | 本机调试作业登记（`scheduler: "local"`；见「本机计算约束」、skill `train-ops`） |
 | `temp/agent/`（common 远端） | 占 GPU 作业登记（`gpu_ids` + `gpus`；不登记 CPU；见「远端 common 计算约束」） |

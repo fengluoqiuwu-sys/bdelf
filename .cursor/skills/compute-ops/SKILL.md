@@ -23,31 +23,12 @@ description: >-
 3. 启动后立即登记 `active/pid<PID>.json` + `launched/`（含 `pid` / `cpus` / `gpus`，`scheduler: "local"`）。
 4. 冒烟看到**首批指标正常**即可尽快停，勿占满本机卡做正式重计算。结束后删对应 active、更新 launched。
 
-## 本机分支与工作区锁（AI）
-
-### 分支（一律 master）
+## 本机分支（AI）
 
 1. 改代码前：`git branch --show-current` 必须为 **`master`**；否则 `git switch master`。
 2. **禁止**为实验另开实现分支；思路隔离用 `temp/`。
 3. 改动默认向前兼容；破坏性改动须用户二次确认。
-
-### 工作区锁（仅非 temp 改动）
-
-锁路径：`temp/local-workspace.lock/`（**目录存在即占锁**；见 rule「temp/ 布局」）。  
-用仓库根工具（勿手写 mkdir）：
-
-```bash
-WHO="<holder>"
-.venv/bin/python scripts/workspace_lock.py acquire --holder "$WHO" --purpose "<简述>"
-# …改代码 / commit…
-.venv/bin/python scripts/workspace_lock.py release --holder "$WHO"
-.venv/bin/python scripts/workspace_lock.py status   # 可选
-```
-
-- AI：`acquire` 失败（exit 1）→ 睡 **30 分钟** 再试。
-- 适用：编辑仓库非 `temp/` 文件、commit、改配置/代码。
-- **不适用**：只读、只动 `temp/`。
-- 勿删他人仍在用的锁；若确认 AI 已死且 `status` 显示僵死，可手动 `rm -rf temp/local-workspace.lock`（慎用）。
+4. **不**抢工作区锁（不要调用 `scripts/workspace_lock.py`）。
 
 ## 远端状态工具（Slurm / ovan-server 强制）
 
