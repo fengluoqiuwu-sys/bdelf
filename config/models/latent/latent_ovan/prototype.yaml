@@ -1,0 +1,30 @@
+_doc: csh BlockVAE 风格 Text VAE 配置模板（块因果；本机 gpt2 词表）  # 文件说明，写入 extra
+
+name: prototype  # 配置名；prototype 不可实例化
+tokenizer: gpt2  # 分词器名；与 config/tokenizers 一致
+max_seq_len: 4096  # 最大序列长度
+n_layer_enc: 6  # 编码器层数（T5-small）
+n_layer_dec: 6  # 解码器层数（T5-small）
+n_head: 8  # 注意力头数（512/64）
+n_embd: 512  # 隐层宽度 E（T5-small d_model）
+d_kv: 64  # 每头 K/V 维（T5-small）
+mlp_mult: 4  # SwiGLU 扩展比；中间维 ⌊2/3·mult·E⌋
+latent_dim: 16  # 瓶颈维 B（对齐 csh z16）
+dropout: 0.1  # Dropout
+beta_kl: 0.05  # 后验 KL 权重
+lambda_mask: 1.0  # BERT-mask 损失权重
+mask_ratio: 0.1  # 抽中位比例
+mask_rand_frac: 1.0  # 抽中位换成随机正文 token 的比例；1=全错词，0=全 [MASK]
+z_zero_ratio: 0.1  # 采样 z 每一维换成 N(0,1) 的概率（仅训练）
+recon_t_mean: 0.5  # decode 加噪 t~LogitNormal 的均值
+recon_t_std: 1.0  # decode 加噪 t~LogitNormal 的标准差；0=关闭
+noise_sigma: 1.0  # ε ~ N(0, σ²) 的尺度
+sample_vocab_size: 50257  # 随机错词从 [0, this) 抽，避开 pad/bos/eos/MASK
+qk_norm: true  # Q/K RMSNorm
+tie_wte_normalize: true  # tied wte 按行 L2 均值归一后再作 logits
+use_flash: true  # 是否 SDPA
+attn_backend: sdpa  # 块因果后端：sdpa | flex
+block_size: 16  # 块大小；1=逐 token 因果；>1 为块内双向、块间因果
+
+sampling:
+  temperature: 1.0  # 采样温度；≤0 为 argmax
